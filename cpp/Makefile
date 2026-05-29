@@ -51,11 +51,11 @@ libgmn.so: gmn.o | check-env
 		-lfusion64 -lmosek64 \
 		-o libgmn.so
 
-mipt_1d.o: mipt_1d.cpp gmn.hpp
-	$(NVQXX) $(CUDAQ_CXXFLAGS) -c mipt_1d.cpp -o mipt_1d.o
+mipt.o: mipt.cpp gmn.hpp
+	$(NVQXX) $(CUDAQ_CXXFLAGS) -c mipt.cpp -o mipt.o
 
-%.exe: mipt_1d.o libgmn.so
-	$(NVQXX) $(CUDAQ_TARGET_FLAGS) mipt_1d.o \
+%.exe: mipt.o libgmn.so
+	$(NVQXX) $(CUDAQ_TARGET_FLAGS) mipt.o \
 		-L. \
 		-Wl,-rpath,'$$ORIGIN' \
 		-Wl,-rpath,$(MSKLIB) \

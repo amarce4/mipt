@@ -1,57 +1,22 @@
 #include <cudaq.h>
+#include <cudaq/algorithms/draw.h>
+#include <Eigen/Dense>
+#include <unsupported/Eigen/KroneckerProduct>
+#include "gmn.hpp"
 #include <vector>
 #include <random>
 #include <iostream>
-#include <Eigen/Dense>
-#include <unsupported/Eigen/KroneckerProduct>
 #include <complex>
 #include <cmath>
 #include <set>
 #include <fstream>
 #include <chrono>
 #include <cstdlib>
+#include <array>
 
 using Complex = std::complex<double>;
 using MatrixXc = Eigen::MatrixXcd;
 using VectorXc = Eigen::VectorXcd;
-
-// Source - https://stackoverflow.com/a/27030598
-// Posted by Akavall, modified by community. See post 'Timeline' for change history
-// Retrieved 2026-05-25, License - CC BY-SA 3.0
-
-#include <sys/socket.h>
-#include <arpa/inet.h>
-#include <unistd.h>
-
-double run_gmn_server(const MatrixXc &rho)
-{
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
-
-    sockaddr_in serv_addr{};
-    serv_addr.sin_family = AF_INET;
-    serv_addr.sin_port = htons(50007);
-
-    inet_pton(AF_INET, "127.0.0.1", &serv_addr.sin_addr);
-
-    connect(sock, (sockaddr*)&serv_addr, sizeof(serv_addr));
-
-    int D = rho.rows();
-    std::vector<double> buffer;
-    buffer.reserve(D*D);
-
-    for (int i = 0; i < D; i++)
-        for (int j = 0; j < D; j++)
-            buffer.push_back(std::real(rho(i,j)));
-
-    send(sock, buffer.data(), buffer.size()*sizeof(double), 0);
-
-    char reply[128] = {0};
-    read(sock, reply, sizeof(reply));
-
-    close(sock);
-
-    return atof(reply);
-}
 
 template <typename T>
 std::vector<double> linspace(T start_in, T end_in, int num_in)
@@ -107,10 +72,7 @@ MatrixXc density_matrix(const VectorXc &psi)
     return psi * psi.adjoint();
 }
 
-MatrixXc partial_trace_statevector(
-    const VectorXc &psi,
-    int n,
-    const std::vector<int> &traced_out)
+MatrixXc partial_trace_statevector(const VectorXc &psi, int n, const std::vector<int> &traced_out)
 {
     std::set<int> traced_set(traced_out.begin(), traced_out.end());
 
@@ -194,97 +156,170 @@ double tmi(const VectorXc &psi, int n)
 
     for (int i = 0; i < n; ++i)
     {
-        if (i != n - 3) notA.push_back(i);
-        if (i != n - 2) notB.push_back(i);
-        if (i != n - 1) notC.push_back(i);
+        if (i != n - 3)
+            notA.push_back(i);
+        if (i != n - 2)
+            notB.push_back(i);
+        if (i != n - 1)
+            notC.push_back(i);
 
-        if (i != n - 3 && i != n - 2) notAB.push_back(i);
-        if (i != n - 3 && i != n - 1) notAC.push_back(i);
-        if (i != n - 2 && i != n - 1) notBC.push_back(i);
+        if (i != n - 3 && i != n - 2)
+            notAB.push_back(i);
+        if (i != n - 3 && i != n - 1)
+            notAC.push_back(i);
+        if (i != n - 2 && i != n - 1)
+            notBC.push_back(i);
     }
 
-    auto rho_A  = partial_trace_statevector(psi, n, notA);
-    auto rho_B  = partial_trace_statevector(psi, n, notB);
-    auto rho_C  = partial_trace_statevector(psi, n, notC);
+    auto rho_A = partial_trace_statevector(psi, n, notA);
+    auto rho_B = partial_trace_statevector(psi, n, notB);
+    auto rho_C = partial_trace_statevector(psi, n, notC);
 
     auto rho_AB = partial_trace_statevector(psi, n, notAB);
     auto rho_AC = partial_trace_statevector(psi, n, notAC);
     auto rho_BC = partial_trace_statevector(psi, n, notBC);
 
-    double S_A  = entropy(rho_A);
-    double S_B  = entropy(rho_B);
-    double S_C  = entropy(rho_C);
+    double S_A = entropy(rho_A);
+    double S_B = entropy(rho_B);
+    double S_C = entropy(rho_C);
 
     double S_AB = entropy(rho_AB);
     double S_AC = entropy(rho_AC);
     double S_BC = entropy(rho_BC);
 
-    return S_A + S_B + S_C
-         - S_AB - S_AC - S_BC;
-}
-
-std::vector<double> matrix_to_vec(const MatrixXc &rho)
-{
-    int D = rho.rows();
-    std::vector<double> v(D * D);
-
-    for (int i = 0; i < D; ++i)
-    for (int j = 0; j < D; ++j)
-    {
-        // GMN uses real matrix (as in your code)
-        v[i * D + j] = std::real(rho(i,j));
-    }
-
-    return v;
+    return S_A + S_B + S_C - S_AB - S_AC - S_BC;
 }
 
 struct LayerData
 {
+    int start = 0;
+
     std::vector<int> measure_flags;
-    std::vector<double> theta_x;
-    std::vector<double> theta_y;
-    std::vector<double> theta_z;
+
+    // Exactly one of these should be 1 for each qubit.
+    std::vector<int> rot_x_flags;
+    std::vector<int> rot_y_flags;
+    std::vector<int> rot_xy_flags;
 };
 
-struct MIPTKernel
+struct MIPTKernel_1D
 {
-
     void operator()(int n,
-                    const std::vector<LayerData> &layers) __qpu__
+                    const std::vector<LayerData> &layers,
+                    bool closed) __qpu__
     {
-
         cudaq::qvector q(n);
 
-        for (std::size_t layer = 0;
-             layer < layers.size();
-             ++layer)
+        for (std::size_t layer = 0; layer < layers.size(); ++layer)
         {
+            int start = layers[layer].start;
 
-            bool even = (layer % 2 == 0);
-
-            int start = even ? 0 : 1;
-
-            // Two-qubit brickwork layer
             for (int i = start; i < n - 1; i += 2)
             {
+                // Local rotation on q[i]
+                if (layers[layer].rot_x_flags[i])
+                {
+                    rx(1.57079632679489661923, q[i]);
+                }
 
-                // Random local rotations
-                rx(layers[layer].theta_x[i], q[i]);
-                ry(layers[layer].theta_y[i], q[i]);
-                rz(layers[layer].theta_z[i], q[i]);
+                if (layers[layer].rot_y_flags[i])
+                {
+                    ry(1.57079632679489661923, q[i]);
+                }
 
-                rx(layers[layer].theta_x[i + 1], q[i + 1]);
-                ry(layers[layer].theta_y[i + 1], q[i + 1]);
-                rz(layers[layer].theta_z[i + 1], q[i + 1]);
+                if (layers[layer].rot_xy_flags[i])
+                {
+                    rz(-0.78539816339744830962, q[i]);
+                    rx(1.57079632679489661923, q[i]);
+                    rz(0.78539816339744830962, q[i]);
+                }
 
-                // Entangling gate
+                // Local rotation on q[i + 1]
+                if (layers[layer].rot_x_flags[i + 1])
+                {
+                    rx(1.57079632679489661923, q[i + 1]);
+                }
+
+                if (layers[layer].rot_y_flags[i + 1])
+                {
+                    ry(1.57079632679489661923, q[i + 1]);
+                }
+
+                if (layers[layer].rot_xy_flags[i + 1])
+                {
+                    rz(-0.78539816339744830962, q[i + 1]);
+                    rx(1.57079632679489661923, q[i + 1]);
+                    rz(0.78539816339744830962, q[i + 1]);
+                }
+
+                // exp(-i*pi/4 X_i X_{i+1})
+                h(q[i]);
+                h(q[i + 1]);
+
                 cx(q[i], q[i + 1]);
+                rz(1.57079632679489661923, q[i + 1]);
+                cx(q[i], q[i + 1]);
+
+                h(q[i]);
+                h(q[i + 1]);
             }
 
-            // Mid-circuit measurements
+            // closed odd-layer closure: bond (n - 1, 0)
+            if (closed && start == 1 && n > 2)
+            {
+                int i = n - 1;
+                int j = 0;
+
+                // Local rotation on q[n - 1]
+                if (layers[layer].rot_x_flags[i])
+                {
+                    rx(1.57079632679489661923, q[i]);
+                }
+
+                if (layers[layer].rot_y_flags[i])
+                {
+                    ry(1.57079632679489661923, q[i]);
+                }
+
+                if (layers[layer].rot_xy_flags[i])
+                {
+                    rz(-0.78539816339744830962, q[i]);
+                    rx(1.57079632679489661923, q[i]);
+                    rz(0.78539816339744830962, q[i]);
+                }
+
+                // Local rotation on q[0]
+                if (layers[layer].rot_x_flags[j])
+                {
+                    rx(1.57079632679489661923, q[j]);
+                }
+
+                if (layers[layer].rot_y_flags[j])
+                {
+                    ry(1.57079632679489661923, q[j]);
+                }
+
+                if (layers[layer].rot_xy_flags[j])
+                {
+                    rz(-0.78539816339744830962, q[j]);
+                    rx(1.57079632679489661923, q[j]);
+                    rz(0.78539816339744830962, q[j]);
+                }
+
+                // exp(-i*pi/4 X_{n-1} X_0)
+                h(q[i]);
+                h(q[j]);
+
+                cx(q[i], q[j]);
+                rz(1.57079632679489661923, q[j]);
+                cx(q[i], q[j]);
+
+                h(q[i]);
+                h(q[j]);
+            }
+
             for (int i = 0; i < n; ++i)
             {
-
                 if (layers[layer].measure_flags[i])
                 {
                     mz(q[i]);
@@ -294,56 +329,330 @@ struct MIPTKernel
     }
 };
 
-std::vector<LayerData> mipt_frontend(int n, int depth, double p)
+struct MIPTKernel_2D
+{
+    void operator()(int x, int y,
+                    const std::vector<LayerData> &layers,
+                    bool closed) __qpu__
+    {
+        int n = x * y;
+        cudaq::qvector q(n);
+
+        for (std::size_t layer = 0; layer < layers.size(); ++layer)
+        {
+            int start = layers[layer].start;
+
+            if (layer % 4 == 0 || layer % 4 == 1)
+            {
+                for (int i = 0; i < y; ++i)
+                {
+                    for (int j = start; j < x-1; j += 2)
+                    {
+                        int idx = i * x + j;
+                        // Local rotation on q[idx]
+                        if (layers[layer].rot_x_flags[idx])
+                        {
+                            rx(1.57079632679489661923, q[idx]);
+                        }
+
+                        if (layers[layer].rot_y_flags[idx])
+                        {
+                            ry(1.57079632679489661923, q[idx]);
+                        }
+
+                        if (layers[layer].rot_xy_flags[idx])
+                        {
+                            rz(-0.78539816339744830962, q[idx]);
+                            rx(1.57079632679489661923, q[idx]);
+                            rz(0.78539816339744830962, q[idx]);
+                        }
+
+                        // Local rotation on q[idx + 1]
+                        if (layers[layer].rot_x_flags[idx + 1])
+                        {
+                            rx(1.57079632679489661923, q[idx + 1]);
+                        }
+
+                        if (layers[layer].rot_y_flags[idx + 1])
+                        {
+                            ry(1.57079632679489661923, q[idx + 1]);
+                        }
+
+                        if (layers[layer].rot_xy_flags[idx + 1])
+                        {
+                            rz(-0.78539816339744830962, q[idx + 1]);
+                            rx(1.57079632679489661923, q[idx + 1]);
+                            rz(0.78539816339744830962, q[idx + 1]);
+                        }
+
+                        // exp(-i*pi/4 X_i X_{i+1})
+                        h(q[idx]);
+                        h(q[idx + 1]);
+
+                        cx(q[idx], q[idx + 1]);
+                        rz(1.57079632679489661923, q[idx + 1]);
+                        cx(q[idx], q[idx + 1]);
+
+                        h(q[idx]);
+                        h(q[idx + 1]);
+                    }
+
+                    // closed odd-layer closure: bond (n - 1, 0)
+                    if (closed && start == 1 && x > 2)
+                    {
+                        int k = i*x;
+                        int l = i*x + x - 1;
+
+                        // Local rotation on q[k]
+                        if (layers[layer].rot_x_flags[k])
+                        {
+                            rx(1.57079632679489661923, q[k]);
+                        }
+
+                        if (layers[layer].rot_y_flags[k])
+                        {
+                            ry(1.57079632679489661923, q[k]);
+                        }
+
+                        if (layers[layer].rot_xy_flags[k])
+                        {
+                            rz(-0.78539816339744830962, q[k]);
+                            rx(1.57079632679489661923, q[k]);
+                            rz(0.78539816339744830962, q[k]);
+                        }
+
+                        // Local rotation on q[0]
+                        if (layers[layer].rot_x_flags[l])
+                        {
+                            rx(1.57079632679489661923, q[l]);
+                        }
+
+                        if (layers[layer].rot_y_flags[l])
+                        {
+                            ry(1.57079632679489661923, q[l]);
+                        }
+
+                        if (layers[layer].rot_xy_flags[l])
+                        {
+                            rz(-0.78539816339744830962, q[l]);
+                            rx(1.57079632679489661923, q[l]);
+                            rz(0.78539816339744830962, q[l]);
+                        }
+
+                        // exp(-i*pi/4 X_{n-1} X_0)
+                        h(q[k]);
+                        h(q[l]);
+
+                        cx(q[k], q[l]);
+                        rz(1.57079632679489661923, q[l]);
+                        cx(q[k], q[l]);
+
+                        h(q[k]);
+                        h(q[l]);
+                    }
+                }
+            }
+            else
+            {
+                for (int i = 0; i < x; ++i)
+                {cl
+                    int x_start = (i % 2 == 0) ? 0 : 1;
+                    x_start = (x_start + layers[layer].start) % 2;
+                    for (int j = x_start; j < y-1; j += 2)
+                    {
+                        int idx = j * y + i;
+                        int idx_next = (j + 1) * y + i;
+                        // Local rotation on q[idx]
+                        if (layers[layer].rot_x_flags[idx])
+                        {
+                            rx(1.57079632679489661923, q[idx]);
+                        }
+
+                        if (layers[layer].rot_y_flags[idx])
+                        {
+                            ry(1.57079632679489661923, q[idx]);
+                        }
+
+                        if (layers[layer].rot_xy_flags[idx])
+                        {
+                            rz(-0.78539816339744830962, q[idx]);
+                            rx(1.57079632679489661923, q[idx]);
+                            rz(0.78539816339744830962, q[idx]);
+                        }
+
+                        // Local rotation on q[idx_next]
+                        if (layers[layer].rot_x_flags[idx_next])
+                        {
+                            rx(1.57079632679489661923, q[idx_next]);
+                        }
+
+                        if (layers[layer].rot_y_flags[idx_next])
+                        {
+                            ry(1.57079632679489661923, q[idx_next]);
+                        }
+
+                        if (layers[layer].rot_xy_flags[idx_next])
+                        {
+                            rz(-0.78539816339744830962, q[idx_next]);
+                            rx(1.57079632679489661923, q[idx_next]);
+                            rz(0.78539816339744830962, q[idx_next]);
+                        }
+
+                        // exp(-i*pi/4 X_i X_{i+1})
+                        h(q[idx]);
+                        h(q[idx_next]);
+
+                        cx(q[idx], q[idx_next]);
+                        rz(1.57079632679489661923, q[idx_next]);
+                        cx(q[idx], q[idx_next]);
+
+                        h(q[idx]);
+                        h(q[idx_next]);
+                    }
+
+                    // closed odd-layer closure: bond (n - 1, 0)
+                    if (closed && x_start == 1 && y > 2)
+                    {
+                        int k = i;
+                        int l = (y-1)*y + i;
+
+                        // Local rotation on q[k]
+                        if (layers[layer].rot_x_flags[k])
+                        {
+                            rx(1.57079632679489661923, q[k]);
+                        }
+
+                        if (layers[layer].rot_y_flags[k])
+                        {
+                            ry(1.57079632679489661923, q[k]);
+                        }
+
+                        if (layers[layer].rot_xy_flags[k])
+                        {
+                            rz(-0.78539816339744830962, q[k]);
+                            rx(1.57079632679489661923, q[k]);
+                            rz(0.78539816339744830962, q[k]);
+                        }
+
+                        // Local rotation on q[0]
+                        if (layers[layer].rot_x_flags[l])
+                        {
+                            rx(1.57079632679489661923, q[l]);
+                        }
+
+                        if (layers[layer].rot_y_flags[l])
+                        {
+                            ry(1.57079632679489661923, q[l]);
+                        }
+
+                        if (layers[layer].rot_xy_flags[l])
+                        {
+                            rz(-0.78539816339744830962, q[l]);
+                            rx(1.57079632679489661923, q[l]);
+                            rz(0.78539816339744830962, q[l]);
+                        }
+
+                        // exp(-i*pi/4 X_{n-1} X_0)
+                        h(q[k]);
+                        h(q[l]);
+
+                        cx(q[k], q[l]);
+                        rz(1.57079632679489661923, q[l]);
+                        cx(q[k], q[l]);
+
+                        h(q[k]);
+                        h(q[l]);
+                    }
+                }
+            }
+            for (int i = 0; i < n; ++i)
+            {
+                if (layers[layer].measure_flags[i])
+                {
+                    mz(q[i]);
+                }
+            }
+        }
+    }
+};
+
+LayerData make_mipt_layer(int n,
+                          int start,
+                          double p,
+                          std::mt19937 &rng)
+{
+    std::uniform_int_distribution<int> axis_dist(0, 2);
+    std::bernoulli_distribution measure_dist(p);
+
+    LayerData layer;
+    layer.start = start;
+
+    layer.measure_flags.resize(n);
+
+    layer.rot_x_flags.resize(n);
+    layer.rot_y_flags.resize(n);
+    layer.rot_xy_flags.resize(n);
+
+    for (int q = 0; q < n; ++q)
+    {
+        int axis = axis_dist(rng);
+
+        layer.rot_x_flags[q] = 0;
+        layer.rot_y_flags[q] = 0;
+        layer.rot_xy_flags[q] = 0;
+
+        if (axis == 0)
+        {
+            layer.rot_x_flags[q] = 1;
+        }
+        else if (axis == 1)
+        {
+            layer.rot_y_flags[q] = 1;
+        }
+        else
+        {
+            layer.rot_xy_flags[q] = 1;
+        }
+
+        layer.measure_flags[q] = measure_dist(rng) ? 1 : 0;
+    }
+
+    return layer;
+}
+
+std::vector<LayerData> mipt_frontend(int n,
+                                     int periods,
+                                     double p)
 {
     std::mt19937 rng(std::random_device{}());
 
-    std::uniform_real_distribution<double>
-        angle_dist(0.0, 2.0 * M_PI);
-
-    std::uniform_real_distribution<double>
-        prob_dist(0.0, 1.0);
-
     std::vector<LayerData> layers;
+    layers.reserve(2 * periods + 1);
 
-    // Generate random circuit CLASSICALLY
-    int eff_depth = depth;
-    // 50% chance of an extra layer
-    if (prob_dist(rng) < 0.5) {
-        eff_depth += 1; 
-    }
-    for (int d = 0; d < eff_depth; ++d)
+    for (int period = 0; period < periods; ++period)
     {
-
-        LayerData layer;
-
-        layer.measure_flags.resize(n);
-        layer.theta_x.resize(n);
-        layer.theta_y.resize(n);
-        layer.theta_z.resize(n);
-
-        for (int q = 0; q < n; ++q)
-        {
-
-            layer.theta_x[q] = angle_dist(rng);
-            layer.theta_y[q] = angle_dist(rng);
-            layer.theta_z[q] = angle_dist(rng);
-
-            layer.measure_flags[q] =
-                (prob_dist(rng) < p);
-        }
-
-        layers.push_back(layer);
+        layers.push_back(make_mipt_layer(n, 0, p, rng)); // even layer
+        layers.push_back(make_mipt_layer(n, 1, p, rng)); // odd layer
     }
+
+    // MIPT-style final even layer with 50% measurement probability.
+    layers.push_back(make_mipt_layer(n, 0, 0.5, rng));
 
     return layers;
 }
 
-void run(int n, int depth, int realizations, int res, double p_min, double p_max)
+
+
+void run_1d(int n, int periods, int realizations, int res, double p_min, double p_max)
 {
     std::vector<double> ps = linspace(p_min, p_max, res);
 
     std::ofstream outfile("data.csv");
+    std::ofstream infofile("info.csv");
+
+    // headers
+    infofile << "n,periods,realizations,resolution,p_min,p_max\n";
+    infofile << n << "," << periods << "," << realizations << "," << res << "," << p_min << "," << p_max << "\n";
 
     // headers
     outfile << "p,tmi,gmn\n";
@@ -355,19 +664,15 @@ void run(int n, int depth, int realizations, int res, double p_min, double p_max
                   << std::flush;
         for (int r = 0; r < realizations; r++)
         {
-            auto layers = mipt_frontend(n, depth, p);
+            auto layers = mipt_frontend(n, periods, p);
 
-            auto counts = cudaq::sample(
-                MIPTKernel{},
-                n,
-                layers,
-                4096
-            );
+            // Get final statevector
+            auto state =
+                cudaq::get_state(MIPTKernel_1D{}, n, layers, true);
 
             // Convert to Eigen vector
             auto psi =
                 cudaq_state_to_eigen(state, n);
-
 
             // Trace out all but last 3 qubits
             std::vector<int> traced;
@@ -380,9 +685,17 @@ void run(int n, int depth, int realizations, int res, double p_min, double p_max
             auto rho_ABC =
                 partial_trace_statevector(psi, n, traced);
 
-            auto rho_vec = matrix_to_vec(rho_ABC);
+            std::array<double, 64> rho_real{};
 
-            double gmn = run_gmn_server(rho_ABC);
+            for (int i = 0; i < 8; ++i)
+            {
+                for (int j = 0; j < 8; ++j)
+                {
+                    rho_real[i * 8 + j] = std::real(rho_ABC(i, j));
+                }
+            }
+
+            double gmn = compute_gmn_mosek_real_8x8(rho_real.data());
 
             double I3 = tmi(psi, n);
             // std::cout << "TMI = "
@@ -396,21 +709,45 @@ void run(int n, int depth, int realizations, int res, double p_min, double p_max
     }
 }
 
-int main(int argc, char* argv[])
+void run_2d(int x, int y, int periods, int realizations, int res, double p_min, double p_max);
+
+int main(int argc, char *argv[])
 {
 
-    int n = argv[1] ? std::stoi(argv[1]) : 10;
-    int depth = argv[2] ? std::stoi(argv[2]) : 20;
-    int realizations = argv[3] ? std::stoi(argv[3]) : 10;
-    int res = argv[4] ? std::stoi(argv[4]) : 5;
-    double p_min = argv[5] ? std::stod(argv[5]) : 0.0;
-    double p_max = argv[6] ? std::stod(argv[6]) : 1.0;
+    if (argv[1] == std::string("--help") || argv[1] == std::string("-h"))
+    {
+        std::cout << "Usage: " << argv[0]
+                  << " [d = 1] [n = 10] [periods = 10] [realizations = 10] [resolution = 5] [p_min = 0.0] [p_max = 1.0]\n";
+        std::cout << "Description:\n";
+        std::cout << "  d = dimensionality (1 or 2)\n";
+        std::cout << "  n = number of qubits per dimension\n";
+        std::cout << "  periods = number of periods (typically = n*d)\n";
+        std::cout << "  realizations = number of realizations (simulations per point)\n";
+        std::cout << "  resolution = number of points\n";
+        std::cout << "  p_min = minimum measurement rate\n";
+        std::cout << "  p_max = maximum measurement rate\n";
+        return 0;
+    }
+    int d = argv[1] ? std::stoi(argv[1]) : 1;
+    int n = argv[2] ? std::stoi(argv[2]) : ((d == 1) ? 10 : 4);
+    int periods = argv[3] ? std::stoi(argv[3]) : ((d == 1)? 10 : 32);
+    int realizations = argv[4] ? std::stoi(argv[4]) : 10;
+    int res = argv[5] ? std::stoi(argv[5]) : 5;
+    double p_min = argv[6] ? std::stod(argv[6]) : 0.0;
+    double p_max = argv[7] ? std::stod(argv[7]) : 1.0;
 
     auto start = std::chrono::steady_clock::now(); // Get start time
 
-    run(n, depth, realizations, res, p_min, p_max);
+    if (d == 1)
+    {
+        run_1d(n, periods, realizations, res, p_min, p_max);
+    }
+    else if (d == 2)
+    {
+        run_2d(n, n, periods, realizations, res, p_min, p_max);
+    }
 
-    auto end = std::chrono::steady_clock::now();   // Get end time
+    auto end = std::chrono::steady_clock::now(); // Get end time
     std::chrono::duration<double> elapsed = end - start;
     std::cout << "Elapsed time: " << elapsed.count() << "s\n";
 
