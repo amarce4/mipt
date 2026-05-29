@@ -144,10 +144,11 @@ namespace
         Variable::t W =
             M->variable("W", Set::make(D, D), Domain::unbounded());
 
-        M->constraint(
-            "trace_W",
-            Expr::dot(Matrix::eye(D), W),
-            Domain::equalsTo(1.0));
+        // tr(W) = 1 bad.
+        // M->constraint(
+        //     "trace_W",
+        //     Expr::dot(Matrix::eye(D), W),
+        //     Domain::equalsTo(1.0));
 
         add_partition_constraints(M, W, 0, "A");
         add_partition_constraints(M, W, 1, "B");

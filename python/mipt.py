@@ -12,12 +12,12 @@ import cvxpy as cp
 import scipy.sparse as sp
 from itertools import combinations
 
-USE_GPU = False
+# USE_GPU = False
 
-if (USE_GPU):
-    backend = AerSimulator(device='GPU', method='matrix_product_state')
-else:
-    backend = AerSimulator(device='CPU', method='matrix_product_state')
+# if (USE_GPU):
+#     backend = AerSimulator(device='GPU', method='matrix_product_state')
+# else:
+#     backend = AerSimulator(device='CPU', method='matrix_product_state')
 
 
 # ------------------------------------------------------------
@@ -219,11 +219,8 @@ def gmn(rho, parties=3):
     P = {}
     Q = {}
 
-    partitions = {
-        "A": [0],
-        "B": [1],
-        "C": [2]
-    }
+    
+    partitions = {chr(ord('A') + i): [i] for i in range(parties)}
 
     constraints = []
 
@@ -236,9 +233,9 @@ def gmn(rho, parties=3):
 
         QT = partial_transpose_expr(Q[name], dims, subsys)
 
-        constraints += [
-            cp.trace(W) == 1
-        ]
+        # constraints += [
+        #     cp.trace(W) == 1
+        # ]
 
         # W = P + Q^{T_M}
         constraints += [
@@ -409,10 +406,15 @@ def random_mipt_2d(x, y, d, p):
     
     return qc
 
-def run_1d(n, d, res, realisations, p_min=0, p_max=1, use_gpu=False):
+def run_1d_p_scan(n, depth, res, realisations, p_min=0, p_max=1, use_gpu=False, d=1):
+
+    if (d*2 > n):
+        raise ValueError(f"N = {n} not sufficient for distance d = {d}")
+
+    subsystem = [i for i in range(0, 2*d+1, d)]
     
     if (use_gpu):
-        backend = AerSimulator(device='GPU', method='matrix_product_state', target_gpus=[1])
+        backend = AerSimulator(device='GPU', method='matrix_product_state')
     else:
         backend = AerSimulator(device='CPU', method='matrix_product_state')
 
@@ -423,31 +425,24 @@ def run_1d(n, d, res, realisations, p_min=0, p_max=1, use_gpu=False):
     mi_stds = []
     gmns = []
     gmn_stds = []
-    # gmnns = []
-    # gmnn_stds = []
     for p in ps:
         print("Simulating p =", p)
         ent = []
         mi = []
         this_gmn = []
-        # this_gmnn = []
     
         for _ in range(realisations):
-            qc = random_mipt_1d(n, d, p, closed=True)
+            qc = random_mipt_1d(n, depth, p, closed=True)
             # qc.save_statevector(label='final_state')
-            qc.save_density_matrix(qubits=[0,1,2], label='final_state')
+            qc.save_density_matrix(qubits=subsystem, label='final_state')
             transpiled_qc = transpile(qc, backend)
 
             result = backend.run(transpiled_qc).result()
 
-            # saved_state = result.data(0)['final_state']
-
-            # sub_m = partial_trace(saved_state, [i for i in range(n-3)])
             sub_m = result.data(0)['final_state']
             ent.append(entropy(sub_m))
             mi.append(tmi(sub_m))
             this_gmn.append(gmn(sub_m))
-            # this_gmnn.append(gmnn_sdp(sub_m, dims=[2,2,2], k_minus_1=2)[0])
 
         ents.append(np.mean(ent))
         ent_stds.append(np.std(ent)/np.sqrt(realisations))
@@ -455,10 +450,55 @@ def run_1d(n, d, res, realisations, p_min=0, p_max=1, use_gpu=False):
         mi_stds.append(np.std(mi)/np.sqrt(realisations))
         gmns.append(np.mean(this_gmn))
         gmn_stds.append(np.std(this_gmn)/np.sqrt(realisations))
-        # gmnns.append(np.mean(this_gmnn))
-        # gmnn_stds.append(np.std(this_gmnn)/np.sqrt(realisations))
 
-    return ps, ents, ent_stds, mis, mi_stds, gmns, gmn_stds#, gmnns, gmnn_stds
+    return ps, ents, ent_stds, mis, mi_stds, gmns, gmn_stds
+
+def run_1d_distance_scan(n, depth, p, realisations, d_min=1, d_max=None, use_gpu=False):
+
+    if d_max is None:
+        d_max = n // 2
+
+    if (use_gpu):
+        backend = AerSimulator(device='GPU', method='matrix_product_state')
+    else:
+        backend = AerSimulator(device='CPU', method='matrix_product_state')
+
+    d_values = range(d_min, d_max + 1)
+    ents = []
+    ent_stds = []
+    mis = []
+    mi_stds = []
+    gmns = []
+    gmn_stds = []
+
+    for d in d_values:
+        print("Simulating d =", d)
+        subsystem = [i for i in range(0, 2*d+1, d)]
+        ent = []
+        mi = []
+        this_gmn = []
+        for _ in range(realisations):
+            qc = random_mipt_1d(n, depth, p, closed=True)
+            # qc.save_statevector(label='final_state')
+            qc.save_density_matrix(qubits=subsystem, label='final_state')
+            transpiled_qc = transpile(qc, backend)
+
+            result = backend.run(transpiled_qc).result()
+
+            sub_m = result.data(0)['final_state']
+            ent.append(entropy(sub_m))
+            mi.append(tmi(sub_m))
+            this_gmn.append(gmn(sub_m))
+
+
+        ents.append(np.mean(ent))
+        ent_stds.append(np.std(ent)/np.sqrt(realisations))
+        mis.append(np.mean(mi))
+        mi_stds.append(np.std(mi)/np.sqrt(realisations))
+        gmns.append(np.mean(this_gmn))
+        gmn_stds.append(np.std(this_gmn)/np.sqrt(realisations))
+
+    return d_values, ents, ent_stds, mis, mi_stds, gmns, gmn_stds
 
 def run_2d(x, y, d, res, realisations, p_min=0, p_max=1, use_gpu=False):
     
