@@ -18,44 +18,6 @@ using Complex = std::complex<double>;
 using MatrixXc = Eigen::MatrixXcd;
 using VectorXc = Eigen::VectorXcd;
 
-// Source - https://stackoverflow.com/a/27030598
-// Posted by Akavall, modified by community. See post 'Timeline' for change history
-// Retrieved 2026-05-25, License - CC BY-SA 3.0
-
-#include <sys/socket.h>
-#include <arpa/inet.h>
-#include <unistd.h>
-
-// double run_gmn_server(const MatrixXc &rho)
-// {
-//     int sock = socket(AF_INET, SOCK_STREAM, 0);
-
-//     sockaddr_in serv_addr{};
-//     serv_addr.sin_family = AF_INET;
-//     serv_addr.sin_port = htons(50007);
-
-//     inet_pton(AF_INET, "127.0.0.1", &serv_addr.sin_addr);
-
-//     connect(sock, (sockaddr *)&serv_addr, sizeof(serv_addr));
-
-//     int D = rho.rows();
-//     std::vector<double> buffer;
-//     buffer.reserve(D * D);
-
-//     for (int i = 0; i < D; i++)
-//         for (int j = 0; j < D; j++)
-//             buffer.push_back(std::real(rho(i, j)));
-
-//     send(sock, buffer.data(), buffer.size() * sizeof(double), 0);
-
-//     char reply[128] = {0};
-//     read(sock, reply, sizeof(reply));
-
-//     close(sock);
-
-//     return atof(reply);
-// }
-
 template <typename T>
 std::vector<double> linspace(T start_in, T end_in, int num_in)
 {
@@ -432,83 +394,7 @@ std::vector<LayerData> mipt_frontend(int n,
     return layers;
 }
 
-// struct MIPTKernel_2D
-// {
 
-//     void operator()(int x, int y,
-//                     const std::vector<LayerData> &layers) __qpu__
-//     {
-
-//         int n = x * y;
-//         cudaq::qvector q(n);
-
-//         for (std::size_t layer = 0;
-//              layer < layers.size();
-//              ++layer)
-//         {
-//             if (layer % 4 == 0 || layer % 4 == 1)
-//             {
-//                 for (int j = 0; j < y; ++j)
-//                 {
-//                     bool even = (j % 2 == 0) ? (layer % 4 == 0) : (layer % 4 == 1);
-//                     int start = even ? 0 : 1;
-
-//                     // Two-qubit brickwork layer
-//                     for (int i = start; i < x - 1; i += 2)
-//                     {
-
-//                         // Random local rotations
-//                         // rx(layers[layer].theta_x[j*x + i], q[j*x + i]);
-//                         // ry(layers[layer].theta_y[j*x + i], q[j*x + i]);
-//                         // rz(layers[layer].theta_z[j*x + i], q[j*x + i]);
-
-//                         // rx(layers[layer].theta_x[j*x + i + 1], q[j*x + i + 1]);
-//                         // ry(layers[layer].theta_y[j*x + i + 1], q[j*x + i + 1]);
-//                         // rz(layers[layer].theta_z[j*x + i + 1], q[j*x + i + 1]);
-
-//                         // Entangling gate
-//                         cx(q[j * x + i], q[j * x + i + 1]);
-//                     }
-//                 }
-//             }
-//             else
-//             {
-//                 for (int j = 0; j < x; ++j)
-//                 {
-//                     bool even = (j % 2 == 0) ? (layer % 4 == 2) : (layer % 4 == 3);
-//                     int start = even ? 0 : 1;
-
-//                     // Two-qubit brickwork layer
-//                     for (int i = start; i < y - 1; i += 2)
-//                     {
-
-//                         // Random local rotations
-//                         // rx(layers[layer].theta_x[i*x + j], q[i*x + j]);
-//                         // ry(layers[layer].theta_y[i*x + j], q[i*x + j]);
-//                         // rz(layers[layer].theta_z[i*x + j], q[i*x + j]);
-
-//                         // rx(layers[layer].theta_x[(i+1)*x + j], q[(i+1)*x + j]);
-//                         // ry(layers[layer].theta_y[(i+1)*x + j], q[(i+1)*x + j]);
-//                         // rz(layers[layer].theta_z[(i+1)*x + j], q[(i+1)*x + j]);
-
-//                         // Entangling gate
-//                         cx(q[i * y + j], q[(i + 1) * y + j]);
-//                     }
-//                 }
-//             }
-
-//             // Mid-circuit measurements
-//             for (int i = 0; i < n; ++i)
-//             {
-
-//                 if (layers[layer].measure_flags[i])
-//                 {
-//                     mz(q[i]);
-//                 }
-//             }
-//         }
-//     }
-// };
 
 void run(int n, int periods, int realizations, int res, double p_min, double p_max)
 {
@@ -602,13 +488,6 @@ int main(int argc, char *argv[])
     auto start = std::chrono::steady_clock::now(); // Get start time
 
     run(n, periods, realizations, res, p_min, p_max);
-
-    // int x = 4, y = 4;
-    // double p = 0.0;
-    // auto layers = mipt_frontend(x * y, 4, p);
-    // std::cout << cudaq::contrib::draw(MIPTKernel_2D{}, x, y, layers) << "\n";
-    // auto layers = mipt_frontend(6, 4, p);
-    // std::cout << cudaq::contrib::draw(MIPTKernel_2D{}, 6, layers) << "\n";
 
     auto end = std::chrono::steady_clock::now(); // Get end time
     std::chrono::duration<double> elapsed = end - start;
