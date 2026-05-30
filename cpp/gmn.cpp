@@ -1,12 +1,11 @@
 #include "gmn.hpp"
 
-#include <cmath>
-#include <limits>
-#include <stdexcept>
-#include <string>
-#include <utility>
-#include <vector>
 #include <array>
+#include <cerrno>
+#include <cstdlib>
+#include <limits>
+#include <memory>
+#include <stdexcept>
 
 #include "fusion.h"
 
@@ -17,155 +16,333 @@ namespace
 {
     constexpr int PARTIES = 3;
     constexpr int D = 8;
+    constexpr int D2 = D * D;
+    constexpr int PSD_MATRICES = 2 * PARTIES;
+    constexpr int ANCHOR_SUBSYSTEM = 0;
+    constexpr int UPPER_COUNT = D * (D + 1) / 2;
 
-    std::shared_ptr<ndarray<int, 1>> nint(const std::vector<int> &x)
+    struct Index2
     {
-        return new_array_ptr<int>(x);
+        int r;
+        int c;
+    };
+
+    using Int1D = std::shared_ptr<ndarray<int, 1>>;
+    using Int2D = std::shared_ptr<ndarray<int, 2>>;
+    using Double1D = std::shared_ptr<ndarray<double, 1>>;
+
+    constexpr int subsystem_mask(int subsystem) noexcept
+    {
+        // subsystem 0 -> A -> bit 2
+        // subsystem 1 -> B -> bit 1
+        // subsystem 2 -> C -> bit 0
+        return 1 << (PARTIES - 1 - subsystem);
     }
 
-    std::shared_ptr<ndarray<int, 1>> idx(int i, int j)
+    constexpr Index2 partial_transpose_source_index(
+        int row,
+        int col,
+        int subsystem) noexcept
     {
-        return nint({i, j});
-    }
+        const int mask = subsystem_mask(subsystem);
 
-    std::array<int, PARTIES> unpack_index(int x)
-    {
+        const int row_bit = row & mask;
+        const int col_bit = col & mask;
+
         return {
-            (x >> 2) & 1,
-            (x >> 1) & 1,
-            x & 1
+            (row & ~mask) | col_bit,
+            (col & ~mask) | row_bit
         };
     }
 
-    int pack_index(const std::array<int, PARTIES> &bits)
+    const Int1D &matrix_shape()
     {
-        return (bits[0] << 2) | (bits[1] << 1) | bits[2];
+        static const Int1D s = new_array_ptr<int, 1>({D, D});
+        return s;
     }
 
-    std::pair<int, int> partial_transpose_source_index(
-        int row,
-        int col,
+    const Matrix::t &identity_matrix()
+    {
+        static const Matrix::t I = Matrix::eye(D);
+        return I;
+    }
+
+    const std::array<Int2D, PARTIES> &partial_transpose_pick_tables()
+    {
+        static const std::array<Int2D, PARTIES> tables = []()
+        {
+            std::array<Int2D, PARTIES> t{};
+
+            for (int subsystem = 0; subsystem < PARTIES; ++subsystem)
+            {
+                auto pick = std::make_shared<ndarray<int, 2>>(shape(D2, 2));
+
+                // The picked vector is reshaped row-major into the target
+                // matrix. Entry target(r,c) receives source(qr,qc).
+                for (int r = 0; r < D; ++r)
+                {
+                    for (int c = 0; c < D; ++c)
+                    {
+                        const int k = r * D + c;
+                        const Index2 q = partial_transpose_source_index(
+                            r,
+                            c,
+                            subsystem);
+
+                        (*pick)(k, 0) = q.r;
+                        (*pick)(k, 1) = q.c;
+                    }
+                }
+
+                t[subsystem] = pick;
+            }
+
+            return t;
+        }();
+
+        return tables;
+    }
+
+    const Int2D &partial_transpose_pick_table(int subsystem)
+    {
+        return partial_transpose_pick_tables()[subsystem];
+    }
+
+    const Int2D &upper_triangle_pick_table()
+    {
+        static const Int2D pick = []()
+        {
+            auto p = std::make_shared<ndarray<int, 2>>(shape(UPPER_COUNT, 2));
+
+            int k = 0;
+            for (int r = 0; r < D; ++r)
+            {
+                for (int c = r; c < D; ++c)
+                {
+                    (*p)(k, 0) = r;
+                    (*p)(k, 1) = c;
+                    ++k;
+                }
+            }
+
+            return p;
+        }();
+
+        return pick;
+    }
+
+    Variable::t psd_slice(Variable::t X, int k)
+    {
+        return X->slice(
+                    new_array_ptr<int, 1>({k, 0, 0}),
+                    new_array_ptr<int, 1>({k + 1, D, D}))
+                ->reshape(matrix_shape());
+    }
+
+    Expression::t partial_transpose_expr(
+        Variable::t Q,
         int subsystem)
     {
-        auto r = unpack_index(row);
-        auto c = unpack_index(col);
-
-        std::swap(r[subsystem], c[subsystem]);
-
-        return {pack_index(r), pack_index(c)};
+        return Expr::reshape(
+            Q->pick(partial_transpose_pick_table(subsystem)),
+            matrix_shape());
     }
 
-    Matrix::t make_objective_matrix_from_row_major_real(const double *rho)
+    Expression::t witness_expr(
+        Variable::t P,
+        Variable::t Q,
+        int subsystem)
     {
-        auto C = std::make_shared<ndarray<double, 2>>(shape(D, D));
-
-        // Objective: trace(rho * W) = sum_{i,j} rho(i,j) W(j,i)
-        // Expr::dot(C,W) = sum_{r,c} C(r,c) W(r,c)
-        // Therefore C(r,c) = rho(c,r).
-        for (int r = 0; r < D; ++r)
-        {
-            for (int c = 0; c < D; ++c)
-            {
-                (*C)(r, c) = rho[c * D + r];
-            }
-        }
-
-        return Matrix::dense(C);
+        return Expr::add(P, partial_transpose_expr(Q, subsystem));
     }
 
-    void add_partition_constraints(
+    Expression::t upper_triangle(Expression::t X)
+    {
+        return X->pick(upper_triangle_pick_table());
+    }
+
+    void add_psd_upper_bound(
         Model::t M,
-        Variable::t W,
-        int subsystem,
-        const std::string &name)
+        Variable::t X)
     {
-        Variable::t P =
-            M->variable("P_" + name, Domain::inPSDCone(D));
-
-        Variable::t Q =
-            M->variable("Q_" + name, Domain::inPSDCone(D));
-
-        Variable::t P_slack =
-            M->variable("P_slack_" + name, Domain::inPSDCone(D));
-
-        Variable::t Q_slack =
-            M->variable("Q_slack_" + name, Domain::inPSDCone(D));
-
-        for (int i = 0; i < D; ++i)
-        {
-            for (int j = 0; j < D; ++j)
-            {
-                const auto [qi, qj] =
-                    partial_transpose_source_index(i, j, subsystem);
-
-                M->constraint(
-                    "w_eq_" + name + "_" +
-                        std::to_string(i) + "_" + std::to_string(j),
-                    Expr::sub(
-                        W->index(idx(i, j)),
-                        Expr::add(
-                            P->index(idx(i, j)),
-                            Q->index(idx(qi, qj)))),
-                    Domain::equalsTo(0.0));
-
-                const double eye_ij = (i == j) ? 1.0 : 0.0;
-
-                M->constraint(
-                    "p_upper_" + name + "_" +
-                        std::to_string(i) + "_" + std::to_string(j),
-                    Expr::add(
-                        P->index(idx(i, j)),
-                        P_slack->index(idx(i, j))),
-                    Domain::equalsTo(eye_ij));
-
-                M->constraint(
-                    "q_upper_" + name + "_" +
-                        std::to_string(i) + "_" + std::to_string(j),
-                    Expr::add(
-                        Q->index(idx(i, j)),
-                        Q_slack->index(idx(i, j))),
-                    Domain::equalsTo(eye_ij));
-            }
-        }
+        // X <= I in the Loewner order:
+        //     I - X is positive semidefinite.
+        M->constraint(
+            Expr::sub(identity_matrix(), X),
+            Domain::inPSDCone(D));
     }
 
-    double compute_gmn_internal(const double *rho)
+    void apply_optional_solver_settings(Model::t M)
     {
-        if (rho == nullptr)
-        {
-            throw std::invalid_argument("rho pointer is null.");
-        }
-
-        Model::t M = new Model("GMN_3Q");
-        auto cleanup = finally([&]() { M->dispose(); });
-
         M->setSolverParam("log", 0);
 
-        Variable::t W =
-            M->variable("W", Set::make(D, D), Domain::unbounded());
+        // Useful when you run many independent GMN solves in parallel.
+        // Example:
+        //     GMN_MOSEK_NUM_THREADS=1 ./mipt.exe
+        //
+        // If unset, MOSEK chooses its default thread behavior.
+        const char *threads = std::getenv("GMN_MOSEK_NUM_THREADS");
+        if (threads != nullptr && *threads != '\0')
+        {
+            char *end = nullptr;
+            errno = 0;
 
-        // tr(W) = 1 bad.
-        // M->constraint(
-        //     "trace_W",
-        //     Expr::dot(Matrix::eye(D), W),
-        //     Domain::equalsTo(1.0));
+            const long value = std::strtol(threads, &end, 10);
 
-        add_partition_constraints(M, W, 0, "A");
-        add_partition_constraints(M, W, 1, "B");
-        add_partition_constraints(M, W, 2, "C");
+            if (errno == 0 &&
+                end != threads &&
+                *end == '\0' &&
+                value > 0 &&
+                value <= std::numeric_limits<int>::max())
+            {
+                M->setSolverParam("numThreads", static_cast<int>(value));
+            }
+        }
+    }
 
-        Matrix::t C = make_objective_matrix_from_row_major_real(rho);
+    void fill_upper_objective_coefficients(
+        const double *rho,
+        Double1D coeffs)
+    {
+        int k = 0;
+        for (int r = 0; r < D; ++r)
+        {
+            for (int c = r; c < D; ++c)
+            {
+                // Objective is trace(rho * W) = sum_{i,j} rho(i,j) W(j,i).
+                // rho and W are real symmetric here. When using only the upper
+                // triangle, off-diagonal coefficients must include both full
+                // matrix entries.
+                if (r == c)
+                {
+                    (*coeffs)(k) = rho[r * D + r];
+                }
+                else
+                {
+                    (*coeffs)(k) = rho[r * D + c] + rho[c * D + r];
+                }
 
-        M->objective(
-            "min_trace_rho_W",
-            ObjectiveSense::Minimize,
-            Expr::dot(C, W));
+                ++k;
+            }
+        }
+    }
 
-        M->solve();
+    struct GmnWorkspace
+    {
+        Model::t M;
+        Parameter::t objective_coeffs;
+        Double1D coeff_values;
 
-        M->acceptedSolutionStatus(AccSolutionStatus::Optimal);
+        GmnWorkspace()
+            : M(new Model("GMN_3Q_cached")),
+              objective_coeffs(nullptr),
+              coeff_values(std::make_shared<ndarray<double, 1>>(shape(UPPER_COUNT)))
+        {
+            // Helps Fusion avoid re-evaluating repeated pick/reshape expressions.
+            M->expressionCache(true);
 
-        return -M->primalObjValue();
+            apply_optional_solver_settings(M);
+
+            // One stacked variable containing:
+            //     P_A, Q_A, P_B, Q_B, P_C, Q_C
+            //
+            // Each slice is an 8x8 symmetric PSD matrix.
+            Variable::t X = M->variable(Domain::inPSDCone(D, PSD_MATRICES));
+
+            std::array<Variable::t, PARTIES> P;
+            std::array<Variable::t, PARTIES> Q;
+
+            for (int subsystem = 0; subsystem < PARTIES; ++subsystem)
+            {
+                P[subsystem] = psd_slice(X, 2 * subsystem);
+                Q[subsystem] = psd_slice(X, 2 * subsystem + 1);
+
+                add_psd_upper_bound(M, P[subsystem]);
+                add_psd_upper_bound(M, Q[subsystem]);
+            }
+
+            // Deliberately no tr(W) = 1 constraint.
+            //
+            // Instead of creating an explicit dense unbounded W variable and
+            // imposing W = P_s + PT_s(Q_s) for all s, use subsystem A as the
+            // anchor witness:
+            //
+            //     W := P_A + PT_A(Q_A)
+            //
+            // and impose equality with the B and C decompositions.
+            Expression::t W_anchor = witness_expr(
+                P[ANCHOR_SUBSYSTEM],
+                Q[ANCHOR_SUBSYSTEM],
+                ANCHOR_SUBSYSTEM);
+
+            Expression::t W_anchor_ut = upper_triangle(W_anchor);
+
+            // Auxiliary scalar copy of the upper triangle. This is intentional:
+            // MOSEK Fusion cannot parametrize coefficients that sit directly on
+            // semidefinite terms, but parameters are valid objective
+            // coefficients for ordinary scalar variables. Reusing this model and
+            // only changing the 36 objective coefficients avoids rebuilding the
+            // Fusion model for every realization.
+            Variable::t W_ut = M->variable(UPPER_COUNT);
+            M->constraint(
+                Expr::sub(W_ut, W_anchor_ut),
+                Domain::equalsTo(0.0));
+
+            for (int subsystem = 0; subsystem < PARTIES; ++subsystem)
+            {
+                if (subsystem == ANCHOR_SUBSYSTEM)
+                {
+                    continue;
+                }
+
+                Expression::t W_other = witness_expr(
+                    P[subsystem],
+                    Q[subsystem],
+                    subsystem);
+
+                // Since every decomposition is symmetric, upper-triangular
+                // equality is sufficient and avoids duplicate scalar equalities.
+                M->constraint(
+                    Expr::sub(W_anchor_ut, upper_triangle(W_other)),
+                    Domain::equalsTo(0.0));
+            }
+
+            objective_coeffs = M->parameter(UPPER_COUNT);
+            M->objective(
+                ObjectiveSense::Minimize,
+                Expr::dot(objective_coeffs, W_ut));
+
+            M->acceptedSolutionStatus(AccSolutionStatus::Optimal);
+        }
+
+        ~GmnWorkspace()
+        {
+            if (M != nullptr)
+            {
+                M->dispose();
+            }
+        }
+
+        double solve(const double *rho)
+        {
+            if (rho == nullptr)
+            {
+                throw std::invalid_argument("rho pointer is null.");
+            }
+
+            fill_upper_objective_coefficients(rho, coeff_values);
+            objective_coeffs->setValue(coeff_values);
+
+            M->solve();
+
+            return -M->primalObjValue();
+        }
+    };
+
+    GmnWorkspace &workspace()
+    {
+        static thread_local GmnWorkspace ws;
+        return ws;
     }
 }
 
@@ -174,7 +351,7 @@ extern "C" double compute_gmn_mosek_real_8x8(
 {
     try
     {
-        return compute_gmn_internal(rho_real_row_major);
+        return workspace().solve(rho_real_row_major);
     }
     catch (...)
     {

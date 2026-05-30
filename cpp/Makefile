@@ -1,66 +1,90 @@
-# CUDA-Q + MOSEK Fusion build
+# CUDA-Q + CUDA reduction + MOSEK Optimizer C API build.
+#
+# The MOSEK Fusion C++ implementation is deliberately not linked: CUDA-Q's
+# nvq++ toolchain on this installation links libc++, while Linux Fusion is
+# built through GCC/libstdc++.  The C Optimizer API avoids that ABI conflict.
 #
 # Usage:
-#   make mipt.exe          # CPU/default CUDA-Q target
-#   make mipt.exe GPU=1    # GPU target: adds --target nvidia
-#   make gpu mipt.exe      # same as GPU=1
-#   make clean
-#
-# Required environment variables:
-#   MSKINC = path to MOSEK headers
-#   MSKLIB = path to MOSEK libraries/bin
+#   make mipt.exe GPU=1 FP64=1 MOSEK_HOME=$HOME/mosek/11.2/tools/platform/linux64x86
+#   make mipt.exe GPU=1 FP64=0 MOSEK_HOME=$HOME/mosek/11.2/tools/platform/linux64x86
+#   make mipt.exe GPU=0          MOSEK_HOME=$HOME/mosek/11.2/tools/platform/linux64x86
 
 NVQXX ?= nvq++
-CXX   ?= g++
+HOSTCC ?= gcc
+NVCC   ?= nvcc
 
-# Allow: make gpu mipt.exe
-ifneq ($(filter gpu,$(MAKECMDGOALS)),)
-GPU := 1
-endif
+EIGEN_INC  ?= /usr/include/eigen3
+MOSEK_HOME ?= $(HOME)/mosek/11.2/tools/platform/linux64x86
+MOSEK_INC  ?= $(MOSEK_HOME)/h
+MOSEK_LIB  ?= $(MOSEK_HOME)/bin
+
+GPU ?= 0
+FP64 ?= 1
+CUDA_RHO ?= $(GPU)
+
+NVQXXFLAGS_COMMON := -std=c++20 -O3 -DNDEBUG -march=native -I$(EIGEN_INC) -I$(MOSEK_INC)
+CFLAGS_COMMON     := -std=c11 -O3 -DNDEBUG -march=native -I$(MOSEK_INC)
+NVCCFLAGS         := -std=c++17 -O3
+LDFLAGS_COMMON    := -L$(MOSEK_LIB) -Wl,-rpath,$(MOSEK_LIB)
+# Use only the ABI-stable Optimizer C API library, not -lfusion64.
+LDLIBS_COMMON     := -lmosek64
 
 ifeq ($(GPU),1)
-CUDAQ_TARGET_FLAGS := --target nvidia
-else
-CUDAQ_TARGET_FLAGS :=
+  CUDAQ_TARGET_FLAGS := --target nvidia
+  ifeq ($(FP64),1)
+    CUDAQ_TARGET_FLAGS += --target-option fp64
+  else
+    CUDAQ_TARGET_FLAGS += --target-option fp32
+  endif
 endif
 
-CXXSTD   := -std=c++20
-OPTFLAGS := -O2
+ifeq ($(CUDA_RHO),1)
+  NVQXXFLAGS_COMMON += -DMIPT_ENABLE_CUDA_RHO
+  LDLIBS_COMMON += -lcudart
+endif
 
-EIGEN_INC ?= /usr/include/eigen3
+CONFIG := gpu$(GPU)_fp64$(FP64)_rho$(CUDA_RHO)_capi
+OBJDIR := build/$(CONFIG)
+BINARY := $(OBJDIR)/mipt.exe
+OBJS   := $(OBJDIR)/mipt.o $(OBJDIR)/gmn_mosek_c.o
+ifeq ($(CUDA_RHO),1)
+  OBJS += $(OBJDIR)/rho_reduce.o
+endif
 
-CUDAQ_CXXFLAGS := $(CUDAQ_TARGET_FLAGS) $(CXXSTD) -I$(EIGEN_INC)
-GMN_CXXFLAGS   := $(CXXSTD) $(OPTFLAGS) -fPIC -I$(MSKINC)
+.PHONY: all clean gpu cpu print-config mipt.exe
 
-.PHONY: clean check-env gpu
+all: mipt.exe
+
+cpu:
+	$(MAKE) mipt.exe GPU=0 CUDA_RHO=0
 
 gpu:
-	@:
+	$(MAKE) mipt.exe GPU=1 CUDA_RHO=1 FP64=$(FP64)
 
-check-env:
-	@test -n "$(MSKINC)" || (echo "ERROR: MSKINC is not set"; exit 1)
-	@test -n "$(MSKLIB)" || (echo "ERROR: MSKLIB is not set"; exit 1)
+print-config:
+	@echo "CONFIG=$(CONFIG)"
+	@echo "NVQXX=$(NVQXX)"
+	@echo "CUDAQ_TARGET_FLAGS=$(CUDAQ_TARGET_FLAGS)"
+	@echo "OBJDIR=$(OBJDIR)"
+	@echo "BINARY=$(BINARY)"
 
-gmn.o: gmn.cpp gmn.hpp | check-env
-	$(CXX) $(GMN_CXXFLAGS) -c gmn.cpp -o gmn.o
+mipt.exe: $(BINARY)
+	cp $(BINARY) $@
 
-libgmn.so: gmn.o | check-env
-	$(CXX) -shared gmn.o \
-		-L$(MSKLIB) \
-		-Wl,-rpath,$(MSKLIB) \
-		-lfusion64 -lmosek64 \
-		-o libgmn.so
+$(BINARY): $(OBJS)
+	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $^ $(LDFLAGS_COMMON) $(LDLIBS_COMMON) -o $@
 
-mipt.o: mipt.cpp gmn.hpp
-	$(NVQXX) $(CUDAQ_CXXFLAGS) -c mipt.cpp -o mipt.o
+$(OBJDIR):
+	mkdir -p $@
 
-%.exe: mipt.o libgmn.so
-	$(NVQXX) $(CUDAQ_TARGET_FLAGS) mipt.o \
-		-L. \
-		-Wl,-rpath,'$$ORIGIN' \
-		-Wl,-rpath,$(MSKLIB) \
-		-lgmn \
-		-o $@
+$(OBJDIR)/mipt.o: mipt.cpp gmn.hpp rho_reduce.hpp | $(OBJDIR)
+	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $(NVQXXFLAGS_COMMON) -c $< -o $@
+
+$(OBJDIR)/gmn_mosek_c.o: gmn_mosek_c.c gmn.hpp | $(OBJDIR)
+	$(HOSTCC) $(CFLAGS_COMMON) -c $< -o $@
+
+$(OBJDIR)/rho_reduce.o: rho_reduce.cu rho_reduce.hpp | $(OBJDIR)
+	$(NVCC) $(NVCCFLAGS) -c $< -o $@
 
 clean:
-	rm -f *.o *.so *.exe
+	rm -rf build mipt.exe data.csv info.csv
