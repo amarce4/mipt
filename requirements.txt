@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Native dependencies for the MIPT CUDA-Q / MOSEK-C GPU build.
+# Installs libraries and build tools only; install the MOSEK license manually.
+#
+# Supported by this installer:
+#   Ubuntu 22.04 or 24.04, x86_64, NVIDIA GPU
+#
+# Installed components:
+#   - GCC / make
+#   - Eigen3 headers
+#   - CUDA Toolkit 12.6, including nvcc and libcudart
+#   - CUDA-Q C++ toolchain with nvq++
+#   - MOSEK 11.2 C Optimizer API
+
+CUDAQ_VERSION="0.14.2"
+MOSEK_VERSION="11.2.0"
+CUDAQ_INSTALL_DIR="$HOME/.cudaq"
+MOSEK_PLATFORM="linux64x86"
+
+if [[ "$(uname -m)" != "x86_64" ]]; then
+    echo "This installer targets x86_64, matching MOSEK linux64x86." >&2
+    echo "For ARM64, use the corresponding CUDA-Q and MOSEK ARM64 packages and update MOSEK_HOME." >&2
+    exit 1
+fi
+
+if [[ ! -f /etc/os-release ]]; then
+    echo "Cannot determine Linux distribution: /etc/os-release is missing." >&2
+    exit 1
+fi
+
+. /etc/os-release
+
+case "${ID}:${VERSION_ID}" in
+    ubuntu:22.04)
+        CUDA_REPO="ubuntu2204"
+        ;;
+    ubuntu:24.04)
+        CUDA_REPO="ubuntu2404"
+        ;;
+    *)
+        echo "This installer supports Ubuntu 22.04 or 24.04 only." >&2
+        echo "For another CUDA-Q-supported distribution, translate the package-manager section using NVIDIA's CUDA installation guide." >&2
+        exit 1
+        ;;
+esac
+
+workdir="$(mktemp -d)"
+trap 'rm -rf "$workdir"' EXIT
+
+echo "Installing system build dependencies and Eigen3..."
+sudo apt-get update
+sudo apt-get install -y --no-install-recommends \
+    build-essential \
+    ca-certificates \
+    curl \
+    bzip2 \
+    tar \
+    gzip \
+    libeigen3-dev
+
+echo "Installing NVIDIA CUDA repository keyring..."
+curl -fsSL \
+    "https://developer.download.nvidia.com/compute/cuda/repos/${CUDA_REPO}/x86_64/cuda-keyring_1.1-1_all.deb" \
+    -o "$workdir/cuda-keyring.deb"
+sudo dpkg -i "$workdir/cuda-keyring.deb"
+
+echo "Installing CUDA Toolkit 12.6..."
+sudo apt-get update
+sudo apt-get install -y --no-install-recommends cuda-toolkit-12-6
+
+echo "Installing CUDA-Q ${CUDAQ_VERSION} C++ toolchain..."
+curl -fL \
+    "https://github.com/NVIDIA/cuda-quantum/releases/download/${CUDAQ_VERSION}/install_cuda_quantum_cu12.x86_64" \
+    -o "$workdir/install_cuda_quantum_cu12.x86_64"
+bash "$workdir/install_cuda_quantum_cu12.x86_64" \
+    --accept -- --installpath "$CUDAQ_INSTALL_DIR"
+
+echo "Installing MOSEK ${MOSEK_VERSION} C Optimizer API..."
+curl -fL \
+    "https://download.mosek.com/stable/${MOSEK_VERSION}/mosektools${MOSEK_PLATFORM}.tar.bz2" \
+    -o "$workdir/mosek.tar.bz2"
+tar -xjf "$workdir/mosek.tar.bz2" -C "$HOME"
+
+cat > "$HOME/.mipt_env.sh" <<'ENVEOF'
+[ -f "$HOME/.cudaq/set_env.sh" ] && source "$HOME/.cudaq/set_env.sh"
+export MOSEK_HOME="$HOME/mosek/11.2/tools/platform/linux64x86"
+export PATH="/usr/local/cuda-12.6/bin:$PATH"
+export LD_LIBRARY_PATH="/usr/local/cuda-12.6/lib64:${LD_LIBRARY_PATH:-}"
+ENVEOF
+
+printf '\nInstallation complete.\n'
+printf 'Source the project environment before compiling:\n'
+printf '  source "$HOME/.mipt_env.sh"\n\n'
+printf 'Install your MOSEK license manually before running the solver.\n'
+printf 'A working NVIDIA driver is also required for GPU execution; verify it with:\n'
+printf '  nvidia-smi\n'
