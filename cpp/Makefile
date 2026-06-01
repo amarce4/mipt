@@ -87,4 +87,4 @@ $(OBJDIR)/rho_reduce.o: rho_reduce.cu rho_reduce.hpp | $(OBJDIR)
 	$(NVCC) $(NVCCFLAGS) -c $< -o $@
 
 clean:
-	rm -rf build mipt.exe data.csv info.csv
+	rm -rf build mipt.exe *.tmp

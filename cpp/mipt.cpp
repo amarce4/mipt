@@ -297,124 +297,6 @@ MatrixXc density_matrix(const VectorXc &psi)
     return psi * psi.adjoint();
 }
 
-// MatrixXc partial_trace_statevector(const VectorXc &psi, int n, const std::vector<int> &traced_out)
-// {
-//     std::set<int> traced_set(traced_out.begin(), traced_out.end());
-
-//     std::vector<int> kept;
-//     for (int i = 0; i < n; ++i)
-//         if (!traced_set.count(i))
-//             kept.push_back(i);
-
-//     int dim_keep = 1 << kept.size();
-//     int dim_trace = 1 << traced_out.size();
-
-//     MatrixXc rho_red =
-//         MatrixXc::Zero(dim_keep, dim_keep);
-
-//     // iterate over all basis states of full system
-//     int dim_full = 1 << n;
-
-//     for (int a = 0; a < dim_full; ++a)
-//     {
-//         // decode indices into (kept, traced)
-//         int a_keep = 0;
-//         int a_trace = 0;
-
-//         for (size_t k = 0; k < kept.size(); ++k)
-//             a_keep |= (((a >> kept[k]) & 1) << k);
-
-//         for (size_t t = 0; t < traced_out.size(); ++t)
-//             a_trace |= (((a >> traced_out[t]) & 1) << t);
-
-//         for (int b = 0; b < dim_full; ++b)
-//         {
-//             int b_keep = 0;
-//             int b_trace = 0;
-
-//             for (size_t k = 0; k < kept.size(); ++k)
-//                 b_keep |= (((b >> kept[k]) & 1) << k);
-
-//             for (size_t t = 0; t < traced_out.size(); ++t)
-//                 b_trace |= (((b >> traced_out[t]) & 1) << t);
-
-//             // trace condition: traced subsystem must match
-//             if (a_trace != b_trace)
-//                 continue;
-
-//             rho_red(a_keep, b_keep) +=
-//                 psi(a) * std::conj(psi(b));
-//         }
-//     }
-
-//     return rho_red;
-// }
-
-double entropy(const MatrixXc &rho)
-{
-
-    Eigen::SelfAdjointEigenSolver<MatrixXc>
-        solver(rho);
-
-    auto eigs = solver.eigenvalues();
-
-    double S = 0.0;
-
-    for (int i = 0; i < eigs.size(); ++i)
-    {
-
-        double lambda = eigs(i);
-
-        if (lambda > 1e-12)
-        {
-            S -= lambda * std::log2(lambda);
-        }
-    }
-
-    return S;
-}
-
-// double tmi(const VectorXc &psi, int n)
-// {
-//     std::vector<int> notA, notB, notC;
-//     std::vector<int> notAB, notAC, notBC;
-
-//     for (int i = 0; i < n; ++i)
-//     {
-//         if (i != n - 3)
-//             notA.push_back(i);
-//         if (i != n - 2)
-//             notB.push_back(i);
-//         if (i != n - 1)
-//             notC.push_back(i);
-
-//         if (i != n - 3 && i != n - 2)
-//             notAB.push_back(i);
-//         if (i != n - 3 && i != n - 1)
-//             notAC.push_back(i);
-//         if (i != n - 2 && i != n - 1)
-//             notBC.push_back(i);
-//     }
-
-//     auto rho_A = partial_trace_statevector(psi, n, notA);
-//     auto rho_B = partial_trace_statevector(psi, n, notB);
-//     auto rho_C = partial_trace_statevector(psi, n, notC);
-
-//     auto rho_AB = partial_trace_statevector(psi, n, notAB);
-//     auto rho_AC = partial_trace_statevector(psi, n, notAC);
-//     auto rho_BC = partial_trace_statevector(psi, n, notBC);
-
-//     double S_A = entropy(rho_A);
-//     double S_B = entropy(rho_B);
-//     double S_C = entropy(rho_C);
-
-//     double S_AB = entropy(rho_AB);
-//     double S_AC = entropy(rho_AC);
-//     double S_BC = entropy(rho_BC);
-
-//     return S_A + S_B + S_C - S_AB - S_AC - S_BC;
-// }
-
 struct LayerData
 {
     int start = 0;
@@ -947,7 +829,86 @@ void run_1d(int n, int periods, int realizations, int res, double p_min, double 
     }
 }
 
-// void run_2d(int x, int y, int periods, int realizations, int res, double p_min, double p_max);
+void run_2d(int x, int y, int periods, int realizations, int res, double p_min, double p_max) 
+{
+    std::vector<double> ps = linspace(p_min, p_max, res);
+
+    std::ofstream outfile("data2.csv");
+    std::ofstream infofile("info2.csv");
+
+    int n = x*y;
+
+    // headers
+    infofile << "n,periods,realizations,resolution,p_min,p_max\n";
+    infofile << n << "," << periods << "," << realizations << "," << res << "," << p_min << "," << p_max << "\n";
+
+    // headers
+    outfile << "p,gmn\n";
+
+    for (double p : ps)
+    {
+        std::cout << "Simulating p = "
+                  << p << "...\n "
+                  << std::flush;
+
+        double sec_per_circ = 0.0;
+
+        for (int r = 0; r < realizations; r++)
+        {
+            auto circ_time_start = std::chrono::steady_clock::now();
+            std::chrono::steady_clock::time_point start, lap1, lap2, lap3, lap4;
+
+            if (r == 0) start = std::chrono::steady_clock::now();
+
+            auto layers = mipt_frontend(n, periods, p);
+            
+            if (r == 0) lap1 = std::chrono::steady_clock::now();
+
+            // Get final statevector
+            auto state =
+                cudaq::get_state(MIPTKernel_2D{}, x, y, layers, true);
+
+            if (r == 0) lap2 = std::chrono::steady_clock::now();
+
+            std::array<double, 64> rho_real{};
+            cudaq_last3_reduced_density_real(state, n, rho_real.data());
+
+            if (r == 0) lap3 = std::chrono::steady_clock::now();
+
+            double gmn = compute_gmn_mosek_real_8x8(rho_real.data());
+            
+            if (r == 0) lap4 = std::chrono::steady_clock::now();
+
+            outfile << p << "," << gmn << "\n";
+
+            if (r == 0) {
+                std::chrono::duration<double> t_layer = lap1 - start;
+                std::chrono::duration<double> t_qc = lap2 - lap1;
+                std::chrono::duration<double> t_im = lap3 - lap2;
+                std::chrono::duration<double> t_gmn = lap4 - lap3;
+                std::cout << "Layer, QC, IM, GMN times: "
+                          << t_layer.count() << "s, "
+                          << t_qc.count() << "s, "
+                          << t_im.count() << "s, "
+                          << t_gmn.count() << "s\n";
+            }
+            auto circ_time_end = std::chrono::steady_clock::now();
+            std::chrono::duration<double> circ_time_diff = circ_time_end - circ_time_start;
+            if (r != 0) 
+            {
+                sec_per_circ = ((r-1)*sec_per_circ + circ_time_diff.count())/r;
+            }
+            else 
+            {
+                sec_per_circ = circ_time_diff.count();
+            }
+            double time_estimate = (realizations - r)*sec_per_circ;
+            std::cout << "\rAverage circuits/second: " << std::round((1 / sec_per_circ) * 100.0)/100.0 
+                      << ", Realisations ETA: " << static_cast<int>(time_estimate) << "s               " << std::flush;
+        }
+        std::cout << "\n";
+    }
+}
 
 int main(int argc, char *argv[])
 {
@@ -960,7 +921,7 @@ int main(int argc, char *argv[])
         std::cout << "Description:\n";
         std::cout << "  d = dimensionality (1 or 2)\n";
         std::cout << "  n = number of qubits per dimension\n";
-        std::cout << "  periods = number of periods (typically = n*d)\n";
+        std::cout << "  periods = number of periods (suggested 1D: n; 2D: 2*n^2)\n";
         std::cout << "  realizations = number of realizations (simulations per point)\n";
         std::cout << "  resolution = number of points\n";
         std::cout << "  p_min = minimum measurement rate\n";
@@ -980,12 +941,13 @@ int main(int argc, char *argv[])
 
     if (d == 1)
     {
+        std::cout << "Running 1D " << n <<"-qubit simulation of " << realizations*res << " circuits.\n"
         run_1d(n, periods, realizations, res, p_min, p_max);
     }
     else if (d == 2)
     {
-        return 0;
-        // run_2d(n, n, periods, realizations, res, p_min, p_max);
+        std::cout << "Running 2D " << n << "x" << n << " = " << n*n << "-qubit simulation of " << realizations*res << " circuits.\n"
+        run_2d(n, n, periods, realizations, res, p_min, p_max);
     }
 
     auto end = std::chrono::steady_clock::now(); // Get end time
