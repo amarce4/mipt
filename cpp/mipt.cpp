@@ -1,8 +1,6 @@
 #include <cudaq.h>
 #include <cudaq/algorithms/draw.h>
-#include <Eigen/Dense>
-#include <unsupported/Eigen/KroneckerProduct>
-#include "gmn.hpp"
+#include "density_io.hpp"
 #include <vector>
 #include <random>
 #include <iostream>
@@ -17,26 +15,19 @@
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
+#include <string>
 #include <cstring>
 
 #ifdef MIPT_ENABLE_CUDA_RHO
 #include "rho_reduce.hpp"
 #endif
 
-using Complex = std::complex<double>;
-using MatrixXc = Eigen::MatrixXcd;
-using VectorXc = Eigen::VectorXcd;
-
-
-// Keep your existing Eigen typedefs/includes if these are already defined:
-// using VectorXc = Eigen::VectorXcd;
-// using MatrixXc = Eigen::MatrixXcd;
-
 namespace
 {
-    constexpr int GMN_KEEP_QUBITS = 3;
-    constexpr int GMN_KEEP_DIM = 1 << GMN_KEEP_QUBITS; // 8
-    constexpr int GMN_RHO_SIZE = GMN_KEEP_DIM * GMN_KEEP_DIM; // 64
+    constexpr int RHO3_QUBITS = 3;
+    constexpr int RHO3_DIM = 1 << RHO3_QUBITS; // 8
+    constexpr std::size_t RHO3_VALUES = 2u * RHO3_DIM * RHO3_DIM;
+    using Subsystem = std::array<int, RHO3_QUBITS>;
 
     inline std::uint64_t checked_pow2_u64(int exponent)
     {
@@ -44,204 +35,265 @@ namespace
         {
             throw std::invalid_argument("Invalid qubit count: 2^n would overflow uint64_t.");
         }
-
         return std::uint64_t{1} << exponent;
     }
 
-    inline void increment_low_bits(std::vector<int> &bits, int bit_count)
+    std::vector<Subsystem> periodic_ring_three_site_subsystems(int n)
     {
-        // Treat bits[0 : bit_count) as a little-endian binary counter.
-        // Average cost is O(1), unlike rewriting every bit from an integer
-        // on every loop iteration.
-        for (int q = 0; q < bit_count; ++q)
+        if (n < RHO3_QUBITS)
         {
-            bits[q] ^= 1;
+            throw std::invalid_argument("Three-qubit RDM output requires n >= 3.");
+        }
 
-            if (bits[q] != 0)
+        std::vector<Subsystem> subsystems;
+        subsystems.reserve(static_cast<std::size_t>(n));
+        for (int start = 0; start < n; ++start)
+        {
+            subsystems.push_back({start, (start + 1) % n, (start + 2) % n});
+        }
+        return subsystems;
+    }
+
+    std::vector<Subsystem> terminal_three_site_subsystem(int n)
+    {
+        if (n < RHO3_QUBITS)
+        {
+            throw std::invalid_argument("Three-qubit RDM output requires at least three qubits.");
+        }
+        return {{n - 3, n - 2, n - 1}};
+    }
+
+    std::vector<int> flatten_subsystems(const std::vector<Subsystem> &subsystems)
+    {
+        std::vector<int> flat;
+        flat.reserve(subsystems.size() * RHO3_QUBITS);
+        for (const auto &subsystem : subsystems)
+        {
+            flat.insert(flat.end(), subsystem.begin(), subsystem.end());
+        }
+        return flat;
+    }
+
+    template <typename Real>
+    void reduced_density_complex_from_host_statevector(
+        const std::complex<Real> *psi,
+        int n,
+        const std::vector<Subsystem> &subsystems,
+        double *rho_ri)
+    {
+        if (psi == nullptr || rho_ri == nullptr)
+        {
+            throw std::invalid_argument("Null state-vector or density-matrix pointer.");
+        }
+        if (n < RHO3_QUBITS || subsystems.empty())
+        {
+            throw std::invalid_argument("Invalid retained subsystem definition.");
+        }
+
+        const std::size_t output_values = subsystems.size() * RHO3_VALUES;
+        std::fill(rho_ri, rho_ri + output_values, 0.0);
+        const std::uint64_t env_dim = checked_pow2_u64(n - RHO3_QUBITS);
+
+        // CUDA-Q qubit b maps to bit b in the linear statevector index.
+        // Reduced-basis bit k maps to subsystem[k]. This preserves the
+        // requested cyclic ordering for wraparound triples such as {n-1,0,1}.
+        for (std::size_t s = 0; s < subsystems.size(); ++s)
+        {
+            const auto &subsystem = subsystems[s];
+            for (int i = 0; i < RHO3_QUBITS; ++i)
             {
-                break;
+                if (subsystem[i] < 0 || subsystem[i] >= n)
+                {
+                    throw std::invalid_argument("Subsystem qubit index is out of range.");
+                }
+                for (int j = 0; j < i; ++j)
+                {
+                    if (subsystem[i] == subsystem[j])
+                    {
+                        throw std::invalid_argument("Subsystem contains duplicate qubits.");
+                    }
+                }
+            }
+
+            std::array<std::uint64_t, RHO3_DIM> retained_offsets{};
+            for (int local_basis = 0; local_basis < RHO3_DIM; ++local_basis)
+            {
+                for (int k = 0; k < RHO3_QUBITS; ++k)
+                {
+                    retained_offsets[local_basis] |=
+                        (static_cast<std::uint64_t>((local_basis >> k) & 1)
+                         << subsystem[k]);
+                }
+            }
+
+            for (std::uint64_t env = 0; env < env_dim; ++env)
+            {
+                std::uint64_t base = 0;
+                int env_bit = 0;
+                for (int q = 0; q < n; ++q)
+                {
+                    if (q != subsystem[0] && q != subsystem[1] && q != subsystem[2])
+                    {
+                        base |= ((env >> env_bit) & std::uint64_t{1}) << q;
+                        ++env_bit;
+                    }
+                }
+
+                for (int row = 0; row < RHO3_DIM; ++row)
+                {
+                    const auto a = psi[base | retained_offsets[row]];
+                    for (int col = 0; col < RHO3_DIM; ++col)
+                    {
+                        const auto b = psi[base | retained_offsets[col]];
+                        const auto value = a * std::conj(b);
+                        const std::size_t out =
+                            s * RHO3_VALUES +
+                            2u * static_cast<std::size_t>(row * RHO3_DIM + col);
+                        rho_ri[out + 0] += static_cast<double>(std::real(value));
+                        rho_ri[out + 1] += static_cast<double>(std::imag(value));
+                    }
+                }
             }
         }
     }
 
-    inline void set_last3_bits(std::vector<int> &bits, int env_qubits, int abc)
+    void cudaq_three_site_density_matrices(
+        cudaq::state &state,
+        int n,
+        const std::vector<Subsystem> &subsystems,
+        double *rho_ri)
     {
-        // This matches your original indexing convention:
-        //
-        // bits[b] = (i >> b) & 1
-        //
-        // and your original kept-qubit order:
-        //
-        // kept = {n - 3, n - 2, n - 1}
-        //
-        // Therefore local ABC bit 0 maps to qubit n - 3,
-        // local ABC bit 1 maps to qubit n - 2,
-        // local ABC bit 2 maps to qubit n - 1.
-        bits[env_qubits + 0] = (abc >> 0) & 1;
-        bits[env_qubits + 1] = (abc >> 1) & 1;
-        bits[env_qubits + 2] = (abc >> 2) & 1;
-    }
-}
-
-// Direct replacement for:
-//     cudaq_state_to_eigen(...)
-//     partial_trace_statevector(...)
-//     real-part extraction
-//
-// This computes only the final real 8x8 reduced density matrix needed by GMN.
-//
-// Assumption:
-//     You are tracing out qubits 0 through n - 4 and keeping qubits
-//     n - 3, n - 2, n - 1, exactly as in your posted code.
-//
-// Output:
-//     rho_real is row-major, length 64.
-//     rho_real[i * 8 + j] = real(rho_ABC(i,j)).
-template <typename Real>
-void last3_reduced_density_real_from_host_statevector(
-    const std::complex<Real> *psi,
-    int n,
-    double *rho_real)
-{
-    if (psi == nullptr)
-    {
-        throw std::invalid_argument("state-vector pointer is null.");
-    }
-
-    std::fill(rho_real, rho_real + GMN_RHO_SIZE, 0.0);
-
-    const int env_qubits = n - GMN_KEEP_QUBITS;
-    const std::uint64_t env_dim = checked_pow2_u64(env_qubits);
-
-    // CUDA-Q's state-vector indexing matches the old amplitude path used here:
-    // qubit b maps to bit b in the linear state index. Therefore, for fixed
-    // environment state `env` and kept subsystem basis `abc`, the full basis
-    // index is env | (abc << env_qubits).
-    for (std::uint64_t env = 0; env < env_dim; ++env)
-    {
-        std::array<std::complex<Real>, GMN_KEEP_DIM> amp{};
-
-        for (int abc = 0; abc < GMN_KEEP_DIM; ++abc)
+        if (rho_ri == nullptr || subsystems.empty())
         {
-            const std::uint64_t idx = env |
-                (static_cast<std::uint64_t>(abc) << env_qubits);
-            amp[abc] = psi[idx];
+            throw std::invalid_argument("Density-matrix output definition is empty.");
+        }
+        if (n < RHO3_QUBITS)
+        {
+            throw std::invalid_argument("Three-qubit RDM output requires at least three qubits.");
         }
 
-        for (int i = 0; i < GMN_KEEP_DIM; ++i)
+        const std::uint64_t dim_u64 = checked_pow2_u64(n);
+        if (dim_u64 >
+            static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()))
         {
-            rho_real[i * GMN_KEEP_DIM + i] +=
-                static_cast<double>(std::norm(amp[i]));
-
-            for (int j = i + 1; j < GMN_KEEP_DIM; ++j)
-            {
-                const double re = static_cast<double>(
-                    std::real(amp[i] * std::conj(amp[j])));
-
-                rho_real[i * GMN_KEEP_DIM + j] += re;
-                rho_real[j * GMN_KEEP_DIM + i] += re;
-            }
+            throw std::invalid_argument("State-vector dimension does not fit in size_t.");
         }
-    }
-}
+        const std::size_t dim = static_cast<std::size_t>(dim_u64);
+        const auto precision = state.get_precision();
+        const auto tensor = state.get_tensor();
 
-void cudaq_last3_reduced_density_real(
-    cudaq::state &state,
-    int n,
-    double *rho_real)
-{
-    if (rho_real == nullptr)
-    {
-        throw std::invalid_argument("rho_real pointer is null.");
-    }
-
-    if (n < GMN_KEEP_QUBITS)
-    {
-        throw std::invalid_argument("Need at least 3 qubits to keep the last 3 qubits.");
-    }
-
-    const std::uint64_t dim_u64 = checked_pow2_u64(n);
-    if (dim_u64 > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()))
-    {
-        throw std::invalid_argument("State-vector dimension does not fit in size_t.");
-    }
-    const std::size_t dim = static_cast<std::size_t>(dim_u64);
-
-    const auto precision = state.get_precision();
-    const auto tensor = state.get_tensor();
-
-    if (tensor.get_rank() != 1 || tensor.get_num_elements() < dim)
-    {
-        throw std::runtime_error("Expected a contiguous rank-1 state-vector tensor.");
-    }
+        if (tensor.get_rank() != 1 || tensor.get_num_elements() < dim)
+        {
+            throw std::runtime_error("Expected a contiguous rank-1 CUDA-Q statevector tensor.");
+        }
 
 #ifdef MIPT_ENABLE_CUDA_RHO
-    if (state.is_on_gpu())
-    {
-        int status = 0;
-
-        if (precision == cudaq::SimulationState::precision::fp64)
+        if (state.is_on_gpu())
         {
-            status = mipt_cuda_last3_reduced_density_real_f64(tensor.data, n, rho_real);
+            const std::vector<int> flat = flatten_subsystems(subsystems);
+            int status = 0;
+            if (precision == cudaq::SimulationState::precision::fp64)
+            {
+                status = mipt_cuda_rho3_subsystems_complex_f64(
+                    tensor.data, n, flat.data(),
+                    static_cast<int>(subsystems.size()), rho_ri);
+            }
+            else
+            {
+                status = mipt_cuda_rho3_subsystems_complex_f32(
+                    tensor.data, n, flat.data(),
+                    static_cast<int>(subsystems.size()), rho_ri);
+            }
+            if (status != 0)
+            {
+                throw std::runtime_error(
+                    "CUDA three-qubit reduced-density-matrix kernel failed; status=" +
+                    std::to_string(status));
+            }
+            return;
         }
-        else
-        {
-            status = mipt_cuda_last3_reduced_density_real_f32(tensor.data, n, rho_real);
-        }
-
-        if (status != 0)
-        {
-            throw std::runtime_error("CUDA last-3 reduced-density-matrix kernel failed with CUDA error code " +
-                                     std::to_string(status));
-        }
-
-        return;
-    }
 #endif
 
-    if (state.is_on_gpu())
-    {
-        // GPU target but no custom CUDA reduction linked. This is still much
-        // faster than scalar amplitude() calls because it performs one bulk
-        // transfer and then a direct contiguous host reduction.
+        if (state.is_on_gpu())
+        {
+            // Without the custom reduction kernel, copy the statevector once
+            // and form every requested retained-subsystem matrix on the host.
+            if (precision == cudaq::SimulationState::precision::fp64)
+            {
+                std::vector<std::complex<double>> host_state(dim);
+                state.to_host(host_state.data(), host_state.size());
+                reduced_density_complex_from_host_statevector(
+                    host_state.data(), n, subsystems, rho_ri);
+            }
+            else
+            {
+                std::vector<std::complex<float>> host_state(dim);
+                state.to_host(host_state.data(), host_state.size());
+                reduced_density_complex_from_host_statevector(
+                    host_state.data(), n, subsystems, rho_ri);
+            }
+            return;
+        }
+
+        if (tensor.data == nullptr)
+        {
+            throw std::runtime_error("CUDA-Q state tensor has a null data pointer.");
+        }
+
         if (precision == cudaq::SimulationState::precision::fp64)
         {
-            std::vector<std::complex<double>> host_state(dim);
-            state.to_host(host_state.data(), host_state.size());
-            last3_reduced_density_real_from_host_statevector(
-                host_state.data(), n, rho_real);
+            reduced_density_complex_from_host_statevector(
+                reinterpret_cast<const std::complex<double> *>(tensor.data),
+                n, subsystems, rho_ri);
         }
         else
         {
-            std::vector<std::complex<float>> host_state(dim);
-            state.to_host(host_state.data(), host_state.size());
-            last3_reduced_density_real_from_host_statevector(
-                host_state.data(), n, rho_real);
+            reduced_density_complex_from_host_statevector(
+                reinterpret_cast<const std::complex<float> *>(tensor.data),
+                n, subsystems, rho_ri);
         }
-
-        return;
     }
 
-    if (tensor.data == nullptr)
+    mipt_io::DensityFileMetadata density_metadata(
+        int dimension,
+        int total_qubits,
+        int periods,
+        int realizations,
+        int res,
+        double p_min,
+        double p_max,
+        int grid_x,
+        int grid_y,
+        const std::vector<Subsystem> &subsystems)
     {
-        throw std::runtime_error("CUDA-Q state tensor has a null data pointer.");
-    }
-
-    if (precision == cudaq::SimulationState::precision::fp64)
-    {
-        last3_reduced_density_real_from_host_statevector(
-            reinterpret_cast<const std::complex<double> *>(tensor.data),
-            n,
-            rho_real);
-    }
-    else
-    {
-        last3_reduced_density_real_from_host_statevector(
-            reinterpret_cast<const std::complex<float> *>(tensor.data),
-            n,
-            rho_real);
+        mipt_io::DensityFileMetadata metadata;
+        metadata.spatial_dimension = static_cast<std::uint32_t>(dimension);
+        metadata.total_qubits = static_cast<std::uint32_t>(total_qubits);
+        metadata.kept_qubits = RHO3_QUBITS;
+        metadata.matrix_dimension = RHO3_DIM;
+        metadata.periods = static_cast<std::uint32_t>(periods);
+        metadata.realizations = static_cast<std::uint32_t>(realizations);
+        metadata.resolution = static_cast<std::uint32_t>(res);
+        metadata.grid_x = static_cast<std::uint32_t>(grid_x);
+        metadata.grid_y = static_cast<std::uint32_t>(grid_y);
+        metadata.subsystem_count = static_cast<std::uint32_t>(subsystems.size());
+        metadata.record_count =
+            static_cast<std::uint64_t>(realizations) *
+            static_cast<std::uint64_t>(res);
+        metadata.p_min = p_min;
+        metadata.p_max = p_max;
+        metadata.subsystem_qubits.reserve(subsystems.size() * RHO3_QUBITS);
+        for (const auto &subsystem : subsystems)
+        {
+            for (int q : subsystem)
+            {
+                metadata.subsystem_qubits.push_back(static_cast<std::uint32_t>(q));
+            }
+        }
+        return metadata;
     }
 }
+
 
 template <typename T>
 std::vector<double> linspace(T start_in, T end_in, int num_in)
@@ -272,29 +324,6 @@ std::vector<double> linspace(T start_in, T end_in, int num_in)
     linspaced.push_back(end); // I want to ensure that start and end
                               // are exactly the same as the input
     return linspaced;
-}
-
-VectorXc cudaq_state_to_eigen(cudaq::state state, int n)
-{
-    int dim = 1 << n;
-    VectorXc psi(dim);
-
-    for (int i = 0; i < dim; ++i)
-    {
-        std::vector<int> bits(n);
-
-        for (int b = 0; b < n; ++b)
-            bits[b] = (i >> b) & 1;
-
-        psi(i) = state.amplitude(bits);
-    }
-
-    return psi;
-}
-
-MatrixXc density_matrix(const VectorXc &psi)
-{
-    return psi * psi.adjoint();
 }
 
 struct LayerData
@@ -752,163 +781,230 @@ std::vector<LayerData> mipt_frontend(int n,
 
 void run_1d(int n, int periods, int realizations, int res, double p_min, double p_max)
 {
-    std::vector<double> ps = linspace(p_min, p_max, res);
+    if (n < RHO3_QUBITS)
+    {
+        throw std::invalid_argument(
+            "Saving three-qubit reduced density matrices requires n >= 3.");
+    }
 
-    std::ofstream outfile("data.csv");
+    const std::vector<Subsystem> subsystems = periodic_ring_three_site_subsystems(n);
+    std::vector<double> ps = linspace(p_min, p_max, res);
     std::ofstream infofile("info.csv");
 
-    // headers
+    // Keep the existing info.csv format unchanged.
     infofile << "n,periods,realizations,resolution,p_min,p_max\n";
-    infofile << n << "," << periods << "," << realizations << "," << res << "," << p_min << "," << p_max << "\n";
+    infofile << n << "," << periods << "," << realizations << "," << res << ","
+             << p_min << "," << p_max << "\n";
 
-    // headers
-    outfile << "p,gmn\n";
+    mipt_io::DensityMatrixWriter rho3_file(
+        "rho3.bin",
+        density_metadata(1, n, periods, realizations, res,
+                         p_min, p_max, n, 1, subsystems));
 
-    for (double p : ps)
+    for (std::size_t p_index = 0; p_index < ps.size(); ++p_index)
     {
-        std::cout << "Simulating p = "
-                  << p << "...\n "
-                  << std::flush;
+        const double p = ps[p_index];
+        std::cout << "Simulating p = " << p << "...\n " << std::flush;
 
         double sec_per_circ = 0.0;
 
-        for (int r = 0; r < realizations; r++)
+        for (int r = 0; r < realizations; ++r)
         {
             auto circ_time_start = std::chrono::steady_clock::now();
             std::chrono::steady_clock::time_point start, lap1, lap2, lap3, lap4;
 
-            if (r == 0) start = std::chrono::steady_clock::now();
+            if (r == 0)
+            {
+                start = std::chrono::steady_clock::now();
+            }
 
             auto layers = mipt_frontend(n, periods, p);
-            
-            if (r == 0) lap1 = std::chrono::steady_clock::now();
 
-            // Get final statevector
-            auto state =
-                cudaq::get_state(MIPTKernel_1D{}, n, layers, true);
+            if (r == 0)
+            {
+                lap1 = std::chrono::steady_clock::now();
+            }
 
-            if (r == 0) lap2 = std::chrono::steady_clock::now();
+            auto state = cudaq::get_state(MIPTKernel_1D{}, n, layers, true);
 
-            std::array<double, 64> rho_real{};
-            cudaq_last3_reduced_density_real(state, n, rho_real.data());
+            if (r == 0)
+            {
+                lap2 = std::chrono::steady_clock::now();
+            }
 
-            if (r == 0) lap3 = std::chrono::steady_clock::now();
+            std::vector<double> rho3_ri(subsystems.size() * RHO3_VALUES);
+            cudaq_three_site_density_matrices(
+                state, n, subsystems, rho3_ri.data());
 
-            double gmn = compute_gmn_mosek_real_8x8(rho_real.data());
-            
-            if (r == 0) lap4 = std::chrono::steady_clock::now();
+            if (r == 0)
+            {
+                lap3 = std::chrono::steady_clock::now();
+            }
 
-            outfile << p << "," << gmn << "\n";
+            rho3_file.write_record(
+                static_cast<std::uint32_t>(p_index),
+                static_cast<std::uint32_t>(r),
+                p,
+                rho3_ri.data(),
+                rho3_ri.size());
 
-            if (r == 0) {
-                std::chrono::duration<double> t_layer = lap1 - start;
-                std::chrono::duration<double> t_qc = lap2 - lap1;
-                std::chrono::duration<double> t_im = lap3 - lap2;
-                std::chrono::duration<double> t_gmn = lap4 - lap3;
-                std::cout << "Layer, QC, IM, GMN times: "
+            if (r == 0)
+            {
+                lap4 = std::chrono::steady_clock::now();
+
+                const std::chrono::duration<double> t_layer = lap1 - start;
+                const std::chrono::duration<double> t_qc = lap2 - lap1;
+                const std::chrono::duration<double> t_dm = lap3 - lap2;
+                const std::chrono::duration<double> t_save = lap4 - lap3;
+                std::cout << "Layer, QC, DM, Save times: "
                           << t_layer.count() << "s, "
                           << t_qc.count() << "s, "
-                          << t_im.count() << "s, "
-                          << t_gmn.count() << "s\n";
+                          << t_dm.count() << "s, "
+                          << t_save.count() << "s\n";
             }
-            auto circ_time_end = std::chrono::steady_clock::now();
-            std::chrono::duration<double> circ_time_diff = circ_time_end - circ_time_start;
-            if (r != 0) 
+
+            const auto circ_time_end = std::chrono::steady_clock::now();
+            const std::chrono::duration<double> circ_time_diff =
+                circ_time_end - circ_time_start;
+            if (r != 0)
             {
-                sec_per_circ = ((r-1)*sec_per_circ + circ_time_diff.count())/r;
+                sec_per_circ = ((r - 1) * sec_per_circ +
+                                circ_time_diff.count()) / r;
             }
-            else 
+            else
             {
                 sec_per_circ = circ_time_diff.count();
             }
-            double time_estimate = (realizations - r)*sec_per_circ;
-            std::cout << "\rAverage circuits/second: " << std::round((1 / sec_per_circ) * 100.0)/100.0 
-                      << ", Realisations ETA: " << static_cast<int>(time_estimate) << "s               " << std::flush;
+
+            const double time_estimate = (realizations - r) * sec_per_circ;
+            std::cout << "\rAverage circuits/second: "
+                      << std::round((1 / sec_per_circ) * 100.0) / 100.0
+                      << ", Realisations ETA: "
+                      << static_cast<int>(time_estimate)
+                      << "s               " << std::flush;
         }
         std::cout << "\n";
     }
+
+    rho3_file.close();
+    std::cout << "Saved " << subsystems.size()
+              << " cyclic three-qubit reduced density matrices per trajectory to rho3.bin.\n";
 }
 
-void run_2d(int x, int y, int periods, int realizations, int res, double p_min, double p_max) 
+void run_2d(int x, int y, int periods, int realizations, int res, double p_min, double p_max)
 {
-    std::vector<double> ps = linspace(p_min, p_max, res);
+    const int n = x * y;
+    if (n < RHO3_QUBITS)
+    {
+        throw std::invalid_argument(
+            "Saving three-qubit reduced density matrices requires x*y >= 3.");
+    }
 
-    std::ofstream outfile("data2.csv");
+    // The requested distance-one window convention is defined for the 1D ring.
+    // Preserve the prior 2D output behaviour as one terminal three-qubit RDM.
+    const std::vector<Subsystem> subsystems = terminal_three_site_subsystem(n);
+    std::vector<double> ps = linspace(p_min, p_max, res);
     std::ofstream infofile("info2.csv");
 
-    int n = x*y;
-
-    // headers
+    // Keep the existing info2.csv format unchanged.
     infofile << "n,periods,realizations,resolution,p_min,p_max\n";
-    infofile << n << "," << periods << "," << realizations << "," << res << "," << p_min << "," << p_max << "\n";
+    infofile << n << "," << periods << "," << realizations << "," << res << ","
+             << p_min << "," << p_max << "\n";
 
-    // headers
-    outfile << "p,gmn\n";
+    mipt_io::DensityMatrixWriter rho3_file(
+        "rho3_2d.bin",
+        density_metadata(2, n, periods, realizations, res,
+                         p_min, p_max, x, y, subsystems));
 
-    for (double p : ps)
+    for (std::size_t p_index = 0; p_index < ps.size(); ++p_index)
     {
-        std::cout << "Simulating p = "
-                  << p << "...\n "
-                  << std::flush;
+        const double p = ps[p_index];
+        std::cout << "Simulating p = " << p << "...\n " << std::flush;
 
         double sec_per_circ = 0.0;
 
-        for (int r = 0; r < realizations; r++)
+        for (int r = 0; r < realizations; ++r)
         {
             auto circ_time_start = std::chrono::steady_clock::now();
             std::chrono::steady_clock::time_point start, lap1, lap2, lap3, lap4;
 
-            if (r == 0) start = std::chrono::steady_clock::now();
+            if (r == 0)
+            {
+                start = std::chrono::steady_clock::now();
+            }
 
             auto layers = mipt_frontend(n, periods, p);
-            
-            if (r == 0) lap1 = std::chrono::steady_clock::now();
 
-            // Get final statevector
-            auto state =
-                cudaq::get_state(MIPTKernel_2D{}, x, y, layers, true);
+            if (r == 0)
+            {
+                lap1 = std::chrono::steady_clock::now();
+            }
 
-            if (r == 0) lap2 = std::chrono::steady_clock::now();
+            auto state = cudaq::get_state(MIPTKernel_2D{}, x, y, layers, true);
 
-            std::array<double, 64> rho_real{};
-            cudaq_last3_reduced_density_real(state, n, rho_real.data());
+            if (r == 0)
+            {
+                lap2 = std::chrono::steady_clock::now();
+            }
 
-            if (r == 0) lap3 = std::chrono::steady_clock::now();
+            std::vector<double> rho3_ri(subsystems.size() * RHO3_VALUES);
+            cudaq_three_site_density_matrices(
+                state, n, subsystems, rho3_ri.data());
 
-            double gmn = compute_gmn_mosek_real_8x8(rho_real.data());
-            
-            if (r == 0) lap4 = std::chrono::steady_clock::now();
+            if (r == 0)
+            {
+                lap3 = std::chrono::steady_clock::now();
+            }
 
-            outfile << p << "," << gmn << "\n";
+            rho3_file.write_record(
+                static_cast<std::uint32_t>(p_index),
+                static_cast<std::uint32_t>(r),
+                p,
+                rho3_ri.data(),
+                rho3_ri.size());
 
-            if (r == 0) {
-                std::chrono::duration<double> t_layer = lap1 - start;
-                std::chrono::duration<double> t_qc = lap2 - lap1;
-                std::chrono::duration<double> t_im = lap3 - lap2;
-                std::chrono::duration<double> t_gmn = lap4 - lap3;
-                std::cout << "Layer, QC, IM, GMN times: "
+            if (r == 0)
+            {
+                lap4 = std::chrono::steady_clock::now();
+
+                const std::chrono::duration<double> t_layer = lap1 - start;
+                const std::chrono::duration<double> t_qc = lap2 - lap1;
+                const std::chrono::duration<double> t_dm = lap3 - lap2;
+                const std::chrono::duration<double> t_save = lap4 - lap3;
+                std::cout << "Layer, QC, DM, Save times: "
                           << t_layer.count() << "s, "
                           << t_qc.count() << "s, "
-                          << t_im.count() << "s, "
-                          << t_gmn.count() << "s\n";
+                          << t_dm.count() << "s, "
+                          << t_save.count() << "s\n";
             }
-            auto circ_time_end = std::chrono::steady_clock::now();
-            std::chrono::duration<double> circ_time_diff = circ_time_end - circ_time_start;
-            if (r != 0) 
+
+            const auto circ_time_end = std::chrono::steady_clock::now();
+            const std::chrono::duration<double> circ_time_diff =
+                circ_time_end - circ_time_start;
+            if (r != 0)
             {
-                sec_per_circ = ((r-1)*sec_per_circ + circ_time_diff.count())/r;
+                sec_per_circ = ((r - 1) * sec_per_circ +
+                                circ_time_diff.count()) / r;
             }
-            else 
+            else
             {
                 sec_per_circ = circ_time_diff.count();
             }
-            double time_estimate = (realizations - r)*sec_per_circ;
-            std::cout << "\rAverage circuits/second: " << std::round((1 / sec_per_circ) * 100.0)/100.0 
-                      << ", Realisations ETA: " << static_cast<int>(time_estimate) << "s               " << std::flush;
+
+            const double time_estimate = (realizations - r) * sec_per_circ;
+            std::cout << "\rAverage circuits/second: "
+                      << std::round((1 / sec_per_circ) * 100.0) / 100.0
+                      << ", Realisations ETA: "
+                      << static_cast<int>(time_estimate)
+                      << "s               " << std::flush;
         }
         std::cout << "\n";
     }
+
+    rho3_file.close();
+    std::cout << "Saved reduced density matrices to rho3_2d.bin.\n";
 }
+
 
 int main(int argc, char *argv[])
 {
@@ -941,12 +1037,12 @@ int main(int argc, char *argv[])
 
     if (d == 1)
     {
-        std::cout << "Running 1D " << n <<"-qubit simulation of " << realizations*res << " circuits.\n"
+        std::cout << "Running 1D " << n <<"-qubit simulation of " << realizations*res << " circuits.\n";
         run_1d(n, periods, realizations, res, p_min, p_max);
     }
     else if (d == 2)
     {
-        std::cout << "Running 2D " << n << "x" << n << " = " << n*n << "-qubit simulation of " << realizations*res << " circuits.\n"
+        std::cout << "Running 2D " << n << "x" << n << " = " << n*n << "-qubit simulation of " << realizations*res << " circuits.\n";
         run_2d(n, n, periods, realizations, res, p_min, p_max);
     }
 

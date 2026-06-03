@@ -1,88 +1,71 @@
 #include "gmn.hpp"
 
 #include <errno.h>
+#include <limits.h>
 #include <math.h>
 #include <stdint.h>
-#include <stdio.h>
 #include <stdlib.h>
 
 #include "mosek.h"
 
 /*
- * GMN SDP implementation through the MOSEK Optimizer C API.
+ * Fully decomposable real-valued GMN witness SDP through the MOSEK C API.
  *
- * This file intentionally contains no C++ and does not link against Fusion.
- * CUDA-Q/nvq++ may use libc++, whereas MOSEK Fusion on Linux is built with
- * GCC/libstdc++; calling the C Optimizer API avoids that ABI boundary.
+ * For each unique bipartition mask m:
+ *     W = P_m + PT_m(Q_m)
+ *     0 <= P_m <= I, 0 <= Q_m <= I
+ * and the objective is:
+ *     minimize Tr(rho W).
  *
- * Model, for subsystem s in {A,B,C}:
- *   W = P_s + PT_s(Q_s)
- *   0 <= P_s <= I, 0 <= Q_s <= I
- *   minimize trace(rho W)
+ * The returned quantity is -min Tr(rho W), matching the sign convention in
+ * the previous implementation.
  *
- * Each 8x8 PSD upper-bound inequality uses a PSD slack:
- *   P_s + S^P_s = I,  Q_s + S^Q_s = I.
+ * The retained system is fixed at three qubits; its three unique
+ * bipartitions are represented by masks 1, 2, and 3.
  *
- * The MOSEK task is cached per host thread. Each solve updates only the two
- * objective bar-matrix coefficients associated with P_A and Q_A.
+ * This implementation is deliberately C-only to avoid the CUDA-Q libc++ /
+ * MOSEK Fusion libstdc++ ABI boundary.
  */
 
-enum {
-    PARTIES = 3,
-    D = 8,
-    UPPER_COUNT = D * (D + 1) / 2,
-    PRIMARY_BARVARS = 2 * PARTIES,
-    NUM_BARVARS = 2 * PRIMARY_BARVARS,
-    UPPER_BOUND_CONS = PRIMARY_BARVARS * UPPER_COUNT,
-    WITNESS_EQUALITY_CONS = (PARTIES - 1) * UPPER_COUNT,
-    NUM_CONS = UPPER_BOUND_CONS + WITNESS_EQUALITY_CONS
-};
-
-enum {
-    P_A = 0, Q_A = 1,
-    P_B = 2, Q_B = 3,
-    P_C = 4, Q_C = 5,
-    S_P_A = 6, S_Q_A = 7,
-    S_P_B = 8, S_Q_B = 9,
-    S_P_C = 10, S_Q_C = 11
-};
-
-typedef struct {
+typedef struct
+{
+    int d;
+    int cuts;
+    int upper_count;
+    int primary_barvars;
+    int num_barvars;
+    int upper_bound_cons;
+    int witness_equality_cons;
+    int num_cons;
+    int *masks;
+    MSKint64t *entry_basis;
     MSKenv_t env;
     MSKtask_t task;
-    MSKint64t entry_basis[UPPER_COUNT];
 } GmnWorkspace;
 
 static _Thread_local GmnWorkspace *tls_ws = NULL;
 
-static int subsystem_mask(int subsystem)
-{
-    /* A -> bit 2, B -> bit 1, C -> bit 0. */
-    return 1 << (PARTIES - 1 - subsystem);
-}
-
-static void partial_transpose_source_index(int row, int col, int subsystem,
-                                           int *src_row, int *src_col)
-{
-    const int mask = subsystem_mask(subsystem);
-    const int row_bit = row & mask;
-    const int col_bit = col & mask;
-    *src_row = (row & ~mask) | col_bit;
-    *src_col = (col & ~mask) | row_bit;
-}
-
-static int upper_index(int row, int col)
+static int upper_index(int d, int row, int col)
 {
     int r = row;
     int c = col;
-    if (r > c) {
+    if (r > c)
+    {
         const int tmp = r;
         r = c;
         c = tmp;
     }
+    return r * d - (r * (r - 1)) / 2 + (c - r);
+}
 
-    /* Entries preceding row r plus offset c-r. */
-    return r * D - (r * (r - 1)) / 2 + (c - r);
+static void partial_transpose_source_index(int row,
+                                           int col,
+                                           int subsystem_mask,
+                                           int *src_row,
+                                           int *src_col)
+{
+    *src_row = (row & ~subsystem_mask) | (col & subsystem_mask);
+    *src_col = (col & ~subsystem_mask) | (row & subsystem_mask);
 }
 
 static MSKrescodee set_fixed_bound(MSKtask_t task, int con, double rhs)
@@ -90,24 +73,48 @@ static MSKrescodee set_fixed_bound(MSKtask_t task, int con, double rhs)
     return MSK_putconbound(task, (MSKint32t)con, MSK_BK_FX, rhs, rhs);
 }
 
+static void destroy_workspace(GmnWorkspace *ws)
+{
+    if (ws == NULL)
+    {
+        return;
+    }
+    if (ws->task != NULL)
+    {
+        MSK_deletetask(&ws->task);
+    }
+    if (ws->env != NULL)
+    {
+        MSK_deleteenv(&ws->env);
+    }
+    free(ws->entry_basis);
+    free(ws->masks);
+    free(ws);
+}
+
 static MSKrescodee append_entry_basis(GmnWorkspace *ws)
 {
     MSKrescodee r = MSK_RES_OK;
-    int row, col;
 
-    for (row = 0; row < D && r == MSK_RES_OK; ++row) {
-        for (col = row; col < D && r == MSK_RES_OK; ++col) {
-            const int k = upper_index(row, col);
-            /* MSK_appendsparsesymmat accepts lower-triangular locations. */
+    for (int row = 0; row < ws->d && r == MSK_RES_OK; ++row)
+    {
+        for (int col = row; col < ws->d && r == MSK_RES_OK; ++col)
+        {
+            const int k = upper_index(ws->d, row, col);
             const MSKint32t subi = (MSKint32t)col;
             const MSKint32t subj = (MSKint32t)row;
-            /* <E_rc, X> = X_rc, including off-diagonal locations. */
             const MSKrealt value = (row == col) ? 1.0 : 0.5;
-            r = MSK_appendsparsesymmat(ws->task, D, 1,
-                                       &subi, &subj, &value,
+
+            r = MSK_appendsparsesymmat(ws->task,
+                                       ws->d,
+                                       1,
+                                       &subi,
+                                       &subj,
+                                       &value,
                                        &ws->entry_basis[k]);
         }
     }
+
     return r;
 }
 
@@ -115,90 +122,118 @@ static MSKrescodee add_upper_bounds(GmnWorkspace *ws, int *constraint_index)
 {
     MSKrescodee r = MSK_RES_OK;
     const MSKrealt one = 1.0;
-    int x, row, col;
 
-    for (x = 0; x < PRIMARY_BARVARS && r == MSK_RES_OK; ++x) {
-        const int slack = PRIMARY_BARVARS + x;
-        for (row = 0; row < D && r == MSK_RES_OK; ++row) {
-            for (col = row; col < D && r == MSK_RES_OK; ++col) {
+    for (int x = 0; x < ws->primary_barvars && r == MSK_RES_OK; ++x)
+    {
+        const int slack = ws->primary_barvars + x;
+
+        for (int row = 0; row < ws->d && r == MSK_RES_OK; ++row)
+        {
+            for (int col = row; col < ws->d && r == MSK_RES_OK; ++col)
+            {
                 const int con = (*constraint_index)++;
-                const int k = upper_index(row, col);
+                const int k = upper_index(ws->d, row, col);
                 const double rhs = (row == col) ? 1.0 : 0.0;
 
                 r = MSK_putbaraij(ws->task, con, x, 1,
                                   &ws->entry_basis[k], &one);
-                if (r == MSK_RES_OK) {
+                if (r == MSK_RES_OK)
+                {
                     r = MSK_putbaraij(ws->task, con, slack, 1,
                                       &ws->entry_basis[k], &one);
                 }
-                if (r == MSK_RES_OK) {
+                if (r == MSK_RES_OK)
+                {
                     r = set_fixed_bound(ws->task, con, rhs);
                 }
             }
         }
     }
+
     return r;
 }
 
-static MSKrescodee add_witness_equalities(GmnWorkspace *ws, int *constraint_index)
+static MSKrescodee add_witness_equalities(GmnWorkspace *ws,
+                                           int *constraint_index)
 {
     MSKrescodee r = MSK_RES_OK;
     const MSKrealt plus_one = 1.0;
     const MSKrealt minus_one = -1.0;
-    int subsystem, row, col;
+    const int anchor_mask = ws->masks[0];
 
-    for (subsystem = 1; subsystem < PARTIES && r == MSK_RES_OK; ++subsystem) {
-        const int p_other = 2 * subsystem;
+    for (int cut = 1; cut < ws->cuts && r == MSK_RES_OK; ++cut)
+    {
+        const int p_other = 2 * cut;
         const int q_other = p_other + 1;
+        const int other_mask = ws->masks[cut];
 
-        for (row = 0; row < D && r == MSK_RES_OK; ++row) {
-            for (col = row; col < D && r == MSK_RES_OK; ++col) {
+        for (int row = 0; row < ws->d && r == MSK_RES_OK; ++row)
+        {
+            for (int col = row; col < ws->d && r == MSK_RES_OK; ++col)
+            {
                 const int con = (*constraint_index)++;
-                const int target = upper_index(row, col);
-                int src_a_row, src_a_col, src_s_row, src_s_col;
-                int source_a, source_s;
+                const int target = upper_index(ws->d, row, col);
+                int src_anchor_row, src_anchor_col;
+                int src_other_row, src_other_col;
 
-                partial_transpose_source_index(row, col, 0,
-                                               &src_a_row, &src_a_col);
-                partial_transpose_source_index(row, col, subsystem,
-                                               &src_s_row, &src_s_col);
-                source_a = upper_index(src_a_row, src_a_col);
-                source_s = upper_index(src_s_row, src_s_col);
+                partial_transpose_source_index(row, col, anchor_mask,
+                                               &src_anchor_row,
+                                               &src_anchor_col);
+                partial_transpose_source_index(row, col, other_mask,
+                                               &src_other_row,
+                                               &src_other_col);
 
-                /* P_A + PT_A(Q_A) - P_s - PT_s(Q_s) = 0. */
-                r = MSK_putbaraij(ws->task, con, P_A, 1,
+                const int source_anchor =
+                    upper_index(ws->d, src_anchor_row, src_anchor_col);
+                const int source_other =
+                    upper_index(ws->d, src_other_row, src_other_col);
+
+                /* P_0 + PT_0(Q_0) - P_cut - PT_cut(Q_cut) = 0. */
+                r = MSK_putbaraij(ws->task, con, 0, 1,
                                   &ws->entry_basis[target], &plus_one);
-                if (r == MSK_RES_OK) {
-                    r = MSK_putbaraij(ws->task, con, Q_A, 1,
-                                      &ws->entry_basis[source_a], &plus_one);
+                if (r == MSK_RES_OK)
+                {
+                    r = MSK_putbaraij(ws->task, con, 1, 1,
+                                      &ws->entry_basis[source_anchor],
+                                      &plus_one);
                 }
-                if (r == MSK_RES_OK) {
+                if (r == MSK_RES_OK)
+                {
                     r = MSK_putbaraij(ws->task, con, p_other, 1,
                                       &ws->entry_basis[target], &minus_one);
                 }
-                if (r == MSK_RES_OK) {
+                if (r == MSK_RES_OK)
+                {
                     r = MSK_putbaraij(ws->task, con, q_other, 1,
-                                      &ws->entry_basis[source_s], &minus_one);
+                                      &ws->entry_basis[source_other],
+                                      &minus_one);
                 }
-                if (r == MSK_RES_OK) {
+                if (r == MSK_RES_OK)
+                {
                     r = set_fixed_bound(ws->task, con, 0.0);
                 }
             }
         }
     }
+
     return r;
 }
 
 static void set_optional_threads(MSKtask_t task)
 {
     const char *s = getenv("GMN_MOSEK_NUM_THREADS");
-    if (s != NULL && *s != '\0') {
+    if (s != NULL && *s != '\0')
+    {
         char *end = NULL;
         long value;
         errno = 0;
         value = strtol(s, &end, 10);
-        if (errno == 0 && end != s && *end == '\0' && value > 0 && value <= INT32_MAX) {
-            (void)MSK_putintparam(task, MSK_IPAR_NUM_THREADS, (MSKint32t)value);
+        if (errno == 0 && end != s && *end == '\0' &&
+            value > 0 && value <= INT_MAX)
+        {
+            (void)MSK_putintparam(task,
+                                  MSK_IPAR_NUM_THREADS,
+                                  (MSKint32t)value);
         }
     }
 }
@@ -206,57 +241,90 @@ static void set_optional_threads(MSKtask_t task)
 static GmnWorkspace *create_workspace(void)
 {
     GmnWorkspace *ws = (GmnWorkspace *)calloc(1, sizeof(*ws));
-    MSKrescodee r = MSK_RES_OK;
-    MSKint32t dim[NUM_BARVARS];
-    int i;
-    int con = 0;
-
-    if (ws == NULL) {
+    if (ws == NULL)
+    {
         return NULL;
     }
 
-    for (i = 0; i < NUM_BARVARS; ++i) {
-        dim[i] = D;
+    ws->d = 8;
+    ws->cuts = 3;
+    ws->upper_count = ws->d * (ws->d + 1) / 2;
+    ws->primary_barvars = 2 * ws->cuts;
+    ws->num_barvars = 2 * ws->primary_barvars;
+    ws->upper_bound_cons = ws->primary_barvars * ws->upper_count;
+    ws->witness_equality_cons = (ws->cuts - 1) * ws->upper_count;
+    ws->num_cons = ws->upper_bound_cons + ws->witness_equality_cons;
+
+    ws->masks = (int *)calloc((size_t)ws->cuts, sizeof(int));
+    ws->entry_basis =
+        (MSKint64t *)calloc((size_t)ws->upper_count, sizeof(MSKint64t));
+    if (ws->masks == NULL || ws->entry_basis == NULL)
+    {
+        destroy_workspace(ws);
+        return NULL;
     }
 
-    r = MSK_makeenv(&ws->env, NULL);
-    if (r == MSK_RES_OK) {
-        r = MSK_maketask(ws->env, NUM_CONS, 0, &ws->task);
+    for (int cut = 0; cut < ws->cuts; ++cut)
+    {
+        ws->masks[cut] = cut + 1;
     }
-    if (r == MSK_RES_OK) {
-        r = MSK_appendcons(ws->task, NUM_CONS);
+
+    MSKrescodee r = MSK_makeenv(&ws->env, NULL);
+    if (r == MSK_RES_OK)
+    {
+        r = MSK_maketask(ws->env, ws->num_cons, 0, &ws->task);
     }
-    if (r == MSK_RES_OK) {
-        r = MSK_appendbarvars(ws->task, NUM_BARVARS, dim);
+    if (r == MSK_RES_OK)
+    {
+        r = MSK_appendcons(ws->task, ws->num_cons);
     }
-    if (r == MSK_RES_OK) {
+    if (r == MSK_RES_OK)
+    {
+        MSKint32t *dims =
+            (MSKint32t *)calloc((size_t)ws->num_barvars, sizeof(MSKint32t));
+        if (dims == NULL)
+        {
+            destroy_workspace(ws);
+            return NULL;
+        }
+        for (int i = 0; i < ws->num_barvars; ++i)
+        {
+            dims[i] = (MSKint32t)ws->d;
+        }
+        r = MSK_appendbarvars(ws->task, ws->num_barvars, dims);
+        free(dims);
+    }
+    if (r == MSK_RES_OK)
+    {
         r = MSK_putobjsense(ws->task, MSK_OBJECTIVE_SENSE_MINIMIZE);
     }
-    if (r == MSK_RES_OK) {
+    if (r == MSK_RES_OK)
+    {
         r = MSK_putintparam(ws->task, MSK_IPAR_LOG, 0);
     }
-    if (r == MSK_RES_OK) {
+    if (r == MSK_RES_OK)
+    {
         set_optional_threads(ws->task);
         r = append_entry_basis(ws);
     }
-    if (r == MSK_RES_OK) {
+
+    int con = 0;
+    if (r == MSK_RES_OK)
+    {
         r = add_upper_bounds(ws, &con);
     }
-    if (r == MSK_RES_OK) {
+    if (r == MSK_RES_OK)
+    {
         r = add_witness_equalities(ws, &con);
     }
-    if (r == MSK_RES_OK && con != NUM_CONS) {
+    if (r == MSK_RES_OK && con != ws->num_cons)
+    {
         r = MSK_RES_ERR_INTERNAL;
     }
 
-    if (r != MSK_RES_OK) {
-        if (ws->task != NULL) {
-            MSK_deletetask(&ws->task);
-        }
-        if (ws->env != NULL) {
-            MSK_deleteenv(&ws->env);
-        }
-        free(ws);
+    if (r != MSK_RES_OK)
+    {
+        destroy_workspace(ws);
         return NULL;
     }
 
@@ -265,78 +333,110 @@ static GmnWorkspace *create_workspace(void)
 
 static GmnWorkspace *workspace(void)
 {
-    if (tls_ws == NULL) {
+    if (tls_ws == NULL)
+    {
         tls_ws = create_workspace();
     }
     return tls_ws;
 }
 
-static void fill_upper_coefficients(const double *matrix, MSKrealt out[UPPER_COUNT])
+static void fill_upper_coefficients(const GmnWorkspace *ws,
+                                    const double *matrix,
+                                    MSKrealt *out)
 {
-    int row, col;
-    for (row = 0; row < D; ++row) {
-        for (col = row; col < D; ++col) {
-            const int k = upper_index(row, col);
+    for (int row = 0; row < ws->d; ++row)
+    {
+        for (int col = row; col < ws->d; ++col)
+        {
+            const int k = upper_index(ws->d, row, col);
             out[k] = (row == col)
-                ? matrix[row * D + row]
-                : matrix[row * D + col] + matrix[col * D + row];
+                         ? matrix[row * ws->d + row]
+                         : matrix[row * ws->d + col] +
+                               matrix[col * ws->d + row];
         }
     }
 }
 
-static void partial_transpose_matrix(const double *in, int subsystem, double out[D * D])
+static void partial_transpose_matrix(const GmnWorkspace *ws,
+                                     const double *in,
+                                     int subsystem_mask,
+                                     double *out)
 {
-    int row, col;
-    for (row = 0; row < D; ++row) {
-        for (col = 0; col < D; ++col) {
+    for (int row = 0; row < ws->d; ++row)
+    {
+        for (int col = 0; col < ws->d; ++col)
+        {
             int src_row, src_col;
-            partial_transpose_source_index(row, col, subsystem, &src_row, &src_col);
-            out[row * D + col] = in[src_row * D + src_col];
+            partial_transpose_source_index(row, col, subsystem_mask,
+                                           &src_row, &src_col);
+            out[row * ws->d + col] = in[src_row * ws->d + src_col];
         }
     }
 }
 
 double compute_gmn_mosek_real_8x8(const double *rho_real_row_major)
 {
-    GmnWorkspace *ws;
-    MSKrescodee r;
+    if (rho_real_row_major == NULL)
+    {
+        return NAN;
+    }
+
+    GmnWorkspace *ws = workspace();
+    if (ws == NULL)
+    {
+        return NAN;
+    }
+
+    MSKrealt *coeff_p =
+        (MSKrealt *)calloc((size_t)ws->upper_count, sizeof(MSKrealt));
+    MSKrealt *coeff_q =
+        (MSKrealt *)calloc((size_t)ws->upper_count, sizeof(MSKrealt));
+    double *rho_pt =
+        (double *)calloc((size_t)ws->d * (size_t)ws->d, sizeof(double));
+    if (coeff_p == NULL || coeff_q == NULL || rho_pt == NULL)
+    {
+        free(coeff_p);
+        free(coeff_q);
+        free(rho_pt);
+        return NAN;
+    }
+
+    fill_upper_coefficients(ws, rho_real_row_major, coeff_p);
+    partial_transpose_matrix(ws, rho_real_row_major, ws->masks[0], rho_pt);
+    fill_upper_coefficients(ws, rho_pt, coeff_q);
+
+    MSKrescodee r =
+        MSK_putbarcj(ws->task, 0, ws->upper_count, ws->entry_basis, coeff_p);
+    if (r == MSK_RES_OK)
+    {
+        r = MSK_putbarcj(ws->task, 1, ws->upper_count,
+                         ws->entry_basis, coeff_q);
+    }
+
     MSKrescodee trm = MSK_RES_OK;
-    MSKsolstae solsta;
-    MSKrealt objective = 0.0;
-    MSKrealt coeff_p[UPPER_COUNT];
-    MSKrealt coeff_q[UPPER_COUNT];
-    double rho_pt_a[D * D];
-
-    if (rho_real_row_major == NULL) {
-        return NAN;
-    }
-
-    ws = workspace();
-    if (ws == NULL) {
-        return NAN;
-    }
-
-    fill_upper_coefficients(rho_real_row_major, coeff_p);
-    partial_transpose_matrix(rho_real_row_major, 0, rho_pt_a);
-    fill_upper_coefficients(rho_pt_a, coeff_q);
-
-    /* W = P_A + PT_A(Q_A): trace(rho W) = <rho,P_A> + <PT_A(rho),Q_A>. */
-    r = MSK_putbarcj(ws->task, P_A, UPPER_COUNT, ws->entry_basis, coeff_p);
-    if (r == MSK_RES_OK) {
-        r = MSK_putbarcj(ws->task, Q_A, UPPER_COUNT, ws->entry_basis, coeff_q);
-    }
-    if (r == MSK_RES_OK) {
+    if (r == MSK_RES_OK)
+    {
         r = MSK_optimizetrm(ws->task, &trm);
     }
-    if (r != MSK_RES_OK) {
+
+    free(coeff_p);
+    free(coeff_q);
+    free(rho_pt);
+
+    if (r != MSK_RES_OK)
+    {
         return NAN;
     }
 
+    MSKsolstae solsta;
     r = MSK_getsolsta(ws->task, MSK_SOL_ITR, &solsta);
-    if (r != MSK_RES_OK || solsta != MSK_SOL_STA_OPTIMAL) {
+    if (r != MSK_RES_OK || solsta != MSK_SOL_STA_OPTIMAL)
+    {
         return NAN;
     }
 
+    MSKrealt objective = 0.0;
     r = MSK_getprimalobj(ws->task, MSK_SOL_ITR, &objective);
     return (r == MSK_RES_OK) ? -(double)objective : NAN;
 }
+

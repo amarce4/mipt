@@ -1,3 +1,4 @@
+from __future__ import annotations
 from qiskit import QuantumCircuit, transpile, QuantumRegister, ClassicalRegister
 from qiskit.providers.basic_provider import BasicSimulator
 from qiskit.quantum_info import random_unitary, Statevector, partial_trace, entropy, mutual_information
@@ -19,253 +20,252 @@ from itertools import combinations
 # else:
 #     backend = AerSimulator(device='CPU', method='matrix_product_state')
 
-
-# ------------------------------------------------------------
-# Convert Qiskit DensityMatrix / Statevector to numpy matrix
-# ------------------------------------------------------------
-def to_numpy_density_matrix(rho):
-    rho = np.asarray(getattr(rho, "data", rho), dtype=complex)
-
-    if rho.ndim == 1:  # statevector
-        rho = np.outer(rho, rho.conj())
-
-    return rho
+from functools import lru_cache
+from itertools import combinations
+from typing import Literal, Sequence
 
 
-# ------------------------------------------------------------
-# Build partial transpose as a LINEAR MAP on vec(W)
-# ------------------------------------------------------------
-def partial_transpose_map(dims, sys):
+
+@lru_cache(maxsize=None)
+def _partial_transpose_permutation(
+    dims: tuple[int, ...],
+    subsys: tuple[int, ...],
+) -> sp.csr_matrix:
     """
-    Returns matrix PT such that:
-        vec(W^T_sys) = PT @ vec(W)
+    Return sparse T satisfying vec(X^{T_M}) = T @ vec(X),
+    using column-major vectorization.
     """
     d = int(np.prod(dims))
-    dim2 = d * d
 
-    PT = np.zeros((dim2, dim2), dtype=float)
+    rows = np.empty(d * d, dtype=np.int64)
+    cols = np.arange(d * d, dtype=np.int64)
+    data = np.ones(d * d, dtype=np.float64)
 
-    # basis element E_ij
     for i in range(d):
+        ii = list(np.unravel_index(i, dims))
+
         for j in range(d):
+            jj = list(np.unravel_index(j, dims))
 
-            E = np.zeros((d, d))
-            E[i, j] = 1.0
+            ii_pt = ii.copy()
+            jj_pt = jj.copy()
 
-            # reshape into tensor form
-            tensor = E.reshape(dims + dims)
+            for s in subsys:
+                ii_pt[s], jj_pt[s] = jj_pt[s], ii_pt[s]
 
-            N = len(dims)
-            axes = list(range(2 * N))
+            ip = np.ravel_multi_index(tuple(ii_pt), dims)
+            jp = np.ravel_multi_index(tuple(jj_pt), dims)
 
-            for s in sys:
-                axes[s], axes[s + N] = axes[s + N], axes[s]
+            src = i + j * d
+            dst = ip + jp * d
 
-            pt = tensor.transpose(axes).reshape(d, d)
+            rows[src] = dst
 
-            col = i * d + j
-            PT[:, col] = pt.flatten()
+    return sp.csr_matrix(
+        (data, (rows, cols)),
+        shape=(d * d, d * d),
+    )
 
-    return PT
 
-
-# ------------------------------------------------------------
-# GMNN SDP
-# ------------------------------------------------------------
-def gmnn_sdp(rho, dims, k_minus_1=2):
+def partial_transpose_expr(
+    X: cp.Expression,
+    dims: Sequence[int],
+    subsys: Sequence[int],
+) -> cp.Expression:
     """
-    GMNN witness SDP relaxation.
-
-    Parameters:
-    - rho: density matrix (Qiskit or numpy)
-    - dims: subsystem dimensions, e.g. [2,2,2]
-    - k_minus_1: max hyperedge size (2 = bipartite resources)
+    Partial transpose of a CVXPY matrix expression over the selected
+    subsystems.
     """
+    dims = tuple(int(x) for x in dims)
+    subsys = tuple(sorted(set(int(x) for x in subsys)))
 
-    rho = to_numpy_density_matrix(rho)
-    d = rho.shape[0]
+    n = len(dims)
+    if any(s < 0 or s >= n for s in subsys):
+        raise ValueError(f"Invalid subsystem indices: {subsys}")
 
-    parties = list(range(len(dims)))
+    d = int(np.prod(dims))
+    T = _partial_transpose_permutation(dims, subsys)
 
-    # --------------------------------------------------------
-    # Build allowed subsystem structure (hyperedges)
-    # --------------------------------------------------------
-    edges = []
-    for r in range(1, k_minus_1 + 1):
-        edges += list(combinations(parties, r))
+    vec_X = cp.reshape(X, (d * d, 1), order="F")
+    vec_X_pt = T @ vec_X
 
-    # --------------------------------------------------------
-    # SDP variable: entanglement witness
-    # --------------------------------------------------------
-    W = cp.Variable((d, d), hermitian=True)
+    return cp.reshape(vec_X_pt, (d, d), order="F")
 
-    constraints = []
 
-    # --------------------------------------------------------
-    # Constraint 1: upper bound (stability / normalization)
-    # --------------------------------------------------------
-    constraints += [W << np.eye(d)]
-
-    # --------------------------------------------------------
-    # Constraint 2: positivity of partial transposes
-    # (network-relaxed PPT constraints)
-    # --------------------------------------------------------
-    W_vec = cp.vec(W, order="C")
-
-    for S in edges:
-        PT = partial_transpose_map(dims, S)
-
-        W_pt = cp.reshape(PT @ W_vec, (d, d), order="C")
-
-        constraints += [W_pt >> 0]
-
-    # --------------------------------------------------------
-    # Objective: GMNN witness value
-    # --------------------------------------------------------
-    objective = cp.Minimize(cp.real(cp.trace(rho @ W)))
-
-    prob = cp.Problem(objective, constraints)
-
-    prob.solve(solver=cp.MOSEK)
-
-    gmnn_value = -prob.value
-
-    return gmnn_value, W.value
-
-# ============================================================
-# Partial transpose
-# ============================================================
-
-def partial_transpose_expr(X, dims, subsys):
+def inequivalent_bipartitions(parties: int) -> list[tuple[int, ...]]:
     """
-    Sparse linear-operator implementation of the partial transpose.
+    Generate one representative M from every nontrivial bipartition
+    M | complement(M).
+
+    Examples
+    --------
+    parties=3:
+        [(0,), (1,), (2,)]
+
+    parties=4:
+        [(0,), (1,), (2,), (3,),
+         (0, 1), (0, 2), (0, 3)]
+    """
+    if parties < 2:
+        raise ValueError("At least two parties are required.")
+
+    cuts: list[tuple[int, ...]] = []
+
+    for size in range(1, parties // 2 + 1):
+        for subset in combinations(range(parties), size):
+            # For equal-size complementary cuts, retain only one
+            # representative by requiring party 0 to be in M.
+            if 2 * size == parties and 0 not in subset:
+                continue
+
+            cuts.append(subset)
+
+    expected = 2 ** (parties - 1) - 1
+    if len(cuts) != expected:
+        raise RuntimeError(
+            f"Generated {len(cuts)} cuts, expected {expected}."
+        )
+
+    return cuts
+
+
+def gmn(
+    rho: np.ndarray,
+    parties: int,
+    *,
+    formulation: Literal["monotone", "paper_witness"] = "monotone",
+    solver: str = cp.MOSEK,
+    solver_options: dict | None = None,
+    zero_tol: float = 1e-8,
+    return_problem: bool = False,
+):
+    """
+    Compute the genuine multipartite negativity SDP score.
 
     Parameters
     ----------
-    X : cvxpy matrix expression
-        Hermitian matrix variable/expression.
-    dims : list[int]
-        Local subsystem dimensions, e.g. [2,2,2].
-    subsys : list[int]
-        Subsystems to transpose, e.g. [0] for T_A.
+    rho
+        Density matrix of shape (2**parties, 2**parties).
+
+    parties
+        Number of qubit parties.
+
+    formulation
+        "monotone":
+            Uses 0 <= P_M <= I and 0 <= Q_M <= I.
+            This is the GMN monotone formulation used in your current code.
+            The returned value is clamped to zero within `zero_tol`.
+
+        "paper_witness":
+            Uses Tr(W) = 1 and P_M, Q_M >= 0.
+            This matches Eq. (4) used for the Table I white-noise benchmark.
+            A strictly positive returned score indicates detection.
+
+    solver
+        CVXPY solver identifier, e.g. cp.MOSEK or cp.SCS.
+
+    solver_options
+        Optional keyword arguments passed to problem.solve().
+
+    zero_tol
+        Numerical tolerance used to suppress solver-scale residual values
+        in the monotone formulation.
+
+    return_problem
+        When True, return (score, raw_score, problem, bipartitions).
 
     Returns
     -------
-    cvxpy expression
-        Partial transpose of X over subsys.
+    float or tuple
+        GMN score, or additional solver details when return_problem=True.
     """
+    if parties < 2:
+        raise ValueError("At least two parties are required.")
 
-    d = int(np.prod(dims))
-    n = len(dims)
-
-    rows = []
-    cols = []
-    data = []
-
-    # Build permutation matrix T such that:
-    # vec(X^{T_M}) = T vec(X)
-
-    for i in range(d):
-        ii = np.unravel_index(i, dims)
-
-        for j in range(d):
-            jj = np.unravel_index(j, dims)
-
-            ii2 = list(ii)
-            jj2 = list(jj)
-
-            # swap bra/ket indices on chosen subsystems
-            for s in subsys:
-                ii2[s], jj2[s] = jj2[s], ii2[s]
-
-            ip = np.ravel_multi_index(ii2, dims)
-            jp = np.ravel_multi_index(jj2, dims)
-
-            # vec indexing (column-major)
-            src = i + j*d
-            dst = ip + jp*d
-
-            rows.append(dst)
-            cols.append(src)
-            data.append(1.0)
-
-    T = sp.coo_matrix((data, (rows, cols)),
-                      shape=(d*d, d*d)).tocsr()
-
-    # vec(X)
-    vecX = cp.reshape(X, (d*d, 1), order='F')
-
-    # Apply permutation
-    vecPT = T @ vecX
-
-    # reshape back into matrix
-    return cp.reshape(vecPT, (d, d), order='F')
-
-def gmn(rho, parties=3):
-
-    # ============================================================
-    # Problem dimensions
-    # ============================================================
-
-    dims = [2 for _ in range(parties)]
+    dims = [2] * parties
     d = 2 ** parties
 
-    # ============================================================
-    # SDP variables
-    # ============================================================
+    rho = np.asarray(rho, dtype=np.complex128)
 
-    W = cp.Variable((d,d), hermitian=True)
+    if rho.shape != (d, d):
+        raise ValueError(
+            f"rho has shape {rho.shape}, expected {(d, d)} "
+            f"for parties={parties}."
+        )
 
-    P = {}
-    Q = {}
+    if not np.allclose(rho, rho.conj().T, atol=1e-10):
+        raise ValueError("rho must be Hermitian.")
 
-    
-    partitions = {chr(ord('A') + i): [i] for i in range(parties)}
+    # Remove insignificant numerical anti-Hermitian noise.
+    rho = 0.5 * (rho + rho.conj().T)
 
-    constraints = []
+    if formulation not in {"monotone", "paper_witness"}:
+        raise ValueError(
+            "formulation must be 'monotone' or 'paper_witness'."
+        )
 
-    I = np.eye(d)
+    I = np.eye(d, dtype=np.complex128)
+    cuts = inequivalent_bipartitions(parties)
 
-    for name, subsys in partitions.items():
+    W = cp.Variable((d, d), hermitian=True, name="W")
 
-        P[name] = cp.Variable((d,d), hermitian=True)
-        Q[name] = cp.Variable((d,d), hermitian=True)
+    P: dict[tuple[int, ...], cp.Variable] = {}
+    Q: dict[tuple[int, ...], cp.Variable] = {}
 
-        QT = partial_transpose_expr(Q[name], dims, subsys)
+    constraints: list[cp.Constraint] = []
 
-        # constraints += [
-        #     cp.trace(W) == 1
-        # ]
+    for cut in cuts:
+        label = "_".join(str(i) for i in cut)
 
-        # W = P + Q^{T_M}
-        constraints += [
-            W == P[name] + QT
-        ]
+        P[cut] = cp.Variable((d, d), hermitian=True, name=f"P_{label}")
+        Q[cut] = cp.Variable((d, d), hermitian=True, name=f"Q_{label}")
 
-        # 0 <= P <= I
-        constraints += [
-            P[name] >> 0,
-            I - P[name] >> 0
-        ]
+        Q_pt = partial_transpose_expr(Q[cut], dims, cut)
 
-        # 0 <= Q <= I
-        constraints += [
-            Q[name] >> 0,
-            I - Q[name] >> 0
-        ]
+        constraints.extend(
+            [
+                W == P[cut] + Q_pt,
+                P[cut] >> 0,
+                Q[cut] >> 0,
+            ]
+        )
 
-    # ============================================================
-    # Objective
-    # ============================================================
+        if formulation == "monotone":
+            constraints.extend(
+                [
+                    I - P[cut] >> 0,
+                    I - Q[cut] >> 0,
+                ]
+            )
 
-    
+    if formulation == "paper_witness":
+        constraints.append(cp.trace(W) == 1)
 
     objective = cp.Minimize(cp.real(cp.trace(rho @ W)))
-
     problem = cp.Problem(objective, constraints)
 
-    problem.solve(solver=cp.MOSEK, warm_start=True)
-    return -problem.value
+    solve_kwargs = {"warm_start": True}
+    if solver_options is not None:
+        solve_kwargs.update(solver_options)
+
+    problem.solve(solver=solver, **solve_kwargs)
+
+    if problem.status not in {cp.OPTIMAL, cp.OPTIMAL_INACCURATE}:
+        raise RuntimeError(
+            f"GMN SDP did not solve successfully: status={problem.status}"
+        )
+
+    raw_score = -float(problem.value)
+
+    if formulation == "monotone":
+        score = raw_score if raw_score > zero_tol else 0.0
+    else:
+        score = raw_score
+
+    if return_problem:
+        return score, raw_score, problem, cuts
+
+    return score
 
 def tmi(dm):
     rho_A = partial_trace(dm, [1, 2])
