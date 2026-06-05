@@ -54,6 +54,27 @@ namespace
         return subsystems;
     }
 
+    std::vector<Subsystem> three_site_subsystems_2d(int x, int y)
+    {
+        std::vector<Subsystem> subsystems;
+        subsystems.reserve(static_cast<std::size_t>(x*y));
+        for (int i = 0; i < y; ++i) // horizontal subsystems
+        {
+            for (int j = 0; j < x; ++j)
+            {
+                subsystems.push_back({i*x + j, i*x + (j + 1)%x, i*x + (j + 2)%x});
+            }
+        }
+        for (int i = 0; i < x; ++i) // vertical subsystems
+        {
+            for (int j = 0; j < y; ++j)
+            {
+                subsystems.push_back({j*x + i, ((j + 1)%y)*x + i, ((j + 2)%y)*x + i});
+            }
+        }
+        return subsystems;
+    }
+
     std::vector<Subsystem> terminal_three_site_subsystem(int n)
     {
         if (n < RHO3_QUBITS)
@@ -902,7 +923,7 @@ void run_2d(int x, int y, int periods, int realizations, int res, double p_min, 
 
     // The requested distance-one window convention is defined for the 1D ring.
     // Preserve the prior 2D output behaviour as one terminal three-qubit RDM.
-    const std::vector<Subsystem> subsystems = terminal_three_site_subsystem(n);
+    const std::vector<Subsystem> subsystems = three_site_subsystems_2d(x, y);
     std::vector<double> ps = linspace(p_min, p_max, res);
     std::ofstream infofile("info2.csv");
 

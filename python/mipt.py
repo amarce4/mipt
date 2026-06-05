@@ -333,6 +333,23 @@ def random_mipt_1d(n, d, p, closed=True):
 
     return qc
 
+def get_mipt_rho_1d(n, d, p, subsyst=3, closed=True):
+
+    backend = AerSimulator(device="CPU", method="matrix_product_state")
+    qc = random_mipt_1d(n=n, d=d, p=float(p), closed=closed)
+
+    qc.save_density_matrix(
+        qubits=list(range(subsyst)),
+        label="final_state",
+        pershot=True,
+    )
+
+    tqc = transpile(qc, backend)
+
+    # One conditional outcome trajectory for this independently drawn circuit.
+    result = backend.run(tqc, shots=1).result()
+    return result.data(0)["final_state"][0]
+
 def random_mipt_2d(x, y, d, p):
     """p must be between 0 and 1."""
     if not (0 <= p <= 1):
