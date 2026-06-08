@@ -25,6 +25,14 @@
  *
  * This implementation is deliberately C-only to avoid the CUDA-Q libc++ /
  * MOSEK Fusion libstdc++ ABI boundary.
+ *
+ * Performance notes:
+ *   - The MOSEK task is cached per host thread.
+ *   - Per-solve heap allocation has been removed from the hot path.
+ *   - The interior-point solution is explicitly deleted after each solve so
+ *     MOSEK can release solution storage before the next objective update.
+ *   - The task is periodically rebuilt by default to avoid long-run task-state
+ *     accumulation on very large scans. Set GMN_MOSEK_RECYCLE=0 to disable.
  */
 
 typedef struct
@@ -37,13 +45,41 @@ typedef struct
     int upper_bound_cons;
     int witness_equality_cons;
     int num_cons;
+    int recycle_after;
+    int solves_since_rebuild;
     int *masks;
     MSKint64t *entry_basis;
+    MSKrealt *coeff_p;
+    MSKrealt *coeff_q;
+    double *rho_pt;
     MSKenv_t env;
     MSKtask_t task;
 } GmnWorkspace;
 
 static _Thread_local GmnWorkspace *tls_ws = NULL;
+
+static int parse_int_env(const char *name, int default_value,
+                         int min_value, int max_value)
+{
+    const char *s = getenv(name);
+    if (s == NULL || *s == '\0')
+    {
+        return default_value;
+    }
+
+    char *end = NULL;
+    long value;
+    errno = 0;
+    value = strtol(s, &end, 10);
+
+    if (errno != 0 || end == s || *end != '\0' ||
+        value < min_value || value > max_value)
+    {
+        return default_value;
+    }
+
+    return (int)value;
+}
 
 static int upper_index(int d, int row, int col)
 {
@@ -87,6 +123,9 @@ static void destroy_workspace(GmnWorkspace *ws)
     {
         MSK_deleteenv(&ws->env);
     }
+    free(ws->rho_pt);
+    free(ws->coeff_q);
+    free(ws->coeff_p);
     free(ws->entry_basis);
     free(ws->masks);
     free(ws);
@@ -219,22 +258,29 @@ static MSKrescodee add_witness_equalities(GmnWorkspace *ws,
     return r;
 }
 
-static void set_optional_threads(MSKtask_t task)
+static void set_optional_solver_settings(MSKtask_t task)
 {
-    const char *s = getenv("GMN_MOSEK_NUM_THREADS");
-    if (s != NULL && *s != '\0')
+    const int threads = parse_int_env(
+        "GMN_MOSEK_NUM_THREADS", 0, 0, INT_MAX);
+    if (threads > 0)
     {
-        char *end = NULL;
-        long value;
-        errno = 0;
-        value = strtol(s, &end, 10);
-        if (errno == 0 && end != s && *end == '\0' &&
-            value > 0 && value <= INT_MAX)
-        {
-            (void)MSK_putintparam(task,
-                                  MSK_IPAR_NUM_THREADS,
-                                  (MSKint32t)value);
-        }
+        (void)MSK_putintparam(task,
+                              MSK_IPAR_NUM_THREADS,
+                              (MSKint32t)threads);
+    }
+
+    /*
+     * For these fixed-size 8x8 SDPs, presolve can be more overhead than help.
+     * It is still optional because MOSEK's default can be better on some CPUs.
+     * Set GMN_MOSEK_PRESOLVE=0 or =1 to force a mode.
+     */
+    const char *presolve = getenv("GMN_MOSEK_PRESOLVE");
+    if (presolve != NULL && *presolve != '\0')
+    {
+        const int enabled = parse_int_env("GMN_MOSEK_PRESOLVE", 1, 0, 1);
+        (void)MSK_putintparam(task,
+                              MSK_IPAR_PRESOLVE_USE,
+                              enabled ? MSK_ON : MSK_OFF);
     }
 }
 
@@ -254,11 +300,22 @@ static GmnWorkspace *create_workspace(void)
     ws->upper_bound_cons = ws->primary_barvars * ws->upper_count;
     ws->witness_equality_cons = (ws->cuts - 1) * ws->upper_count;
     ws->num_cons = ws->upper_bound_cons + ws->witness_equality_cons;
+    ws->recycle_after = parse_int_env(
+        "GMN_MOSEK_RECYCLE", 10000, 0, INT_MAX);
+    ws->solves_since_rebuild = 0;
 
     ws->masks = (int *)calloc((size_t)ws->cuts, sizeof(int));
     ws->entry_basis =
         (MSKint64t *)calloc((size_t)ws->upper_count, sizeof(MSKint64t));
-    if (ws->masks == NULL || ws->entry_basis == NULL)
+    ws->coeff_p =
+        (MSKrealt *)calloc((size_t)ws->upper_count, sizeof(MSKrealt));
+    ws->coeff_q =
+        (MSKrealt *)calloc((size_t)ws->upper_count, sizeof(MSKrealt));
+    ws->rho_pt =
+        (double *)calloc((size_t)ws->d * (size_t)ws->d, sizeof(double));
+
+    if (ws->masks == NULL || ws->entry_basis == NULL ||
+        ws->coeff_p == NULL || ws->coeff_q == NULL || ws->rho_pt == NULL)
     {
         destroy_workspace(ws);
         return NULL;
@@ -304,7 +361,7 @@ static GmnWorkspace *create_workspace(void)
     }
     if (r == MSK_RES_OK)
     {
-        set_optional_threads(ws->task);
+        set_optional_solver_settings(ws->task);
         r = append_entry_basis(ws);
     }
 
@@ -335,6 +392,12 @@ static GmnWorkspace *workspace(void)
 {
     if (tls_ws == NULL)
     {
+        tls_ws = create_workspace();
+    }
+    else if (tls_ws->recycle_after > 0 &&
+             tls_ws->solves_since_rebuild >= tls_ws->recycle_after)
+    {
+        destroy_workspace(tls_ws);
         tls_ws = create_workspace();
     }
     return tls_ws;
@@ -387,30 +450,25 @@ double compute_gmn_mosek_real_8x8(const double *rho_real_row_major)
         return NAN;
     }
 
-    MSKrealt *coeff_p =
-        (MSKrealt *)calloc((size_t)ws->upper_count, sizeof(MSKrealt));
-    MSKrealt *coeff_q =
-        (MSKrealt *)calloc((size_t)ws->upper_count, sizeof(MSKrealt));
-    double *rho_pt =
-        (double *)calloc((size_t)ws->d * (size_t)ws->d, sizeof(double));
-    if (coeff_p == NULL || coeff_q == NULL || rho_pt == NULL)
-    {
-        free(coeff_p);
-        free(coeff_q);
-        free(rho_pt);
-        return NAN;
-    }
-
-    fill_upper_coefficients(ws, rho_real_row_major, coeff_p);
-    partial_transpose_matrix(ws, rho_real_row_major, ws->masks[0], rho_pt);
-    fill_upper_coefficients(ws, rho_pt, coeff_q);
+    fill_upper_coefficients(ws, rho_real_row_major, ws->coeff_p);
+    partial_transpose_matrix(ws, rho_real_row_major, ws->masks[0], ws->rho_pt);
+    fill_upper_coefficients(ws, ws->rho_pt, ws->coeff_q);
 
     MSKrescodee r =
-        MSK_putbarcj(ws->task, 0, ws->upper_count, ws->entry_basis, coeff_p);
+        MSK_putbarcj(ws->task, 0, ws->upper_count,
+                     ws->entry_basis, ws->coeff_p);
     if (r == MSK_RES_OK)
     {
         r = MSK_putbarcj(ws->task, 1, ws->upper_count,
-                         ws->entry_basis, coeff_q);
+                         ws->entry_basis, ws->coeff_q);
+    }
+
+    /* Defensive: previous interior-point solution is not useful as a warm
+     * start here, and deleting it prevents solution-storage accumulation.
+     */
+    if (r == MSK_RES_OK)
+    {
+        (void)MSK_deletesolution(ws->task, MSK_SOL_ITR);
     }
 
     MSKrescodee trm = MSK_RES_OK;
@@ -418,10 +476,6 @@ double compute_gmn_mosek_real_8x8(const double *rho_real_row_major)
     {
         r = MSK_optimizetrm(ws->task, &trm);
     }
-
-    free(coeff_p);
-    free(coeff_q);
-    free(rho_pt);
 
     if (r != MSK_RES_OK)
     {
@@ -437,6 +491,10 @@ double compute_gmn_mosek_real_8x8(const double *rho_real_row_major)
 
     MSKrealt objective = 0.0;
     r = MSK_getprimalobj(ws->task, MSK_SOL_ITR, &objective);
+
+    /* Free the solution before the next objective update. */
+    (void)MSK_deletesolution(ws->task, MSK_SOL_ITR);
+    ++ws->solves_since_rebuild;
+
     return (r == MSK_RES_OK) ? -(double)objective : NAN;
 }
-

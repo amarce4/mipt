@@ -30,6 +30,7 @@ MOSEK_LIB  ?= $(MOSEK_HOME)/bin
 GPU ?= 0
 FP64 ?= 1
 CUDA_RHO ?= $(GPU)
+OPENMP ?= 1
 
 NVQXXFLAGS_COMMON := -std=c++20 -O3 -DNDEBUG -march=native
 CXXFLAGS_COMMON   := -std=c++20 -O3 -DNDEBUG -march=native -I$(MOSEK_INC)
@@ -37,6 +38,10 @@ CFLAGS_COMMON     := -std=c11 -O3 -DNDEBUG -march=native -I$(MOSEK_INC)
 NVCCFLAGS         := -std=c++17 -O3
 MOSEK_LDFLAGS     := -L$(MOSEK_LIB) -Wl,-rpath,$(MOSEK_LIB)
 MOSEK_LIBS        := -lmosek64
+
+ifeq ($(OPENMP),1)
+  GMN_OPENMP_FLAGS := -fopenmp
+endif
 
 ifeq ($(GPU),1)
   CUDAQ_TARGET_FLAGS := --target nvidia
@@ -83,6 +88,7 @@ print-config:
 	@echo "GMN_OBJDIR=$(GMN_OBJDIR)"
 	@echo "MIPT_BINARY=$(MIPT_BINARY)"
 	@echo "GMN_BINARY=$(GMN_BINARY)"
+	@echo "OPENMP=$(OPENMP)"
 
 mipt.exe: $(MIPT_BINARY)
 	cp $(MIPT_BINARY) $@
@@ -94,7 +100,7 @@ $(MIPT_BINARY): $(MIPT_OBJS)
 	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $^ $(MIPT_CUDA_LIBS) -o $@
 
 $(GMN_BINARY): $(GMN_OBJS)
-	$(HOSTCXX) $^ $(MOSEK_LDFLAGS) $(MOSEK_LIBS) -o $@
+	$(HOSTCXX) $^ $(GMN_OPENMP_FLAGS) $(MOSEK_LDFLAGS) $(MOSEK_LIBS) -o $@
 
 $(MIPT_OBJDIR):
 	mkdir -p $@
@@ -109,7 +115,7 @@ $(MIPT_OBJDIR)/rho_reduce.o: rho_reduce.cu rho_reduce.hpp | $(MIPT_OBJDIR)
 	$(NVCC) $(NVCCFLAGS) -c $< -o $@
 
 $(GMN_OBJDIR)/gmn_main.o: gmn_main.cpp density_io.hpp gmn.hpp | $(GMN_OBJDIR)
-	$(HOSTCXX) $(CXXFLAGS_COMMON) -c $< -o $@
+	$(HOSTCXX) $(CXXFLAGS_COMMON) $(GMN_OPENMP_FLAGS) -c $< -o $@
 
 $(GMN_OBJDIR)/gmn_mosek_c.o: gmn_mosek_c.c gmn.hpp | $(GMN_OBJDIR)
 	$(HOSTCC) $(CFLAGS_COMMON) -c $< -o $@

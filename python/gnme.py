@@ -211,19 +211,28 @@ def marginal_matrix_expr(
 def inflation_score(rho, verbose=False, max_iters=10_000, tol=1e-4):
     rho = np.asarray(rho, dtype=np.complex128)
 
-    dims = [2, 2, 2, 2, 2, 2]
-    d = int(np.prod(dims))
+    dims: list
+    d: int
 
-    if rho.shape != (8, 8):
-        raise ValueError(f"Expected rho shape (8, 8), got {rho.shape}")
+    if rho.shape == (8, 8):
+        dims = [2, 2, 2, 2, 2, 2]
+    elif rho.shape == (64, 64):
+        dims = [4, 4, 4, 4, 4, 4]
+    else:
+        raise ValueError(f"unsupported matrix shape {rho.shape}")
+    
+    d = int(np.prod(dims))
+    
+    rho_dims = rho.shape
+    rho_d = np.prod(rho_dims)
 
     t = cp.Variable(name="t")
     tau = cp.Variable((d, d), hermitian=True, name="tau")
     gamma = cp.Variable((d, d), hermitian=True, name="gamma")
 
-    I8 = np.eye(8, dtype=np.complex128)
-    rho_vec = rho.reshape(8 * 8, order="F")
-    I8_vec = I8.reshape(8 * 8, order="F")
+    I = np.eye(rho_dims[0], dtype=np.complex128)
+    rho_vec = rho.reshape(rho_d, order="F")
+    I_vec = I.reshape(rho_d, order="F")
 
     constraints: list[cp.Constraint] = []
 
@@ -237,11 +246,11 @@ def inflation_score(rho, verbose=False, max_iters=10_000, tol=1e-4):
     ]
 
     # White-noise mixture:
-    # tau_012 = t*rho + (1-t)*I/8
+    # tau_012 = t*rho + (1-t)*I/rho_dims[0]
     constraints.append(
         marginal_vec_expr(tau, dims, [0, 1, 2])
         ==
-        t * rho_vec + (1 - t) * I8_vec / 8
+        t * rho_vec + (1 - t) * I_vec / rho_dims[0]
     )
 
     # Marginal equality constraints.
