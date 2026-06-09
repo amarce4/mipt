@@ -55,7 +55,7 @@ def level_3_inflation_score(
     constraints += [
         # gamma_7801245 = tau_4501278
         marginal_vec_expr(gamma, dims, [7,8,0,1,2,4,5])
-        == marginal_vec_expr(tau, [4,5,0,1,2,7,8]),
+        == marginal_vec_expr(tau, dims, [4,5,0,1,2,7,8]),
         # tau_1245678 = sigma_1245678
         marginal_vec_expr(tau, dims, [1,2,4,5,6,7,8])
         == marginal_vec_expr(sigma, dims, [1,2,4,5,6,7,8]),
@@ -122,20 +122,20 @@ def level_3_inflation_score(
     tau_2450678_T450 = partial_transpose_expr_sparse(tau_2450678, partial_dims, [1,2,3])
 
     constraints += [
-        tau_T678 >> 0,
-        sigma_T678 >> 0,
-        gamma_0234567_T0 >> 0,
-        gamma_0124567_T012 >> 0,
-        gamma_1345678_T1 >> 0,
-        gamma_1235678_T123 >> 0,
-        gamma_2456780_T2 >> 0,
-        gamma_2346780_T234 >> 0,
-        tau_0234678_T1 >> 0,
-        tau_0234678_T234 >> 0,
-        tau_1345678_T2 >> 0,
-        tau_1345678_T345 >> 0,
-        tau_2450678_T3 >> 0,
-        tau_2450678_T450 >> 0
+        (tau_T678 + tau_T678.H) / 2  >> 0,
+        (sigma_T678 + sigma_T678.H) / 2 >> 0,
+        (gamma_0234567_T0 + gamma_0234567_T0.H) / 2 >> 0,
+        (gamma_0124567_T012 + gamma_0124567_T012.H) / 2 >> 0,
+        (gamma_1345678_T1 + gamma_1345678_T1.H) / 2 >> 0,
+        (gamma_1235678_T123 + gamma_1235678_T123.H) / 2 >> 0,
+        (gamma_2456780_T2 + gamma_2456780_T2.H) / 2 >> 0,
+        (gamma_2346780_T234 + gamma_2346780_T234.H) / 2 >> 0,
+        (tau_0234678_T1 + tau_0234678_T1.H) / 2 >> 0,
+        (tau_0234678_T234 + tau_0234678_T234.H) / 2 >> 0,
+        (tau_1345678_T2 + tau_1345678_T2.H) / 2 >> 0,
+        (tau_1345678_T345 + tau_1345678_T345.H) / 2 >> 0,
+        (tau_2450678_T3 + tau_2450678_T3.H) / 2 >> 0,
+        (tau_2450678_T450 + tau_2450678_T450.H) / 2 >> 0
     ]
 
     objective = cp.Maximize(cp.real(t))

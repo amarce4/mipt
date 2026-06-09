@@ -14,9 +14,8 @@
 #   make GPU=1 CUDA_RHO=1 FP64=0
 #
 # GMN analysis:
-#   ./gmn.exe                         # rho3.bin -> data.csv
-#   ./gmn.exe 3 rho3.bin data.csv     # explicit/back-compatible form
-#   ./gmn.exe 3 rho3_2d.bin data2.csv
+#   ./gmn.exe 0 rho3.bin data_real.csv       # real-only GMN on Re(rho)
+#   ./gmn.exe 1 rho3.bin data_complex.csv    # full complex Hermitian GMN SDP
 
 NVQXX   ?= nvq++
 HOSTCXX ?= g++
@@ -40,7 +39,9 @@ MOSEK_LDFLAGS     := -L$(MOSEK_LIB) -Wl,-rpath,$(MOSEK_LIB)
 MOSEK_LIBS        := -lmosek64
 
 ifeq ($(OPENMP),1)
-  GMN_OPENMP_FLAGS := -fopenmp
+  CXXFLAGS_COMMON += -fopenmp
+  CFLAGS_COMMON   += -fopenmp
+  HOST_LDFLAGS    += -fopenmp
 endif
 
 ifeq ($(GPU),1)
@@ -59,7 +60,7 @@ endif
 
 CONFIG := gpu$(GPU)_fp64$(FP64)_rho$(CUDA_RHO)
 MIPT_OBJDIR := build/mipt_$(CONFIG)
-GMN_OBJDIR  := build/gmn_capi
+GMN_OBJDIR  := build/gmn_capi_omp$(OPENMP)
 MIPT_BINARY := $(MIPT_OBJDIR)/mipt.exe
 GMN_BINARY  := $(GMN_OBJDIR)/gmn.exe
 
@@ -100,7 +101,7 @@ $(MIPT_BINARY): $(MIPT_OBJS)
 	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $^ $(MIPT_CUDA_LIBS) -o $@
 
 $(GMN_BINARY): $(GMN_OBJS)
-	$(HOSTCXX) $^ $(GMN_OPENMP_FLAGS) $(MOSEK_LDFLAGS) $(MOSEK_LIBS) -o $@
+	$(HOSTCXX) $(HOST_LDFLAGS) $^ $(MOSEK_LDFLAGS) $(MOSEK_LIBS) -o $@
 
 $(MIPT_OBJDIR):
 	mkdir -p $@
@@ -115,7 +116,7 @@ $(MIPT_OBJDIR)/rho_reduce.o: rho_reduce.cu rho_reduce.hpp | $(MIPT_OBJDIR)
 	$(NVCC) $(NVCCFLAGS) -c $< -o $@
 
 $(GMN_OBJDIR)/gmn_main.o: gmn_main.cpp density_io.hpp gmn.hpp | $(GMN_OBJDIR)
-	$(HOSTCXX) $(CXXFLAGS_COMMON) $(GMN_OPENMP_FLAGS) -c $< -o $@
+	$(HOSTCXX) $(CXXFLAGS_COMMON) -c $< -o $@
 
 $(GMN_OBJDIR)/gmn_mosek_c.o: gmn_mosek_c.c gmn.hpp | $(GMN_OBJDIR)
 	$(HOSTCC) $(CFLAGS_COMMON) -c $< -o $@
