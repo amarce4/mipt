@@ -131,8 +131,8 @@ def inequivalent_bipartitions(parties: int) -> list[tuple[int, ...]]:
 
 def gmn(
     rho: np.ndarray,
-    parties: int,
     *,
+    parties: int = 3,
     formulation: Literal["monotone", "paper_witness"] = "monotone",
     solver: str = cp.MOSEK,
     solver_options: dict | None = None,
@@ -333,22 +333,37 @@ def random_mipt_1d(n, d, p, closed=True):
 
     return qc
 
-def get_mipt_rho_1d(n, d, p, subsyst=3, closed=True):
+def get_mipt_rho_1d(n, d, p, subsyst=3, all_matrices=False, closed=True):
+
+    subsystems = []
+    if all_matrices and closed:
+        subsystems = [[ (i + j) % n for j in range(subsyst) ] for i in range(n)]
+    else:
+        subsystems = [list(range(subsyst))]
 
     backend = AerSimulator(device="CPU", method="matrix_product_state")
     qc = random_mipt_1d(n=n, d=d, p=float(p), closed=closed)
 
-    qc.save_density_matrix(
-        qubits=list(range(subsyst)),
-        label="final_state",
-        pershot=True,
-    )
+    for i in range(len(subsystems)):
+        qc.save_density_matrix(
+            qubits=subsystems[i],
+            label=f"final_state_{i}",
+            pershot=True,
+        )
 
     tqc = transpile(qc, backend)
 
     # One conditional outcome trajectory for this independently drawn circuit.
     result = backend.run(tqc, shots=1).result()
-    return result.data(0)["final_state"][0]
+
+    if len(subsystems) == 1:
+        return result.data(0)["final_state_0"][0]
+
+    data = []
+    for i in range(len(subsystems)):
+        data.append(result.data(0)[f"final_state_{i}"][0])
+
+    return data
 
 def random_mipt_2d(x, y, d, p):
     """p must be between 0 and 1."""
