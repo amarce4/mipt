@@ -1,0 +1,11 @@
+#!/bin/bash
+
+cp ~/mipt/*.cpp ~/mipt/mipt/cpp
+cp ~/mipt/*.cu ~/mipt/mipt/cpp
+cp ~/mipt/*.hpp ~/mipt/mipt/cpp
+cp ~/mipt/*.c ~/mipt/mipt/cpp
+cp ~/mipt/Makefile ~/mipt/mipt/cpp
+
+
+cp ~/mipt/*.py ~/mipt/mipt/python
+cp ~/mipt/*.ipynb ~/mipt/mipt/python
