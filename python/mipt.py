@@ -333,7 +333,7 @@ def random_mipt_1d(n, d, p, closed=True):
 
     return qc
 
-def get_mipt_rho_1d(n, d, p, subsyst=3, all_matrices=False, closed=True):
+def get_mipt_rho_1d(n, d, p, subsyst=3, all_matrices=False, closed=True, gpu=False):
 
     subsystems = []
     if all_matrices and closed:
@@ -341,7 +341,12 @@ def get_mipt_rho_1d(n, d, p, subsyst=3, all_matrices=False, closed=True):
     else:
         subsystems = [list(range(subsyst))]
 
-    backend = AerSimulator(device="CPU", method="matrix_product_state")
+    backend: AerSimulator
+    if gpu == False:
+        backend = AerSimulator(device="CPU", method="matrix_product_state")
+    else:
+        backend = AerSimulator(device="GPU", method="matrix_product_state")
+        
     qc = random_mipt_1d(n=n, d=d, p=float(p), closed=closed)
 
     for i in range(len(subsystems)):

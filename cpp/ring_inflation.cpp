@@ -6,7 +6,7 @@
 #elif __has_include(<scs/scs.h>)
 #include <scs/scs.h>
 #else
-#error "Could not find SCS public header. Try: make ring_inflation.exe SCS_CFLAGS="-I$HOME/opt/scs/include -I$HOME/opt/scs/include/scs""
+#error "Could not find SCS public header. Add -I/path/to/scs/include or -I/path/to/scs/include/scs"
 #endif
 
 #include <algorithm>
@@ -51,6 +51,13 @@ namespace
         int max_iters = 2000;
         double tol = 1.0e-3;
         double time_limit_secs = 0.0;
+        std::uint64_t limit_per_p = 0; // 0 means no per-measurement-rate limit.
+        double p_min_select = -std::numeric_limits<double>::infinity();
+        double p_max_select = std::numeric_limits<double>::infinity();
+        bool has_p_range = false;
+        std::uint64_t record_start = 0;
+        std::uint64_t record_stop = std::numeric_limits<std::uint64_t>::max(); // exclusive.
+        bool has_record_range = false;
         std::string output_csv = "ring_inflation.csv";
         bool scs_verbose = false;
     };
@@ -142,6 +149,123 @@ namespace
         return value;
     }
 
+    std::string normalize_numeric_arg(const char *s)
+    {
+        std::string out = s == nullptr ? std::string() : std::string(s);
+        while (!out.empty() && (out.back() == ',' || out.back() == ';'))
+        {
+            out.pop_back();
+        }
+        return out;
+    }
+
+    std::uint64_t parse_nonnegative_uint64(const char *s, const char *name)
+    {
+        const std::string cleaned = normalize_numeric_arg(s);
+        char *end = nullptr;
+        errno = 0;
+        const unsigned long long value = std::strtoull(cleaned.c_str(), &end, 10);
+        if (errno != 0 || end == cleaned.c_str() || *end != '\0')
+        {
+            throw std::invalid_argument(std::string(name) + " must be a nonnegative integer.");
+        }
+        return static_cast<std::uint64_t>(value);
+    }
+
+    double parse_p_bound(const char *s, const char *name, bool lower_bound)
+    {
+        const std::string cleaned = normalize_numeric_arg(s);
+        if (cleaned == "all" || cleaned == "ALL" || cleaned == "*" || cleaned == "none" || cleaned == "None")
+        {
+            return lower_bound ? -std::numeric_limits<double>::infinity()
+                               : std::numeric_limits<double>::infinity();
+        }
+
+        char *end = nullptr;
+        errno = 0;
+        const double value = std::strtod(cleaned.c_str(), &end);
+        if (errno != 0 || end == cleaned.c_str() || *end != '\0' || !std::isfinite(value))
+        {
+            throw std::invalid_argument(std::string(name) + " must be a finite p value, or 'all'.");
+        }
+        return value;
+    }
+
+    bool p_in_selected_range(double p, const Options &opts)
+    {
+        if (!opts.has_p_range)
+        {
+            return true;
+        }
+        const double scale = std::max({1.0, std::fabs(p), std::fabs(opts.p_min_select), std::fabs(opts.p_max_select)});
+        const double eps = 64.0 * std::numeric_limits<double>::epsilon() * scale;
+        return p + eps >= opts.p_min_select && p - eps <= opts.p_max_select;
+    }
+
+    double p_value_for_index(const mipt_io::DensityFileMetadata &metadata, std::uint32_t p_index)
+    {
+        if (metadata.resolution <= 1)
+        {
+            return metadata.p_min;
+        }
+        const double alpha = static_cast<double>(p_index) / static_cast<double>(metadata.resolution - 1u);
+        return metadata.p_min + alpha * (metadata.p_max - metadata.p_min);
+    }
+
+    std::uint64_t records_per_p_estimate(const mipt_io::DensityFileMetadata &metadata)
+    {
+        if (metadata.realizations > 0)
+        {
+            return metadata.realizations;
+        }
+        if (metadata.resolution > 0)
+        {
+            return metadata.record_count / metadata.resolution;
+        }
+        return metadata.record_count;
+    }
+
+    std::uint64_t selected_record_window_size(const Options &opts, std::uint64_t records_per_p)
+    {
+        if (records_per_p <= opts.record_start)
+        {
+            return 0;
+        }
+        const std::uint64_t effective_stop =
+            opts.record_stop == std::numeric_limits<std::uint64_t>::max()
+                ? records_per_p
+                : std::min(records_per_p, opts.record_stop);
+        if (effective_stop <= opts.record_start)
+        {
+            return 0;
+        }
+        std::uint64_t count = effective_stop - opts.record_start;
+        if (opts.limit_per_p > 0)
+        {
+            count = std::min(count, opts.limit_per_p);
+        }
+        return count;
+    }
+
+    std::uint64_t estimate_progress_total(const mipt_io::DensityFileMetadata &metadata, const Options &opts)
+    {
+        if (metadata.resolution == 0)
+        {
+            return metadata.record_count;
+        }
+
+        const std::uint64_t per_p = selected_record_window_size(opts, records_per_p_estimate(metadata));
+        std::uint64_t selected_p_values = 0;
+        for (std::uint32_t i = 0; i < metadata.resolution; ++i)
+        {
+            if (p_in_selected_range(p_value_for_index(metadata, i), opts))
+            {
+                ++selected_p_values;
+            }
+        }
+        return std::min(metadata.record_count, selected_p_values * per_p);
+    }
+
     bool env_flag(const char *name, bool default_value = false)
     {
         const char *value = std::getenv(name);
@@ -169,15 +293,29 @@ namespace
     void print_usage(const char *program)
     {
         std::cout
-            << "Usage: " << program << " [file] [max_iters] [tol] [time_limit_secs]\n\n"
+            << "Usage:\n"
+            << "  " << program << " [file] [max_iters] [tol] [time_limit_secs]\n"
+            << "  " << program << " [file] [max_iters] [tol] [time_limit_secs] [limit_per_p]\n"
+            << "  " << program << " [file] [max_iters] [tol] [time_limit_secs] [limit_per_p] [p_min] [p_max]\n"
+            << "  " << program << " [file] [max_iters] [tol] [time_limit_secs] [limit_per_p] [p_min] [p_max] [record_start] [record_stop]\n\n"
             << "Pipeline:\n"
             << "  1. Reads a version-2 MIPT 3-qubit RDM .bin file.\n"
             << "  2. Runs full complex MOSEK GMN on every stored distance-1 subsystem.\n"
             << "  3. Selects the subsystem with highest GMN for each trajectory.\n"
             << "  4. Runs the level-2 ring-inflation SDP with SCS on that subsystem.\n"
             << "  5. Writes ring_inflation.csv with columns: p,gmn,inflation_score.\n\n"
-            << "Example:\n"
-            << "  " << program << " rho3.bin 2000 1e-3 300\n\n"
+            << "Optional arguments:\n"
+            << "  limit_per_p             0 or omitted means no limit; otherwise cap processed records per p after filtering.\n"
+            << "  p_min p_max             Inclusive measurement-rate p range. Use 'all all' for all p values.\n"
+            << "  record_start record_stop\n"
+            << "                          Half-open per-p record-index window [start, stop). Example 500 1000\n"
+            << "                          skips indices 0..499, processes 500..999, then skips the rest.\n\n"
+            << "Examples:\n"
+            << "  " << program << " rho3.bin 2000 1e-3 300\n"
+            << "  " << program << " rho3.bin 2000 1e-3 300 100\n"
+            << "  " << program << " rho3.bin 2000 1e-3 300 0 0.20 0.60\n"
+            << "  " << program << " rho3.bin 2000 1e-3 300 0 0.20 0.60 500 1000\n"
+            << "  " << program << " rho3.bin 2000 1e-3 300 0 all all 500 1000\n\n"
             << "Environment variables:\n"
             << "  RING_OUTPUT_CSV=path       Output CSV path; default ring_inflation.csv.\n"
             << "  RING_SCS_VERBOSE=1         Enable SCS iteration logging.\n"
@@ -192,10 +330,12 @@ namespace
             print_usage(argv[0]);
             std::exit(0);
         }
-        if (argc != 5)
+        if (!(argc == 5 || argc == 6 || argc == 8 || argc == 9 || argc == 10))
         {
             throw std::invalid_argument(
-                "Expected exactly four arguments: [file] [max_iters] [tol] [time_limit_secs].");
+                "Expected one of: [file] [max_iters] [tol] [time_limit_secs]; "
+                "plus optional [limit_per_p]; plus optional [p_min] [p_max]; "
+                "plus optional [record_start] [record_stop].");
         }
 
         Options opts;
@@ -203,6 +343,45 @@ namespace
         opts.max_iters = parse_positive_int(argv[2], "max_iters");
         opts.tol = parse_positive_double(argv[3], "tol", false);
         opts.time_limit_secs = parse_positive_double(argv[4], "time_limit_secs", true);
+        if (argc >= 6)
+        {
+            opts.limit_per_p = parse_nonnegative_uint64(argv[5], "limit_per_p");
+        }
+        if (argc >= 8)
+        {
+            opts.has_p_range = true;
+            opts.p_min_select = parse_p_bound(argv[6], "p_min", true);
+            opts.p_max_select = parse_p_bound(argv[7], "p_max", false);
+            if (opts.p_min_select > opts.p_max_select)
+            {
+                throw std::invalid_argument("p_min must be <= p_max.");
+            }
+        }
+        if (argc == 9)
+        {
+            const std::string pair = normalize_numeric_arg(argv[8]);
+            const std::size_t comma = pair.find(',');
+            if (comma == std::string::npos)
+            {
+                throw std::invalid_argument(
+                    "A single record range argument must have the form record_start,record_stop.");
+            }
+            const std::string start_s = pair.substr(0, comma);
+            const std::string stop_s = pair.substr(comma + 1);
+            opts.has_record_range = true;
+            opts.record_start = parse_nonnegative_uint64(start_s.c_str(), "record_start");
+            opts.record_stop = parse_nonnegative_uint64(stop_s.c_str(), "record_stop");
+        }
+        if (argc == 10)
+        {
+            opts.has_record_range = true;
+            opts.record_start = parse_nonnegative_uint64(argv[8], "record_start");
+            opts.record_stop = parse_nonnegative_uint64(argv[9], "record_stop");
+        }
+        if (opts.has_record_range && opts.record_stop <= opts.record_start)
+        {
+            throw std::invalid_argument("record_stop must be greater than record_start. The window is [start, stop).");
+        }
         opts.scs_verbose = env_flag("RING_SCS_VERBOSE", false);
 
         if (const char *out = std::getenv("RING_OUTPUT_CSV"); out != nullptr && *out != '\0')
@@ -1021,7 +1200,18 @@ int main(int argc, char **argv)
                   << "; subsystems per record: " << metadata.subsystem_count
                   << "; SCS max_iters=" << opts.max_iters
                   << "; tol=" << opts.tol
-                  << "; time_limit_secs=" << opts.time_limit_secs << "\n"
+                  << "; time_limit_secs=" << opts.time_limit_secs
+                  << "; limit_per_p="
+                  << (opts.limit_per_p == 0 ? std::string("none") : std::to_string(opts.limit_per_p))
+                  << "; p_range="
+                  << (opts.has_p_range
+                          ? (std::to_string(opts.p_min_select) + ".." + std::to_string(opts.p_max_select))
+                          : std::string("all"))
+                  << "; record_range="
+                  << (opts.has_record_range
+                          ? (std::to_string(opts.record_start) + ".." + std::to_string(opts.record_stop) + " (exclusive)")
+                          : std::string("all"))
+                  << "\n"
                   << "Output CSV: " << opts.output_csv << "\n";
 #ifdef _OPENMP
         std::cout << "OpenMP GMN workers: " << omp_get_max_threads()
@@ -1034,10 +1224,50 @@ int main(int argc, char **argv)
 
         mipt_io::DensityRecord record;
         std::uint64_t processed = 0;
+        std::uint64_t skipped_by_p_range = 0;
+        std::uint64_t skipped_before_record_window = 0;
+        std::uint64_t skipped_after_record_window = 0;
+        std::uint64_t skipped_by_limit = 0;
+        std::unordered_map<std::uint32_t, std::uint64_t> seen_per_p;
+        std::unordered_map<std::uint32_t, std::uint64_t> processed_per_p;
+
+        std::uint64_t progress_total = estimate_progress_total(metadata, opts);
+        if (progress_total == 0)
+        {
+            std::cout << "Selected p/record window contains zero records; no SDP solves will be run.\n";
+        }
+
         const auto start = std::chrono::steady_clock::now();
 
         while (reader.read_record(record))
         {
+            if (!p_in_selected_range(record.p, opts))
+            {
+                ++skipped_by_p_range;
+                continue;
+            }
+
+            std::uint64_t &p_seen = seen_per_p[record.p_index];
+            const std::uint64_t record_index_at_p = p_seen++;
+
+            if (record_index_at_p < opts.record_start)
+            {
+                ++skipped_before_record_window;
+                continue;
+            }
+            if (record_index_at_p >= opts.record_stop)
+            {
+                ++skipped_after_record_window;
+                continue;
+            }
+
+            std::uint64_t &p_count = processed_per_p[record.p_index];
+            if (opts.limit_per_p > 0 && p_count >= opts.limit_per_p)
+            {
+                ++skipped_by_limit;
+                continue;
+            }
+
             Candidate best = select_highest_gmn_subsystem(metadata, record);
             const SCSResult inflation = solve_ring_inflation_scs(
                 best.rho_ri.data(), opts.max_iters, opts.tol, opts.time_limit_secs,
@@ -1045,23 +1275,34 @@ int main(int argc, char **argv)
 
             out << record.p << ',' << best.gmn << ',' << inflation.score << '\n';
             ++processed;
+            ++p_count;
 
             const auto now = std::chrono::steady_clock::now();
             const std::chrono::duration<double> elapsed = now - start;
             const double rate = elapsed.count() > 0.0 ? processed / elapsed.count() : 0.0;
-            const double eta = rate > 0.0 ? (metadata.record_count - processed) / rate : 0.0;
+            const std::uint64_t remaining =
+                progress_total > processed ? progress_total - processed : 0;
+            const double eta = rate > 0.0 ? remaining / rate : 0.0;
 
-            std::cout << "\rProcessed " << processed << '/' << metadata.record_count
+            std::cout << "\rProcessed " << processed << '/' << progress_total\
                       << "; p=" << std::setprecision(6) << record.p
                       << "; best_gmn=" << std::setprecision(6) << best.gmn
                       << "; inflation=" << std::setprecision(6) << inflation.score
                       << "; SCS=" << inflation.status
                       << " (" << inflation.iter << " iters)"
-                      << "; ETA " << std::fixed << std::setprecision(1) << eta << " s       "
+                      << "; ETA " << std::fixed << std::setprecision(1) << eta << " s                   "
                       << std::flush;
         }
 
-        std::cout << "\nWrote " << opts.output_csv << ".\n";
+        std::cout << "\nWrote " << processed << " rows to " << opts.output_csv << "."
+                  << " Skipped by p range: " << skipped_by_p_range << "."
+                  << " Skipped before record window: " << skipped_before_record_window << "."
+                  << " Skipped after record window: " << skipped_after_record_window << ".";
+        if (opts.limit_per_p > 0)
+        {
+            std::cout << " Skipped by per-p limit cap: " << skipped_by_limit << ".";
+        }
+        std::cout << "\n";
         return 0;
     }
     catch (const std::exception &error)
