@@ -129,6 +129,124 @@ def inequivalent_bipartitions(parties: int) -> list[tuple[int, ...]]:
     return cuts
 
 
+class _GMN3CachedProblem:
+    """
+    Reusable fixed-size 3-qubit GMN SDP.
+
+    This avoids rebuilding the CVXPY graph for every 8x8 density matrix.  The
+    density matrix is a CVXPY Parameter; each call only updates that parameter
+    and resolves the same problem.  This is the biggest GMN-side speedup for
+    scans where thousands of 3-qubit density matrices are solved.
+    """
+
+    dims: tuple[int, int, int] = (2, 2, 2)
+    d: int = 8
+    cuts: tuple[tuple[int, ...], ...] = ((0,), (1,), (2,))
+
+    def __init__(self, formulation: Literal["monotone", "paper_witness"] = "monotone"):
+        if formulation not in {"monotone", "paper_witness"}:
+            raise ValueError("formulation must be 'monotone' or 'paper_witness'.")
+
+        self.formulation = formulation
+        self.rho_param = cp.Parameter((self.d, self.d), complex=True, name="rho")
+        self.W = cp.Variable((self.d, self.d), hermitian=True, name="W")
+
+        I = np.eye(self.d, dtype=np.complex128)
+        constraints: list[cp.Constraint] = []
+
+        self.P: dict[tuple[int, ...], cp.Variable] = {}
+        self.Q: dict[tuple[int, ...], cp.Variable] = {}
+
+        for cut in self.cuts:
+            label = "_".join(str(i) for i in cut)
+            P_cut = cp.Variable((self.d, self.d), hermitian=True, name=f"P_{label}")
+            Q_cut = cp.Variable((self.d, self.d), hermitian=True, name=f"Q_{label}")
+
+            self.P[cut] = P_cut
+            self.Q[cut] = Q_cut
+
+            Q_pt = partial_transpose_expr(Q_cut, self.dims, cut)
+
+            constraints.extend(
+                [
+                    self.W == P_cut + Q_pt,
+                    P_cut >> 0,
+                    Q_cut >> 0,
+                ]
+            )
+
+            if formulation == "monotone":
+                constraints.extend(
+                    [
+                        I - P_cut >> 0,
+                        I - Q_cut >> 0,
+                    ]
+                )
+
+        if formulation == "paper_witness":
+            constraints.append(cp.trace(self.W) == 1)
+
+        objective = cp.Minimize(cp.real(cp.trace(self.rho_param @ self.W)))
+        self.problem = cp.Problem(objective, constraints)
+
+    @staticmethod
+    def _clean_rho(rho: np.ndarray) -> np.ndarray:
+        rho = np.asarray(rho, dtype=np.complex128)
+
+        if rho.shape != (8, 8):
+            raise ValueError(f"rho has shape {rho.shape}; this optimized GMN expects an 8x8 matrix.")
+
+        if not np.allclose(rho, rho.conj().T, atol=1e-10):
+            raise ValueError("rho must be Hermitian.")
+
+        return 0.5 * (rho + rho.conj().T)
+
+    def solve(
+        self,
+        rho: np.ndarray,
+        *,
+        solver: str = cp.MOSEK,
+        solver_options: dict | None = None,
+        zero_tol: float = 1e-8,
+        return_problem: bool = False,
+    ):
+        self.rho_param.value = self._clean_rho(rho)
+
+        solve_kwargs = {"warm_start": True}
+        if solver_options is not None:
+            solve_kwargs.update(solver_options)
+
+        self.problem.solve(solver=solver, **solve_kwargs)
+
+        if self.problem.status not in {cp.OPTIMAL, cp.OPTIMAL_INACCURATE}:
+            raise RuntimeError(
+                f"GMN SDP did not solve successfully: status={self.problem.status}"
+            )
+
+        raw_score = -float(self.problem.value)
+
+        if self.formulation == "monotone":
+            score = raw_score if raw_score > zero_tol else 0.0
+        else:
+            score = raw_score
+
+        if return_problem:
+            return score, raw_score, self.problem, list(self.cuts)
+
+        return score
+
+
+_GMN3_CACHE: dict[str, _GMN3CachedProblem] = {}
+
+
+def _get_gmn3_problem(formulation: Literal["monotone", "paper_witness"]) -> _GMN3CachedProblem:
+    problem = _GMN3_CACHE.get(formulation)
+    if problem is None:
+        problem = _GMN3CachedProblem(formulation=formulation)
+        _GMN3_CACHE[formulation] = problem
+    return problem
+
+
 def gmn(
     rho: np.ndarray,
     *,
@@ -140,132 +258,26 @@ def gmn(
     return_problem: bool = False,
 ):
     """
-    Compute the genuine multipartite negativity SDP score.
+    Optimized 3-qubit genuine multipartite negativity SDP score.
 
-    Parameters
-    ----------
-    rho
-        Density matrix of shape (2**parties, 2**parties).
-
-    parties
-        Number of qubit parties.
-
-    formulation
-        "monotone":
-            Uses 0 <= P_M <= I and 0 <= Q_M <= I.
-            This is the GMN monotone formulation used in your current code.
-            The returned value is clamped to zero within `zero_tol`.
-
-        "paper_witness":
-            Uses Tr(W) = 1 and P_M, Q_M >= 0.
-            This matches Eq. (4) used for the Table I white-noise benchmark.
-            A strictly positive returned score indicates detection.
-
-    solver
-        CVXPY solver identifier, e.g. cp.MOSEK or cp.SCS.
-
-    solver_options
-        Optional keyword arguments passed to problem.solve().
-
-    zero_tol
-        Numerical tolerance used to suppress solver-scale residual values
-        in the monotone formulation.
-
-    return_problem
-        When True, return (score, raw_score, problem, bipartitions).
-
-    Returns
-    -------
-    float or tuple
-        GMN score, or additional solver details when return_problem=True.
+    This version intentionally supports only the 3-party / 8x8 case.  It reuses
+    a cached CVXPY problem with the density matrix supplied as a Parameter,
+    which removes the repeated problem-construction cost from large MIPT scans.
+    The call signature is kept compatible with the previous ``gmn(rho)`` usage.
     """
-    if parties < 2:
-        raise ValueError("At least two parties are required.")
-
-    dims = [2] * parties
-    d = 2 ** parties
-
-    rho = np.asarray(rho, dtype=np.complex128)
-
-    if rho.shape != (d, d):
+    if parties != 3:
         raise ValueError(
-            f"rho has shape {rho.shape}, expected {(d, d)} "
-            f"for parties={parties}."
+            "This optimized gmn implementation only supports parties=3 and 8x8 rho."
         )
 
-    if not np.allclose(rho, rho.conj().T, atol=1e-10):
-        raise ValueError("rho must be Hermitian.")
-
-    # Remove insignificant numerical anti-Hermitian noise.
-    rho = 0.5 * (rho + rho.conj().T)
-
-    if formulation not in {"monotone", "paper_witness"}:
-        raise ValueError(
-            "formulation must be 'monotone' or 'paper_witness'."
-        )
-
-    I = np.eye(d, dtype=np.complex128)
-    cuts = inequivalent_bipartitions(parties)
-
-    W = cp.Variable((d, d), hermitian=True, name="W")
-
-    P: dict[tuple[int, ...], cp.Variable] = {}
-    Q: dict[tuple[int, ...], cp.Variable] = {}
-
-    constraints: list[cp.Constraint] = []
-
-    for cut in cuts:
-        label = "_".join(str(i) for i in cut)
-
-        P[cut] = cp.Variable((d, d), hermitian=True, name=f"P_{label}")
-        Q[cut] = cp.Variable((d, d), hermitian=True, name=f"Q_{label}")
-
-        Q_pt = partial_transpose_expr(Q[cut], dims, cut)
-
-        constraints.extend(
-            [
-                W == P[cut] + Q_pt,
-                P[cut] >> 0,
-                Q[cut] >> 0,
-            ]
-        )
-
-        if formulation == "monotone":
-            constraints.extend(
-                [
-                    I - P[cut] >> 0,
-                    I - Q[cut] >> 0,
-                ]
-            )
-
-    if formulation == "paper_witness":
-        constraints.append(cp.trace(W) == 1)
-
-    objective = cp.Minimize(cp.real(cp.trace(rho @ W)))
-    problem = cp.Problem(objective, constraints)
-
-    solve_kwargs = {"warm_start": True}
-    if solver_options is not None:
-        solve_kwargs.update(solver_options)
-
-    problem.solve(solver=solver, **solve_kwargs)
-
-    if problem.status not in {cp.OPTIMAL, cp.OPTIMAL_INACCURATE}:
-        raise RuntimeError(
-            f"GMN SDP did not solve successfully: status={problem.status}"
-        )
-
-    raw_score = -float(problem.value)
-
-    if formulation == "monotone":
-        score = raw_score if raw_score > zero_tol else 0.0
-    else:
-        score = raw_score
-
-    if return_problem:
-        return score, raw_score, problem, cuts
-
-    return score
+    problem = _get_gmn3_problem(formulation)
+    return problem.solve(
+        rho,
+        solver=solver,
+        solver_options=solver_options,
+        zero_tol=zero_tol,
+        return_problem=return_problem,
+    )
 
 def tmi(dm):
     rho_A = partial_trace(dm, [1, 2])

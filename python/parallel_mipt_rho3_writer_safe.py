@@ -56,6 +56,7 @@ class ParallelRho3SafeResult:
 
 def _worker_loop(
     *,
+    rho_getter,
     worker_id: int,
     use_gpu: bool,
     task_queue,
@@ -73,7 +74,7 @@ def _worker_loop(
             os.environ.setdefault("OPENBLAS_NUM_THREADS", threads)
             os.environ.setdefault("NUMEXPR_NUM_THREADS", threads)
 
-        from mipt import get_mipt_rho_1d
+        # from mipt import get_mipt_rho_1d
 
         while True:
             task = task_queue.get()
@@ -81,7 +82,7 @@ def _worker_loop(
                 return
 
             p_index, realization, p = task
-            rhos = get_mipt_rho_1d(
+            rhos = rho_getter(
                 int(n),
                 int(d),
                 float(p),
@@ -98,6 +99,7 @@ def _worker_loop(
 
 def _start_workers(
     *,
+    rho_getter,
     ctx: BaseContext,
     gpu_workers: int,
     cpu_workers: int,
@@ -115,6 +117,7 @@ def _start_workers(
         proc = ctx.Process(
             target=_worker_loop,
             kwargs=dict(
+                rho_getter=rho_getter,
                 worker_id=worker_id,
                 use_gpu=True,
                 task_queue=task_queue,
@@ -133,6 +136,7 @@ def _start_workers(
         proc = ctx.Process(
             target=_worker_loop,
             kwargs=dict(
+                rho_getter=rho_getter,
                 worker_id=worker_id,
                 use_gpu=False,
                 task_queue=task_queue,
@@ -152,6 +156,7 @@ def _start_workers(
 
 def write_mipt_rho3_bin_parallel_safe(
     file: str | os.PathLike[str],
+    rho_getter,
     *,
     n: int,
     d: int,
@@ -229,6 +234,7 @@ def write_mipt_rho3_bin_parallel_safe(
                     pass
 
     workers = _start_workers(
+        rho_getter=rho_getter,
         ctx=ctx,
         gpu_workers=int(gpu_workers),
         cpu_workers=int(cpu_workers),
