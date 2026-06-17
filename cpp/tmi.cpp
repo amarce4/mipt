@@ -33,6 +33,12 @@ namespace
     constexpr int RHO3_VALUES = 2 * RHO3_DIM * RHO3_DIM;
     constexpr double LOG2_EPS = 1.0e-15;
 
+    enum class TraceMode
+    {
+        Qubit,
+        Fermion
+    };
+
     struct TracePlan
     {
         int keep_mask = 0;
@@ -40,6 +46,7 @@ namespace
         int env_terms = 0;
         int output_elements = 0;
         std::array<int, 16 * 4> source_elements{}; // max 4x4 output, 4 traced terms
+        std::array<int, 16 * 4> source_signs{};    // +1 for qubit trace; +/-1 for fermionic trace
     };
 
     int popcount3(int x)
@@ -57,7 +64,51 @@ namespace
         return expanded;
     }
 
-    TracePlan make_trace_plan(int keep_mask)
+    int index_from_new_mode_order_little(int new_index, const std::array<int, 3> &new_mode_order)
+    {
+        int old_index = 0;
+        for (int slot = 0; slot < RHO3_QUBITS; ++slot)
+        {
+            const int mode = new_mode_order[static_cast<std::size_t>(slot)];
+            old_index |= ((new_index >> slot) & 1) << mode;
+        }
+        return old_index;
+    }
+
+    int fermionic_reorder_sign_little(int new_index, const std::array<int, 3> &new_mode_order)
+    {
+        // Canonical basis: |n0 n1 n2> = (c0^dag)^n0 (c1^dag)^n1 (c2^dag)^n2 |vac>.
+        // This returns s in |old/canonical> = s |new_mode_order>, where new_index is
+        // indexed in the new order.  It is (-1)^(number of occupied-mode inversions).
+        std::array<int, 3> pos_new{};
+        for (int slot = 0; slot < RHO3_QUBITS; ++slot)
+        {
+            pos_new[static_cast<std::size_t>(new_mode_order[static_cast<std::size_t>(slot)])] = slot;
+        }
+
+        int inversions = 0;
+        for (int mode_i = 0; mode_i < RHO3_QUBITS; ++mode_i)
+        {
+            const int slot_i = pos_new[static_cast<std::size_t>(mode_i)];
+            const int occ_i = (new_index >> slot_i) & 1;
+            if (!occ_i)
+            {
+                continue;
+            }
+            for (int mode_j = mode_i + 1; mode_j < RHO3_QUBITS; ++mode_j)
+            {
+                const int slot_j = pos_new[static_cast<std::size_t>(mode_j)];
+                const int occ_j = (new_index >> slot_j) & 1;
+                if (occ_j && slot_i > slot_j)
+                {
+                    inversions ^= 1;
+                }
+            }
+        }
+        return inversions ? -1 : 1;
+    }
+
+    TracePlan make_trace_plan(int keep_mask, TraceMode mode)
     {
         TracePlan plan;
         plan.keep_mask = keep_mask;
@@ -83,36 +134,65 @@ namespace
             }
         }
 
+        std::array<int, 3> new_mode_order{};
+        for (int i = 0; i < kept_count; ++i)
+        {
+            new_mode_order[static_cast<std::size_t>(i)] = kept_pos[static_cast<std::size_t>(i)];
+        }
+        for (int i = 0; i < traced_count; ++i)
+        {
+            new_mode_order[static_cast<std::size_t>(kept_count + i)] = traced_pos[static_cast<std::size_t>(i)];
+        }
+
         int cursor = 0;
         for (int row_k = 0; row_k < plan.dim; ++row_k)
         {
-            const int row_keep = expand_bits(row_k, kept_pos, kept_count);
             for (int col_k = 0; col_k < plan.dim; ++col_k)
             {
-                const int col_keep = expand_bits(col_k, kept_pos, kept_count);
                 for (int e = 0; e < plan.env_terms; ++e)
                 {
-                    const int env_bits = expand_bits(e, traced_pos, traced_count);
-                    const int row = row_keep | env_bits;
-                    const int col = col_keep | env_bits;
-                    plan.source_elements[static_cast<std::size_t>(cursor++)] = row * RHO3_DIM + col;
+                    // In little-endian compact indexing, the kept subsystem occupies
+                    // the low bits and the traced suffix occupies the high bits.
+                    const int row_new = row_k + plan.dim * e;
+                    const int col_new = col_k + plan.dim * e;
+                    const int row = index_from_new_mode_order_little(row_new, new_mode_order);
+                    const int col = index_from_new_mode_order_little(col_new, new_mode_order);
+
+                    int sign = 1;
+                    if (mode == TraceMode::Fermion)
+                    {
+                        sign = fermionic_reorder_sign_little(row_new, new_mode_order) *
+                               fermionic_reorder_sign_little(col_new, new_mode_order);
+                    }
+
+                    plan.source_elements[static_cast<std::size_t>(cursor)] = row * RHO3_DIM + col;
+                    plan.source_signs[static_cast<std::size_t>(cursor)] = sign;
+                    ++cursor;
                 }
             }
         }
         return plan;
     }
 
-    const std::array<TracePlan, 6> &trace_plans()
+    const std::array<TracePlan, 6> &trace_plans(TraceMode mode)
     {
-        static const std::array<TracePlan, 6> plans = {
-            make_trace_plan(0b001), // A
-            make_trace_plan(0b010), // B
-            make_trace_plan(0b100), // C
-            make_trace_plan(0b011), // AB
-            make_trace_plan(0b101), // AC
-            make_trace_plan(0b110)  // BC
+        static const std::array<TracePlan, 6> qubit_plans = {
+            make_trace_plan(0b001, TraceMode::Qubit), // A
+            make_trace_plan(0b010, TraceMode::Qubit), // B
+            make_trace_plan(0b100, TraceMode::Qubit), // C
+            make_trace_plan(0b011, TraceMode::Qubit), // AB
+            make_trace_plan(0b101, TraceMode::Qubit), // AC
+            make_trace_plan(0b110, TraceMode::Qubit)  // BC
         };
-        return plans;
+        static const std::array<TracePlan, 6> fermion_plans = {
+            make_trace_plan(0b001, TraceMode::Fermion), // A
+            make_trace_plan(0b010, TraceMode::Fermion), // B
+            make_trace_plan(0b100, TraceMode::Fermion), // C
+            make_trace_plan(0b011, TraceMode::Fermion), // AB
+            make_trace_plan(0b101, TraceMode::Fermion), // AC
+            make_trace_plan(0b110, TraceMode::Fermion)  // BC
+        };
+        return mode == TraceMode::Fermion ? fermion_plans : qubit_plans;
     }
 
     void partial_trace_from_rho3(const double *rho_ri, const TracePlan &plan, C64 *out)
@@ -124,9 +204,11 @@ namespace
             double im = 0.0;
             for (int t = 0; t < plan.env_terms; ++t)
             {
-                const int src = plan.source_elements[static_cast<std::size_t>(cursor++)];
-                re += rho_ri[2 * src + 0];
-                im += rho_ri[2 * src + 1];
+                const int src = plan.source_elements[static_cast<std::size_t>(cursor)];
+                const int sign = plan.source_signs[static_cast<std::size_t>(cursor)];
+                re += static_cast<double>(sign) * rho_ri[2 * src + 0];
+                im += static_cast<double>(sign) * rho_ri[2 * src + 1];
+                ++cursor;
             }
             out[element] = C64(re, im);
         }
@@ -328,9 +410,9 @@ namespace
         return entropy_hermitian_jacobi<8>(a);
     }
 
-    double tmi_rho3(const double *rho_ri)
+    double tmi_rho3(const double *rho_ri, TraceMode mode)
     {
-        const auto &plans = trace_plans();
+        const auto &plans = trace_plans(mode);
         std::array<C64, 4> rho_1q{};
         std::array<C64, 16> rho_2q{};
 
@@ -354,6 +436,25 @@ namespace
 
         const double s_abc = entropy_rho3_8x8(rho_ri);
         return s_a + s_b + s_c - s_ab - s_ac - s_bc + s_abc;
+    }
+
+    TraceMode parse_trace_mode(std::string_view text)
+    {
+        if (text == "0")
+        {
+            return TraceMode::Qubit;
+        }
+        if (text == "1")
+        {
+            return TraceMode::Fermion;
+        }
+        throw std::invalid_argument("Invalid trace_mode: expected 0 for qubit or 1 for fermion, got " +
+                                    std::string(text));
+    }
+
+    const char *trace_mode_name(TraceMode mode)
+    {
+        return mode == TraceMode::Fermion ? "fermion" : "qubit";
     }
 
     std::uint64_t parse_u64(std::string_view text, const char *name)
@@ -454,11 +555,15 @@ namespace
     {
         std::cerr
             << "Usage:\n"
-            << "  " << argv0 << " <rho_file.bin> <output.csv> [limit_per_p]\n\n"
+            << "  " << argv0 << " <trace_mode> <rho_file.bin> <output.csv> [limit_per_p]\n\n"
+            << "Arguments:\n"
+            << "  trace_mode = 0  ordinary qubit partial traces inside each 8x8 rho_ABC\n"
+            << "  trace_mode = 1  fermionic partial traces inside each 8x8 rho_ABC\n\n"
             << "Output columns:\n"
             << "  p,tmi\n\n"
             << "Notes:\n"
             << "  * This expects the MIPTRHO2 .bin format with kept_qubits=3 and D=8.\n"
+            << "  * Fermion mode assumes little-endian occupation/Jordan-Wigner basis.\n"
             << "  * limit_per_p limits processed trajectory records per p value; 0 means unlimited.\n";
     }
 } // namespace
@@ -467,18 +572,19 @@ int main(int argc, char **argv)
 {
     try
     {
-        if (argc < 3 || argc > 4)
+        if (argc < 4 || argc > 5)
         {
             print_usage(argv[0]);
             return 2;
         }
 
-        const std::string input_path = argv[1];
-        const std::string output_path = argv[2];
+        const TraceMode trace_mode = parse_trace_mode(argv[1]);
+        const std::string input_path = argv[2];
+        const std::string output_path = argv[3];
         std::uint64_t limit_per_p = std::numeric_limits<std::uint64_t>::max();
-        if (argc == 4)
+        if (argc == 5)
         {
-            const std::uint64_t parsed = parse_u64(argv[3], "limit_per_p");
+            const std::uint64_t parsed = parse_u64(argv[4], "limit_per_p");
             if (parsed != 0)
             {
                 limit_per_p = parsed;
@@ -524,6 +630,7 @@ int main(int argc, char **argv)
         *out << "p,tmi\n";
 
         std::cerr << "Input: " << input_path << '\n'
+                  << "trace_mode=" << trace_mode_name(trace_mode) << '\n'
                   << "records=" << meta.record_count
                   << ", p_values=" << meta.resolution
                   << ", realizations=" << meta.realizations
@@ -566,7 +673,7 @@ int main(int argc, char **argv)
             {
                 const double *rho = record.rho_ri.data() +
                                     static_cast<std::size_t>(s) * RHO3_VALUES;
-                tmi_values[static_cast<std::size_t>(s)] = tmi_rho3(rho);
+                tmi_values[static_cast<std::size_t>(s)] = tmi_rho3(rho, trace_mode);
             }
 
             std::string lines;

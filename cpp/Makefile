@@ -19,7 +19,8 @@
 #   ./gmn.exe 0 rho3.bin data_real.csv       # real-only GMN on Re(rho)
 #   ./gmn.exe 1 rho3.bin data_complex.csv    # full complex Hermitian GMN SDP
 #   ./ring_inflation.exe rho3.bin 2000 1e-3 300 [limit_per_p] [p_min p_max [record_start record_stop]]
-#   ./tmi.exe rho3.bin tmi.csv [limit_per_p]
+#   ./tmi.exe 0 rho3.bin tmi_qubit.csv [limit_per_p]
+#   ./tmi.exe 1 rho3.bin tmi_fermion.csv [limit_per_p]
 
 NVQXX   ?= nvq++
 HOSTCXX ?= g++

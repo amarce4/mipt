@@ -6,6 +6,7 @@ import os
 from typing import Iterable, Sequence
 
 from mipt import *
+from fermionic_partial_trace import *
 
 
 _UINT32_MAX = 2**32 - 1
@@ -179,6 +180,7 @@ def get_mipt_rho_1d_ferm(
     n,
     d,
     p,
+    plans,
     subsyst=3,
     all_matrices=False,
     closed=True,
@@ -207,22 +209,30 @@ def get_mipt_rho_1d_ferm(
 
     qc = random_mipt_1d_ferm(n=n, d=d, p=float(p), closed=closed, seed=seed)
 
-    for i, subsystem in enumerate(subsystems):
-        qc.save_density_matrix(
-            qubits=subsystem,
-            label=f"final_state_{i}",
-            pershot=True,
-        )
+    qc.save_statevector(pershot=True, label="final_state")
+    # for i, subsystem in enumerate(subsystems):
+    #     qc.save_density_matrix(
+    #         qubits=subsystem,
+    #         label=f"final_state_{i}",
+    #         pershot=True,
+    #     )
 
     tqc = transpile(qc, backend, optimization_level=transpile_optimization_level)
 
     # One conditional outcome trajectory for this independently drawn circuit.
     result = backend.run(tqc, shots=1).result()
+    psi = result.data(0)["final_state"][0]
 
     if len(subsystems) == 1:
-        return result.data(0)["final_state_0"][0]
+        raise NotImplemented
 
-    return [result.data(0)[f"final_state_{i}"][0] for i in range(len(subsystems))]
+    return [plan.trace_statevector(psi) for plan in plans]
+
+    # if len(subsystems) == 1:
+    #     return result.data(0)["final_state_0"][0]
+
+    # return [result.data(0)[f"final_state_{i}"][0] for i in range(len(subsystems))]
+    
 
 
 def _merge_mosek_thread_option(solver_options: dict | None, mosek_threads: int | None) -> dict | None:
