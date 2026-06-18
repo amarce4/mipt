@@ -618,6 +618,45 @@ def make_ring_3mode_plans(
     ]
 
 
+def tmi_block_subsystems(n_modes: int) -> list[tuple[int, ...]]:
+    """
+    Return the four mode groups stored by the C++/Python TMI .bin format.
+
+    For N modes, with block=N/4, the stored order is:
+        AB, AC, BC, D
+    where
+        A=[0, ..., block-1]
+        B=[block, ..., 2*block-1]
+        C=[2*block, ..., 3*block-1]
+        D=[3*block, ..., 4*block-1]
+    """
+    n = int(n_modes)
+    if n < 4 or (n % 4) != 0:
+        raise FermionicPartialTraceError(
+            "TMI block subsystems require n_modes >= 4 and divisible by 4"
+        )
+
+    block = n // 4
+    A = tuple(range(0, block))
+    B = tuple(range(block, 2 * block))
+    C = tuple(range(2 * block, 3 * block))
+    D = tuple(range(3 * block, 4 * block))
+
+    return [A + B, A + C, B + C, D]
+
+
+def make_tmi_block_plans(
+    n_modes: int,
+    *,
+    basis_order: BasisOrder = "little",
+) -> list[FermionicPartialTracePlan]:
+    """Precompute fermionic partial-trace plans for TMI terms AB, AC, BC, D."""
+    return [
+        FermionicPartialTracePlan(n_modes, keep=subsys, basis_order=basis_order)
+        for subsys in tmi_block_subsystems(n_modes)
+    ]
+
+
 # Short aliases for interactive use.
 fpt_statevector = fermionic_partial_trace_statevector
 fpt_density_matrix = fermionic_partial_trace_density_matrix

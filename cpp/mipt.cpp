@@ -313,6 +313,385 @@ namespace
         }
         return metadata;
     }
+
+    struct TmiMatrixTerm
+    {
+        std::string name;
+        std::vector<int> modes;
+    };
+
+    constexpr std::uint32_t TMI_FILE_VERSION = 1;
+    constexpr std::uint32_t TMI_ENDIAN_MARKER = 0x01020304u;
+    constexpr char TMI_FILE_MAGIC[8] = {'M', 'I', 'P', 'T', 'T', 'M', 'I', '1'};
+
+    std::uint64_t term_matrix_dim_u64(const TmiMatrixTerm &term)
+    {
+        return checked_pow2_u64(static_cast<int>(term.modes.size()));
+    }
+
+    std::size_t term_value_count(const TmiMatrixTerm &term)
+    {
+        const std::uint64_t d64 = term_matrix_dim_u64(term);
+        if (d64 > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()))
+        {
+            throw std::invalid_argument("TMI matrix dimension does not fit in size_t.");
+        }
+        const std::size_t d = static_cast<std::size_t>(d64);
+        if (d != 0 && d > std::numeric_limits<std::size_t>::max() / d / 2u)
+        {
+            throw std::invalid_argument("TMI matrix payload is too large for this host.");
+        }
+        return 2u * d * d;
+    }
+
+    std::size_t tmi_payload_value_count(const std::vector<TmiMatrixTerm> &terms)
+    {
+        std::size_t total = 0;
+        for (const auto &term : terms)
+        {
+            total += term_value_count(term);
+        }
+        return total;
+    }
+
+    std::vector<int> mode_range(int begin, int count)
+    {
+        std::vector<int> modes;
+        modes.reserve(static_cast<std::size_t>(count));
+        for (int i = 0; i < count; ++i)
+        {
+            modes.push_back(begin + i);
+        }
+        return modes;
+    }
+
+    std::vector<int> concatenate_modes(const std::vector<int> &a,
+                                       const std::vector<int> &b)
+    {
+        std::vector<int> out;
+        out.reserve(a.size() + b.size());
+        out.insert(out.end(), a.begin(), a.end());
+        out.insert(out.end(), b.begin(), b.end());
+        return out;
+    }
+
+    std::vector<TmiMatrixTerm> tmi_terms_1d(int n)
+    {
+        if (n < 4)
+        {
+            throw std::invalid_argument("TMI output requires N=L >= 4.");
+        }
+        if ((n % 4) != 0)
+        {
+            throw std::invalid_argument("TMI output requires N=L to be divisible by 4.");
+        }
+
+        const int block = n / 4;
+        const std::vector<int> A = mode_range(0 * block, block);
+        const std::vector<int> B = mode_range(1 * block, block);
+        const std::vector<int> C = mode_range(2 * block, block);
+        const std::vector<int> D = mode_range(3 * block, block);
+
+        // Four stored matrices are enough for the requested pure-state identity:
+        // AB, AC, and BC provide the three pair entropies and can be traced down
+        // to obtain A, B, and C. D is stored directly for S(D)=S(ABC).
+        return {
+            {"AB", concatenate_modes(A, B)},
+            {"AC", concatenate_modes(A, C)},
+            {"BC", concatenate_modes(B, C)},
+            {"D", D},
+        };
+    }
+
+    template <typename Real>
+    void append_reduced_density_for_modes_from_host_statevector(
+        const std::complex<Real> *psi,
+        int n,
+        const std::vector<int> &modes,
+        double *rho_ri)
+    {
+        if (psi == nullptr || rho_ri == nullptr)
+        {
+            throw std::invalid_argument("Null state-vector or TMI density-matrix pointer.");
+        }
+        if (modes.empty())
+        {
+            throw std::invalid_argument("TMI reduced-density term cannot have zero retained modes.");
+        }
+
+        const int kept = static_cast<int>(modes.size());
+        const std::uint64_t kept_dim_u64 = checked_pow2_u64(kept);
+        const std::uint64_t env_dim = checked_pow2_u64(n - kept);
+        if (kept_dim_u64 > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()))
+        {
+            throw std::invalid_argument("TMI retained dimension does not fit in size_t.");
+        }
+        const std::size_t kept_dim = static_cast<std::size_t>(kept_dim_u64);
+
+        std::vector<unsigned char> is_retained(static_cast<std::size_t>(n), 0);
+        for (int q : modes)
+        {
+            if (q < 0 || q >= n)
+            {
+                throw std::invalid_argument("TMI subsystem mode index is out of range.");
+            }
+            if (is_retained[static_cast<std::size_t>(q)])
+            {
+                throw std::invalid_argument("TMI subsystem contains duplicate modes.");
+            }
+            is_retained[static_cast<std::size_t>(q)] = 1;
+        }
+
+        std::vector<int> environment_modes;
+        environment_modes.reserve(static_cast<std::size_t>(n - kept));
+        for (int q = 0; q < n; ++q)
+        {
+            if (!is_retained[static_cast<std::size_t>(q)])
+            {
+                environment_modes.push_back(q);
+            }
+        }
+
+        std::vector<std::uint64_t> retained_offsets(kept_dim, 0);
+        for (std::uint64_t local_basis = 0; local_basis < kept_dim_u64; ++local_basis)
+        {
+            std::uint64_t offset = 0;
+            for (int k = 0; k < kept; ++k)
+            {
+                offset |= ((local_basis >> k) & std::uint64_t{1})
+                          << modes[static_cast<std::size_t>(k)];
+            }
+            retained_offsets[static_cast<std::size_t>(local_basis)] = offset;
+        }
+
+        std::fill(rho_ri, rho_ri + 2u * kept_dim * kept_dim, 0.0);
+        for (std::uint64_t env = 0; env < env_dim; ++env)
+        {
+            std::uint64_t base = 0;
+            for (std::size_t e = 0; e < environment_modes.size(); ++e)
+            {
+                base |= ((env >> e) & std::uint64_t{1})
+                        << environment_modes[e];
+            }
+
+            for (std::uint64_t row = 0; row < kept_dim_u64; ++row)
+            {
+                const auto a = psi[base | retained_offsets[static_cast<std::size_t>(row)]];
+                for (std::uint64_t col = 0; col < kept_dim_u64; ++col)
+                {
+                    const auto b = psi[base | retained_offsets[static_cast<std::size_t>(col)]];
+                    const auto value = a * std::conj(b);
+                    const std::size_t out = 2u * static_cast<std::size_t>(row * kept_dim_u64 + col);
+                    rho_ri[out + 0] += static_cast<double>(std::real(value));
+                    rho_ri[out + 1] += static_cast<double>(std::imag(value));
+                }
+            }
+        }
+    }
+
+    template <typename Real>
+    void tmi_density_matrices_from_host_statevector(
+        const std::complex<Real> *psi,
+        int n,
+        const std::vector<TmiMatrixTerm> &terms,
+        std::vector<double> &payload)
+    {
+        payload.resize(tmi_payload_value_count(terms));
+        std::size_t offset = 0;
+        for (const auto &term : terms)
+        {
+            append_reduced_density_for_modes_from_host_statevector(
+                psi, n, term.modes, payload.data() + offset);
+            offset += term_value_count(term);
+        }
+    }
+
+    void cudaq_tmi_density_matrices(
+        cudaq::state &state,
+        int n,
+        const std::vector<TmiMatrixTerm> &terms,
+        std::vector<double> &payload)
+    {
+        if (terms.size() != 4)
+        {
+            throw std::invalid_argument("TMI output expects exactly four stored matrices: AB, AC, BC, D.");
+        }
+
+        const std::uint64_t dim_u64 = checked_pow2_u64(n);
+        if (dim_u64 > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()))
+        {
+            throw std::invalid_argument("State-vector dimension does not fit in size_t.");
+        }
+        const std::size_t dim = static_cast<std::size_t>(dim_u64);
+        const auto precision = state.get_precision();
+        const auto tensor = state.get_tensor();
+
+        if (tensor.get_rank() != 1 || tensor.get_num_elements() < dim)
+        {
+            throw std::runtime_error("Expected a contiguous rank-1 CUDA-Q statevector tensor.");
+        }
+
+        if (state.is_on_gpu())
+        {
+            if (precision == cudaq::SimulationState::precision::fp64)
+            {
+                std::vector<std::complex<double>> host_state(dim);
+                state.to_host(host_state.data(), host_state.size());
+                tmi_density_matrices_from_host_statevector(host_state.data(), n, terms, payload);
+            }
+            else
+            {
+                std::vector<std::complex<float>> host_state(dim);
+                state.to_host(host_state.data(), host_state.size());
+                tmi_density_matrices_from_host_statevector(host_state.data(), n, terms, payload);
+            }
+            return;
+        }
+
+        if (tensor.data == nullptr)
+        {
+            throw std::runtime_error("CUDA-Q state tensor has a null data pointer.");
+        }
+
+        if (precision == cudaq::SimulationState::precision::fp64)
+        {
+            tmi_density_matrices_from_host_statevector(
+                reinterpret_cast<const std::complex<double> *>(tensor.data), n, terms, payload);
+        }
+        else
+        {
+            tmi_density_matrices_from_host_statevector(
+                reinterpret_cast<const std::complex<float> *>(tensor.data), n, terms, payload);
+        }
+    }
+
+    class TmiMatrixWriter
+    {
+      public:
+        TmiMatrixWriter(const std::string &path,
+                        int dimension,
+                        int total_qubits,
+                        int periods,
+                        int realizations,
+                        int res,
+                        double p_min,
+                        double p_max,
+                        int grid_x,
+                        int grid_y,
+                        int block_qubits,
+                        std::vector<TmiMatrixTerm> terms)
+            : terms_(std::move(terms)),
+              expected_values_(tmi_payload_value_count(terms_)),
+              record_count_(static_cast<std::uint64_t>(realizations) *
+                            static_cast<std::uint64_t>(res)),
+              stream_(path, std::ios::binary | std::ios::trunc)
+        {
+            if (!stream_)
+            {
+                throw std::runtime_error("Could not create TMI density-matrix file: " + path);
+            }
+            if (terms_.size() != 4)
+            {
+                throw std::invalid_argument("TMI density-matrix file requires exactly four terms.");
+            }
+
+            stream_.write(TMI_FILE_MAGIC, sizeof(TMI_FILE_MAGIC));
+            mipt_io::write_scalar(stream_, TMI_ENDIAN_MARKER);
+            mipt_io::write_scalar(stream_, TMI_FILE_VERSION);
+            mipt_io::write_scalar(stream_, static_cast<std::uint32_t>(dimension));
+            mipt_io::write_scalar(stream_, static_cast<std::uint32_t>(total_qubits));
+            mipt_io::write_scalar(stream_, static_cast<std::uint32_t>(block_qubits));
+            mipt_io::write_scalar(stream_, static_cast<std::uint32_t>(periods));
+            mipt_io::write_scalar(stream_, static_cast<std::uint32_t>(realizations));
+            mipt_io::write_scalar(stream_, static_cast<std::uint32_t>(res));
+            mipt_io::write_scalar(stream_, static_cast<std::uint32_t>(grid_x));
+            mipt_io::write_scalar(stream_, static_cast<std::uint32_t>(grid_y));
+            mipt_io::write_scalar(stream_, static_cast<std::uint32_t>(terms_.size()));
+            mipt_io::write_scalar(stream_, record_count_);
+            mipt_io::write_scalar(stream_, p_min);
+            mipt_io::write_scalar(stream_, p_max);
+
+            for (const auto &term : terms_)
+            {
+                char name[8]{};
+                const std::size_t copy_count = std::min<std::size_t>(term.name.size(), sizeof(name));
+                std::memcpy(name, term.name.data(), copy_count);
+                stream_.write(name, sizeof(name));
+                mipt_io::write_scalar(stream_, static_cast<std::uint32_t>(term.modes.size()));
+                mipt_io::write_scalar(stream_, static_cast<std::uint32_t>(term_matrix_dim_u64(term)));
+                for (int q : term.modes)
+                {
+                    mipt_io::write_scalar(stream_, static_cast<std::uint32_t>(q));
+                }
+            }
+            if (!stream_)
+            {
+                throw std::runtime_error("Failed while writing TMI metadata.");
+            }
+        }
+
+        void write_record(std::uint32_t p_index,
+                          std::uint32_t realization,
+                          double p,
+                          const std::vector<double> &payload)
+        {
+            if (payload.size() != expected_values_)
+            {
+                throw std::invalid_argument("Incorrect TMI density-matrix record size.");
+            }
+            if (records_written_ >= record_count_)
+            {
+                throw std::runtime_error("Attempted to write too many TMI records.");
+            }
+
+            mipt_io::write_scalar(stream_, p_index);
+            mipt_io::write_scalar(stream_, realization);
+            mipt_io::write_scalar(stream_, p);
+            stream_.write(reinterpret_cast<const char *>(payload.data()),
+                          static_cast<std::streamsize>(payload.size() * sizeof(double)));
+            if (!stream_)
+            {
+                throw std::runtime_error("Failed while writing TMI record payload.");
+            }
+            ++records_written_;
+        }
+
+        void close()
+        {
+            if (closed_)
+            {
+                return;
+            }
+            if (records_written_ != record_count_)
+            {
+                throw std::runtime_error("TMI file closed before all records were written.");
+            }
+            stream_.flush();
+            if (!stream_)
+            {
+                throw std::runtime_error("Failed while flushing TMI density-matrix file.");
+            }
+            stream_.close();
+            closed_ = true;
+        }
+
+        ~TmiMatrixWriter()
+        {
+            if (!closed_)
+            {
+                stream_.close();
+            }
+        }
+
+      private:
+        std::vector<TmiMatrixTerm> terms_;
+        std::size_t expected_values_ = 0;
+        std::uint64_t record_count_ = 0;
+        std::uint64_t records_written_ = 0;
+        bool closed_ = false;
+        std::ofstream stream_;
+    };
+
 }
 
 
@@ -912,6 +1291,121 @@ void run_1d(int n, int periods, int realizations, int res, double p_min, double 
               << " cyclic three-qubit reduced density matrices per trajectory to rho3.bin.\n";
 }
 
+
+void run_1d_tmi(int n, int periods, int realizations, int res, double p_min, double p_max)
+{
+    const int block_qubits = n / 4;
+    const std::vector<TmiMatrixTerm> terms = tmi_terms_1d(n);
+    std::vector<double> ps = linspace(p_min, p_max, res);
+    std::ofstream infofile("info_tmi.csv");
+
+    infofile << "n,periods,realizations,resolution,p_min,p_max,tmi_block_qubits,terms\n";
+    infofile << n << "," << periods << "," << realizations << "," << res << ","
+             << p_min << "," << p_max << "," << block_qubits << ",AB;AC;BC;D\n";
+
+    TmiMatrixWriter tmi_file(
+        "rho_tmi.bin",
+        1,
+        n,
+        periods,
+        realizations,
+        res,
+        p_min,
+        p_max,
+        n,
+        1,
+        block_qubits,
+        terms);
+
+    for (std::size_t p_index = 0; p_index < ps.size(); ++p_index)
+    {
+        const double p = ps[p_index];
+        std::cout << "Simulating p = " << p << "...\n " << std::flush;
+
+        double sec_per_circ = 0.0;
+
+        for (int r = 0; r < realizations; ++r)
+        {
+            auto circ_time_start = std::chrono::steady_clock::now();
+            std::chrono::steady_clock::time_point start, lap1, lap2, lap3, lap4;
+
+            if (r == 0)
+            {
+                start = std::chrono::steady_clock::now();
+            }
+
+            auto layers = mipt_frontend(n, periods, p);
+
+            if (r == 0)
+            {
+                lap1 = std::chrono::steady_clock::now();
+            }
+
+            auto state = cudaq::get_state(MIPTKernel_1D{}, n, layers, true);
+
+            if (r == 0)
+            {
+                lap2 = std::chrono::steady_clock::now();
+            }
+
+            std::vector<double> payload;
+            cudaq_tmi_density_matrices(state, n, terms, payload);
+
+            if (r == 0)
+            {
+                lap3 = std::chrono::steady_clock::now();
+            }
+
+            tmi_file.write_record(
+                static_cast<std::uint32_t>(p_index),
+                static_cast<std::uint32_t>(r),
+                p,
+                payload);
+
+            if (r == 0)
+            {
+                lap4 = std::chrono::steady_clock::now();
+
+                const std::chrono::duration<double> t_layer = lap1 - start;
+                const std::chrono::duration<double> t_qc = lap2 - lap1;
+                const std::chrono::duration<double> t_dm = lap3 - lap2;
+                const std::chrono::duration<double> t_save = lap4 - lap3;
+                std::cout << "Layer, QC, TMI-DM, Save times: "
+                          << t_layer.count() << "s, "
+                          << t_qc.count() << "s, "
+                          << t_dm.count() << "s, "
+                          << t_save.count() << "s\n";
+            }
+
+            const auto circ_time_end = std::chrono::steady_clock::now();
+            const std::chrono::duration<double> circ_time_diff =
+                circ_time_end - circ_time_start;
+            if (r != 0)
+            {
+                sec_per_circ = ((r - 1) * sec_per_circ +
+                                circ_time_diff.count()) / r;
+            }
+            else
+            {
+                sec_per_circ = circ_time_diff.count();
+            }
+
+            const double time_estimate = (realizations - r) * sec_per_circ;
+            std::cout << "\rAverage circuits/second: "
+                      << std::round((1 / sec_per_circ) * 100.0) / 100.0
+                      << ", Realisations ETA: "
+                      << static_cast<int>(time_estimate)
+                      << "s               " << std::flush;
+        }
+        std::cout << "\n";
+    }
+
+    tmi_file.close();
+    std::cout << "Saved TMI matrices per trajectory to rho_tmi.bin. "
+              << "Stored terms: AB, AC, BC, D; block size="
+              << block_qubits << " modes.\n";
+}
+
 void run_2d(int x, int y, int periods, int realizations, int res, double p_min, double p_max)
 {
     const int n = x * y;
@@ -1034,7 +1528,7 @@ int main(int argc, char *argv[])
          std::strcmp(argv[1], "-h") == 0))
     {
         std::cout << "Usage: " << argv[0]
-                  << " [d = 1] [n = 10] [periods = 10] [realizations = 10] [resolution = 5] [p_min = 0.0] [p_max = 1.0]\n";
+                  << " [d = 1] [n = 10] [periods = 10] [realizations = 10] [resolution = 5] [p_min = 0.0] [p_max = 1.0] [tmi = 0]\n";
         std::cout << "Description:\n";
         std::cout << "  d = dimensionality (1 or 2)\n";
         std::cout << "  n = number of qubits per dimension\n";
@@ -1043,7 +1537,14 @@ int main(int argc, char *argv[])
         std::cout << "  resolution = number of points\n";
         std::cout << "  p_min = minimum measurement rate\n";
         std::cout << "  p_max = maximum measurement rate\n";
+        std::cout << "  tmi = 0 writes the existing rho3.bin format; tmi = 1 writes rho_tmi.bin for four-block TMI\n";
         return 0;
+    }
+
+    if (argc > 9)
+    {
+        std::cerr << "Too many arguments. Use --help for usage.\n";
+        return 2;
     }
 
     int d = (argc > 1) ? std::stoi(argv[1]) : 1;
@@ -1053,16 +1554,32 @@ int main(int argc, char *argv[])
     int res = (argc > 5) ? std::stoi(argv[5]) : 5;
     double p_min = (argc > 6) ? std::stod(argv[6]) : 0.0;
     double p_max = (argc > 7) ? std::stod(argv[7]) : 1.0;
+    int tmi_output = (argc > 8) ? std::stoi(argv[8]) : 0;
+    if (tmi_output != 0 && tmi_output != 1)
+    {
+        throw std::invalid_argument("The optional tmi argument must be 0 or 1.");
+    }
 
     auto start = std::chrono::steady_clock::now(); // Get start time
 
     if (d == 1)
     {
         std::cout << "Running 1D " << n <<"-qubit simulation of " << realizations*res << " circuits.\n";
-        run_1d(n, periods, realizations, res, p_min, p_max);
+        if (tmi_output == 1)
+        {
+            run_1d_tmi(n, periods, realizations, res, p_min, p_max);
+        }
+        else
+        {
+            run_1d(n, periods, realizations, res, p_min, p_max);
+        }
     }
     else if (d == 2)
     {
+        if (tmi_output == 1)
+        {
+            throw std::invalid_argument("TMI output mode is currently defined only for 1D circuits.");
+        }
         std::cout << "Running 2D " << n << "x" << n << " = " << n*n << "-qubit simulation of " << realizations*res << " circuits.\n";
         run_2d(n, n, periods, realizations, res, p_min, p_max);
     }

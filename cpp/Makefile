@@ -3,10 +3,10 @@
 # Default build:
 #   make
 # produces:
-#   ./mipt.exe  - simulates circuits and saves complex three-qubit RDM datasets
+#   ./mipt.exe  - simulates circuits and saves complex RDM datasets
 #   ./gmn.exe   - reads rho3 datasets and computes GMN for every stored subsystem
 #   ./ring_inflation.exe - selects max-GMN subsystem per record and solves level-2 ring inflation with SCS
-#   ./tmi.exe  - reads rho3 datasets and computes tripartite mutual information
+#   ./tmi.exe   - reads MIPTTMI1 four-block TMI datasets and computes TMI
 #
 # CPU simulation:
 #   make GPU=0 CUDA_RHO=0
@@ -19,8 +19,10 @@
 #   ./gmn.exe 0 rho3.bin data_real.csv       # real-only GMN on Re(rho)
 #   ./gmn.exe 1 rho3.bin data_complex.csv    # full complex Hermitian GMN SDP
 #   ./ring_inflation.exe rho3.bin 2000 1e-3 300 [limit_per_p] [p_min p_max [record_start record_stop]]
-#   ./tmi.exe 0 rho3.bin tmi_qubit.csv [limit_per_p]
-#   ./tmi.exe 1 rho3.bin tmi_fermion.csv [limit_per_p]
+#
+# TMI analysis:
+#   ./tmi.exe 0 rho_tmi.bin tmi_qubit.csv [limit_per_p]
+#   ./tmi.exe 1 rho_tmi.bin tmi_fermion.csv [limit_per_p]
 
 NVQXX   ?= nvq++
 HOSTCXX ?= g++
@@ -39,9 +41,14 @@ OPENMP ?= 1
 NVQXXFLAGS_COMMON := -std=c++20 -O3 -DNDEBUG -march=native
 CXXFLAGS_COMMON   := -std=c++20 -O3 -DNDEBUG -march=native -I$(MOSEK_INC)
 CFLAGS_COMMON     := -std=c11 -O3 -DNDEBUG -march=native -I$(MOSEK_INC)
+TMI_CXXFLAGS      := -std=c++20 -O3 -DNDEBUG -march=native
 NVCCFLAGS         := -std=c++17 -O3
 MOSEK_LDFLAGS     := -L$(MOSEK_LIB) -Wl,-rpath,$(MOSEK_LIB)
 MOSEK_LIBS        := -lmosek64
+# tmi.cpp dynamically loads LAPACK at runtime through dlopen/dlsym.
+# On current glibc this may resolve without -ldl, but keeping -ldl is safer
+# across WSL/Ubuntu versions. Override with TMI_LDLIBS= if needed.
+TMI_LDLIBS        ?= -ldl
 
 # ---- SCS C library configuration for ring_inflation.exe ----
 # SCS source/CMake installs commonly provide versioned direct/indirect solver
@@ -75,6 +82,7 @@ endif
 ifeq ($(OPENMP),1)
   CXXFLAGS_COMMON += -fopenmp
   CFLAGS_COMMON   += -fopenmp
+  TMI_CXXFLAGS    += -fopenmp
   HOST_LDFLAGS    += -fopenmp
 endif
 
@@ -137,6 +145,8 @@ print-config:
 	@echo "SCS_LIBFILE=$(SCS_LIBFILE)"
 	@echo "SCS_LDFLAGS=$(SCS_LDFLAGS)"
 	@echo "OPENMP=$(OPENMP)"
+	@echo "TMI_CXXFLAGS=$(TMI_CXXFLAGS)"
+	@echo "TMI_LDLIBS=$(TMI_LDLIBS)"
 
 mipt.exe: $(MIPT_BINARY)
 	cp $(MIPT_BINARY) $@
@@ -160,7 +170,7 @@ $(RING_BINARY): $(RING_OBJS)
 	$(HOSTCXX) $(HOST_LDFLAGS) $^ $(MOSEK_LDFLAGS) $(MOSEK_LIBS) $(SCS_LDFLAGS) -o $@
 
 $(TMI_BINARY): $(TMI_OBJS)
-	$(HOSTCXX) $(HOST_LDFLAGS) $^ -o $@
+	$(HOSTCXX) $(HOST_LDFLAGS) $^ $(TMI_LDLIBS) -o $@
 
 $(MIPT_OBJDIR):
 	mkdir -p $@
@@ -192,8 +202,8 @@ $(RING_OBJDIR)/ring_inflation.o: ring_inflation.cpp density_io.hpp gmn.hpp | $(R
 $(RING_OBJDIR)/gmn_mosek_c.o: gmn_mosek_c.c gmn.hpp | $(RING_OBJDIR)
 	$(HOSTCC) $(CFLAGS_COMMON) -c $< -o $@
 
-$(TMI_OBJDIR)/tmi.o: tmi.cpp density_io.hpp | $(TMI_OBJDIR)
-	$(HOSTCXX) $(CXXFLAGS_COMMON) -c $< -o $@
+$(TMI_OBJDIR)/tmi.o: tmi.cpp | $(TMI_OBJDIR)
+	$(HOSTCXX) $(TMI_CXXFLAGS) -c $< -o $@
 
 clean:
 	rm -rf build mipt.exe gmn.exe ring_inflation.exe tmi.exe *.tmp

@@ -180,27 +180,44 @@ def get_mipt_rho_1d_ferm(
     n,
     d,
     p,
-    plans,
+    plans=None,
     subsyst=3,
     all_matrices=False,
     closed=True,
     gpu=False,
     seed=None,
     transpile_optimization_level: int = 0,
+    tmi: bool = False,
 ):
     """
     Return one trajectory's reduced density matrix/matrices for the fermionic
     parity-preserving MIPT circuit.
 
-    For repeated random scans, pass an explicit seed from the scan driver.  The
-    default transpile optimization level is 0 because these circuits are already
-    simulator-oriented and repeated high-level optimization is usually wasted
-    work in Monte Carlo scans.
+    tmi=False preserves the previous rho3/ring-neighborhood behavior.
+    tmi=True returns four fermionically reduced matrices in the C++ TMI storage
+    order AB, AC, BC, D.
+
+    For repeated scans, pass precomputed ``plans``. If omitted, plans are built
+    automatically for the selected mode.
     """
-    if all_matrices and closed:
+    if tmi:
+        subsystems = [list(x) for x in tmi_block_subsystems(int(n))]
+        if plans is None:
+            plans = make_tmi_block_plans(int(n), basis_order="little")
+    elif all_matrices and closed:
         subsystems = [[(i + j) % n for j in range(subsyst)] for i in range(n)]
+        if plans is None:
+            plans = make_ring_3mode_plans(int(n), closed=True, basis_order="little")
     else:
         subsystems = [list(range(subsyst))]
+        if plans is None:
+            plans = [FermionicPartialTracePlan(int(n), keep=subsystems[0], basis_order="little")]
+
+    if len(plans) != len(subsystems):
+        raise ValueError(
+            f"Number of fermionic trace plans ({len(plans)}) does not match "
+            f"number of requested subsystems ({len(subsystems)})."
+        )
 
     if gpu:
         backend = AerSimulator(device="GPU", method="matrix_product_state")
@@ -210,12 +227,6 @@ def get_mipt_rho_1d_ferm(
     qc = random_mipt_1d_ferm(n=n, d=d, p=float(p), closed=closed, seed=seed)
 
     qc.save_statevector(pershot=True, label="final_state")
-    # for i, subsystem in enumerate(subsystems):
-    #     qc.save_density_matrix(
-    #         qubits=subsystem,
-    #         label=f"final_state_{i}",
-    #         pershot=True,
-    #     )
 
     tqc = transpile(qc, backend, optimization_level=transpile_optimization_level)
 
@@ -223,17 +234,10 @@ def get_mipt_rho_1d_ferm(
     result = backend.run(tqc, shots=1).result()
     psi = result.data(0)["final_state"][0]
 
-    if len(subsystems) == 1:
-        raise NotImplemented
-
-    return [plan.trace_statevector(psi) for plan in plans]
-
-    # if len(subsystems) == 1:
-    #     return result.data(0)["final_state_0"][0]
-
-    # return [result.data(0)[f"final_state_{i}"][0] for i in range(len(subsystems))]
-    
-
+    rhos = [plan.trace_statevector(psi) for plan in plans]
+    if len(rhos) == 1:
+        return rhos[0]
+    return rhos
 
 def _merge_mosek_thread_option(solver_options: dict | None, mosek_threads: int | None) -> dict | None:
     if solver_options is None and mosek_threads is None:

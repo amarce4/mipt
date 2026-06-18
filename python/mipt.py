@@ -345,30 +345,63 @@ def random_mipt_1d(n, d, p, closed=True):
 
     return qc
 
-def get_mipt_rho_1d(n, d, p, subsyst=3, all_matrices=False, closed=True, gpu=False):
+def _tmi_block_subsystems_1d(n: int) -> list[tuple[int, ...]]:
+    """Return TMI storage subsystems in AB/AC/BC/D order."""
+    n = int(n)
+    if n < 4 or (n % 4) != 0:
+        raise ValueError("TMI matrix writing requires n >= 4 and divisible by 4.")
 
-    subsystems = []
-    if all_matrices and closed:
-        subsystems = [[ (i + j) % n for j in range(subsyst) ] for i in range(n)]
+    block = n // 4
+    A = tuple(range(0, block))
+    B = tuple(range(block, 2 * block))
+    C = tuple(range(2 * block, 3 * block))
+    D = tuple(range(3 * block, 4 * block))
+    return [A + B, A + C, B + C, D]
+
+
+def get_mipt_rho_1d(
+    n,
+    d,
+    p,
+    subsyst=3,
+    all_matrices=False,
+    closed=True,
+    gpu=False,
+    tmi: bool = False,
+    transpile_optimization_level: int = 0,
+):
+    """
+    Return one trajectory's reduced density matrix/matrices for the qubit MIPT
+    circuit.
+
+    tmi=False preserves the previous rho3 behavior.
+    tmi=True returns four matrices in the C++ TMI storage order AB, AC, BC, D.
+    These are ordinary qubit partial traces, appropriate for the non-fermionic
+    circuit path.
+    """
+
+    if tmi:
+        subsystems = [list(x) for x in _tmi_block_subsystems_1d(int(n))]
+    elif all_matrices and closed:
+        subsystems = [[(i + j) % n for j in range(subsyst)] for i in range(n)]
     else:
         subsystems = [list(range(subsyst))]
 
-    backend: AerSimulator
     if gpu == False:
         backend = AerSimulator(device="CPU", method="matrix_product_state")
     else:
         backend = AerSimulator(device="GPU", method="matrix_product_state")
-        
+
     qc = random_mipt_1d(n=n, d=d, p=float(p), closed=closed)
 
-    for i in range(len(subsystems)):
+    for i, subsystem in enumerate(subsystems):
         qc.save_density_matrix(
-            qubits=subsystems[i],
+            qubits=subsystem,
             label=f"final_state_{i}",
             pershot=True,
         )
 
-    tqc = transpile(qc, backend)
+    tqc = transpile(qc, backend, optimization_level=transpile_optimization_level)
 
     # One conditional outcome trajectory for this independently drawn circuit.
     result = backend.run(tqc, shots=1).result()
@@ -376,11 +409,7 @@ def get_mipt_rho_1d(n, d, p, subsyst=3, all_matrices=False, closed=True, gpu=Fal
     if len(subsystems) == 1:
         return result.data(0)["final_state_0"][0]
 
-    data = []
-    for i in range(len(subsystems)):
-        data.append(result.data(0)[f"final_state_{i}"][0])
-
-    return data
+    return [result.data(0)[f"final_state_{i}"][0] for i in range(len(subsystems))]
 
 def random_mipt_2d(x, y, d, p):
     """p must be between 0 and 1."""
