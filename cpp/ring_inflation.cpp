@@ -301,9 +301,8 @@ namespace
             << "Pipeline:\n"
             << "  1. Reads a version-2 MIPT 3-qubit RDM .bin file.\n"
             << "  2. Runs full complex MOSEK GMN on every stored distance-1 subsystem.\n"
-            << "  3. Selects the subsystem with highest GMN for each trajectory.\n"
-            << "  4. Runs the level-2 ring-inflation SDP with SCS on that subsystem.\n"
-            << "  5. Writes ring_inflation.csv with columns: p,gmn,inflation_score.\n\n"
+            << "  3. Runs the level-2 ring-inflation SDP with SCS on each subsystem independently.\n"
+            << "  4. Writes one CSV row per subsystem with columns: p,gmn,inflation_score.\n\n"
             << "Optional arguments:\n"
             << "  limit_per_p             0 or omitted means no limit; otherwise cap processed records per p after filtering.\n"
             << "  p_min p_max             Inclusive measurement-rate p range. Use 'all all' for all p values.\n"
@@ -1114,8 +1113,8 @@ namespace
         return result;
     }
 
-    Candidate select_highest_gmn_subsystem(const mipt_io::DensityFileMetadata &metadata,
-                                           const mipt_io::DensityRecord &record)
+    std::vector<Candidate> evaluate_all_subsystems_gmn(const mipt_io::DensityFileMetadata &metadata,
+                                                       const mipt_io::DensityRecord &record)
     {
         if (metadata.kept_qubits != 3 || metadata.matrix_dimension != RHO_DIM)
         {
@@ -1127,43 +1126,28 @@ namespace
             throw std::runtime_error("Density record payload size is inconsistent with metadata.");
         }
 
-        std::vector<double> gmns(static_cast<std::size_t>(metadata.subsystem_count),
-                                 -std::numeric_limits<double>::infinity());
+        std::vector<Candidate> candidates(static_cast<std::size_t>(metadata.subsystem_count));
+        for (std::uint32_t s = 0; s < metadata.subsystem_count; ++s)
+        {
+            Candidate &candidate = candidates[static_cast<std::size_t>(s)];
+            candidate.subsystem = s;
+            candidate.gmn = std::numeric_limits<double>::quiet_NaN();
+
+            const double *rho = record.rho_ri.data() +
+                static_cast<std::size_t>(s) * RHO_RI_VALUES;
+            std::copy(rho, rho + RHO_RI_VALUES, candidate.rho_ri.begin());
+        }
 
 #ifdef _OPENMP
 #pragma omp parallel for schedule(dynamic, 1)
 #endif
         for (std::int64_t s = 0; s < static_cast<std::int64_t>(metadata.subsystem_count); ++s)
         {
-            const double *rho = record.rho_ri.data() +
-                static_cast<std::size_t>(s) * RHO_RI_VALUES;
-            gmns[static_cast<std::size_t>(s)] = compute_gmn_mosek_complex_8x8(rho);
+            Candidate &candidate = candidates[static_cast<std::size_t>(s)];
+            candidate.gmn = compute_gmn_mosek_complex_8x8(candidate.rho_ri.data());
         }
 
-        std::uint32_t best_index = 0;
-        double best_gmn = -std::numeric_limits<double>::infinity();
-        for (std::uint32_t s = 0; s < metadata.subsystem_count; ++s)
-        {
-            const double value = gmns[static_cast<std::size_t>(s)];
-            if (std::isfinite(value) && value > best_gmn)
-            {
-                best_gmn = value;
-                best_index = s;
-            }
-        }
-
-        if (!std::isfinite(best_gmn))
-        {
-            throw std::runtime_error("All GMN solves failed or returned non-finite values for a record.");
-        }
-
-        Candidate candidate;
-        candidate.subsystem = best_index;
-        candidate.gmn = best_gmn;
-        const double *rho = record.rho_ri.data() +
-            static_cast<std::size_t>(best_index) * RHO_RI_VALUES;
-        std::copy(rho, rho + RHO_RI_VALUES, candidate.rho_ri.begin());
-        return candidate;
+        return candidates;
     }
 } // namespace
 
@@ -1195,7 +1179,7 @@ int main(int argc, char **argv)
         out << "p,gmn,inflation_score\n";
         out << std::setprecision(17);
 
-        std::cout << "Running GMN-selected level-2 ring inflation from " << opts.input_file << "\n"
+        std::cout << "Running per-subsystem GMN + level-2 ring inflation from " << opts.input_file << "\n"
                   << "Records: " << metadata.record_count
                   << "; subsystems per record: " << metadata.subsystem_count
                   << "; SCS max_iters=" << opts.max_iters
@@ -1223,7 +1207,8 @@ int main(int argc, char **argv)
 #endif
 
         mipt_io::DensityRecord record;
-        std::uint64_t processed = 0;
+        std::uint64_t records_processed = 0;
+        std::uint64_t rows_written = 0;
         std::uint64_t skipped_by_p_range = 0;
         std::uint64_t skipped_before_record_window = 0;
         std::uint64_t skipped_after_record_window = 0;
@@ -1231,8 +1216,10 @@ int main(int argc, char **argv)
         std::unordered_map<std::uint32_t, std::uint64_t> seen_per_p;
         std::unordered_map<std::uint32_t, std::uint64_t> processed_per_p;
 
-        std::uint64_t progress_total = estimate_progress_total(metadata, opts);
-        if (progress_total == 0)
+        const std::uint64_t progress_total_records = estimate_progress_total(metadata, opts);
+        const std::uint64_t progress_total_rows =
+            progress_total_records * static_cast<std::uint64_t>(metadata.subsystem_count);
+        if (progress_total_records == 0)
         {
             std::cout << "Selected p/record window contains zero records; no SDP solves will be run.\n";
         }
@@ -1268,33 +1255,42 @@ int main(int argc, char **argv)
                 continue;
             }
 
-            Candidate best = select_highest_gmn_subsystem(metadata, record);
-            const SCSResult inflation = solve_ring_inflation_scs(
-                best.rho_ri.data(), opts.max_iters, opts.tol, opts.time_limit_secs,
-                opts.scs_verbose);
+            std::vector<Candidate> candidates = evaluate_all_subsystems_gmn(metadata, record);
+            for (const Candidate &candidate : candidates)
+            {
+                const SCSResult inflation = solve_ring_inflation_scs(
+                    candidate.rho_ri.data(), opts.max_iters, opts.tol, opts.time_limit_secs,
+                    opts.scs_verbose);
 
-            out << record.p << ',' << best.gmn << ',' << inflation.score << '\n';
-            ++processed;
+                out << record.p << ',' << candidate.gmn << ',' << inflation.score << '\n';
+                ++rows_written;
+
+                const auto now = std::chrono::steady_clock::now();
+                const std::chrono::duration<double> elapsed = now - start;
+                const double rate = elapsed.count() > 0.0
+                    ? static_cast<double>(rows_written) / elapsed.count()
+                    : 0.0;
+                const std::uint64_t remaining =
+                    progress_total_rows > rows_written ? progress_total_rows - rows_written : 0;
+                const double eta = rate > 0.0 ? static_cast<double>(remaining) / rate : 0.0;
+
+                std::cout << "\rWrote row " << rows_written << '/' << progress_total_rows
+                          << "; records=" << (records_processed + 1) << '/' << progress_total_records
+                          << "; p=" << std::setprecision(6) << record.p
+                          << "; subsystem=" << candidate.subsystem
+                          << "; gmn=" << std::setprecision(6) << candidate.gmn
+                          << "; inflation=" << std::setprecision(6) << inflation.score
+                          << "; SCS=" << inflation.status
+                          << " (" << inflation.iter << " iters)"
+                          << "; ETA " << std::fixed << std::setprecision(1) << eta << " s                   "
+                          << std::flush;
+            }
+            ++records_processed;
             ++p_count;
-
-            const auto now = std::chrono::steady_clock::now();
-            const std::chrono::duration<double> elapsed = now - start;
-            const double rate = elapsed.count() > 0.0 ? processed / elapsed.count() : 0.0;
-            const std::uint64_t remaining =
-                progress_total > processed ? progress_total - processed : 0;
-            const double eta = rate > 0.0 ? remaining / rate : 0.0;
-
-            std::cout << "\rProcessed " << processed << '/' << progress_total\
-                      << "; p=" << std::setprecision(6) << record.p
-                      << "; best_gmn=" << std::setprecision(6) << best.gmn
-                      << "; inflation=" << std::setprecision(6) << inflation.score
-                      << "; SCS=" << inflation.status
-                      << " (" << inflation.iter << " iters)"
-                      << "; ETA " << std::fixed << std::setprecision(1) << eta << " s                   "
-                      << std::flush;
         }
 
-        std::cout << "\nWrote " << processed << " rows to " << opts.output_csv << "."
+        std::cout << "\nWrote " << rows_written << " rows from " << records_processed
+                  << " records to " << opts.output_csv << "."
                   << " Skipped by p range: " << skipped_by_p_range << "."
                   << " Skipped before record window: " << skipped_before_record_window << "."
                   << " Skipped after record window: " << skipped_after_record_window << ".";
