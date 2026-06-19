@@ -1057,7 +1057,7 @@ namespace
             << "Input:\n"
             << "  MIPTTMI1 file produced by mipt.exe ... 1. The stored terms are AB, AC, BC, D.\n\n"
             << "Output columns:\n"
-            << "  record,p_index,p,realization,tmi\n";
+            << "  p,tmi\n";
     }
 } // namespace
 
@@ -1115,7 +1115,7 @@ int main(int argc, char **argv)
             out = &output_file;
         }
 
-        *out << "record,p_index,p,realization,tmi\n";
+        *out << "p,tmi\n";
 
         std::cerr << "Input: " << input_path << '\n'
                   << "records=" << meta.record_count
@@ -1172,13 +1172,7 @@ int main(int argc, char **argv)
             lines.reserve(rows.size() * 128u);
             for (const auto &row : rows)
             {
-                append_uint(lines, row.record_linear);
-                lines.push_back(',');
-                append_uint(lines, row.p_index);
-                lines.push_back(',');
                 append_double(lines, row.p);
-                lines.push_back(',');
-                append_uint(lines, row.realization);
                 lines.push_back(',');
                 append_double(lines, row.tmi);
                 lines.push_back('\n');

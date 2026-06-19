@@ -38,6 +38,57 @@ namespace
         return std::uint64_t{1} << exponent;
     }
 
+    inline int fermionic_reorder_sign_from_occupations(
+        const std::vector<unsigned char> &occ_by_mode,
+        const std::vector<int> &new_mode_order)
+    {
+        // Sign for |n_0...n_{N-1}>_canonical =
+        // sign * |n_{new_order[0]}...>_new_order.
+        std::vector<int> pos_new(occ_by_mode.size(), 0);
+        for (std::size_t pos = 0; pos < new_mode_order.size(); ++pos)
+        {
+            pos_new[static_cast<std::size_t>(new_mode_order[pos])] =
+                static_cast<int>(pos);
+        }
+
+        int parity = 0;
+        std::vector<int> occupied_positions;
+        occupied_positions.reserve(occ_by_mode.size());
+        for (std::size_t mode = 0; mode < occ_by_mode.size(); ++mode)
+        {
+            if (occ_by_mode[mode])
+            {
+                occupied_positions.push_back(pos_new[mode]);
+            }
+        }
+
+        for (std::size_t i = 0; i < occupied_positions.size(); ++i)
+        {
+            for (std::size_t j = i + 1; j < occupied_positions.size(); ++j)
+            {
+                if (occupied_positions[i] > occupied_positions[j])
+                {
+                    parity ^= 1;
+                }
+            }
+        }
+        return parity ? -1 : 1;
+    }
+
+    inline std::uint64_t index_from_occupations_little(
+        const std::vector<unsigned char> &occ_by_mode)
+    {
+        std::uint64_t idx = 0;
+        for (std::size_t mode = 0; mode < occ_by_mode.size(); ++mode)
+        {
+            if (occ_by_mode[mode])
+            {
+                idx |= std::uint64_t{1} << mode;
+            }
+        }
+        return idx;
+    }
+
     std::vector<Subsystem> periodic_ring_three_site_subsystems(int n)
     {
         if (n < RHO3_QUBITS)
@@ -100,7 +151,8 @@ namespace
         const std::complex<Real> *psi,
         int n,
         const std::vector<Subsystem> &subsystems,
-        double *rho_ri)
+        double *rho_ri,
+        bool fermion_trace = false)
     {
         if (psi == nullptr || rho_ri == nullptr)
         {
@@ -136,36 +188,110 @@ namespace
                 }
             }
 
-            std::array<std::uint64_t, RHO3_DIM> retained_offsets{};
-            for (int local_basis = 0; local_basis < RHO3_DIM; ++local_basis)
+            if (!fermion_trace)
             {
-                for (int k = 0; k < RHO3_QUBITS; ++k)
+                std::array<std::uint64_t, RHO3_DIM> retained_offsets{};
+                for (int local_basis = 0; local_basis < RHO3_DIM; ++local_basis)
                 {
-                    retained_offsets[local_basis] |=
-                        (static_cast<std::uint64_t>((local_basis >> k) & 1)
-                         << subsystem[k]);
+                    for (int k = 0; k < RHO3_QUBITS; ++k)
+                    {
+                        retained_offsets[local_basis] |=
+                            (static_cast<std::uint64_t>((local_basis >> k) & 1)
+                             << subsystem[k]);
+                    }
+                }
+
+                for (std::uint64_t env = 0; env < env_dim; ++env)
+                {
+                    std::uint64_t base = 0;
+                    int env_bit = 0;
+                    for (int q = 0; q < n; ++q)
+                    {
+                        if (q != subsystem[0] && q != subsystem[1] && q != subsystem[2])
+                        {
+                            base |= ((env >> env_bit) & std::uint64_t{1}) << q;
+                            ++env_bit;
+                        }
+                    }
+
+                    for (int row = 0; row < RHO3_DIM; ++row)
+                    {
+                        const auto a = psi[base | retained_offsets[row]];
+                        for (int col = 0; col < RHO3_DIM; ++col)
+                        {
+                            const auto b = psi[base | retained_offsets[col]];
+                            const auto value = a * std::conj(b);
+                            const std::size_t out =
+                                s * RHO3_VALUES +
+                                2u * static_cast<std::size_t>(row * RHO3_DIM + col);
+                            rho_ri[out + 0] += static_cast<double>(std::real(value));
+                            rho_ri[out + 1] += static_cast<double>(std::imag(value));
+                        }
+                    }
+                }
+                continue;
+            }
+
+            std::vector<int> kept_modes(subsystem.begin(), subsystem.end());
+            std::vector<unsigned char> is_retained(static_cast<std::size_t>(n), 0);
+            for (int q : kept_modes)
+            {
+                is_retained[static_cast<std::size_t>(q)] = 1;
+            }
+
+            std::vector<int> environment_modes;
+            environment_modes.reserve(static_cast<std::size_t>(n - RHO3_QUBITS));
+            for (int q = 0; q < n; ++q)
+            {
+                if (!is_retained[static_cast<std::size_t>(q)])
+                {
+                    environment_modes.push_back(q);
+                }
+            }
+
+            std::vector<int> new_mode_order = kept_modes;
+            new_mode_order.insert(new_mode_order.end(),
+                                  environment_modes.begin(),
+                                  environment_modes.end());
+
+            std::vector<std::array<std::uint64_t, RHO3_DIM>> old_index_by_env(
+                static_cast<std::size_t>(env_dim));
+            std::vector<std::array<int, RHO3_DIM>> sign_by_env(
+                static_cast<std::size_t>(env_dim));
+
+            for (std::uint64_t env = 0; env < env_dim; ++env)
+            {
+                for (int local_basis = 0; local_basis < RHO3_DIM; ++local_basis)
+                {
+                    std::vector<unsigned char> occ_by_mode(static_cast<std::size_t>(n), 0);
+                    for (int k = 0; k < RHO3_QUBITS; ++k)
+                    {
+                        occ_by_mode[static_cast<std::size_t>(kept_modes[k])] =
+                            static_cast<unsigned char>((local_basis >> k) & 1);
+                    }
+                    for (std::size_t e = 0; e < environment_modes.size(); ++e)
+                    {
+                        occ_by_mode[static_cast<std::size_t>(environment_modes[e])] =
+                            static_cast<unsigned char>((env >> e) & std::uint64_t{1});
+                    }
+
+                    old_index_by_env[static_cast<std::size_t>(env)][local_basis] =
+                        index_from_occupations_little(occ_by_mode);
+                    sign_by_env[static_cast<std::size_t>(env)][local_basis] =
+                        fermionic_reorder_sign_from_occupations(occ_by_mode, new_mode_order);
                 }
             }
 
             for (std::uint64_t env = 0; env < env_dim; ++env)
             {
-                std::uint64_t base = 0;
-                int env_bit = 0;
-                for (int q = 0; q < n; ++q)
-                {
-                    if (q != subsystem[0] && q != subsystem[1] && q != subsystem[2])
-                    {
-                        base |= ((env >> env_bit) & std::uint64_t{1}) << q;
-                        ++env_bit;
-                    }
-                }
-
+                const auto &old_index = old_index_by_env[static_cast<std::size_t>(env)];
+                const auto &sign = sign_by_env[static_cast<std::size_t>(env)];
                 for (int row = 0; row < RHO3_DIM; ++row)
                 {
-                    const auto a = psi[base | retained_offsets[row]];
+                    const auto a = psi[old_index[row]] * static_cast<Real>(sign[row]);
                     for (int col = 0; col < RHO3_DIM; ++col)
                     {
-                        const auto b = psi[base | retained_offsets[col]];
+                        const auto b = psi[old_index[col]] * static_cast<Real>(sign[col]);
                         const auto value = a * std::conj(b);
                         const std::size_t out =
                             s * RHO3_VALUES +
@@ -182,7 +308,8 @@ namespace
         cudaq::state &state,
         int n,
         const std::vector<Subsystem> &subsystems,
-        double *rho_ri)
+        double *rho_ri,
+        bool fermion_trace = false)
     {
         if (rho_ri == nullptr || subsystems.empty())
         {
@@ -209,7 +336,7 @@ namespace
         }
 
 #ifdef MIPT_ENABLE_CUDA_RHO
-        if (state.is_on_gpu())
+        if (state.is_on_gpu() && !fermion_trace)
         {
             const std::vector<int> flat = flatten_subsystems(subsystems);
             int status = 0;
@@ -244,14 +371,14 @@ namespace
                 std::vector<std::complex<double>> host_state(dim);
                 state.to_host(host_state.data(), host_state.size());
                 reduced_density_complex_from_host_statevector(
-                    host_state.data(), n, subsystems, rho_ri);
+                    host_state.data(), n, subsystems, rho_ri, fermion_trace);
             }
             else
             {
                 std::vector<std::complex<float>> host_state(dim);
                 state.to_host(host_state.data(), host_state.size());
                 reduced_density_complex_from_host_statevector(
-                    host_state.data(), n, subsystems, rho_ri);
+                    host_state.data(), n, subsystems, rho_ri, fermion_trace);
             }
             return;
         }
@@ -265,13 +392,13 @@ namespace
         {
             reduced_density_complex_from_host_statevector(
                 reinterpret_cast<const std::complex<double> *>(tensor.data),
-                n, subsystems, rho_ri);
+                n, subsystems, rho_ri, fermion_trace);
         }
         else
         {
             reduced_density_complex_from_host_statevector(
                 reinterpret_cast<const std::complex<float> *>(tensor.data),
-                n, subsystems, rho_ri);
+                n, subsystems, rho_ri, fermion_trace);
         }
     }
 
@@ -408,7 +535,8 @@ namespace
         const std::complex<Real> *psi,
         int n,
         const std::vector<int> &modes,
-        double *rho_ri)
+        double *rho_ri,
+        bool fermion_trace = false)
     {
         if (psi == nullptr || rho_ri == nullptr)
         {
@@ -452,34 +580,93 @@ namespace
             }
         }
 
-        std::vector<std::uint64_t> retained_offsets(kept_dim, 0);
-        for (std::uint64_t local_basis = 0; local_basis < kept_dim_u64; ++local_basis)
+        std::fill(rho_ri, rho_ri + 2u * kept_dim * kept_dim, 0.0);
+
+        if (!fermion_trace)
         {
-            std::uint64_t offset = 0;
-            for (int k = 0; k < kept; ++k)
+            std::vector<std::uint64_t> retained_offsets(kept_dim, 0);
+            for (std::uint64_t local_basis = 0; local_basis < kept_dim_u64; ++local_basis)
             {
-                offset |= ((local_basis >> k) & std::uint64_t{1})
-                          << modes[static_cast<std::size_t>(k)];
+                std::uint64_t offset = 0;
+                for (int k = 0; k < kept; ++k)
+                {
+                    offset |= ((local_basis >> k) & std::uint64_t{1})
+                              << modes[static_cast<std::size_t>(k)];
+                }
+                retained_offsets[static_cast<std::size_t>(local_basis)] = offset;
             }
-            retained_offsets[static_cast<std::size_t>(local_basis)] = offset;
+
+            for (std::uint64_t env = 0; env < env_dim; ++env)
+            {
+                std::uint64_t base = 0;
+                for (std::size_t e = 0; e < environment_modes.size(); ++e)
+                {
+                    base |= ((env >> e) & std::uint64_t{1})
+                            << environment_modes[e];
+                }
+
+                for (std::uint64_t row = 0; row < kept_dim_u64; ++row)
+                {
+                    const auto a = psi[base | retained_offsets[static_cast<std::size_t>(row)]];
+                    for (std::uint64_t col = 0; col < kept_dim_u64; ++col)
+                    {
+                        const auto b = psi[base | retained_offsets[static_cast<std::size_t>(col)]];
+                        const auto value = a * std::conj(b);
+                        const std::size_t out = 2u * static_cast<std::size_t>(row * kept_dim_u64 + col);
+                        rho_ri[out + 0] += static_cast<double>(std::real(value));
+                        rho_ri[out + 1] += static_cast<double>(std::imag(value));
+                    }
+                }
+            }
+            return;
         }
 
-        std::fill(rho_ri, rho_ri + 2u * kept_dim * kept_dim, 0.0);
+        std::vector<int> new_mode_order = modes;
+        new_mode_order.insert(new_mode_order.end(),
+                              environment_modes.begin(),
+                              environment_modes.end());
+
+        std::vector<std::uint64_t> old_index_by_new_basis(
+            static_cast<std::size_t>(kept_dim_u64 * env_dim));
+        std::vector<int> sign_by_new_basis(
+            static_cast<std::size_t>(kept_dim_u64 * env_dim));
+
         for (std::uint64_t env = 0; env < env_dim; ++env)
         {
-            std::uint64_t base = 0;
-            for (std::size_t e = 0; e < environment_modes.size(); ++e)
+            for (std::uint64_t local_basis = 0; local_basis < kept_dim_u64; ++local_basis)
             {
-                base |= ((env >> e) & std::uint64_t{1})
-                        << environment_modes[e];
-            }
+                std::vector<unsigned char> occ_by_mode(static_cast<std::size_t>(n), 0);
+                for (int k = 0; k < kept; ++k)
+                {
+                    occ_by_mode[static_cast<std::size_t>(modes[static_cast<std::size_t>(k)])] =
+                        static_cast<unsigned char>((local_basis >> k) & std::uint64_t{1});
+                }
+                for (std::size_t e = 0; e < environment_modes.size(); ++e)
+                {
+                    occ_by_mode[static_cast<std::size_t>(environment_modes[e])] =
+                        static_cast<unsigned char>((env >> e) & std::uint64_t{1});
+                }
 
+                const std::size_t idx = static_cast<std::size_t>(env * kept_dim_u64 + local_basis);
+                old_index_by_new_basis[idx] = index_from_occupations_little(occ_by_mode);
+                sign_by_new_basis[idx] =
+                    fermionic_reorder_sign_from_occupations(occ_by_mode, new_mode_order);
+            }
+        }
+
+        for (std::uint64_t env = 0; env < env_dim; ++env)
+        {
+            const std::size_t block = static_cast<std::size_t>(env * kept_dim_u64);
             for (std::uint64_t row = 0; row < kept_dim_u64; ++row)
             {
-                const auto a = psi[base | retained_offsets[static_cast<std::size_t>(row)]];
+                const std::size_t row_idx = block + static_cast<std::size_t>(row);
+                const auto a = psi[old_index_by_new_basis[row_idx]] *
+                               static_cast<Real>(sign_by_new_basis[row_idx]);
                 for (std::uint64_t col = 0; col < kept_dim_u64; ++col)
                 {
-                    const auto b = psi[base | retained_offsets[static_cast<std::size_t>(col)]];
+                    const std::size_t col_idx = block + static_cast<std::size_t>(col);
+                    const auto b = psi[old_index_by_new_basis[col_idx]] *
+                                   static_cast<Real>(sign_by_new_basis[col_idx]);
                     const auto value = a * std::conj(b);
                     const std::size_t out = 2u * static_cast<std::size_t>(row * kept_dim_u64 + col);
                     rho_ri[out + 0] += static_cast<double>(std::real(value));
@@ -494,14 +681,15 @@ namespace
         const std::complex<Real> *psi,
         int n,
         const std::vector<TmiMatrixTerm> &terms,
-        std::vector<double> &payload)
+        std::vector<double> &payload,
+        bool fermion_trace = false)
     {
         payload.resize(tmi_payload_value_count(terms));
         std::size_t offset = 0;
         for (const auto &term : terms)
         {
             append_reduced_density_for_modes_from_host_statevector(
-                psi, n, term.modes, payload.data() + offset);
+                psi, n, term.modes, payload.data() + offset, fermion_trace);
             offset += term_value_count(term);
         }
     }
@@ -510,7 +698,8 @@ namespace
         cudaq::state &state,
         int n,
         const std::vector<TmiMatrixTerm> &terms,
-        std::vector<double> &payload)
+        std::vector<double> &payload,
+        bool fermion_trace = false)
     {
         if (terms.size() != 4)
         {
@@ -537,13 +726,13 @@ namespace
             {
                 std::vector<std::complex<double>> host_state(dim);
                 state.to_host(host_state.data(), host_state.size());
-                tmi_density_matrices_from_host_statevector(host_state.data(), n, terms, payload);
+                tmi_density_matrices_from_host_statevector(host_state.data(), n, terms, payload, fermion_trace);
             }
             else
             {
                 std::vector<std::complex<float>> host_state(dim);
                 state.to_host(host_state.data(), host_state.size());
-                tmi_density_matrices_from_host_statevector(host_state.data(), n, terms, payload);
+                tmi_density_matrices_from_host_statevector(host_state.data(), n, terms, payload, fermion_trace);
             }
             return;
         }
@@ -556,12 +745,12 @@ namespace
         if (precision == cudaq::SimulationState::precision::fp64)
         {
             tmi_density_matrices_from_host_statevector(
-                reinterpret_cast<const std::complex<double> *>(tensor.data), n, terms, payload);
+                reinterpret_cast<const std::complex<double> *>(tensor.data), n, terms, payload, fermion_trace);
         }
         else
         {
             tmi_density_matrices_from_host_statevector(
-                reinterpret_cast<const std::complex<float> *>(tensor.data), n, terms, payload);
+                reinterpret_cast<const std::complex<float> *>(tensor.data), n, terms, payload, fermion_trace);
         }
     }
 
@@ -736,6 +925,89 @@ struct LayerData
     std::vector<int> rot_x_flags;
     std::vector<int> rot_y_flags;
     std::vector<int> rot_xy_flags;
+};
+
+struct FermionU2Params
+{
+    // U = exp(i global_phase) * U3(theta, phi, lambda).
+    double global_phase = 0.0;
+    double theta = 0.0;
+    double phi = 0.0;
+    double lambda = 0.0;
+};
+
+struct FermionBondGate
+{
+    // kind = 0: parity-preserving two-mode unitary.
+    // kind = 1: adjacent fermionic swap.
+    int kind = 0;
+    int q0 = 0;
+    int q1 = 0;
+    FermionU2Params even;
+    FermionU2Params odd;
+};
+
+struct FermionLayerData
+{
+    std::vector<FermionBondGate> gates;
+    std::vector<int> measure_flags;
+};
+
+struct MIPTFermionKernel_1D
+{
+    void operator()(int n,
+                    const std::vector<FermionLayerData> &layers) __qpu__
+    {
+        cudaq::qvector q(n);
+
+        for (std::size_t layer = 0; layer < layers.size(); ++layer)
+        {
+            for (std::size_t gi = 0; gi < layers[layer].gates.size(); ++gi)
+            {
+                const auto gate = layers[layer].gates[gi];
+                if (gate.kind == 1)
+                {
+                    // FSWAP = CZ * SWAP in the |00>,|01>,|10>,|11> basis.
+                    z<cudaq::ctrl>(q[gate.q0], q[gate.q1]);
+                    swap(q[gate.q0], q[gate.q1]);
+                }
+                else
+                {
+                    // Let a=q0 and b=q1.  First map parity sectors with
+                    // CNOT(a -> b).  In the mapped basis, b=1 is the original
+                    // odd sector {|01>,|10>} and b=0 is the original even
+                    // sector {|00>,|11>}.  Controlled U3 on a then implements
+                    // the desired 2x2 block; r1 supplies the block-global
+                    // phase, which is physically relevant between parity blocks.
+                    cx(q[gate.q0], q[gate.q1]);
+
+                    r1(gate.odd.global_phase, q[gate.q1]);
+                    u3<cudaq::ctrl>(gate.odd.theta,
+                                     gate.odd.phi,
+                                     gate.odd.lambda,
+                                     q[gate.q1], q[gate.q0]);
+
+                    x(q[gate.q1]);
+                    r1(gate.even.global_phase, q[gate.q1]);
+                    u3<cudaq::ctrl>(gate.even.theta,
+                                     gate.even.phi,
+                                     gate.even.lambda,
+                                     q[gate.q1], q[gate.q0]);
+                    x(q[gate.q1]);
+
+                    cx(q[gate.q0], q[gate.q1]);
+                }
+            }
+
+            for (int i = 0; i < n; ++i)
+            {
+                if (layers[layer].measure_flags[i])
+                {
+                    mz(q[i]);
+                }
+            }
+        }
+    }
 };
 
 struct MIPTKernel_1D
@@ -1179,7 +1451,197 @@ std::vector<LayerData> mipt_frontend(int n,
 
 
 
-void run_1d(int n, int periods, int realizations, int res, double p_min, double p_max)
+std::array<std::complex<double>, 4> haar_unitary_2(std::mt19937 &rng)
+{
+    std::normal_distribution<double> normal(0.0, 1.0);
+
+    std::array<std::complex<double>, 4> z{
+        std::complex<double>(normal(rng), normal(rng)),
+        std::complex<double>(normal(rng), normal(rng)),
+        std::complex<double>(normal(rng), normal(rng)),
+        std::complex<double>(normal(rng), normal(rng)),
+    };
+
+    // Columns of z in row-major storage.
+    std::complex<double> z00 = z[0];
+    std::complex<double> z10 = z[2];
+    std::complex<double> z01 = z[1];
+    std::complex<double> z11 = z[3];
+
+    double n0 = std::sqrt(std::norm(z00) + std::norm(z10));
+    if (n0 == 0.0)
+    {
+        z00 = 1.0;
+        z10 = 0.0;
+        n0 = 1.0;
+    }
+
+    std::complex<double> q00 = z00 / n0;
+    std::complex<double> q10 = z10 / n0;
+
+    const std::complex<double> r01 = std::conj(q00) * z01 + std::conj(q10) * z11;
+    std::complex<double> u01 = z01 - q00 * r01;
+    std::complex<double> u11 = z11 - q10 * r01;
+
+    double n1 = std::sqrt(std::norm(u01) + std::norm(u11));
+    if (n1 < 1e-15)
+    {
+        // Extremely unlikely fallback: choose a deterministic orthogonal column.
+        u01 = -std::conj(q10);
+        u11 = std::conj(q00);
+        n1 = std::sqrt(std::norm(u01) + std::norm(u11));
+    }
+
+    std::complex<double> q01 = u01 / n1;
+    std::complex<double> q11 = u11 / n1;
+
+    return {q00, q01, q10, q11};
+}
+
+FermionU2Params decompose_u2_to_u3_phase(const std::array<std::complex<double>, 4> &u)
+{
+    const auto a = u[0];
+    const auto b = u[1];
+    const auto c = u[2];
+    const auto d = u[3];
+
+    const double ca = std::abs(a);
+    const double sa = std::abs(c);
+    FermionU2Params out;
+    out.theta = 2.0 * std::atan2(sa, ca);
+
+    constexpr double eps = 1e-12;
+    if (ca > eps && sa > eps)
+    {
+        out.global_phase = std::arg(a);
+        out.phi = std::arg(c) - out.global_phase;
+        out.lambda = std::arg(-b) - out.global_phase;
+    }
+    else if (ca > eps)
+    {
+        out.global_phase = std::arg(a);
+        out.phi = 0.0;
+        out.lambda = std::arg(d) - out.global_phase;
+    }
+    else
+    {
+        out.global_phase = 0.0;
+        out.phi = std::arg(c);
+        out.lambda = std::arg(-b);
+    }
+
+    return out;
+}
+
+FermionBondGate random_parity_preserving_gate(int q0, int q1, std::mt19937 &rng)
+{
+    FermionBondGate gate;
+    gate.kind = 0;
+    gate.q0 = q0;
+    gate.q1 = q1;
+    gate.even = decompose_u2_to_u3_phase(haar_unitary_2(rng));
+    gate.odd = decompose_u2_to_u3_phase(haar_unitary_2(rng));
+    return gate;
+}
+
+FermionBondGate fermionic_swap_gate(int q0, int q1)
+{
+    FermionBondGate gate;
+    gate.kind = 1;
+    gate.q0 = q0;
+    gate.q1 = q1;
+    return gate;
+}
+
+FermionLayerData make_fermion_layer(int n,
+                                    bool odd_layer,
+                                    double p,
+                                    bool closed,
+                                    std::mt19937 &rng)
+{
+    std::bernoulli_distribution measure_dist(p);
+
+    FermionLayerData layer;
+    layer.measure_flags.resize(static_cast<std::size_t>(n));
+
+    if (!odd_layer)
+    {
+        for (int qubit = 0; qubit < n; qubit += 2)
+        {
+            layer.gates.push_back(random_parity_preserving_gate(qubit, qubit + 1, rng));
+        }
+    }
+    else
+    {
+        if (closed)
+        {
+            for (int k = n - 2; k > 0; --k)
+            {
+                layer.gates.push_back(fermionic_swap_gate(k, k + 1));
+            }
+
+            layer.gates.push_back(random_parity_preserving_gate(0, 1, rng));
+
+            for (int k = 1; k < n - 1; ++k)
+            {
+                layer.gates.push_back(fermionic_swap_gate(k, k + 1));
+            }
+        }
+
+        for (int qubit = 1; qubit < n - 1; qubit += 2)
+        {
+            layer.gates.push_back(random_parity_preserving_gate(qubit, qubit + 1, rng));
+        }
+    }
+
+    for (int qubit = 0; qubit < n; ++qubit)
+    {
+        layer.measure_flags[static_cast<std::size_t>(qubit)] =
+            measure_dist(rng) ? 1 : 0;
+    }
+
+    return layer;
+}
+
+std::vector<FermionLayerData> mipt_fermion_frontend(int n,
+                                                    int periods,
+                                                    double p,
+                                                    bool closed = true)
+{
+    if ((n % 2) != 0)
+    {
+        throw std::invalid_argument("Fermionic 1D simulation requires even n.");
+    }
+    if (p < 0.0 || p > 1.0)
+    {
+        throw std::invalid_argument("Measurement probability p must be in [0,1].");
+    }
+
+    std::mt19937 rng(std::random_device{}());
+    std::bernoulli_distribution extra_even_layer(0.5);
+
+    std::vector<FermionLayerData> layers;
+    layers.reserve(static_cast<std::size_t>(2 * periods + 1));
+
+    for (int period = 0; period < periods; ++period)
+    {
+        layers.push_back(make_fermion_layer(n, false, p, closed, rng));
+        layers.push_back(make_fermion_layer(n, true, p, closed, rng));
+    }
+
+    // Match the Python fermionic circuit: a final even layer is included with
+    // 50% probability, and its measurements still use probability p.
+    if (extra_even_layer(rng))
+    {
+        layers.push_back(make_fermion_layer(n, false, p, closed, rng));
+    }
+
+    return layers;
+}
+
+
+
+void run_1d(int n, int periods, int realizations, int res, double p_min, double p_max, bool fermion)
 {
     if (n < RHO3_QUBITS)
     {
@@ -1191,10 +1653,9 @@ void run_1d(int n, int periods, int realizations, int res, double p_min, double 
     std::vector<double> ps = linspace(p_min, p_max, res);
     std::ofstream infofile("info.csv");
 
-    // Keep the existing info.csv format unchanged.
-    infofile << "n,periods,realizations,resolution,p_min,p_max\n";
+    infofile << "n,periods,realizations,resolution,p_min,p_max,fermion\n";
     infofile << n << "," << periods << "," << realizations << "," << res << ","
-             << p_min << "," << p_max << "\n";
+             << p_min << "," << p_max << "," << (fermion ? 1 : 0) << "\n";
 
     mipt_io::DensityMatrixWriter rho3_file(
         "rho3.bin",
@@ -1218,14 +1679,24 @@ void run_1d(int n, int periods, int realizations, int res, double p_min, double 
                 start = std::chrono::steady_clock::now();
             }
 
-            auto layers = mipt_frontend(n, periods, p);
+            auto state = [&]() {
+                if (fermion)
+                {
+                    auto layers = mipt_fermion_frontend(n, periods, p, true);
+                    if (r == 0)
+                    {
+                        lap1 = std::chrono::steady_clock::now();
+                    }
+                    return cudaq::get_state(MIPTFermionKernel_1D{}, n, layers);
+                }
 
-            if (r == 0)
-            {
-                lap1 = std::chrono::steady_clock::now();
-            }
-
-            auto state = cudaq::get_state(MIPTKernel_1D{}, n, layers, true);
+                auto layers = mipt_frontend(n, periods, p);
+                if (r == 0)
+                {
+                    lap1 = std::chrono::steady_clock::now();
+                }
+                return cudaq::get_state(MIPTKernel_1D{}, n, layers, true);
+            }();
 
             if (r == 0)
             {
@@ -1234,7 +1705,7 @@ void run_1d(int n, int periods, int realizations, int res, double p_min, double 
 
             std::vector<double> rho3_ri(subsystems.size() * RHO3_VALUES);
             cudaq_three_site_density_matrices(
-                state, n, subsystems, rho3_ri.data());
+                state, n, subsystems, rho3_ri.data(), fermion);
 
             if (r == 0)
             {
@@ -1288,20 +1759,22 @@ void run_1d(int n, int periods, int realizations, int res, double p_min, double 
 
     rho3_file.close();
     std::cout << "Saved " << subsystems.size()
-              << " cyclic three-qubit reduced density matrices per trajectory to rho3.bin.\n";
+              << " cyclic three-qubit reduced density matrices per trajectory to rho3.bin"
+              << (fermion ? " using fermionic partial traces.\n" : ".\n");
 }
 
 
-void run_1d_tmi(int n, int periods, int realizations, int res, double p_min, double p_max)
+void run_1d_tmi(int n, int periods, int realizations, int res, double p_min, double p_max, bool fermion)
 {
     const int block_qubits = n / 4;
     const std::vector<TmiMatrixTerm> terms = tmi_terms_1d(n);
     std::vector<double> ps = linspace(p_min, p_max, res);
     std::ofstream infofile("info_tmi.csv");
 
-    infofile << "n,periods,realizations,resolution,p_min,p_max,tmi_block_qubits,terms\n";
+    infofile << "n,periods,realizations,resolution,p_min,p_max,fermion,tmi_block_qubits,terms\n";
     infofile << n << "," << periods << "," << realizations << "," << res << ","
-             << p_min << "," << p_max << "," << block_qubits << ",AB;AC;BC;D\n";
+             << p_min << "," << p_max << "," << (fermion ? 1 : 0) << ","
+             << block_qubits << ",AB;AC;BC;D\n";
 
     TmiMatrixWriter tmi_file(
         "rho_tmi.bin",
@@ -1334,14 +1807,24 @@ void run_1d_tmi(int n, int periods, int realizations, int res, double p_min, dou
                 start = std::chrono::steady_clock::now();
             }
 
-            auto layers = mipt_frontend(n, periods, p);
+            auto state = [&]() {
+                if (fermion)
+                {
+                    auto layers = mipt_fermion_frontend(n, periods, p, true);
+                    if (r == 0)
+                    {
+                        lap1 = std::chrono::steady_clock::now();
+                    }
+                    return cudaq::get_state(MIPTFermionKernel_1D{}, n, layers);
+                }
 
-            if (r == 0)
-            {
-                lap1 = std::chrono::steady_clock::now();
-            }
-
-            auto state = cudaq::get_state(MIPTKernel_1D{}, n, layers, true);
+                auto layers = mipt_frontend(n, periods, p);
+                if (r == 0)
+                {
+                    lap1 = std::chrono::steady_clock::now();
+                }
+                return cudaq::get_state(MIPTKernel_1D{}, n, layers, true);
+            }();
 
             if (r == 0)
             {
@@ -1349,7 +1832,7 @@ void run_1d_tmi(int n, int periods, int realizations, int res, double p_min, dou
             }
 
             std::vector<double> payload;
-            cudaq_tmi_density_matrices(state, n, terms, payload);
+            cudaq_tmi_density_matrices(state, n, terms, payload, fermion);
 
             if (r == 0)
             {
@@ -1403,7 +1886,8 @@ void run_1d_tmi(int n, int periods, int realizations, int res, double p_min, dou
     tmi_file.close();
     std::cout << "Saved TMI matrices per trajectory to rho_tmi.bin. "
               << "Stored terms: AB, AC, BC, D; block size="
-              << block_qubits << " modes.\n";
+              << block_qubits << " modes"
+              << (fermion ? " using fermionic partial traces.\n" : ".\n");
 }
 
 void run_2d(int x, int y, int periods, int realizations, int res, double p_min, double p_max)
@@ -1528,7 +2012,7 @@ int main(int argc, char *argv[])
          std::strcmp(argv[1], "-h") == 0))
     {
         std::cout << "Usage: " << argv[0]
-                  << " [d = 1] [n = 10] [periods = 10] [realizations = 10] [resolution = 5] [p_min = 0.0] [p_max = 1.0] [tmi = 0]\n";
+                  << " [d = 1] [n = 10] [periods = 10] [realizations = 10] [resolution = 5] [p_min = 0.0] [p_max = 1.0] [fermion = 0] [tmi = 0]\n";
         std::cout << "Description:\n";
         std::cout << "  d = dimensionality (1 or 2)\n";
         std::cout << "  n = number of qubits per dimension\n";
@@ -1537,11 +2021,12 @@ int main(int argc, char *argv[])
         std::cout << "  resolution = number of points\n";
         std::cout << "  p_min = minimum measurement rate\n";
         std::cout << "  p_max = maximum measurement rate\n";
+        std::cout << "  fermion = 0 uses the existing MMS/qubit circuit; fermion = 1 uses parity-preserving fermionic gates and JW FSWAP boundaries\n";
         std::cout << "  tmi = 0 writes the existing rho3.bin format; tmi = 1 writes rho_tmi.bin for four-block TMI\n";
         return 0;
     }
 
-    if (argc > 9)
+    if (argc > 10)
     {
         std::cerr << "Too many arguments. Use --help for usage.\n";
         return 2;
@@ -1554,7 +2039,12 @@ int main(int argc, char *argv[])
     int res = (argc > 5) ? std::stoi(argv[5]) : 5;
     double p_min = (argc > 6) ? std::stod(argv[6]) : 0.0;
     double p_max = (argc > 7) ? std::stod(argv[7]) : 1.0;
-    int tmi_output = (argc > 8) ? std::stoi(argv[8]) : 0;
+    int fermion = (argc > 8) ? std::stoi(argv[8]) : 0;
+    int tmi_output = (argc > 9) ? std::stoi(argv[9]) : 0;
+    if (fermion != 0 && fermion != 1)
+    {
+        throw std::invalid_argument("The optional fermion argument must be 0 or 1.");
+    }
     if (tmi_output != 0 && tmi_output != 1)
     {
         throw std::invalid_argument("The optional tmi argument must be 0 or 1.");
@@ -1564,18 +2054,24 @@ int main(int argc, char *argv[])
 
     if (d == 1)
     {
-        std::cout << "Running 1D " << n <<"-qubit simulation of " << realizations*res << " circuits.\n";
+        std::cout << "Running 1D " << n << "-qubit "
+                  << (fermion ? "fermionic" : "MMS/qubit")
+                  << " simulation of " << realizations*res << " circuits.\n";
         if (tmi_output == 1)
         {
-            run_1d_tmi(n, periods, realizations, res, p_min, p_max);
+            run_1d_tmi(n, periods, realizations, res, p_min, p_max, fermion != 0);
         }
         else
         {
-            run_1d(n, periods, realizations, res, p_min, p_max);
+            run_1d(n, periods, realizations, res, p_min, p_max, fermion != 0);
         }
     }
     else if (d == 2)
     {
+        if (fermion == 1)
+        {
+            throw std::invalid_argument("Fermionic circuit mode is currently defined only for 1D circuits.");
+        }
         if (tmi_output == 1)
         {
             throw std::invalid_argument("TMI output mode is currently defined only for 1D circuits.");

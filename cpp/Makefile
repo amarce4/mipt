@@ -3,10 +3,11 @@
 # Default build:
 #   make
 # produces:
-#   ./mipt.exe  - simulates circuits and saves complex RDM datasets
+#   ./mipt.exe  - simulates circuits and saves complex three-qubit RDM datasets
 #   ./gmn.exe   - reads rho3 datasets and computes GMN for every stored subsystem
 #   ./ring_inflation.exe - selects max-GMN subsystem per record and solves level-2 ring inflation with SCS
-#   ./tmi.exe   - reads MIPTTMI1 four-block TMI datasets and computes TMI
+#   ./tmi.exe  - reads rho_tmi.bin and computes TMI to p,tmi CSV
+#   ./sim_tmi.exe - simulates circuits and computes TMI online to p,tmi CSV
 #
 # CPU simulation:
 #   make GPU=0 CUDA_RHO=0
@@ -19,10 +20,6 @@
 #   ./gmn.exe 0 rho3.bin data_real.csv       # real-only GMN on Re(rho)
 #   ./gmn.exe 1 rho3.bin data_complex.csv    # full complex Hermitian GMN SDP
 #   ./ring_inflation.exe rho3.bin 2000 1e-3 300 [limit_per_p] [p_min p_max [record_start record_stop]]
-#
-# TMI analysis:
-#   ./tmi.exe 0 rho_tmi.bin tmi_qubit.csv [limit_per_p]
-#   ./tmi.exe 1 rho_tmi.bin tmi_fermion.csv [limit_per_p]
 
 NVQXX   ?= nvq++
 HOSTCXX ?= g++
@@ -41,14 +38,10 @@ OPENMP ?= 1
 NVQXXFLAGS_COMMON := -std=c++20 -O3 -DNDEBUG -march=native
 CXXFLAGS_COMMON   := -std=c++20 -O3 -DNDEBUG -march=native -I$(MOSEK_INC)
 CFLAGS_COMMON     := -std=c11 -O3 -DNDEBUG -march=native -I$(MOSEK_INC)
-TMI_CXXFLAGS      := -std=c++20 -O3 -DNDEBUG -march=native
 NVCCFLAGS         := -std=c++17 -O3
 MOSEK_LDFLAGS     := -L$(MOSEK_LIB) -Wl,-rpath,$(MOSEK_LIB)
 MOSEK_LIBS        := -lmosek64
-# tmi.cpp dynamically loads LAPACK at runtime through dlopen/dlsym.
-# On current glibc this may resolve without -ldl, but keeping -ldl is safer
-# across WSL/Ubuntu versions. Override with TMI_LDLIBS= if needed.
-TMI_LDLIBS        ?= -ldl
+DL_LIBS           ?= -ldl
 
 # ---- SCS C library configuration for ring_inflation.exe ----
 # SCS source/CMake installs commonly provide versioned direct/indirect solver
@@ -82,7 +75,6 @@ endif
 ifeq ($(OPENMP),1)
   CXXFLAGS_COMMON += -fopenmp
   CFLAGS_COMMON   += -fopenmp
-  TMI_CXXFLAGS    += -fopenmp
   HOST_LDFLAGS    += -fopenmp
 endif
 
@@ -106,22 +98,25 @@ GMN_OBJDIR  := build/gmn_capi_omp$(OPENMP)
 RING_OBJDIR := build/ring_scs_omp$(OPENMP)
 TMI_OBJDIR  := build/tmi_omp$(OPENMP)
 MIPT_BINARY := $(MIPT_OBJDIR)/mipt.exe
+SIM_TMI_BINARY := $(MIPT_OBJDIR)/sim_tmi.exe
 GMN_BINARY  := $(GMN_OBJDIR)/gmn.exe
 RING_BINARY := $(RING_OBJDIR)/ring_inflation.exe
 TMI_BINARY  := $(TMI_OBJDIR)/tmi.exe
 
 MIPT_OBJS := $(MIPT_OBJDIR)/mipt.o
+SIM_TMI_OBJS := $(MIPT_OBJDIR)/sim_tmi.o
 ifeq ($(CUDA_RHO),1)
   MIPT_OBJS += $(MIPT_OBJDIR)/rho_reduce.o
+  SIM_TMI_OBJS += $(MIPT_OBJDIR)/rho_reduce.o
 endif
 
 GMN_OBJS := $(GMN_OBJDIR)/gmn_main.o $(GMN_OBJDIR)/gmn_mosek_c.o
 RING_OBJS := $(RING_OBJDIR)/ring_inflation.o $(RING_OBJDIR)/gmn_mosek_c.o
 TMI_OBJS := $(TMI_OBJDIR)/tmi.o
 
-.PHONY: all clean cpu gpu print-config mipt.exe gmn.exe ring_inflation.exe tmi.exe
+.PHONY: all clean cpu gpu print-config mipt.exe sim_tmi.exe gmn.exe ring_inflation.exe tmi.exe
 
-all: mipt.exe gmn.exe ring_inflation.exe tmi.exe
+all: mipt.exe sim_tmi.exe gmn.exe ring_inflation.exe tmi.exe
 
 cpu:
 	$(MAKE) all GPU=0 CUDA_RHO=0
@@ -136,8 +131,8 @@ print-config:
 	@echo "MIPT_OBJDIR=$(MIPT_OBJDIR)"
 	@echo "GMN_OBJDIR=$(GMN_OBJDIR)"
 	@echo "RING_OBJDIR=$(RING_OBJDIR)"
-	@echo "TMI_OBJDIR=$(TMI_OBJDIR)"
 	@echo "MIPT_BINARY=$(MIPT_BINARY)"
+	@echo "SIM_TMI_BINARY=$(SIM_TMI_BINARY)"
 	@echo "GMN_BINARY=$(GMN_BINARY)"
 	@echo "RING_BINARY=$(RING_BINARY)"
 	@echo "TMI_BINARY=$(TMI_BINARY)"
@@ -145,11 +140,12 @@ print-config:
 	@echo "SCS_LIBFILE=$(SCS_LIBFILE)"
 	@echo "SCS_LDFLAGS=$(SCS_LDFLAGS)"
 	@echo "OPENMP=$(OPENMP)"
-	@echo "TMI_CXXFLAGS=$(TMI_CXXFLAGS)"
-	@echo "TMI_LDLIBS=$(TMI_LDLIBS)"
 
 mipt.exe: $(MIPT_BINARY)
 	cp $(MIPT_BINARY) $@
+
+sim_tmi.exe: $(SIM_TMI_BINARY)
+	cp $(SIM_TMI_BINARY) $@
 
 gmn.exe: $(GMN_BINARY)
 	cp $(GMN_BINARY) $@
@@ -163,14 +159,17 @@ tmi.exe: $(TMI_BINARY)
 $(MIPT_BINARY): $(MIPT_OBJS)
 	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $^ $(MIPT_CUDA_LIBS) -o $@
 
+$(SIM_TMI_BINARY): $(SIM_TMI_OBJS)
+	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $^ $(MIPT_CUDA_LIBS) $(DL_LIBS) -o $@
+
+$(TMI_BINARY): $(TMI_OBJS)
+	$(HOSTCXX) $(HOST_LDFLAGS) $^ $(DL_LIBS) -o $@
+
 $(GMN_BINARY): $(GMN_OBJS)
 	$(HOSTCXX) $(HOST_LDFLAGS) $^ $(MOSEK_LDFLAGS) $(MOSEK_LIBS) -o $@
 
 $(RING_BINARY): $(RING_OBJS)
 	$(HOSTCXX) $(HOST_LDFLAGS) $^ $(MOSEK_LDFLAGS) $(MOSEK_LIBS) $(SCS_LDFLAGS) -o $@
-
-$(TMI_BINARY): $(TMI_OBJS)
-	$(HOSTCXX) $(HOST_LDFLAGS) $^ $(TMI_LDLIBS) -o $@
 
 $(MIPT_OBJDIR):
 	mkdir -p $@
@@ -185,6 +184,9 @@ $(TMI_OBJDIR):
 	mkdir -p $@
 
 $(MIPT_OBJDIR)/mipt.o: mipt.cpp density_io.hpp rho_reduce.hpp | $(MIPT_OBJDIR)
+	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $(NVQXXFLAGS_COMMON) -c $< -o $@
+
+$(MIPT_OBJDIR)/sim_tmi.o: sim_tmi.cpp mipt.cpp density_io.hpp rho_reduce.hpp | $(MIPT_OBJDIR)
 	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $(NVQXXFLAGS_COMMON) -c $< -o $@
 
 $(MIPT_OBJDIR)/rho_reduce.o: rho_reduce.cu rho_reduce.hpp | $(MIPT_OBJDIR)
@@ -203,7 +205,7 @@ $(RING_OBJDIR)/gmn_mosek_c.o: gmn_mosek_c.c gmn.hpp | $(RING_OBJDIR)
 	$(HOSTCC) $(CFLAGS_COMMON) -c $< -o $@
 
 $(TMI_OBJDIR)/tmi.o: tmi.cpp | $(TMI_OBJDIR)
-	$(HOSTCXX) $(TMI_CXXFLAGS) -c $< -o $@
+	$(HOSTCXX) $(CXXFLAGS_COMMON) -c $< -o $@
 
 clean:
-	rm -rf build mipt.exe gmn.exe ring_inflation.exe tmi.exe *.tmp
+	rm -rf build mipt.exe sim_tmi.exe gmn.exe ring_inflation.exe tmi.exe *.tmp
