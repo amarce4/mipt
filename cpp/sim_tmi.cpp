@@ -1,16 +1,19 @@
 // sim_tmi.cpp
 //
 // Online TMI simulator for the MIPT codebase.  This executable reuses the
-// circuit-generation and reduced-density-matrix machinery from mipt.cpp, but it
-// does not write rho_tmi.bin.  Instead, it immediately computes
+// circuit-generation machinery from mipt.cpp, but it does not write rho_tmi.bin.
+// Instead, it immediately computes
 //
 //   I(A:B:C) = S(A) + S(B) + S(C) + S(D) - S(AB) - S(AC) - S(BC)
 //
-// from the four TMI matrices AB, AC, BC, D and writes only:
+// and writes only:
 //
 //   p,tmi
 //
-// to CSV.  This avoids the exponential storage blow-up of saving AB/AC/BC.
+// to CSV.  The fast path avoids materializing the half-system reduced density
+// matrices: S(AB), S(AC), and S(BC) are computed from Schmidt singular values,
+// while the small one-block entropies use BLAS Hermitian rank-k updates when
+// BLAS is available at runtime.
 
 #ifdef __has_include
 #if __has_include(<dlfcn.h>)
@@ -210,12 +213,16 @@ namespace sim_tmi
     namespace lapack_runtime
     {
         using zheevd_fn = void (*)(char *, char *, int *, C64 *, int *, double *, C64 *, int *, double *, int *, int *, int *, int *);
+        using zgesvd_fn = void (*)(char *, char *, int *, int *, C64 *, int *, double *, C64 *, int *, C64 *, int *, C64 *, int *, double *, int *);
+        using zherk_fn = void (*)(char *, char *, int *, int *, double *, C64 *, int *, double *, C64 *, int *);
 
         struct Handle
         {
             std::once_flag init_once;
-            void *library = nullptr;
+            std::vector<void *> libraries;
             zheevd_fn zheevd = nullptr;
+            zgesvd_fn zgesvd = nullptr;
+            zherk_fn zherk = nullptr;
             std::string status;
         };
 
@@ -230,30 +237,45 @@ namespace sim_tmi
             auto &h = handle();
 #ifdef SIM_TMI_HAS_DLFCN
             const char *library_names[] = {
+                "libopenblas.so.0",
+                "libopenblas.so",
                 "liblapack.so.3",
                 "liblapack.so",
-                "libopenblas.so.0",
-                "libopenblas.so"};
+                "libblas.so.3",
+                "libblas.so"};
 
             for (const char *name : library_names)
             {
-                h.library = dlopen(name, RTLD_LAZY | RTLD_LOCAL);
-                if (!h.library)
+                void *lib = dlopen(name, RTLD_LAZY | RTLD_LOCAL);
+                if (!lib)
                 {
                     continue;
                 }
-                h.zheevd = reinterpret_cast<zheevd_fn>(dlsym(h.library, "zheevd_"));
-                if (h.zheevd)
+                h.libraries.push_back(lib);
+                if (!h.zheevd)
                 {
-                    h.status = std::string("using LAPACK zheevd_ from ") + name;
-                    return;
+                    h.zheevd = reinterpret_cast<zheevd_fn>(dlsym(lib, "zheevd_"));
                 }
-                dlclose(h.library);
-                h.library = nullptr;
+                if (!h.zgesvd)
+                {
+                    h.zgesvd = reinterpret_cast<zgesvd_fn>(dlsym(lib, "zgesvd_"));
+                }
+                if (!h.zherk)
+                {
+                    h.zherk = reinterpret_cast<zherk_fn>(dlsym(lib, "zherk_"));
+                }
             }
-            h.status = "LAPACK zheevd_ could not be loaded; using slower Jacobi fallback";
+
+            h.status = "LAPACK/BLAS:";
+            h.status += h.zheevd ? " zheevd" : " no-zheevd";
+            h.status += h.zgesvd ? " zgesvd" : " no-zgesvd";
+            h.status += h.zherk ? " zherk" : " no-zherk";
+            if (!h.zheevd || !h.zgesvd)
+            {
+                h.status += "; missing symbols force slower fallbacks";
+            }
 #else
-            h.status = "<dlfcn.h> is unavailable; using slower Jacobi fallback";
+            h.status = "<dlfcn.h> is unavailable; using slower Jacobi/reduction fallbacks";
 #endif
         }
 
@@ -262,6 +284,20 @@ namespace sim_tmi
             auto &h = handle();
             std::call_once(h.init_once, initialize);
             return h.zheevd;
+        }
+
+        zgesvd_fn zgesvd()
+        {
+            auto &h = handle();
+            std::call_once(h.init_once, initialize);
+            return h.zgesvd;
+        }
+
+        zherk_fn zherk()
+        {
+            auto &h = handle();
+            std::call_once(h.init_once, initialize);
+            return h.zherk;
         }
 
         const std::string &status()
@@ -395,6 +431,460 @@ namespace sim_tmi
     {
         fill_complex_from_ri_ptr(rho_ri, dim, matrix_buffer);
         return entropy_hermitian_inplace(matrix_buffer, dim, entropy_ws);
+    }
+
+    struct SvdWorkspace
+    {
+        std::size_t rows = 0;
+        std::size_t cols = 0;
+        std::vector<double> singular_values;
+        std::vector<C64> work;
+        std::vector<double> rwork;
+    };
+
+    double entropy_from_singular_values(const std::vector<double> &singular_values)
+    {
+        double entropy = 0.0;
+        for (double sigma : singular_values)
+        {
+            const double lambda = sigma * sigma;
+            entropy += entropy_from_eigenvalue(lambda);
+        }
+        return finish_entropy(entropy);
+    }
+
+    void prepare_zgesvd_workspace(std::size_t rows, std::size_t cols, SvdWorkspace &ws)
+    {
+        if (ws.rows == rows && ws.cols == cols)
+        {
+            return;
+        }
+        if (rows == 0 || cols == 0 ||
+            rows > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
+            cols > static_cast<std::size_t>(std::numeric_limits<int>::max()))
+        {
+            throw std::runtime_error("Invalid matrix dimensions for LAPACK zgesvd.");
+        }
+
+        auto zgesvd = lapack_runtime::zgesvd();
+        if (!zgesvd)
+        {
+            throw std::runtime_error("LAPACK zgesvd_ is unavailable.");
+        }
+
+        int m = static_cast<int>(rows);
+        int n = static_cast<int>(cols);
+        int lda = static_cast<int>(rows);
+        int min_dim = std::min(m, n);
+        int ldu = 1;
+        int ldvt = 1;
+        int lwork = -1;
+        int info = 0;
+        char jobu = 'N';
+        char jobvt = 'N';
+        C64 dummy_a(0.0, 0.0);
+        C64 dummy_u(0.0, 0.0);
+        C64 dummy_vt(0.0, 0.0);
+        C64 work_query(0.0, 0.0);
+        std::vector<double> query_s(static_cast<std::size_t>(min_dim), 0.0);
+        std::vector<double> query_rwork(static_cast<std::size_t>(std::max(1, 5 * min_dim)), 0.0);
+
+        zgesvd(&jobu, &jobvt, &m, &n, &dummy_a, &lda, query_s.data(),
+               &dummy_u, &ldu, &dummy_vt, &ldvt, &work_query, &lwork,
+               query_rwork.data(), &info);
+        if (info != 0)
+        {
+            throw std::runtime_error("LAPACK zgesvd workspace query failed.");
+        }
+
+        const int lwork_opt = std::max(1, static_cast<int>(std::ceil(work_query.real())));
+        ws.rows = rows;
+        ws.cols = cols;
+        ws.singular_values.assign(static_cast<std::size_t>(min_dim), 0.0);
+        ws.work.assign(static_cast<std::size_t>(lwork_opt), C64(0.0, 0.0));
+        ws.rwork.assign(static_cast<std::size_t>(std::max(1, 5 * min_dim)), 0.0);
+    }
+
+    double entropy_svd_inplace(std::vector<C64> &matrix_col_major,
+                               std::size_t rows,
+                               std::size_t cols,
+                               SvdWorkspace &ws)
+    {
+        if (matrix_col_major.size() != rows * cols)
+        {
+            throw std::invalid_argument("Invalid matrix size passed to entropy_svd_inplace.");
+        }
+        if (rows == 1 || cols == 1)
+        {
+            // A normalized pure-state coefficient vector has exactly one
+            // non-zero Schmidt coefficient.
+            return 0.0;
+        }
+
+        prepare_zgesvd_workspace(rows, cols, ws);
+        auto zgesvd = lapack_runtime::zgesvd();
+        int m = static_cast<int>(rows);
+        int n = static_cast<int>(cols);
+        int lda = static_cast<int>(rows);
+        int ldu = 1;
+        int ldvt = 1;
+        int lwork = static_cast<int>(ws.work.size());
+        int info = 0;
+        char jobu = 'N';
+        char jobvt = 'N';
+        C64 dummy_u(0.0, 0.0);
+        C64 dummy_vt(0.0, 0.0);
+
+        zgesvd(&jobu, &jobvt, &m, &n, matrix_col_major.data(), &lda,
+               ws.singular_values.data(), &dummy_u, &ldu, &dummy_vt, &ldvt,
+               ws.work.data(), &lwork, ws.rwork.data(), &info);
+        if (info != 0)
+        {
+            throw std::runtime_error("LAPACK zgesvd failed while computing a Schmidt spectrum.");
+        }
+        return entropy_from_singular_values(ws.singular_values);
+    }
+
+    std::vector<int> complement_modes(int n, const std::vector<int> &modes)
+    {
+        std::vector<unsigned char> kept(static_cast<std::size_t>(n), 0);
+        for (int q : modes)
+        {
+            if (q < 0 || q >= n)
+            {
+                throw std::invalid_argument("Subsystem mode index is out of range.");
+            }
+            if (kept[static_cast<std::size_t>(q)])
+            {
+                throw std::invalid_argument("Subsystem mode list contains duplicates.");
+            }
+            kept[static_cast<std::size_t>(q)] = 1;
+        }
+
+        std::vector<int> env;
+        env.reserve(static_cast<std::size_t>(n - static_cast<int>(modes.size())));
+        for (int q = 0; q < n; ++q)
+        {
+            if (!kept[static_cast<std::size_t>(q)])
+            {
+                env.push_back(q);
+            }
+        }
+        return env;
+    }
+
+    std::vector<std::uint64_t> basis_offsets(const std::vector<int> &modes)
+    {
+        if (modes.size() >= 63)
+        {
+            throw std::invalid_argument("Mode count is too large for uint64_t basis indexing.");
+        }
+        const std::uint64_t dim = std::uint64_t{1} << modes.size();
+        std::vector<std::uint64_t> offsets(static_cast<std::size_t>(dim), 0);
+        for (std::uint64_t basis = 0; basis < dim; ++basis)
+        {
+            std::uint64_t offset = 0;
+            for (std::size_t k = 0; k < modes.size(); ++k)
+            {
+                offset |= ((basis >> k) & std::uint64_t{1}) << modes[k];
+            }
+            offsets[static_cast<std::size_t>(basis)] = offset;
+        }
+        return offsets;
+    }
+
+    std::vector<std::uint64_t> fermion_cross_masks_by_row(const std::vector<int> &kept_modes,
+                                                           const std::vector<int> &env_modes)
+    {
+        if (env_modes.size() >= 63)
+        {
+            throw std::invalid_argument("Environment mode count is too large for uint64_t sign masks.");
+        }
+        const std::uint64_t kept_dim = std::uint64_t{1} << kept_modes.size();
+        std::vector<std::uint64_t> masks(static_cast<std::size_t>(kept_dim), 0);
+
+        std::vector<std::uint64_t> lower_env_mask(kept_modes.size(), 0);
+        for (std::size_t k = 0; k < kept_modes.size(); ++k)
+        {
+            std::uint64_t mask = 0;
+            for (std::size_t e = 0; e < env_modes.size(); ++e)
+            {
+                if (env_modes[e] < kept_modes[k])
+                {
+                    mask |= std::uint64_t{1} << e;
+                }
+            }
+            lower_env_mask[k] = mask;
+        }
+
+        for (std::uint64_t row = 0; row < kept_dim; ++row)
+        {
+            std::uint64_t mask = 0;
+            for (std::size_t k = 0; k < kept_modes.size(); ++k)
+            {
+                if ((row >> k) & std::uint64_t{1})
+                {
+                    mask ^= lower_env_mask[k];
+                }
+            }
+            masks[static_cast<std::size_t>(row)] = mask;
+        }
+        return masks;
+    }
+
+    inline bool odd_popcount(std::uint64_t x)
+    {
+#if defined(__GNUG__) || defined(__clang__)
+        return (__builtin_popcountll(x) & 1) != 0;
+#else
+        bool parity = false;
+        while (x)
+        {
+            parity = !parity;
+            x &= x - 1;
+        }
+        return parity;
+#endif
+    }
+
+    template <typename Real>
+    inline C64 state_value_as_c64(const std::complex<Real> &z)
+    {
+        return C64(static_cast<double>(std::real(z)),
+                   static_cast<double>(std::imag(z)));
+    }
+
+    struct StateEntropyWorkspace
+    {
+        SvdWorkspace svd;
+        EntropyWorkspace entropy;
+        std::vector<C64> matrix_col_major;
+        std::vector<C64> coeff_chunk_col_major;
+        std::vector<C64> rdm_col_major;
+        std::vector<C64> rdm_row_major;
+        std::vector<C64> row_values;
+        std::vector<std::uint64_t> row_offsets;
+        std::vector<std::uint64_t> env_offsets;
+        std::vector<std::uint64_t> row_cross_masks;
+    };
+
+    template <typename Real>
+    void build_coefficient_matrix_col_major(const std::complex<Real> *psi,
+                                            int n,
+                                            const std::vector<int> &kept_modes,
+                                            bool fermion_trace,
+                                            StateEntropyWorkspace &ws)
+    {
+        const std::vector<int> env_modes = complement_modes(n, kept_modes);
+        const std::size_t rows = std::size_t{1} << kept_modes.size();
+        const std::size_t cols = std::size_t{1} << env_modes.size();
+        ws.row_offsets = basis_offsets(kept_modes);
+        ws.env_offsets = basis_offsets(env_modes);
+        if (fermion_trace)
+        {
+            ws.row_cross_masks = fermion_cross_masks_by_row(kept_modes, env_modes);
+        }
+        else
+        {
+            ws.row_cross_masks.assign(rows, 0);
+        }
+
+        if (cols != 0 && rows > std::numeric_limits<std::size_t>::max() / cols)
+        {
+            throw std::bad_alloc();
+        }
+        ws.matrix_col_major.resize(rows * cols);
+        for (std::size_t col = 0; col < cols; ++col)
+        {
+            const std::uint64_t env_offset = ws.env_offsets[col];
+            for (std::size_t row = 0; row < rows; ++row)
+            {
+                C64 value = state_value_as_c64(psi[env_offset | ws.row_offsets[row]]);
+                if (fermion_trace && odd_popcount(static_cast<std::uint64_t>(col) & ws.row_cross_masks[row]))
+                {
+                    value = -value;
+                }
+                ws.matrix_col_major[row + col * rows] = value;
+            }
+        }
+    }
+
+    template <typename Real>
+    double entropy_subsystem_svd_from_state(const std::complex<Real> *psi,
+                                            int n,
+                                            const std::vector<int> &kept_modes,
+                                            bool fermion_trace,
+                                            StateEntropyWorkspace &ws)
+    {
+        if (!lapack_runtime::zgesvd())
+        {
+            throw std::runtime_error("Fast state-vector TMI needs LAPACK zgesvd_.");
+        }
+        build_coefficient_matrix_col_major(psi, n, kept_modes, fermion_trace, ws);
+        const std::vector<int> env_modes = complement_modes(n, kept_modes);
+        const std::size_t rows = std::size_t{1} << kept_modes.size();
+        const std::size_t cols = std::size_t{1} << env_modes.size();
+        return entropy_svd_inplace(ws.matrix_col_major, rows, cols, ws.svd);
+    }
+
+    template <typename Real>
+    void reduced_density_manual_from_state(const std::complex<Real> *psi,
+                                           int n,
+                                           const std::vector<int> &kept_modes,
+                                           bool fermion_trace,
+                                           StateEntropyWorkspace &ws,
+                                           std::vector<C64> &out_row_major)
+    {
+        const std::vector<int> env_modes = complement_modes(n, kept_modes);
+        const std::size_t rows = std::size_t{1} << kept_modes.size();
+        const std::size_t cols = std::size_t{1} << env_modes.size();
+        ws.row_offsets = basis_offsets(kept_modes);
+        ws.env_offsets = basis_offsets(env_modes);
+        ws.row_values.assign(rows, C64(0.0, 0.0));
+        if (fermion_trace)
+        {
+            ws.row_cross_masks = fermion_cross_masks_by_row(kept_modes, env_modes);
+        }
+        else
+        {
+            ws.row_cross_masks.assign(rows, 0);
+        }
+
+        out_row_major.assign(rows * rows, C64(0.0, 0.0));
+        for (std::size_t col = 0; col < cols; ++col)
+        {
+            const std::uint64_t env_offset = ws.env_offsets[col];
+            for (std::size_t row = 0; row < rows; ++row)
+            {
+                C64 value = state_value_as_c64(psi[env_offset | ws.row_offsets[row]]);
+                if (fermion_trace && odd_popcount(static_cast<std::uint64_t>(col) & ws.row_cross_masks[row]))
+                {
+                    value = -value;
+                }
+                ws.row_values[row] = value;
+            }
+            for (std::size_t row = 0; row < rows; ++row)
+            {
+                const C64 a = ws.row_values[row];
+                for (std::size_t crow = 0; crow < rows; ++crow)
+                {
+                    out_row_major[row * rows + crow] += a * std::conj(ws.row_values[crow]);
+                }
+            }
+        }
+    }
+
+    template <typename Real>
+    bool reduced_density_zherk_from_state(const std::complex<Real> *psi,
+                                          int n,
+                                          const std::vector<int> &kept_modes,
+                                          bool fermion_trace,
+                                          StateEntropyWorkspace &ws,
+                                          std::vector<C64> &out_row_major)
+    {
+        auto zherk = lapack_runtime::zherk();
+        if (!zherk)
+        {
+            return false;
+        }
+
+        const std::vector<int> env_modes = complement_modes(n, kept_modes);
+        const std::size_t rows = std::size_t{1} << kept_modes.size();
+        const std::size_t cols = std::size_t{1} << env_modes.size();
+        if (rows > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
+            cols > static_cast<std::size_t>(std::numeric_limits<int>::max()))
+        {
+            return false;
+        }
+
+        ws.row_offsets = basis_offsets(kept_modes);
+        ws.env_offsets = basis_offsets(env_modes);
+        if (fermion_trace)
+        {
+            ws.row_cross_masks = fermion_cross_masks_by_row(kept_modes, env_modes);
+        }
+        else
+        {
+            ws.row_cross_masks.assign(rows, 0);
+        }
+
+        ws.rdm_col_major.assign(rows * rows, C64(0.0, 0.0));
+        const std::size_t target_chunk_bytes = 64u << 20;
+        const std::size_t min_chunk_cols = 1;
+        const std::size_t max_chunk_cols = std::max<std::size_t>(
+            min_chunk_cols,
+            target_chunk_bytes / std::max<std::size_t>(1, rows * sizeof(C64)));
+
+        char uplo = 'U';
+        char trans = 'N';
+        int n_blas = static_cast<int>(rows);
+        int lda = static_cast<int>(rows);
+        int ldc = static_cast<int>(rows);
+        double alpha = 1.0;
+        bool first = true;
+
+        for (std::size_t col0 = 0; col0 < cols; col0 += max_chunk_cols)
+        {
+            const std::size_t chunk_cols = std::min(max_chunk_cols, cols - col0);
+            ws.coeff_chunk_col_major.resize(rows * chunk_cols);
+            for (std::size_t local_col = 0; local_col < chunk_cols; ++local_col)
+            {
+                const std::size_t col = col0 + local_col;
+                const std::uint64_t env_offset = ws.env_offsets[col];
+                for (std::size_t row = 0; row < rows; ++row)
+                {
+                    C64 value = state_value_as_c64(psi[env_offset | ws.row_offsets[row]]);
+                    if (fermion_trace && odd_popcount(static_cast<std::uint64_t>(col) & ws.row_cross_masks[row]))
+                    {
+                        value = -value;
+                    }
+                    ws.coeff_chunk_col_major[row + local_col * rows] = value;
+                }
+            }
+
+            int k_blas = static_cast<int>(chunk_cols);
+            double beta = first ? 0.0 : 1.0;
+            zherk(&uplo, &trans, &n_blas, &k_blas, &alpha,
+                  ws.coeff_chunk_col_major.data(), &lda, &beta,
+                  ws.rdm_col_major.data(), &ldc);
+            first = false;
+        }
+
+        out_row_major.assign(rows * rows, C64(0.0, 0.0));
+        for (std::size_t j = 0; j < rows; ++j)
+        {
+            for (std::size_t i = 0; i <= j; ++i)
+            {
+                C64 value = ws.rdm_col_major[i + j * rows];
+                if (i == j)
+                {
+                    value = C64(value.real(), 0.0);
+                }
+                out_row_major[i * rows + j] = value;
+                out_row_major[j * rows + i] = std::conj(value);
+            }
+        }
+        return true;
+    }
+
+    template <typename Real>
+    double entropy_subsystem_rdm_from_state(const std::complex<Real> *psi,
+                                            int n,
+                                            const std::vector<int> &kept_modes,
+                                            bool fermion_trace,
+                                            StateEntropyWorkspace &ws)
+    {
+        const std::size_t rows = std::size_t{1} << kept_modes.size();
+        if (rows == 1)
+        {
+            return 0.0;
+        }
+
+        if (!reduced_density_zherk_from_state(psi, n, kept_modes, fermion_trace, ws, ws.rdm_row_major))
+        {
+            reduced_density_manual_from_state(psi, n, kept_modes, fermion_trace, ws, ws.rdm_row_major);
+        }
+        return entropy_hermitian_inplace(ws.rdm_row_major, rows, ws.entropy);
     }
 
     int index_from_new_mode_order(int new_index, const std::vector<int> &new_mode_order)
@@ -581,6 +1071,16 @@ namespace sim_tmi
         std::vector<C64> rho_b;
         std::vector<C64> rho_c;
         std::vector<C64> direct_matrix;
+
+        StateEntropyWorkspace entropy_a;
+        StateEntropyWorkspace entropy_b;
+        StateEntropyWorkspace entropy_c;
+        StateEntropyWorkspace entropy_d;
+        StateEntropyWorkspace entropy_ab;
+        StateEntropyWorkspace entropy_ac;
+        StateEntropyWorkspace entropy_bc;
+        std::vector<std::complex<double>> host_state_f64;
+        std::vector<std::complex<float>> host_state_f32;
     };
 
     double tmi_from_payload(const std::vector<double> &payload,
@@ -622,6 +1122,95 @@ namespace sim_tmi
         const double s_bc = entropy_ri_ptr(term_ptrs[2], pair_dim, workspace.direct_matrix, workspace.entropy);
 
         return s_a + s_b + s_c + s_d - s_ab - s_ac - s_bc;
+    }
+
+    template <typename Real>
+    double tmi_from_statevector(const std::complex<Real> *psi,
+                                int n,
+                                std::uint32_t block_qubits,
+                                bool fermion_trace,
+                                TmiWorkspace &workspace)
+    {
+        const int block = static_cast<int>(block_qubits);
+        const std::vector<int> A = mode_range(0 * block, block);
+        const std::vector<int> B = mode_range(1 * block, block);
+        const std::vector<int> C = mode_range(2 * block, block);
+        const std::vector<int> D = mode_range(3 * block, block);
+        const std::vector<int> AB = concatenate_modes(A, B);
+        const std::vector<int> AC = concatenate_modes(A, C);
+        const std::vector<int> BC = concatenate_modes(B, C);
+
+        const double s_a = entropy_subsystem_rdm_from_state(
+            psi, n, A, fermion_trace, workspace.entropy_a);
+        const double s_b = entropy_subsystem_rdm_from_state(
+            psi, n, B, fermion_trace, workspace.entropy_b);
+        const double s_c = entropy_subsystem_rdm_from_state(
+            psi, n, C, fermion_trace, workspace.entropy_c);
+        const double s_d = entropy_subsystem_rdm_from_state(
+            psi, n, D, fermion_trace, workspace.entropy_d);
+
+        const double s_ab = entropy_subsystem_svd_from_state(
+            psi, n, AB, fermion_trace, workspace.entropy_ab);
+        const double s_ac = entropy_subsystem_svd_from_state(
+            psi, n, AC, fermion_trace, workspace.entropy_ac);
+        const double s_bc = entropy_subsystem_svd_from_state(
+            psi, n, BC, fermion_trace, workspace.entropy_bc);
+
+        return s_a + s_b + s_c + s_d - s_ab - s_ac - s_bc;
+    }
+
+    double tmi_from_cudaq_state_fast(cudaq::state &state,
+                                     int n,
+                                     std::uint32_t block_qubits,
+                                     bool fermion_trace,
+                                     TmiWorkspace &workspace)
+    {
+        const std::uint64_t dim_u64 = checked_pow2_u64(n);
+        if (dim_u64 > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()))
+        {
+            throw std::invalid_argument("State-vector dimension does not fit in size_t.");
+        }
+        const std::size_t dim = static_cast<std::size_t>(dim_u64);
+        const auto precision = state.get_precision();
+        const auto tensor = state.get_tensor();
+
+        if (tensor.get_rank() != 1 || tensor.get_num_elements() < dim)
+        {
+            throw std::runtime_error("Expected a contiguous rank-1 CUDA-Q statevector tensor.");
+        }
+
+        if (precision == cudaq::SimulationState::precision::fp64)
+        {
+            if (state.is_on_gpu())
+            {
+                workspace.host_state_f64.resize(dim);
+                state.to_host(workspace.host_state_f64.data(), workspace.host_state_f64.size());
+                return tmi_from_statevector(workspace.host_state_f64.data(), n, block_qubits,
+                                            fermion_trace, workspace);
+            }
+            if (tensor.data == nullptr)
+            {
+                throw std::runtime_error("CUDA-Q state tensor has a null data pointer.");
+            }
+            return tmi_from_statevector(
+                reinterpret_cast<const std::complex<double> *>(tensor.data),
+                n, block_qubits, fermion_trace, workspace);
+        }
+
+        if (state.is_on_gpu())
+        {
+            workspace.host_state_f32.resize(dim);
+            state.to_host(workspace.host_state_f32.data(), workspace.host_state_f32.size());
+            return tmi_from_statevector(workspace.host_state_f32.data(), n, block_qubits,
+                                        fermion_trace, workspace);
+        }
+        if (tensor.data == nullptr)
+        {
+            throw std::runtime_error("CUDA-Q state tensor has a null data pointer.");
+        }
+        return tmi_from_statevector(
+            reinterpret_cast<const std::complex<float> *>(tensor.data),
+            n, block_qubits, fermion_trace, workspace);
     }
 
     std::string format_duration(double seconds)
@@ -711,7 +1300,12 @@ namespace sim_tmi
                   << ", block_qubits=" << block_qubits
                   << ", mode=" << (fermion ? "fermion" : "qubit/MMS")
                   << ", output=" << output_path << '\n'
-                  << "entropy_backend=" << lapack_runtime::status() << '\n';
+                  << "entropy_backend=" << lapack_runtime::status() << '\n'
+                  << "tmi_method="
+                  << (lapack_runtime::zgesvd()
+                          ? "state-vector Schmidt/SVD for half cuts + BLAS HERK small-cut path when available"
+                          : "legacy reduced-density-matrix fallback")
+                  << '\n';
 
         TmiWorkspace workspace;
         std::string line_buffer;
@@ -738,9 +1332,29 @@ namespace sim_tmi
                     return cudaq::get_state(MIPTKernel_1D{}, n, layers, true);
                 }();
 
-                std::vector<double> payload;
-                cudaq_tmi_density_matrices(state, n, terms, payload, fermion);
-                const double tmi = tmi_from_payload(payload, block_qubits, terms, plans, workspace);
+                double tmi = 0.0;
+                if (lapack_runtime::zgesvd())
+                {
+                    try
+                    {
+                        tmi = tmi_from_cudaq_state_fast(state, n, block_qubits, fermion, workspace);
+                    }
+                    catch (const std::bad_alloc &)
+                    {
+                        throw std::runtime_error(
+                            "Out of host memory while building a Schmidt matrix for fast TMI. "
+                            "For N=24 and especially N=28, the exact half-cut SVD still requires a large "
+                            "host matrix; ensure enough RAM/swap or reduce concurrent memory pressure.");
+                    }
+                }
+                else
+                {
+                    // Compatibility path for systems without a usable LAPACK SVD.
+                    // This is exact but much slower because it materializes pair RDMs.
+                    std::vector<double> payload;
+                    cudaq_tmi_density_matrices(state, n, terms, payload, fermion);
+                    tmi = tmi_from_payload(payload, block_qubits, terms, plans, workspace);
+                }
 
                 append_double(line_buffer, p);
                 line_buffer.push_back(',');

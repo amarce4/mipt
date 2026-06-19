@@ -9,6 +9,10 @@
 #   ./tmi.exe  - reads rho_tmi.bin and computes TMI to p,tmi CSV
 #   ./sim_tmi.exe - simulates circuits and computes TMI online to p,tmi CSV
 #
+# sim_tmi.exe dynamically loads LAPACK/BLAS symbols at runtime.  Installing
+# OpenBLAS/LAPACK enables the fast exact Schmidt-SVD path; otherwise it falls
+# back to the older reduced-density-matrix path.
+#
 # CPU simulation:
 #   make GPU=0 CUDA_RHO=0
 #
