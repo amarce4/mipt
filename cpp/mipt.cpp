@@ -1793,9 +1793,9 @@ void run_1d(int n, int periods, int realizations, int res, double p_min, double 
     std::vector<double> ps = linspace(p_min, p_max, res);
     std::ofstream infofile("info.csv");
 
-    infofile << "n,periods,realizations,resolution,p_min,p_max,fermion\n";
+    infofile << "n,periods,realizations,resolution,p_min,p_max,fermion,rgs\n";
     infofile << n << "," << periods << "," << realizations << "," << res << ","
-             << p_min << "," << p_max << "," << (fermion ? 1 : 0) << "\n";
+             << p_min << "," << p_max << "," << (fermion ? 1 : 0) << "," << (rgs ? 1 : 0) << "\n";
 
     mipt_io::DensityMatrixWriter rho3_file(
         "rho3.bin",
@@ -1912,17 +1912,17 @@ void run_1d(int n, int periods, int realizations, int res, double p_min, double 
 }
 
 
-void run_1d_tmi(int n, int periods, int realizations, int res, double p_min, double p_max, bool fermion)
+void run_1d_tmi(int n, int periods, int realizations, int res, double p_min, double p_max, bool fermion, bool rgs=false)
 {
     const int block_qubits = n / 4;
     const std::vector<TmiMatrixTerm> terms = tmi_terms_1d(n);
     std::vector<double> ps = linspace(p_min, p_max, res);
     std::ofstream infofile("info_tmi.csv");
 
-    infofile << "n,periods,realizations,resolution,p_min,p_max,fermion,tmi_block_qubits,terms\n";
+    infofile << "n,periods,realizations,resolution,p_min,p_max,fermion,rgs,tmi_block_qubits,terms\n";
     infofile << n << "," << periods << "," << realizations << "," << res << ","
              << p_min << "," << p_max << "," << (fermion ? 1 : 0) << ","
-             << block_qubits << ",AB;AC;BC;D\n";
+             << (rgs ? 1 : 0) << "," << block_qubits << ",AB;AC;BC;D\n";
 
     TmiMatrixWriter tmi_file(
         "rho_tmi.bin",
@@ -1958,6 +1958,14 @@ void run_1d_tmi(int n, int periods, int realizations, int res, double p_min, dou
             auto state = [&]() {
                 if (fermion)
                 {
+                    if(rgs){
+                        auto layers = frgs_mipt_frontend(n, periods, p);
+                        if (r == 0)
+                        {
+                            lap1 = std::chrono::steady_clock::now();
+                        }
+                        return cudaq::get_state(MIPTKernel_1D_FRGS{}, n, layers, true);
+                    }
                     auto layers = mipt_fermion_frontend(n, periods, p, true);
                     if (r == 0)
                     {
