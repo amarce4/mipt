@@ -163,15 +163,15 @@ def random_mipt_1d_ferm(n, d, p, closed=True, seed=None):
             if rng.random() < p:
                 qc.measure(qubit, qubit)
 
-    if rng.random() < 0.5:
-        # 50% chance of an extra even layer at the end.
-        for qubit in range(0, n, 2):
-            U = random_parity_preserving_gate(seed=_child_seed(rng))
-            qc.append(U, [qubit, qubit + 1])
+    # if rng.random() < 0.5:
+    #     # 50% chance of an extra even layer at the end.
+    #     for qubit in range(0, n, 2):
+    #         U = random_parity_preserving_gate(seed=_child_seed(rng))
+    #         qc.append(U, [qubit, qubit + 1])
 
-        for qubit in range(n):
-            if rng.random() < p:
-                qc.measure(qubit, qubit)
+    #     for qubit in range(n):
+    #         if rng.random() < p:
+    #             qc.measure(qubit, qubit)
 
     return qc
 
