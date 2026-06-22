@@ -1570,6 +1570,7 @@ std::vector<FRGSLayerData> frgs_mipt_frontend(int n,
                                      double p)
 {
     std::mt19937 rng(std::random_device{}());
+    std::bernoulli_distribution extra_even_layer(0.5);
 
     std::vector<FRGSLayerData> layers;
     layers.reserve(2 * periods + 1);
@@ -1581,8 +1582,7 @@ std::vector<FRGSLayerData> frgs_mipt_frontend(int n,
     }
 
     // Implement final even layer with 50% probability.
-    std::bernoulli_distribution coin_flip(0.5);
-    if(coin_flip(rng)){
+    if(extra_even_layer(rng)){
         layers.push_back(make_frgs_mipt_layer(n, 0, p, rng));
     }
 
