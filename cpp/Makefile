@@ -8,6 +8,7 @@
 #   ./ring_inflation.exe - selects max-GMN subsystem per record and solves level-2 ring inflation with SCS
 #   ./tmi.exe  - reads rho_tmi.bin and computes TMI to p,tmi CSV
 #   ./sim_tmi.exe - simulates circuits and computes TMI online to p,tmi CSV
+#                 accepts fermion=0 (MMS/qubit), 1 (Haar fermion), or 2 (FRGS fermion)
 #
 # sim_tmi.exe dynamically loads LAPACK/BLAS symbols at runtime.  Installing
 # OpenBLAS/LAPACK enables the fast exact Schmidt-SVD path; otherwise it falls
@@ -190,7 +191,7 @@ $(TMI_OBJDIR):
 $(MIPT_OBJDIR)/mipt.o: mipt.cpp density_io.hpp rho_reduce.hpp | $(MIPT_OBJDIR)
 	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $(NVQXXFLAGS_COMMON) -c $< -o $@
 
-$(MIPT_OBJDIR)/sim_tmi.o: sim_tmi.cpp mipt.cpp density_io.hpp rho_reduce.hpp | $(MIPT_OBJDIR)
+$(MIPT_OBJDIR)/sim_tmi.o: sim_tmi.cpp mipt.cpp mipt_fermion.cpp density_io.hpp rho_reduce.hpp | $(MIPT_OBJDIR)
 	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $(NVQXXFLAGS_COMMON) -c $< -o $@
 
 $(MIPT_OBJDIR)/rho_reduce.o: rho_reduce.cu rho_reduce.hpp | $(MIPT_OBJDIR)

@@ -1384,6 +1384,93 @@ struct MIPTKernel_2D
     }
 };
 
+struct FRGSLayerData //LayerData for fermions with a reduced gate set
+{
+    int start = 0;
+
+    std::vector<int> measure_flags;
+
+    // This flag can be 1 simultaneously with the others, but the others should not overlap with each other.
+    std::vector<int> rot_z_flags;
+    // Exactly one of these should be 1 for each qubit. 
+    // Because these are two-layer gates, only the first qubit of each gate (last qubit if it's the wrapping gate) will determine if
+    // we apply the gate or not.
+    std::vector<int> rot_xx_flags;
+    std::vector<int> rot_zz_flags;
+};
+
+struct MIPTKernel_1D_FRGS
+{
+    void operator()(int n,
+                    const std::vector<FRGSLayerData> &flayers,
+                    bool closed) __qpu__
+    {
+        cudaq::qvector q(n);
+
+        for (std::size_t layer = 0; layer < flayers.size(); ++layer)
+        {
+            int start = flayers[layer].start;
+
+            for (int i = start; i < n - 1; i += 2)
+            {
+                int j = (i+1) % n;
+                // Local rotation on q[i]
+                if (flayers[layer].rot_z_flags[i])
+                {
+                    rz(0.392699081698724154808, q[i]); //pi/8 Z rotation, i.e. T gate
+                }
+                if (flayers[layer].rot_z_flags[j])
+                {
+                    rz(0.392699081698724154808, q[j]);
+                }
+                // Local XX or ZZ rotation
+                if (flayers[layer].rot_xx_flags[i]) //pi/4 XX rotation (i.e. conjugate of Molmer-Sorensen)
+                {
+                    if(j < i){// If we're wrapping, we need to apply a Jordan-Wigner string of conditional phase gates
+                        // If q[i] occupancy changes, need to apply a Z to all sites between j and i. We can implement this by
+                        // applying a CZ between q[i] and each site between j and i, and then doing it again after the XX rotation.  
+                        // If the occupancy of q[i] changes, we've effectively applied the Z gates, and if it doesn't change, these gates cancel out.
+                        for(int k = j+1; k < i; k++){
+                            cz(3.14159265358979323846, q[k],q[i]);
+                        }
+                        // Also, reversing the order of the Majoranas change it from an XX rotation to a YY rotation, so we apply S gates to
+                        // convert an XX to a YY since S X S^\dag = Y. 
+                        rz(-1.57079632679489661923, q[i]);
+                        rz(-1.57079632679489661923, q[j]);
+                    }
+                    // This is probably the most efficient way to implement a XX rotation using basic CUDA-Q gates?
+                    //h(q[i]);h(q[j]);
+                    cx(q[i], q[j]);
+                    rx(0.78539816339744830962, q[i]);
+                    cx(q[i], q[j]);
+                    //h(q[i]);h(q[j]);
+                    if(j < i){
+                        s(q[i]);
+                        s(q[j]);
+                        for(int k = j+1; k < i; k++){
+                            cz(3.14159265358979323846, q[k],q[i]);
+                        }
+                    }
+                }
+                if (flayers[layer].rot_zz_flags[i]) //pi/4 ZZ rotation (the only four-Majorana interaction)
+                {
+                    cx(q[i], q[j]);
+                    rz(0.78539816339744830962, q[j]);
+                    cx(q[i], q[j]);
+                }
+            }
+
+            for (int i = 0; i < n; ++i)
+            {
+                if (flayers[layer].measure_flags[i])
+                {
+                    mz(q[i]); // Z measurement preserves fermion parity so this is still all right
+                }
+            }
+        }
+    }
+};
+
 LayerData make_mipt_layer(int n,
                           int start,
                           double p,
@@ -1445,6 +1532,59 @@ std::vector<LayerData> mipt_frontend(int n,
 
     // MIPT-style final even layer with 50% measurement probability.
     layers.push_back(make_mipt_layer(n, 0, 0.5, rng));
+
+    return layers;
+}
+
+FRGSLayerData make_frgs_mipt_layer(int n,
+                          int start,
+                          double p,
+                          std::mt19937 &rng)
+{
+    std::bernoulli_distribution coin_flip(0.5);
+    std::bernoulli_distribution measure_dist(p);
+
+    FRGSLayerData layer;
+    layer.start = start;
+
+    layer.measure_flags.resize(n);
+
+    layer.rot_z_flags.resize(n);
+    layer.rot_xx_flags.resize(n);
+    layer.rot_zz_flags.resize(n);
+
+    for (int q = 0; q < n; ++q)
+    {
+        layer.rot_z_flags[q] = coin_flip(rng) ? 1 : 0; // Single-site Z rotation on each site with a 50/50 chance;
+        layer.rot_xx_flags[q] = coin_flip(rng) ? 1 : 0; // Apply an XX rotation with a 50/50 chance;
+        layer.rot_zz_flags[q] = 1-layer.rot_xx_flags[q]; // If we're not applying an XX rotation, apply a ZZ rotation instead.
+
+        layer.measure_flags[q] = measure_dist(rng) ? 1 : 0;
+    }
+
+    return layer;
+}
+
+std::vector<FRGSLayerData> frgs_mipt_frontend(int n,
+                                     int periods,
+                                     double p)
+{
+    std::mt19937 rng(std::random_device{}());
+    std::bernoulli_distribution extra_even_layer(0.5);
+
+    std::vector<FRGSLayerData> layers;
+    layers.reserve(2 * periods + 1);
+
+    for (int period = 0; period < periods; ++period)
+    {
+        layers.push_back(make_frgs_mipt_layer(n, 0, p, rng)); // even layer
+        layers.push_back(make_frgs_mipt_layer(n, 1, p, rng)); // odd layer
+    }
+
+    // Implement final even layer with 50% probability.
+    if(extra_even_layer(rng)){
+        layers.push_back(make_frgs_mipt_layer(n, 0, p, rng));
+    }
 
     return layers;
 }
@@ -1631,17 +1771,17 @@ std::vector<FermionLayerData> mipt_fermion_frontend(int n,
 
     // Match the Python fermionic circuit: a final even layer is included with
     // 50% probability, and its measurements still use probability p.
-    // if (extra_even_layer(rng))
-    // {
-    //     layers.push_back(make_fermion_layer(n, false, p, closed, rng));
-    // }
+    if (extra_even_layer(rng))
+    {
+        layers.push_back(make_fermion_layer(n, false, p, closed, rng));
+    }
 
     return layers;
 }
 
 
 
-void run_1d(int n, int periods, int realizations, int res, double p_min, double p_max, bool fermion)
+void run_1d(int n, int periods, int realizations, int res, double p_min, double p_max, bool fermion, bool rgs=false)
 {
     if (n < RHO3_QUBITS)
     {
@@ -1653,9 +1793,9 @@ void run_1d(int n, int periods, int realizations, int res, double p_min, double 
     std::vector<double> ps = linspace(p_min, p_max, res);
     std::ofstream infofile("info.csv");
 
-    infofile << "n,periods,realizations,resolution,p_min,p_max,fermion\n";
+    infofile << "n,periods,realizations,resolution,p_min,p_max,fermion,rgs\n";
     infofile << n << "," << periods << "," << realizations << "," << res << ","
-             << p_min << "," << p_max << "," << (fermion ? 1 : 0) << "\n";
+             << p_min << "," << p_max << "," << (fermion ? 1 : 0) << "," << (rgs ? 1 : 0) << "\n";
 
     mipt_io::DensityMatrixWriter rho3_file(
         "rho3.bin",
@@ -1682,6 +1822,14 @@ void run_1d(int n, int periods, int realizations, int res, double p_min, double 
             auto state = [&]() {
                 if (fermion)
                 {
+                    if(rgs){
+                        auto layers = frgs_mipt_frontend(n, periods, p);
+                        if (r == 0)
+                        {
+                            lap1 = std::chrono::steady_clock::now();
+                        }
+                        return cudaq::get_state(MIPTKernel_1D_FRGS{}, n, layers, true);
+                    }
                     auto layers = mipt_fermion_frontend(n, periods, p, true);
                     if (r == 0)
                     {
@@ -1764,17 +1912,17 @@ void run_1d(int n, int periods, int realizations, int res, double p_min, double 
 }
 
 
-void run_1d_tmi(int n, int periods, int realizations, int res, double p_min, double p_max, bool fermion)
+void run_1d_tmi(int n, int periods, int realizations, int res, double p_min, double p_max, bool fermion, bool rgs=false)
 {
     const int block_qubits = n / 4;
     const std::vector<TmiMatrixTerm> terms = tmi_terms_1d(n);
     std::vector<double> ps = linspace(p_min, p_max, res);
     std::ofstream infofile("info_tmi.csv");
 
-    infofile << "n,periods,realizations,resolution,p_min,p_max,fermion,tmi_block_qubits,terms\n";
+    infofile << "n,periods,realizations,resolution,p_min,p_max,fermion,rgs,tmi_block_qubits,terms\n";
     infofile << n << "," << periods << "," << realizations << "," << res << ","
              << p_min << "," << p_max << "," << (fermion ? 1 : 0) << ","
-             << block_qubits << ",AB;AC;BC;D\n";
+             << (rgs ? 1 : 0) << "," << block_qubits << ",AB;AC;BC;D\n";
 
     TmiMatrixWriter tmi_file(
         "rho_tmi.bin",
@@ -1810,6 +1958,14 @@ void run_1d_tmi(int n, int periods, int realizations, int res, double p_min, dou
             auto state = [&]() {
                 if (fermion)
                 {
+                    if(rgs){
+                        auto layers = frgs_mipt_frontend(n, periods, p);
+                        if (r == 0)
+                        {
+                            lap1 = std::chrono::steady_clock::now();
+                        }
+                        return cudaq::get_state(MIPTKernel_1D_FRGS{}, n, layers, true);
+                    }
                     auto layers = mipt_fermion_frontend(n, periods, p, true);
                     if (r == 0)
                     {

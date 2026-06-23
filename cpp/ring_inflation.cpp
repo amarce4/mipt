@@ -1101,14 +1101,7 @@ namespace
         double raw = static_cast<double>(x[0]);
         if (std::isfinite(raw))
         {
-            if (raw >= 1.0 - tol)
-            {
-                raw = 1.0;
-            }
-            else
-            {
-                raw = std::min(1.0, std::max(0.0, raw));
-            }
+            raw = std::min(1.0, std::max(0.0, raw));
         }
 
         SCSResult result;

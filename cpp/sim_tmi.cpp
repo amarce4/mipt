@@ -34,6 +34,156 @@
 #include "mipt.cpp"
 #undef main
 
+
+// Fermionic reduced-gate-set architecture imported from mipt_fermion.cpp for
+// sim_tmi.exe fermion=2.  This intentionally leaves mipt.cpp's existing
+// fermion=1 Haar parity-preserving architecture unchanged.
+struct FRGSLayerData
+{
+    int start = 0;
+
+    std::vector<int> measure_flags;
+
+    // This flag can be 1 simultaneously with the two-site gate selector.
+    std::vector<int> rot_z_flags;
+
+    // Exactly one of these should be 1 for each candidate bond.  As in
+    // mipt_fermion.cpp, only the first qubit of each bond selects the gate.
+    std::vector<int> rot_xx_flags;
+    std::vector<int> rot_zz_flags;
+};
+
+struct MIPTKernel_1D_FRGS
+{
+    void operator()(int n,
+                    const std::vector<FRGSLayerData> &flayers,
+                    bool closed) __qpu__
+    {
+        cudaq::qvector q(n);
+
+        for (std::size_t layer = 0; layer < flayers.size(); ++layer)
+        {
+            int start = flayers[layer].start;
+
+            for (int i = start; i < n - 1; i += 2)
+            {
+                int j = (i + 1) % n;
+
+                if (flayers[layer].rot_z_flags[i])
+                {
+                    rz(0.392699081698724154808, q[i]);
+                }
+                if (flayers[layer].rot_z_flags[j])
+                {
+                    rz(0.392699081698724154808, q[j]);
+                }
+
+                if (flayers[layer].rot_xx_flags[i])
+                {
+                    if (j < i)
+                    {
+                        for (int k = j + 1; k < i; ++k)
+                        {
+                            z<cudaq::ctrl>(q[k], q[i]);
+                        }
+                        rz(-1.57079632679489661923, q[i]);
+                        rz(-1.57079632679489661923, q[j]);
+                    }
+
+                    cx(q[i], q[j]);
+                    rx(0.78539816339744830962, q[i]);
+                    cx(q[i], q[j]);
+
+                    if (j < i)
+                    {
+                        s(q[i]);
+                        s(q[j]);
+                        for (int k = j + 1; k < i; ++k)
+                        {
+                            z<cudaq::ctrl>(q[k], q[i]);
+                        }
+                    }
+                }
+
+                if (flayers[layer].rot_zz_flags[i])
+                {
+                    cx(q[i], q[j]);
+                    rz(0.78539816339744830962, q[j]);
+                    cx(q[i], q[j]);
+                }
+            }
+
+            for (int i = 0; i < n; ++i)
+            {
+                if (flayers[layer].measure_flags[i])
+                {
+                    mz(q[i]);
+                }
+            }
+        }
+    }
+};
+
+FRGSLayerData make_frgs_mipt_layer(int n,
+                                   int start,
+                                   double p,
+                                   std::mt19937 &rng)
+{
+    std::bernoulli_distribution coin_flip(0.5);
+    std::bernoulli_distribution measure_dist(p);
+
+    FRGSLayerData layer;
+    layer.start = start;
+
+    layer.measure_flags.resize(n);
+    layer.rot_z_flags.resize(n);
+    layer.rot_xx_flags.resize(n);
+    layer.rot_zz_flags.resize(n);
+
+    for (int q = 0; q < n; ++q)
+    {
+        layer.rot_z_flags[q] = coin_flip(rng) ? 1 : 0;
+        layer.rot_xx_flags[q] = coin_flip(rng) ? 1 : 0;
+        layer.rot_zz_flags[q] = 1 - layer.rot_xx_flags[q];
+        layer.measure_flags[q] = measure_dist(rng) ? 1 : 0;
+    }
+
+    return layer;
+}
+
+std::vector<FRGSLayerData> frgs_mipt_frontend(int n,
+                                              int periods,
+                                              double p)
+{
+    if ((n % 2) != 0)
+    {
+        throw std::invalid_argument("FRGS fermionic 1D simulation requires even n.");
+    }
+    if (p < 0.0 || p > 1.0)
+    {
+        throw std::invalid_argument("Measurement probability p must be in [0,1].");
+    }
+
+    std::mt19937 rng(std::random_device{}());
+    std::bernoulli_distribution extra_even_layer(0.5);
+
+    std::vector<FRGSLayerData> layers;
+    layers.reserve(2 * periods + 1);
+
+    for (int period = 0; period < periods; ++period)
+    {
+        layers.push_back(make_frgs_mipt_layer(n, 0, p, rng));
+        layers.push_back(make_frgs_mipt_layer(n, 1, p, rng));
+    }
+
+    if (extra_even_layer(rng))
+    {
+        layers.push_back(make_frgs_mipt_layer(n, 0, p, rng));
+    }
+
+    return layers;
+}
+
 namespace sim_tmi
 {
     using C64 = std::complex<double>;
@@ -44,6 +194,47 @@ namespace sim_tmi
         Qubit,
         Fermion
     };
+
+    enum class CircuitMode
+    {
+        QubitMms = 0,
+        FermionHaar = 1,
+        FermionReducedGateSet = 2
+    };
+
+    CircuitMode circuit_mode_from_int(int value)
+    {
+        switch (value)
+        {
+        case 0:
+            return CircuitMode::QubitMms;
+        case 1:
+            return CircuitMode::FermionHaar;
+        case 2:
+            return CircuitMode::FermionReducedGateSet;
+        default:
+            throw std::invalid_argument("fermion must be 0, 1, or 2.");
+        }
+    }
+
+    bool uses_fermionic_trace(CircuitMode mode)
+    {
+        return mode != CircuitMode::QubitMms;
+    }
+
+    const char *circuit_mode_name(CircuitMode mode)
+    {
+        switch (mode)
+        {
+        case CircuitMode::QubitMms:
+            return "qubit/MMS";
+        case CircuitMode::FermionHaar:
+            return "fermion/Haar parity-preserving + JW FSWAP";
+        case CircuitMode::FermionReducedGateSet:
+            return "fermion/reduced gate set from mipt_fermion.cpp";
+        }
+        return "unknown";
+    }
 
     struct TraceSource
     {
@@ -1270,15 +1461,16 @@ namespace sim_tmi
                         int res,
                         double p_min,
                         double p_max,
-                        bool fermion,
+                        CircuitMode circuit_mode,
                         const std::string &output_path)
     {
         validate_sim_args(n, periods, realizations, res, p_min, p_max);
 
         const std::uint32_t block_qubits = static_cast<std::uint32_t>(n / 4);
         const std::vector<TmiMatrixTerm> terms = tmi_terms_1d(n);
+        const bool fermion_trace = uses_fermionic_trace(circuit_mode);
         const TmiPlans plans = make_tmi_plans(block_qubits,
-                                             fermion ? TraceMode::Fermion : TraceMode::Qubit);
+                                             fermion_trace ? TraceMode::Fermion : TraceMode::Qubit);
         const std::vector<double> ps = linspace(p_min, p_max, res);
         const std::uint64_t total = static_cast<std::uint64_t>(res) *
                                     static_cast<std::uint64_t>(realizations);
@@ -1298,7 +1490,7 @@ namespace sim_tmi
                   << ", p_min=" << p_min
                   << ", p_max=" << p_max
                   << ", block_qubits=" << block_qubits
-                  << ", mode=" << (fermion ? "fermion" : "qubit/MMS")
+                  << ", mode=" << circuit_mode_name(circuit_mode)
                   << ", output=" << output_path << '\n'
                   << "entropy_backend=" << lapack_runtime::status() << '\n'
                   << "tmi_method="
@@ -1322,7 +1514,12 @@ namespace sim_tmi
             for (int r = 0; r < realizations; ++r)
             {
                 auto state = [&]() {
-                    if (fermion)
+                    if (circuit_mode == CircuitMode::FermionReducedGateSet)
+                    {
+                        auto layers = frgs_mipt_frontend(n, periods, p);
+                        return cudaq::get_state(MIPTKernel_1D_FRGS{}, n, layers, true);
+                    }
+                    if (circuit_mode == CircuitMode::FermionHaar)
                     {
                         auto layers = mipt_fermion_frontend(n, periods, p, true);
                         return cudaq::get_state(MIPTFermionKernel_1D{}, n, layers);
@@ -1337,7 +1534,7 @@ namespace sim_tmi
                 {
                     try
                     {
-                        tmi = tmi_from_cudaq_state_fast(state, n, block_qubits, fermion, workspace);
+                        tmi = tmi_from_cudaq_state_fast(state, n, block_qubits, fermion_trace, workspace);
                     }
                     catch (const std::bad_alloc &)
                     {
@@ -1352,7 +1549,7 @@ namespace sim_tmi
                     // Compatibility path for systems without a usable LAPACK SVD.
                     // This is exact but much slower because it materializes pair RDMs.
                     std::vector<double> payload;
-                    cudaq_tmi_density_matrices(state, n, terms, payload, fermion);
+                    cudaq_tmi_density_matrices(state, n, terms, payload, fermion_trace);
                     tmi = tmi_from_payload(payload, block_qubits, terms, plans, workspace);
                 }
 
@@ -1412,7 +1609,8 @@ namespace sim_tmi
             << "  " << argv0 << " [n = 10] [periods = 10] [realizations = 10] [resolution = 5] [p_min = 0.0] [p_max = 1.0] [fermion = 0] [output.csv = tmi.csv]\n\n"
             << "Arguments:\n"
             << "  fermion = 0 uses the existing MMS/qubit circuit.\n"
-            << "  fermion = 1 uses parity-preserving fermionic gates with JW FSWAP boundaries.\n\n"
+            << "  fermion = 1 uses parity-preserving fermionic gates with JW FSWAP boundaries.\n"
+            << "  fermion = 2 uses the reduced-gate-set fermionic architecture from mipt_fermion.cpp.\n\n"
             << "Output CSV columns:\n"
             << "  p,tmi\n";
     }
@@ -1444,10 +1642,7 @@ int main(int argc, char **argv)
         const int fermion = (argc > 7) ? std::stoi(argv[7]) : 0;
         const std::string output_path = (argc > 8) ? argv[8] : "tmi.csv";
 
-        if (fermion != 0 && fermion != 1)
-        {
-            throw std::invalid_argument("fermion must be 0 or 1.");
-        }
+        const sim_tmi::CircuitMode circuit_mode = sim_tmi::circuit_mode_from_int(fermion);
 
         sim_tmi::run_1d_sim_tmi(n,
                                 periods,
@@ -1455,7 +1650,7 @@ int main(int argc, char **argv)
                                 res,
                                 p_min,
                                 p_max,
-                                fermion != 0,
+                                circuit_mode,
                                 output_path);
         return 0;
     }
