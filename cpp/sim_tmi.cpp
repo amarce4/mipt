@@ -10,7 +10,9 @@
 //
 //   p,tmi
 //
-// to CSV.  The fast path avoids materializing the half-system reduced density
+// to CSV, one TMI value per line.  With all_cycles=1 it writes N/4 cyclic
+// TMI values per circuit, still as separate p,tmi rows.  The fast path avoids
+// materializing the half-system reduced density
 // matrices: S(AB), S(AC), and S(BC) are computed from Schmidt singular values,
 // while the small one-block entropies use BLAS Hermitian rank-k updates when
 // BLAS is available at runtime.
@@ -1255,6 +1257,62 @@ namespace sim_tmi
         };
     }
 
+    std::vector<int> cyclic_mode_range(int begin, int count, int n)
+    {
+        if (n <= 0)
+        {
+            throw std::invalid_argument("cyclic_mode_range requires positive n.");
+        }
+        if (count < 0 || count > n)
+        {
+            throw std::invalid_argument("Invalid cyclic subsystem block size.");
+        }
+
+        std::vector<int> modes;
+        modes.reserve(static_cast<std::size_t>(count));
+        for (int i = 0; i < count; ++i)
+        {
+            int q = (begin + i) % n;
+            if (q < 0)
+            {
+                q += n;
+            }
+            modes.push_back(q);
+        }
+        return modes;
+    }
+
+    std::vector<TmiMatrixTerm> tmi_terms_1d_cycle(int n, int cycle_offset)
+    {
+        if (n < 4 || (n % 4) != 0)
+        {
+            throw std::invalid_argument("TMI output requires N=L >= 4 and divisible by 4.");
+        }
+
+        const int block = n / 4;
+        if (cycle_offset < 0 || cycle_offset >= block)
+        {
+            throw std::invalid_argument("TMI cycle offset is out of range.");
+        }
+
+        const std::vector<int> A = cyclic_mode_range(cycle_offset + 0 * block, block, n);
+        const std::vector<int> B = cyclic_mode_range(cycle_offset + 1 * block, block, n);
+        const std::vector<int> C = cyclic_mode_range(cycle_offset + 2 * block, block, n);
+        const std::vector<int> D = cyclic_mode_range(cycle_offset + 3 * block, block, n);
+
+        return {
+            {"AB", concatenate_modes(A, B)},
+            {"AC", concatenate_modes(A, C)},
+            {"BC", concatenate_modes(B, C)},
+            {"D", D},
+        };
+    }
+
+    int tmi_cycle_count(int n, bool all_cycles)
+    {
+        return all_cycles ? (n / 4) : 1;
+    }
+
     struct TmiWorkspace
     {
         EntropyWorkspace entropy;
@@ -1319,14 +1377,20 @@ namespace sim_tmi
     double tmi_from_statevector(const std::complex<Real> *psi,
                                 int n,
                                 std::uint32_t block_qubits,
+                                int cycle_offset,
                                 bool fermion_trace,
                                 TmiWorkspace &workspace)
     {
         const int block = static_cast<int>(block_qubits);
-        const std::vector<int> A = mode_range(0 * block, block);
-        const std::vector<int> B = mode_range(1 * block, block);
-        const std::vector<int> C = mode_range(2 * block, block);
-        const std::vector<int> D = mode_range(3 * block, block);
+        if (cycle_offset < 0 || cycle_offset >= block)
+        {
+            throw std::invalid_argument("TMI cycle offset is out of range.");
+        }
+
+        const std::vector<int> A = cyclic_mode_range(cycle_offset + 0 * block, block, n);
+        const std::vector<int> B = cyclic_mode_range(cycle_offset + 1 * block, block, n);
+        const std::vector<int> C = cyclic_mode_range(cycle_offset + 2 * block, block, n);
+        const std::vector<int> D = cyclic_mode_range(cycle_offset + 3 * block, block, n);
         const std::vector<int> AB = concatenate_modes(A, B);
         const std::vector<int> AC = concatenate_modes(A, C);
         const std::vector<int> BC = concatenate_modes(B, C);
@@ -1350,11 +1414,56 @@ namespace sim_tmi
         return s_a + s_b + s_c + s_d - s_ab - s_ac - s_bc;
     }
 
-    double tmi_from_cudaq_state_fast(cudaq::state &state,
-                                     int n,
-                                     std::uint32_t block_qubits,
-                                     bool fermion_trace,
-                                     TmiWorkspace &workspace)
+    template <typename Real>
+    std::vector<double> tmi_values_from_statevector_fast(const std::complex<Real> *psi,
+                                                         int n,
+                                                         std::uint32_t block_qubits,
+                                                         int cycle_count,
+                                                         bool fermion_trace,
+                                                         TmiWorkspace &workspace)
+    {
+        std::vector<double> values;
+        values.reserve(static_cast<std::size_t>(cycle_count));
+        for (int cycle_offset = 0; cycle_offset < cycle_count; ++cycle_offset)
+        {
+            values.push_back(tmi_from_statevector(psi,
+                                                  n,
+                                                  block_qubits,
+                                                  cycle_offset,
+                                                  fermion_trace,
+                                                  workspace));
+        }
+        return values;
+    }
+
+    template <typename Real>
+    std::vector<double> tmi_values_from_statevector_payload(const std::complex<Real> *psi,
+                                                            int n,
+                                                            std::uint32_t block_qubits,
+                                                            int cycle_count,
+                                                            bool fermion_trace,
+                                                            const TmiPlans &plans,
+                                                            TmiWorkspace &workspace)
+    {
+        std::vector<double> values;
+        values.reserve(static_cast<std::size_t>(cycle_count));
+        std::vector<double> payload;
+
+        for (int cycle_offset = 0; cycle_offset < cycle_count; ++cycle_offset)
+        {
+            const std::vector<TmiMatrixTerm> terms = tmi_terms_1d_cycle(n, cycle_offset);
+            tmi_density_matrices_from_host_statevector(psi, n, terms, payload, fermion_trace);
+            values.push_back(tmi_from_payload(payload, block_qubits, terms, plans, workspace));
+        }
+        return values;
+    }
+
+    std::vector<double> tmi_values_from_cudaq_state_fast(cudaq::state &state,
+                                                         int n,
+                                                         std::uint32_t block_qubits,
+                                                         int cycle_count,
+                                                         bool fermion_trace,
+                                                         TmiWorkspace &workspace)
     {
         const std::uint64_t dim_u64 = checked_pow2_u64(n);
         if (dim_u64 > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()))
@@ -1376,32 +1485,124 @@ namespace sim_tmi
             {
                 workspace.host_state_f64.resize(dim);
                 state.to_host(workspace.host_state_f64.data(), workspace.host_state_f64.size());
-                return tmi_from_statevector(workspace.host_state_f64.data(), n, block_qubits,
-                                            fermion_trace, workspace);
+                return tmi_values_from_statevector_fast(workspace.host_state_f64.data(),
+                                                        n,
+                                                        block_qubits,
+                                                        cycle_count,
+                                                        fermion_trace,
+                                                        workspace);
             }
             if (tensor.data == nullptr)
             {
                 throw std::runtime_error("CUDA-Q state tensor has a null data pointer.");
             }
-            return tmi_from_statevector(
+            return tmi_values_from_statevector_fast(
                 reinterpret_cast<const std::complex<double> *>(tensor.data),
-                n, block_qubits, fermion_trace, workspace);
+                n,
+                block_qubits,
+                cycle_count,
+                fermion_trace,
+                workspace);
         }
 
         if (state.is_on_gpu())
         {
             workspace.host_state_f32.resize(dim);
             state.to_host(workspace.host_state_f32.data(), workspace.host_state_f32.size());
-            return tmi_from_statevector(workspace.host_state_f32.data(), n, block_qubits,
-                                        fermion_trace, workspace);
+            return tmi_values_from_statevector_fast(workspace.host_state_f32.data(),
+                                                    n,
+                                                    block_qubits,
+                                                    cycle_count,
+                                                    fermion_trace,
+                                                    workspace);
         }
         if (tensor.data == nullptr)
         {
             throw std::runtime_error("CUDA-Q state tensor has a null data pointer.");
         }
-        return tmi_from_statevector(
+        return tmi_values_from_statevector_fast(
             reinterpret_cast<const std::complex<float> *>(tensor.data),
-            n, block_qubits, fermion_trace, workspace);
+            n,
+            block_qubits,
+            cycle_count,
+            fermion_trace,
+            workspace);
+    }
+
+    std::vector<double> tmi_values_from_cudaq_state_payload(cudaq::state &state,
+                                                            int n,
+                                                            std::uint32_t block_qubits,
+                                                            int cycle_count,
+                                                            bool fermion_trace,
+                                                            const TmiPlans &plans,
+                                                            TmiWorkspace &workspace)
+    {
+        const std::uint64_t dim_u64 = checked_pow2_u64(n);
+        if (dim_u64 > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()))
+        {
+            throw std::invalid_argument("State-vector dimension does not fit in size_t.");
+        }
+        const std::size_t dim = static_cast<std::size_t>(dim_u64);
+        const auto precision = state.get_precision();
+        const auto tensor = state.get_tensor();
+
+        if (tensor.get_rank() != 1 || tensor.get_num_elements() < dim)
+        {
+            throw std::runtime_error("Expected a contiguous rank-1 CUDA-Q statevector tensor.");
+        }
+
+        if (precision == cudaq::SimulationState::precision::fp64)
+        {
+            if (state.is_on_gpu())
+            {
+                workspace.host_state_f64.resize(dim);
+                state.to_host(workspace.host_state_f64.data(), workspace.host_state_f64.size());
+                return tmi_values_from_statevector_payload(workspace.host_state_f64.data(),
+                                                           n,
+                                                           block_qubits,
+                                                           cycle_count,
+                                                           fermion_trace,
+                                                           plans,
+                                                           workspace);
+            }
+            if (tensor.data == nullptr)
+            {
+                throw std::runtime_error("CUDA-Q state tensor has a null data pointer.");
+            }
+            return tmi_values_from_statevector_payload(
+                reinterpret_cast<const std::complex<double> *>(tensor.data),
+                n,
+                block_qubits,
+                cycle_count,
+                fermion_trace,
+                plans,
+                workspace);
+        }
+
+        if (state.is_on_gpu())
+        {
+            workspace.host_state_f32.resize(dim);
+            state.to_host(workspace.host_state_f32.data(), workspace.host_state_f32.size());
+            return tmi_values_from_statevector_payload(workspace.host_state_f32.data(),
+                                                       n,
+                                                       block_qubits,
+                                                       cycle_count,
+                                                       fermion_trace,
+                                                       plans,
+                                                       workspace);
+        }
+        if (tensor.data == nullptr)
+        {
+            throw std::runtime_error("CUDA-Q state tensor has a null data pointer.");
+        }
+        return tmi_values_from_statevector_payload(
+            reinterpret_cast<const std::complex<float> *>(tensor.data),
+            n,
+            block_qubits,
+            cycle_count,
+            fermion_trace,
+            plans,
+            workspace);
     }
 
     std::string format_duration(double seconds)
@@ -1462,18 +1663,20 @@ namespace sim_tmi
                         double p_min,
                         double p_max,
                         CircuitMode circuit_mode,
+                        bool all_cycles,
                         const std::string &output_path)
     {
         validate_sim_args(n, periods, realizations, res, p_min, p_max);
 
         const std::uint32_t block_qubits = static_cast<std::uint32_t>(n / 4);
-        const std::vector<TmiMatrixTerm> terms = tmi_terms_1d(n);
+        const int cycle_count = tmi_cycle_count(n, all_cycles);
         const bool fermion_trace = uses_fermionic_trace(circuit_mode);
         const TmiPlans plans = make_tmi_plans(block_qubits,
                                              fermion_trace ? TraceMode::Fermion : TraceMode::Qubit);
         const std::vector<double> ps = linspace(p_min, p_max, res);
         const std::uint64_t total = static_cast<std::uint64_t>(res) *
-                                    static_cast<std::uint64_t>(realizations);
+                                    static_cast<std::uint64_t>(realizations) *
+                                    static_cast<std::uint64_t>(cycle_count);
 
         std::ofstream csv(output_path, std::ios::binary | std::ios::trunc);
         if (!csv)
@@ -1481,6 +1684,11 @@ namespace sim_tmi
             throw std::runtime_error("Could not create output CSV: " + output_path);
         }
         csv << "p,tmi\n";
+        csv.flush();
+        if (!csv)
+        {
+            throw std::runtime_error("Failed while writing output CSV header.");
+        }
 
         std::cerr << "Online TMI simulation\n"
                   << "n=" << n
@@ -1490,6 +1698,8 @@ namespace sim_tmi
                   << ", p_min=" << p_min
                   << ", p_max=" << p_max
                   << ", block_qubits=" << block_qubits
+                  << ", all_cycles=" << (all_cycles ? 1 : 0)
+                  << ", tmi_cycles_per_circuit=" << cycle_count
                   << ", mode=" << circuit_mode_name(circuit_mode)
                   << ", output=" << output_path << '\n'
                   << "entropy_backend=" << lapack_runtime::status() << '\n'
@@ -1500,8 +1710,8 @@ namespace sim_tmi
                   << '\n';
 
         TmiWorkspace workspace;
-        std::string line_buffer;
-        line_buffer.reserve(1u << 20);
+        std::string line;
+        line.reserve(128);
 
         const auto start = std::chrono::steady_clock::now();
         auto last_report = start;
@@ -1529,12 +1739,17 @@ namespace sim_tmi
                     return cudaq::get_state(MIPTKernel_1D{}, n, layers, true);
                 }();
 
-                double tmi = 0.0;
+                std::vector<double> tmi_values;
                 if (lapack_runtime::zgesvd())
                 {
                     try
                     {
-                        tmi = tmi_from_cudaq_state_fast(state, n, block_qubits, fermion_trace, workspace);
+                        tmi_values = tmi_values_from_cudaq_state_fast(state,
+                                                                      n,
+                                                                      block_qubits,
+                                                                      cycle_count,
+                                                                      fermion_trace,
+                                                                      workspace);
                     }
                     catch (const std::bad_alloc &)
                     {
@@ -1548,52 +1763,52 @@ namespace sim_tmi
                 {
                     // Compatibility path for systems without a usable LAPACK SVD.
                     // This is exact but much slower because it materializes pair RDMs.
-                    std::vector<double> payload;
-                    cudaq_tmi_density_matrices(state, n, terms, payload, fermion_trace);
-                    tmi = tmi_from_payload(payload, block_qubits, terms, plans, workspace);
+                    tmi_values = tmi_values_from_cudaq_state_payload(state,
+                                                                     n,
+                                                                     block_qubits,
+                                                                     cycle_count,
+                                                                     fermion_trace,
+                                                                     plans,
+                                                                     workspace);
                 }
 
-                append_double(line_buffer, p);
-                line_buffer.push_back(',');
-                append_double(line_buffer, tmi);
-                line_buffer.push_back('\n');
-
-                if (line_buffer.size() >= (1u << 20))
+                for (double tmi : tmi_values)
                 {
-                    csv.write(line_buffer.data(), static_cast<std::streamsize>(line_buffer.size()));
+                    line.clear();
+                    append_double(line, p);
+                    line.push_back(',');
+                    append_double(line, tmi);
+                    line.push_back('\n');
+
+                    csv.write(line.data(), static_cast<std::streamsize>(line.size()));
+                    csv.flush();
                     if (!csv)
                     {
                         throw std::runtime_error("Failed while writing output CSV.");
                     }
-                    line_buffer.clear();
-                }
 
-                ++processed;
-                const auto now = std::chrono::steady_clock::now();
-                const double since_last = std::chrono::duration<double>(now - last_report).count();
-                if (since_last >= 1.0 || processed == total)
-                {
-                    const double elapsed = std::max(1.0e-12, std::chrono::duration<double>(now - start).count());
-                    const double avg = static_cast<double>(processed) / elapsed;
-                    const double recent = static_cast<double>(processed - last_processed) / std::max(1.0e-12, since_last);
-                    const double eta = avg > 0.0 ? static_cast<double>(total - processed) / avg : 0.0;
-                    std::cerr << '\r'
-                              << "processed " << processed << '/' << total
-                              << " | avg " << std::fixed << std::setprecision(2) << avg << "/s"
-                              << " | recent " << std::fixed << std::setprecision(2) << recent << "/s"
-                              << " | ETA " << format_duration(eta)
-                              << "          " << std::flush;
-                    last_report = now;
-                    last_processed = processed;
+                    ++processed;
+                    const auto now = std::chrono::steady_clock::now();
+                    const double since_last = std::chrono::duration<double>(now - last_report).count();
+                    if (since_last >= 1.0 || processed == total)
+                    {
+                        const double elapsed = std::max(1.0e-12, std::chrono::duration<double>(now - start).count());
+                        const double avg = static_cast<double>(processed) / elapsed;
+                        const double recent = static_cast<double>(processed - last_processed) / std::max(1.0e-12, since_last);
+                        const double eta = avg > 0.0 ? static_cast<double>(total - processed) / avg : 0.0;
+                        std::cerr << '\r'
+                                  << "processed TMI " << processed << '/' << total
+                                  << " | avg " << std::fixed << std::setprecision(2) << avg << "/s"
+                                  << " | recent " << std::fixed << std::setprecision(2) << recent << "/s"
+                                  << " | ETA " << format_duration(eta)
+                                  << "          " << std::flush;
+                        last_report = now;
+                        last_processed = processed;
+                    }
                 }
             }
         }
 
-        if (!line_buffer.empty())
-        {
-            csv.write(line_buffer.data(), static_cast<std::streamsize>(line_buffer.size()));
-            line_buffer.clear();
-        }
         csv.flush();
         if (!csv)
         {
@@ -1602,15 +1817,36 @@ namespace sim_tmi
         std::cerr << '\n';
     }
 
+    bool is_bool01_arg(std::string_view value)
+    {
+        return value == "0" || value == "1";
+    }
+
+    bool parse_bool01_arg(std::string_view value, const char *name)
+    {
+        if (value == "0")
+        {
+            return false;
+        }
+        if (value == "1")
+        {
+            return true;
+        }
+        throw std::invalid_argument(std::string(name) + " must be 0 or 1.");
+    }
+
     void print_usage(const char *argv0)
     {
         std::cerr
             << "Usage:\n"
-            << "  " << argv0 << " [n = 10] [periods = 10] [realizations = 10] [resolution = 5] [p_min = 0.0] [p_max = 1.0] [fermion = 0] [output.csv = tmi.csv]\n\n"
+            << "  " << argv0 << " [n = 10] [periods = 10] [realizations = 10] [resolution = 5] [p_min = 0.0] [p_max = 1.0] [fermion = 0] [all_cycles = 0] [output.csv = tmi.csv]\n\n"
             << "Arguments:\n"
             << "  fermion = 0 uses the existing MMS/qubit circuit.\n"
             << "  fermion = 1 uses parity-preserving fermionic gates with JW FSWAP boundaries.\n"
-            << "  fermion = 2 uses the reduced-gate-set fermionic architecture from mipt_fermion.cpp.\n\n"
+            << "  fermion = 2 uses the reduced-gate-set fermionic architecture from mipt_fermion.cpp.\n"
+            << "  all_cycles = 0 computes the original offset only.\n"
+            << "  all_cycles = 1 computes N/4 cyclic offsets; e.g. N=8 gives [0,1]|[2,3]|[4,5]|[6,7] and [1,2]|[3,4]|[5,6]|[7,0].\n"
+            << "  For backward compatibility, output.csv may also be supplied before all_cycles.\n\n"
             << "Output CSV columns:\n"
             << "  p,tmi\n";
     }
@@ -1627,7 +1863,7 @@ int main(int argc, char **argv)
             sim_tmi::print_usage(argv[0]);
             return 0;
         }
-        if (argc > 9)
+        if (argc > 10)
         {
             std::cerr << "Too many arguments. Use --help for usage.\n";
             return 2;
@@ -1640,7 +1876,29 @@ int main(int argc, char **argv)
         const double p_min = (argc > 5) ? std::stod(argv[5]) : 0.0;
         const double p_max = (argc > 6) ? std::stod(argv[6]) : 1.0;
         const int fermion = (argc > 7) ? std::stoi(argv[7]) : 0;
-        const std::string output_path = (argc > 8) ? argv[8] : "tmi.csv";
+
+        bool all_cycles = false;
+        std::string output_path = "tmi.csv";
+        if (argc > 8)
+        {
+            const std::string_view arg8(argv[8]);
+            if (sim_tmi::is_bool01_arg(arg8))
+            {
+                all_cycles = sim_tmi::parse_bool01_arg(arg8, "all_cycles");
+                if (argc > 9)
+                {
+                    output_path = argv[9];
+                }
+            }
+            else
+            {
+                output_path = argv[8];
+                if (argc > 9)
+                {
+                    all_cycles = sim_tmi::parse_bool01_arg(argv[9], "all_cycles");
+                }
+            }
+        }
 
         const sim_tmi::CircuitMode circuit_mode = sim_tmi::circuit_mode_from_int(fermion);
 
@@ -1651,6 +1909,7 @@ int main(int argc, char **argv)
                                 p_min,
                                 p_max,
                                 circuit_mode,
+                                all_cycles,
                                 output_path);
         return 0;
     }

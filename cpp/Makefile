@@ -9,6 +9,8 @@
 #   ./tmi.exe  - reads rho_tmi.bin and computes TMI to p,tmi CSV
 #   ./sim_tmi.exe - simulates circuits and computes TMI online to p,tmi CSV
 #                 accepts fermion=0 (MMS/qubit), 1 (Haar fermion), or 2 (FRGS fermion)
+#                 accepts all_cycles=0/1 to emit one or N/4 cyclic TMI values per circuit
+#   ./entropy.exe - simulates circuits and emits cyclic von Neumann entropy CSV rows
 #
 # sim_tmi.exe dynamically loads LAPACK/BLAS symbols at runtime.  Installing
 # OpenBLAS/LAPACK enables the fast exact Schmidt-SVD path; otherwise it falls
@@ -104,24 +106,27 @@ RING_OBJDIR := build/ring_scs_omp$(OPENMP)
 TMI_OBJDIR  := build/tmi_omp$(OPENMP)
 MIPT_BINARY := $(MIPT_OBJDIR)/mipt.exe
 SIM_TMI_BINARY := $(MIPT_OBJDIR)/sim_tmi.exe
+ENTROPY_BINARY := $(MIPT_OBJDIR)/entropy.exe
 GMN_BINARY  := $(GMN_OBJDIR)/gmn.exe
 RING_BINARY := $(RING_OBJDIR)/ring_inflation.exe
 TMI_BINARY  := $(TMI_OBJDIR)/tmi.exe
 
 MIPT_OBJS := $(MIPT_OBJDIR)/mipt.o
 SIM_TMI_OBJS := $(MIPT_OBJDIR)/sim_tmi.o
+ENTROPY_OBJS := $(MIPT_OBJDIR)/entropy.o
 ifeq ($(CUDA_RHO),1)
   MIPT_OBJS += $(MIPT_OBJDIR)/rho_reduce.o
   SIM_TMI_OBJS += $(MIPT_OBJDIR)/rho_reduce.o
+  ENTROPY_OBJS += $(MIPT_OBJDIR)/rho_reduce.o
 endif
 
 GMN_OBJS := $(GMN_OBJDIR)/gmn_main.o $(GMN_OBJDIR)/gmn_mosek_c.o
 RING_OBJS := $(RING_OBJDIR)/ring_inflation.o $(RING_OBJDIR)/gmn_mosek_c.o
 TMI_OBJS := $(TMI_OBJDIR)/tmi.o
 
-.PHONY: all clean cpu gpu print-config mipt.exe sim_tmi.exe gmn.exe ring_inflation.exe tmi.exe
+.PHONY: all clean cpu gpu print-config mipt.exe sim_tmi.exe entropy.exe gmn.exe ring_inflation.exe tmi.exe
 
-all: mipt.exe sim_tmi.exe gmn.exe ring_inflation.exe tmi.exe
+all: mipt.exe sim_tmi.exe entropy.exe gmn.exe ring_inflation.exe tmi.exe
 
 cpu:
 	$(MAKE) all GPU=0 CUDA_RHO=0
@@ -138,6 +143,7 @@ print-config:
 	@echo "RING_OBJDIR=$(RING_OBJDIR)"
 	@echo "MIPT_BINARY=$(MIPT_BINARY)"
 	@echo "SIM_TMI_BINARY=$(SIM_TMI_BINARY)"
+	@echo "ENTROPY_BINARY=$(ENTROPY_BINARY)"
 	@echo "GMN_BINARY=$(GMN_BINARY)"
 	@echo "RING_BINARY=$(RING_BINARY)"
 	@echo "TMI_BINARY=$(TMI_BINARY)"
@@ -152,6 +158,9 @@ mipt.exe: $(MIPT_BINARY)
 sim_tmi.exe: $(SIM_TMI_BINARY)
 	cp $(SIM_TMI_BINARY) $@
 
+entropy.exe: $(ENTROPY_BINARY)
+	cp $(ENTROPY_BINARY) $@
+
 gmn.exe: $(GMN_BINARY)
 	cp $(GMN_BINARY) $@
 
@@ -165,6 +174,9 @@ $(MIPT_BINARY): $(MIPT_OBJS)
 	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $^ $(MIPT_CUDA_LIBS) -o $@
 
 $(SIM_TMI_BINARY): $(SIM_TMI_OBJS)
+	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $^ $(MIPT_CUDA_LIBS) $(DL_LIBS) -o $@
+
+$(ENTROPY_BINARY): $(ENTROPY_OBJS)
 	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $^ $(MIPT_CUDA_LIBS) $(DL_LIBS) -o $@
 
 $(TMI_BINARY): $(TMI_OBJS)
@@ -194,6 +206,9 @@ $(MIPT_OBJDIR)/mipt.o: mipt.cpp density_io.hpp rho_reduce.hpp | $(MIPT_OBJDIR)
 $(MIPT_OBJDIR)/sim_tmi.o: sim_tmi.cpp mipt.cpp mipt_fermion.cpp density_io.hpp rho_reduce.hpp | $(MIPT_OBJDIR)
 	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $(NVQXXFLAGS_COMMON) -c $< -o $@
 
+$(MIPT_OBJDIR)/entropy.o: entropy.cpp mipt_fermion.cpp density_io.hpp rho_reduce.hpp | $(MIPT_OBJDIR)
+	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $(NVQXXFLAGS_COMMON) -c $< -o $@
+
 $(MIPT_OBJDIR)/rho_reduce.o: rho_reduce.cu rho_reduce.hpp | $(MIPT_OBJDIR)
 	$(NVCC) $(NVCCFLAGS) -c $< -o $@
 
@@ -213,4 +228,4 @@ $(TMI_OBJDIR)/tmi.o: tmi.cpp | $(TMI_OBJDIR)
 	$(HOSTCXX) $(CXXFLAGS_COMMON) -c $< -o $@
 
 clean:
-	rm -rf build mipt.exe sim_tmi.exe gmn.exe ring_inflation.exe tmi.exe *.tmp
+	rm -rf build mipt.exe sim_tmi.exe entropy.exe gmn.exe ring_inflation.exe tmi.exe *.tmp
