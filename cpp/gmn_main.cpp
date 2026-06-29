@@ -349,6 +349,8 @@ int main(int argc, char *argv[])
         }
 #endif
 
+        gmn_mosek_reset_diagnostics();
+
         mipt_io::DensityMatrixReader reader(input_path);
         const auto &metadata = reader.metadata();
 
@@ -397,6 +399,7 @@ int main(int argc, char *argv[])
         std::uint64_t nonfinite_input_value_count = 0;
         std::uint64_t sanitized_matrix_count = 0;
         std::uint64_t nonfinite_gmn_count = 0;
+        std::uint64_t clipped_negative_gmn_count = 0;
         const auto start = std::chrono::steady_clock::now();
         auto interval_start = start;
         std::uint64_t interval_processed = 0;
@@ -442,10 +445,15 @@ int main(int argc, char *argv[])
             for (std::size_t i = 0; i < jobs.size(); ++i)
             {
                 const GmnJob &job = jobs[i];
-                const double safe_gmn = csv_safe_gmn(gmn_values[i]);
-                if (safe_gmn != gmn_values[i])
+                const double raw_gmn = gmn_values[i];
+                const double safe_gmn = csv_safe_gmn(raw_gmn);
+                if (!std::isfinite(raw_gmn))
                 {
                     ++nonfinite_gmn_count;
+                }
+                else if (safe_gmn != raw_gmn)
+                {
+                    ++clipped_negative_gmn_count;
                 }
                 outfile << job.p << ',' << safe_gmn << '\n';
             }
@@ -501,6 +509,43 @@ int main(int argc, char *argv[])
             std::cerr
                 << "Warning: solver returned " << nonfinite_gmn_count
                 << " non-finite GMN value(s); those CSV entries were written as 0.\n";
+        }
+        if (clipped_negative_gmn_count > 0)
+        {
+            std::cerr
+                << "Warning: clipped " << clipped_negative_gmn_count
+                << " tiny negative GMN value(s) to 0.\n";
+        }
+
+        const GmnMosekDiagnostics mosek_diag = gmn_mosek_get_diagnostics();
+        if (mosek_diag.workspace_failures > 0)
+        {
+            std::cerr
+                << "Warning: MOSEK workspace creation failed "
+                << mosek_diag.workspace_failures << " time(s). Check MOSEK_HOME, "
+                << "license availability, and runtime library path.\n";
+        }
+        if (mosek_diag.optimize_errors > 0)
+        {
+            std::cerr
+                << "Warning: MOSEK optimize/update returned an error "
+                << mosek_diag.optimize_errors << " time(s).\n";
+        }
+        if (mosek_diag.nonfinite_objectives > 0)
+        {
+            std::cerr
+                << "Warning: MOSEK returned/exposed a non-finite objective "
+                << mosek_diag.nonfinite_objectives << " time(s).\n";
+        }
+        if (mosek_diag.accepted_nonoptimal_solutions > 0)
+        {
+            std::cerr
+                << "Warning: accepted "
+                << mosek_diag.accepted_nonoptimal_solutions
+                << " finite MOSEK primal objective(s) with non-OPTIMAL "
+                << "solution status. This avoids false zeroing of complex-mode "
+                << "results; rerun a small batch with OMP_NUM_THREADS=1 "
+                << "if you want to isolate individual MOSEK behavior.\n";
         }
 
         if (mode == EvaluationMode::RealOnly && max_imag_norm > 1.0e-10)

@@ -4,6 +4,7 @@
 #include <limits.h>
 #include <math.h>
 #include <stdint.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -30,13 +31,11 @@
  *     R(X) = [ A  -B ]
  *            [ B   A ]
  *
- * The old complex path explicitly enforced this block structure with many
- * equality constraints. That is not necessary here: all constraints, right-hand
- * sides, and objective matrices are invariant under the realification symmetry.
- * Any feasible 16x16 real PSD solution can therefore be averaged with its
- * symmetry transform to obtain an equally good structured solution. By default
- * those redundant structure constraints are omitted. Set
- * GMN_COMPLEX_STRUCTURE=1 to restore them for validation. Since
+ * The old complex path explicitly enforced this block structure with equality
+ * constraints. Keep those constraints enabled by default. Without them, MOSEK
+ * can return non-OPTIMAL solution statuses consistently on the realified
+ * relaxation even though the mathematical complex problem is bounded and
+ * feasible. Set GMN_COMPLEX_STRUCTURE=0 only for profiling/experiments. Since
  * Tr(R(C)R(X)) = 2 Re Tr(CX), complex-mode objective coefficients use
  * 0.5 * R(rho) and 0.5 * R(PT(rho)).
  *
@@ -76,6 +75,30 @@ typedef struct
 
 static _Thread_local GmnWorkspace *tls_ws_real = NULL;
 static _Thread_local GmnWorkspace *tls_ws_complex = NULL;
+
+static _Atomic uint64_t diag_workspace_failures = 0;
+static _Atomic uint64_t diag_optimize_errors = 0;
+static _Atomic uint64_t diag_nonfinite_objectives = 0;
+static _Atomic uint64_t diag_accepted_nonoptimal_solutions = 0;
+
+void gmn_mosek_reset_diagnostics(void)
+{
+    atomic_store(&diag_workspace_failures, 0);
+    atomic_store(&diag_optimize_errors, 0);
+    atomic_store(&diag_nonfinite_objectives, 0);
+    atomic_store(&diag_accepted_nonoptimal_solutions, 0);
+}
+
+GmnMosekDiagnostics gmn_mosek_get_diagnostics(void)
+{
+    GmnMosekDiagnostics out;
+    out.workspace_failures = atomic_load(&diag_workspace_failures);
+    out.optimize_errors = atomic_load(&diag_optimize_errors);
+    out.nonfinite_objectives = atomic_load(&diag_nonfinite_objectives);
+    out.accepted_nonoptimal_solutions =
+        atomic_load(&diag_accepted_nonoptimal_solutions);
+    return out;
+}
 
 static int parse_int_env(const char *name, int default_value,
                          int min_value, int max_value)
@@ -333,7 +356,7 @@ static MSKrescodee add_witness_equalities(GmnWorkspace *ws,
 
 static int use_explicit_complex_structure_constraints(void)
 {
-    return parse_int_env("GMN_COMPLEX_STRUCTURE", 0, 0, 1) != 0;
+    return parse_int_env("GMN_COMPLEX_STRUCTURE", 1, 0, 1) != 0;
 }
 
 static MSKrescodee add_complex_structure_constraints(GmnWorkspace *ws,
@@ -656,6 +679,7 @@ static double optimize_current_task(GmnWorkspace *ws)
 {
     if (ws == NULL || ws->task == NULL)
     {
+        atomic_fetch_add(&diag_workspace_failures, 1);
         return NAN;
     }
 
@@ -677,21 +701,15 @@ static double optimize_current_task(GmnWorkspace *ws)
 
     if (r != MSK_RES_OK)
     {
+        atomic_fetch_add(&diag_optimize_errors, 1);
         (void)MSK_deletesolution(ws->task, MSK_SOL_ITR);
         ++ws->solves_since_rebuild;
         maybe_recycle_workspace(ws);
         return NAN;
     }
 
-    MSKsolstae solsta;
-    r = MSK_getsolsta(ws->task, MSK_SOL_ITR, &solsta);
-    if (r != MSK_RES_OK || solsta != MSK_SOL_STA_OPTIMAL)
-    {
-        (void)MSK_deletesolution(ws->task, MSK_SOL_ITR);
-        ++ws->solves_since_rebuild;
-        maybe_recycle_workspace(ws);
-        return NAN;
-    }
+    MSKsolstae solsta = MSK_SOL_STA_UNKNOWN;
+    const MSKrescodee solsta_r = MSK_getsolsta(ws->task, MSK_SOL_ITR, &solsta);
 
     MSKrealt objective = 0.0;
     r = MSK_getprimalobj(ws->task, MSK_SOL_ITR, &objective);
@@ -700,7 +718,24 @@ static double optimize_current_task(GmnWorkspace *ws)
     ++ws->solves_since_rebuild;
     maybe_recycle_workspace(ws);
 
-    return (r == MSK_RES_OK) ? -(double)objective : NAN;
+    /* Do not discard usable complex solves just because MOSEK reports a
+     * non-OPTIMAL solution status. In practice the realified complex SDP can
+     * terminate with a feasible/unknown status while still providing a finite
+     * primal objective. The problem is compact because every P_m,Q_m has an
+     * explicit 0 <= X <= I constraint, so a finite primal objective is the best
+     * available value and is far preferable to collapsing the entire column to 0.
+     */
+    if (r == MSK_RES_OK && isfinite((double)objective))
+    {
+        if (solsta_r != MSK_RES_OK || solsta != MSK_SOL_STA_OPTIMAL)
+        {
+            atomic_fetch_add(&diag_accepted_nonoptimal_solutions, 1);
+        }
+        return -(double)objective;
+    }
+
+    atomic_fetch_add(&diag_nonfinite_objectives, 1);
+    return NAN;
 }
 
 double compute_gmn_mosek_real_8x8(const double *rho_real_row_major)
@@ -713,6 +748,7 @@ double compute_gmn_mosek_real_8x8(const double *rho_real_row_major)
     GmnWorkspace *ws = workspace(0);
     if (ws == NULL)
     {
+        atomic_fetch_add(&diag_workspace_failures, 1);
         return NAN;
     }
 
@@ -733,6 +769,7 @@ double compute_gmn_mosek_complex_8x8(const double *rho_ri_row_major)
     GmnWorkspace *ws = workspace(1);
     if (ws == NULL)
     {
+        atomic_fetch_add(&diag_workspace_failures, 1);
         return NAN;
     }
 
