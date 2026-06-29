@@ -1411,7 +1411,8 @@ struct MIPTKernel_1D_FRGS
         {
             int start = flayers[layer].start;
 
-            for (int i = start; i < n - 1; i += 2)
+            const int bond_stop = (closed && start == 1 && n > 2) ? n : (n - 1);
+            for (int i = start; i < bond_stop; i += 2)
             {
                 int j = (i+1) % n;
                 // Local rotation on q[i]
