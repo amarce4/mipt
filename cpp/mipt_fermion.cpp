@@ -1431,7 +1431,7 @@ struct MIPTKernel_1D_FRGS
                         // applying a CZ between q[i] and each site between j and i, and then doing it again after the XX rotation.  
                         // If the occupancy of q[i] changes, we've effectively applied the Z gates, and if it doesn't change, these gates cancel out.
                         for(int k = j+1; k < i; k++){
-                            cz(3.14159265358979323846, q[k],q[i]);
+                            cz(q[k], q[i]);
                         }
                         // Also, reversing the order of the Majoranas change it from an XX rotation to a YY rotation, so we apply S gates to
                         // convert an XX to a YY since S X S^\dag = Y. 
@@ -1448,7 +1448,7 @@ struct MIPTKernel_1D_FRGS
                         s(q[i]);
                         s(q[j]);
                         for(int k = j+1; k < i; k++){
-                            cz(3.14159265358979323846, q[k],q[i]);
+                            cz(q[k], q[i]);
                         }
                     }
                 }

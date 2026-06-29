@@ -134,6 +134,24 @@ namespace
         return out;
     }
 
+    template <std::size_t N>
+    bool all_finite(const std::array<double, N> &values)
+    {
+        return std::all_of(values.begin(), values.end(), [](double value) {
+            return std::isfinite(value);
+        });
+    }
+
+    double csv_safe_gmn(double value)
+    {
+        /* MOSEK can return no usable interior-point solution on numerically
+         * difficult records, especially in the complex realified SDP. The CSV
+         * should remain numeric and compact, so failed/non-finite solves are
+         * emitted as 0 rather than NaN/Inf.
+         */
+        return std::isfinite(value) ? value : 0.0;
+    }
+
     EvaluationMode parse_mode(const char *arg)
     {
         const std::string value(arg);
@@ -245,7 +263,7 @@ int main(int argc, char *argv[])
             throw std::runtime_error("Could not create output CSV: " + output_path);
         }
 
-        outfile << "p,gmn,p_index,realization,subsystem_index,q0,q1,q2\n";
+        outfile << "p,gmn\n";
         outfile << std::setprecision(17);
 
         const std::uint64_t total_solves =
@@ -275,6 +293,7 @@ int main(int argc, char *argv[])
         mipt_io::DensityRecord record;
         std::uint64_t processed = 0;
         double max_imag_norm = 0.0;
+        std::uint64_t nonfinite_gmn_count = 0;
         const auto start = std::chrono::steady_clock::now();
         auto interval_start = start;
         std::uint64_t interval_processed = 0;
@@ -302,28 +321,36 @@ int main(int argc, char *argv[])
 #endif
             for (std::int64_t i = 0; i < static_cast<std::int64_t>(jobs.size()); ++i)
             {
+                const GmnJob &job = jobs[static_cast<std::size_t>(i)];
                 if (mode == EvaluationMode::Complex)
                 {
-                    gmn_values[static_cast<std::size_t>(i)] =
-                        compute_gmn_mosek_complex_8x8(
-                            jobs[static_cast<std::size_t>(i)].rho_ri.data());
+                    if (all_finite(job.rho_ri))
+                    {
+                        gmn_values[static_cast<std::size_t>(i)] =
+                            compute_gmn_mosek_complex_8x8(job.rho_ri.data());
+                    }
                 }
                 else
                 {
-                    gmn_values[static_cast<std::size_t>(i)] =
-                        compute_gmn_mosek_real_8x8(
-                            jobs[static_cast<std::size_t>(i)].rho_real.data());
+                    if (all_finite(job.rho_real))
+                    {
+                        gmn_values[static_cast<std::size_t>(i)] =
+                            compute_gmn_mosek_real_8x8(job.rho_real.data());
+                    }
                 }
             }
 
             for (std::size_t i = 0; i < jobs.size(); ++i)
             {
                 const GmnJob &job = jobs[i];
-                outfile << job.p << ',' << gmn_values[i] << ','
-                        << job.p_index << ',' << job.realization << ','
-                        << job.subsystem << ','
-                        << job.q0 << ',' << job.q1 << ',' << job.q2 << '\n';
+                const double safe_gmn = csv_safe_gmn(gmn_values[i]);
+                if (safe_gmn != gmn_values[i])
+                {
+                    ++nonfinite_gmn_count;
+                }
+                outfile << job.p << ',' << safe_gmn << '\n';
             }
+            outfile.flush();
 
             processed += jobs.size();
             interval_processed += jobs.size();
@@ -361,6 +388,13 @@ int main(int argc, char *argv[])
                   << "Maximum imaginary Frobenius norm in input records: "
                   << std::scientific << std::setprecision(6)
                   << max_imag_norm << "\n";
+
+        if (nonfinite_gmn_count > 0)
+        {
+            std::cerr
+                << "Warning: replaced " << nonfinite_gmn_count
+                << " non-finite GMN value(s) with 0 in the CSV.\n";
+        }
 
         if (mode == EvaluationMode::RealOnly && max_imag_norm > 1.0e-10)
         {
