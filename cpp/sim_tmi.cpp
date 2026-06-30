@@ -24,10 +24,18 @@
 #endif
 #endif
 
+#include <cerrno>
 #include <charconv>
+#include <cmath>
+#include <cstring>
+#include <sys/stat.h>
+#include <sys/types.h>
 #include <mutex>
 #include <string_view>
 #include <system_error>
+#include <iomanip>
+#include <sstream>
+#include <stdexcept>
 
 // Reuse the existing CUDA-Q kernels, random circuit frontends, fermionic gates,
 // and TMI density-matrix reducers.  Rename mipt.cpp's CLI entry point so this
@@ -40,21 +48,23 @@
 // Fermionic reduced-gate-set architecture imported from mipt_fermion.cpp for
 // sim_tmi.exe fermion=2.  This intentionally leaves mipt.cpp's existing
 // fermion=1 Haar parity-preserving architecture unchanged.
-struct FRGSLayerData
+struct FRGSLayerData // LayerData for fermions with a reduced topological gate set
 {
     int start = 0;
 
     std::vector<int> measure_flags;
 
-    // Per-site gate selector:
-    //   1 -> T gate:             R_Z(pi/4) = exp(-i*pi/8 Z_j)
-    //   2 -> single-site braid:  R_Z(pi/2) = exp(-i*pi/4 Z_j)
-    std::vector<int> local_gate_kind;
+    // Per-active-bond local gate selectors.  These vectors are indexed by the
+    // compact brickwork-bond index, not by the absolute site index, so no RNG
+    // or host->kernel payload is spent on unused q entries.
+    //   0 -> T gate:             R_Z(pi/4) = exp(-i*pi/8 Z_j)
+    //   1 -> single-site braid:  R_Z(pi/2) = exp(-i*pi/4 Z_j)
+    std::vector<int> local_left_kind;
+    std::vector<int> local_right_kind;
 
-    // Per-bond gate selector. Only the first qubit of each candidate bond
-    // selects the two-site gate; for the wrapping bond this is q[n-1].
+    // Per-active-bond two-site gate selector:
     //   0 -> double-site braid:  R_XX(pi/2) = exp(+i*pi/4 X_j X_{j+1})
-    //   1 -> R_ZZ(pi/4) = exp(+i*pi/8  Z_j Z_{j+1})
+    //   1 -> R_ZZ(pi/4) = exp(+i*pi/8 Z_j Z_{j+1})
     std::vector<int> bond_gate_kind;
 };
 
@@ -68,109 +78,179 @@ struct MIPTKernel_1D_FRGS
 
         for (std::size_t layer = 0; layer < flayers.size(); ++layer)
         {
-            int start = flayers[layer].start;
-
+            const int start = flayers[layer].start;
             const int bond_stop = (closed && start == 1 && n > 2) ? n : (n - 1);
+
+            int bond_index = 0;
             for (int i = start; i < bond_stop; i += 2)
             {
-                int j = (i + 1) % n;
+                const int j = (i + 1) % n;
+                const int local_i = flayers[layer].local_left_kind[bond_index];
+                const int local_j = flayers[layer].local_right_kind[bond_index];
+                const int bond_gate = flayers[layer].bond_gate_kind[bond_index];
+                const bool wrapping_bond = (j < i);
 
-                const int local_i = flayers[layer].local_gate_kind[i];
-                if (local_i == 1)
+                if (bond_gate == 0 && wrapping_bond) // double-site braid across periodic boundary
                 {
-                    rz(0.78539816339744830962, q[i]); // T = R_Z(pi/4)
-                }
-                else if (local_i == 2)
-                {
-                    rz(1.57079632679489661923, q[i]); // single-site braid = R_Z(pi/2)
-                }
-
-                const int local_j = flayers[layer].local_gate_kind[j];
-                if (local_j == 1)
-                {
-                    rz(0.78539816339744830962, q[j]); // T = R_Z(pi/4)
-                }
-                else if (local_j == 2)
-                {
-                    rz(1.57079632679489661923, q[j]); // single-site braid = R_Z(pi/2)
-                }
-
-                const int bond_gate = flayers[layer].bond_gate_kind[i];
-
-                if (bond_gate == 0) // double-site braid: exp(+i*pi/4 X_i X_j)
-                {
-                    if (j < i)
+                    // Wrapping fermionic bond: apply the Jordan-Wigner string
+                    // around the periodic boundary, then undo it after the gate.
+                    for (int k = j + 1; k < i; ++k)
                     {
-                        for (int k = j + 1; k < i; ++k)
-                        {
-                            z<cudaq::ctrl>(q[k], q[i]);
-                        }
-                        rz(-1.57079632679489661923, q[i]);
-                        rz(-1.57079632679489661923, q[j]);
+                        z<cudaq::ctrl>(q[k], q[i]);
+                    }
+
+                    // The wrapping XX implementation needs S^dagger on both
+                    // endpoints before the XX rotation.  Fuse that diagonal
+                    // phase with the sampled local gate:
+                    //   local S  * S^dagger -> identity, up to global phase
+                    //   local T  * S^dagger -> R_Z(-pi/4), up to global phase
+                    if (local_i == 0)
+                    {
+                        t<cudaq::adj>(q[i]);
+                    }
+                    if (local_j == 0)
+                    {
+                        t<cudaq::adj>(q[j]);
                     }
 
                     cx(q[i], q[j]);
                     rx(-1.57079632679489661923, q[i]);
                     cx(q[i], q[j]);
 
-                    if (j < i)
+                    s(q[i]);
+                    s(q[j]);
+                    for (int k = j + 1; k < i; ++k)
                     {
-                        s(q[i]);
-                        s(q[j]);
-                        for (int k = j + 1; k < i; ++k)
-                        {
-                            z<cudaq::ctrl>(q[k], q[i]);
-                        }
+                        z<cudaq::ctrl>(q[k], q[i]);
                     }
                 }
-                else if (bond_gate == 1) // R_ZZ(pi/4): exp(+i*pi/8 Z_i Z_j)
+                else
                 {
-                    cx(q[i], q[j]);
-                    rz(-0.78539816339744830962, q[j]);
-                    cx(q[i], q[j]);
+                    // CUDA-Q T and S differ from R_Z(pi/4) and R_Z(pi/2)
+                    // only by one-qubit global phases, so observables and
+                    // reduced density matrices are unchanged while the
+                    // simulator gets native phase gates instead of generic RZs.
+                    if (local_i == 0)
+                    {
+                        t(q[i]);
+                    }
+                    else
+                    {
+                        s(q[i]);
+                    }
+
+                    if (local_j == 0)
+                    {
+                        t(q[j]);
+                    }
+                    else
+                    {
+                        s(q[j]);
+                    }
+
+                    if (bond_gate == 0) // double-site braid: exp(+i*pi/4 X_i X_j)
+                    {
+                        cx(q[i], q[j]);
+                        rx(-1.57079632679489661923, q[i]);
+                        cx(q[i], q[j]);
+                    }
+                    else // R_ZZ(pi/4): exp(+i*pi/8 Z_i Z_j)
+                    {
+                        cx(q[i], q[j]);
+                        t<cudaq::adj>(q[j]);
+                        cx(q[i], q[j]);
+                    }
                 }
+                ++bond_index;
             }
 
             for (int i = 0; i < n; ++i)
             {
                 if (flayers[layer].measure_flags[i])
                 {
-                    mz(q[i]);
+                    mz(q[i]); // Z measurement preserves fermion parity.
                 }
             }
         }
     }
 };
 
+int frgs_active_bond_count(int n, int start, bool closed = true)
+{
+    const int bond_stop = (closed && start == 1 && n > 2) ? n : (n - 1);
+    if (bond_stop <= start)
+    {
+        return 0;
+    }
+    return (bond_stop - start + 1) / 2;
+}
+
+inline int frgs_rng_bit(std::mt19937 &rng)
+{
+    return static_cast<int>((rng() >> 31) & 1u);
+}
+
+void fill_frgs_mipt_layer(FRGSLayerData &layer,
+                          int n,
+                          int start,
+                          double p,
+                          std::mt19937 &rng,
+                          bool closed = true)
+{
+    std::bernoulli_distribution measure_dist(p);
+
+    layer.start = start;
+    layer.measure_flags.resize(n);
+
+    const int bond_count = frgs_active_bond_count(n, start, closed);
+    layer.local_left_kind.resize(bond_count);
+    layer.local_right_kind.resize(bond_count);
+    layer.bond_gate_kind.resize(bond_count);
+
+    for (int b = 0; b < bond_count; ++b)
+    {
+        // 50/50 local T vs single-site braid on each endpoint, independently.
+        layer.local_left_kind[b] = frgs_rng_bit(rng);
+        layer.local_right_kind[b] = frgs_rng_bit(rng);
+
+        // 50/50 double-site braid vs R_ZZ(pi/4).
+        layer.bond_gate_kind[b] = frgs_rng_bit(rng);
+    }
+
+    if (p <= 0.0)
+    {
+        std::fill(layer.measure_flags.begin(), layer.measure_flags.end(), 0);
+    }
+    else if (p >= 1.0)
+    {
+        std::fill(layer.measure_flags.begin(), layer.measure_flags.end(), 1);
+    }
+    else
+    {
+        for (int qidx = 0; qidx < n; ++qidx)
+        {
+            layer.measure_flags[qidx] = measure_dist(rng) ? 1 : 0;
+        }
+    }
+}
+
 FRGSLayerData make_frgs_mipt_layer(int n,
                                    int start,
                                    double p,
-                                   std::mt19937 &rng)
+                                   std::mt19937 &rng,
+                                   bool closed = true)
 {
-    std::uniform_int_distribution<int> local_gate_dist(1, 2); // T or single-site braid.
-    std::uniform_int_distribution<int> bond_gate_dist(0, 1);  // XX braid or ZZ(pi/4).
-    std::bernoulli_distribution measure_dist(p);
-
     FRGSLayerData layer;
-    layer.start = start;
-
-    layer.measure_flags.resize(n);
-    layer.local_gate_kind.resize(n);
-    layer.bond_gate_kind.resize(n);
-
-    for (int q = 0; q < n; ++q)
-    {
-        layer.local_gate_kind[q] = local_gate_dist(rng);
-        layer.bond_gate_kind[q] = bond_gate_dist(rng);
-        layer.measure_flags[q] = measure_dist(rng) ? 1 : 0;
-    }
-
+    fill_frgs_mipt_layer(layer, n, start, p, rng, closed);
     return layer;
 }
 
-std::vector<FRGSLayerData> frgs_mipt_frontend(int n,
-                                              int periods,
-                                              double p)
+void frgs_mipt_frontend_inplace(std::vector<FRGSLayerData> &layers,
+                                int n,
+                                int periods,
+                                double p,
+                                std::mt19937 &rng,
+                                bool closed = true)
 {
     if ((n % 2) != 0)
     {
@@ -181,23 +261,35 @@ std::vector<FRGSLayerData> frgs_mipt_frontend(int n,
         throw std::invalid_argument("Measurement probability p must be in [0,1].");
     }
 
-    std::mt19937 rng(std::random_device{}());
     std::bernoulli_distribution extra_even_layer(0.5);
+    const bool add_extra_even_layer = extra_even_layer(rng);
+    const std::size_t layer_count = static_cast<std::size_t>(2 * periods + (add_extra_even_layer ? 1 : 0));
 
-    std::vector<FRGSLayerData> layers;
-    layers.reserve(2 * periods + 1);
+    // resize() preserves the inner vector capacities for existing layers,
+    // avoiding thousands of small allocations during large realization sweeps.
+    layers.resize(layer_count);
 
+    std::size_t idx = 0;
     for (int period = 0; period < periods; ++period)
     {
-        layers.push_back(make_frgs_mipt_layer(n, 0, p, rng));
-        layers.push_back(make_frgs_mipt_layer(n, 1, p, rng));
+        fill_frgs_mipt_layer(layers[idx++], n, 0, p, rng, closed);
+        fill_frgs_mipt_layer(layers[idx++], n, 1, p, rng, closed);
     }
 
-    if (extra_even_layer(rng))
+    if (add_extra_even_layer)
     {
-        layers.push_back(make_frgs_mipt_layer(n, 0, p, rng));
+        fill_frgs_mipt_layer(layers[idx++], n, 0, p, rng, closed);
     }
+}
 
+std::vector<FRGSLayerData> frgs_mipt_frontend(int n,
+                                              int periods,
+                                              double p,
+                                              bool closed = true)
+{
+    std::mt19937 rng(std::random_device{}());
+    std::vector<FRGSLayerData> layers;
+    frgs_mipt_frontend_inplace(layers, n, periods, p, rng, closed);
     return layers;
 }
 
@@ -1671,6 +1763,8 @@ namespace sim_tmi
         }
     }
 
+    void ensure_output_parent_directory(const std::string &output_path);
+
     void run_1d_sim_tmi(int n,
                         int periods,
                         int realizations,
@@ -1692,6 +1786,8 @@ namespace sim_tmi
         const std::uint64_t total = static_cast<std::uint64_t>(res) *
                                     static_cast<std::uint64_t>(realizations) *
                                     static_cast<std::uint64_t>(cycle_count);
+
+        ensure_output_parent_directory(output_path);
 
         std::ofstream csv(output_path, std::ios::binary | std::ios::trunc);
         if (!csv)
@@ -1728,6 +1824,10 @@ namespace sim_tmi
         std::string line;
         line.reserve(128);
 
+        std::mt19937 frgs_rng(std::random_device{}());
+        std::vector<FRGSLayerData> frgs_layers;
+        frgs_layers.reserve(static_cast<std::size_t>(2 * periods + 1));
+
         const auto start = std::chrono::steady_clock::now();
         auto last_report = start;
         std::uint64_t processed = 0;
@@ -1741,8 +1841,8 @@ namespace sim_tmi
                 auto state = [&]() {
                     if (circuit_mode == CircuitMode::FermionReducedGateSet)
                     {
-                        auto layers = frgs_mipt_frontend(n, periods, p);
-                        return cudaq::get_state(MIPTKernel_1D_FRGS{}, n, layers, true);
+                        frgs_mipt_frontend_inplace(frgs_layers, n, periods, p, frgs_rng, true);
+                        return cudaq::get_state(MIPTKernel_1D_FRGS{}, n, frgs_layers, true);
                     }
                     if (circuit_mode == CircuitMode::FermionHaar)
                     {
@@ -1850,18 +1950,162 @@ namespace sim_tmi
         throw std::invalid_argument(std::string(name) + " must be 0 or 1.");
     }
 
+    std::string format_number_for_filename(double value)
+    {
+        if (std::abs(value) < 1.0e-15)
+        {
+            value = 0.0;
+        }
+
+        std::ostringstream out;
+        out << std::fixed << std::setprecision(12) << value;
+        std::string text = out.str();
+
+        const std::size_t dot = text.find('.');
+        if (dot != std::string::npos)
+        {
+            while (!text.empty() && text.back() == '0')
+            {
+                text.pop_back();
+            }
+            if (!text.empty() && text.back() == '.')
+            {
+                text.pop_back();
+            }
+        }
+
+        if (text == "-0")
+        {
+            text = "0";
+        }
+        return text;
+    }
+
+    std::string tmi_output_tag(CircuitMode circuit_mode, bool all_cycles)
+    {
+        std::string tag;
+        switch (circuit_mode)
+        {
+        case CircuitMode::QubitMms:
+            tag = "qubit";
+            break;
+        case CircuitMode::FermionHaar:
+            tag = "fermion1";
+            break;
+        case CircuitMode::FermionReducedGateSet:
+            tag = "fermion2";
+            break;
+        default:
+            throw std::invalid_argument("Unsupported fermion mode for TMI output naming.");
+        }
+
+        if (all_cycles)
+        {
+            tag += "c";
+        }
+        return tag;
+    }
+
+    std::string default_tmi_output_path(int n,
+                                        int realizations,
+                                        int res,
+                                        double p_min,
+                                        double p_max,
+                                        CircuitMode circuit_mode,
+                                        bool all_cycles)
+    {
+        const std::string tag = tmi_output_tag(circuit_mode, all_cycles);
+
+        std::ostringstream filename;
+        filename << "tmi_" << tag
+                 << "_n_" << n
+                 << "_real_" << realizations
+                 << '_' << format_number_for_filename(p_min)
+                 << '_' << format_number_for_filename(p_max)
+                 << "_res_" << res
+                 << ".csv";
+
+        return std::string("csv/tmi/") + tag + "/" + filename.str();
+    }
+
+    void make_directory_if_needed(const std::string &path)
+    {
+        if (path.empty())
+        {
+            return;
+        }
+
+        if (::mkdir(path.c_str(), 0755) == 0)
+        {
+            return;
+        }
+
+        if (errno == EEXIST)
+        {
+            return;
+        }
+
+        throw std::runtime_error("Could not create output directory: " + path + " (" + std::strerror(errno) + ")");
+    }
+
+    void ensure_output_parent_directory(const std::string &output_path)
+    {
+        const std::size_t slash = output_path.find_last_of("/\\");
+        if (slash == std::string::npos)
+        {
+            return;
+        }
+
+        const std::string parent = output_path.substr(0, slash);
+        if (parent.empty())
+        {
+            return;
+        }
+
+        std::string current;
+        std::size_t pos = 0;
+        if (parent[0] == '/')
+        {
+            current = "/";
+            pos = 1;
+        }
+
+        while (pos < parent.size())
+        {
+            const std::size_t next = parent.find_first_of("/\\", pos);
+            const std::string part = parent.substr(pos, next == std::string::npos ? std::string::npos : next - pos);
+            if (!part.empty())
+            {
+                if (!current.empty() && current.back() != '/')
+                {
+                    current += '/';
+                }
+                current += part;
+                make_directory_if_needed(current);
+            }
+            if (next == std::string::npos)
+            {
+                break;
+            }
+            pos = next + 1;
+        }
+    }
+
     void print_usage(const char *argv0)
     {
         std::cerr
             << "Usage:\n"
-            << "  " << argv0 << " [n = 10] [periods = 10] [realizations = 10] [resolution = 5] [p_min = 0.0] [p_max = 1.0] [fermion = 0] [all_cycles = 0] [output.csv = tmi.csv]\n\n"
+            << "  " << argv0 << " [n = 10] [periods = 10] [realizations = 10] [resolution = 5] [p_min = 0.0] [p_max = 1.0] [fermion = 0] [all_cycles = 0] [output.csv = auto]\n\n"
             << "Arguments:\n"
             << "  fermion = 0 uses the existing MMS/qubit circuit.\n"
             << "  fermion = 1 uses parity-preserving fermionic gates with JW FSWAP boundaries.\n"
             << "  fermion = 2 uses the reduced-gate-set fermionic architecture from mipt_fermion.cpp.\n"
             << "  all_cycles = 0 computes the original offset only.\n"
             << "  all_cycles = 1 computes N/4 cyclic offsets; e.g. N=8 gives [0,1]|[2,3]|[4,5]|[6,7] and [1,2]|[3,4]|[5,6]|[7,0].\n"
-            << "  For backward compatibility, output.csv may also be supplied before all_cycles.\n\n"
+            << "  For backward compatibility, output.csv may also be supplied before all_cycles.\n"
+            << "  If output.csv is omitted, the default path is:\n"
+            << "    csv/tmi/<tag>/tmi_<tag>_n_<n>_real_<realizations>_<p_min>_<p_max>_res_<resolution>.csv\n"
+            << "  Tags are qubit, fermion1, or fermion2; all_cycles=1 appends c, e.g. fermion2c.\n\n"
             << "Output CSV columns:\n"
             << "  p,tmi\n";
     }
@@ -1893,7 +2137,8 @@ int main(int argc, char **argv)
         const int fermion = (argc > 7) ? std::stoi(argv[7]) : 0;
 
         bool all_cycles = false;
-        std::string output_path = "tmi.csv";
+        std::string output_path;
+        bool output_path_explicit = false;
         if (argc > 8)
         {
             const std::string_view arg8(argv[8]);
@@ -1903,11 +2148,13 @@ int main(int argc, char **argv)
                 if (argc > 9)
                 {
                     output_path = argv[9];
+                    output_path_explicit = true;
                 }
             }
             else
             {
                 output_path = argv[8];
+                output_path_explicit = true;
                 if (argc > 9)
                 {
                     all_cycles = sim_tmi::parse_bool01_arg(argv[9], "all_cycles");
@@ -1916,6 +2163,16 @@ int main(int argc, char **argv)
         }
 
         const sim_tmi::CircuitMode circuit_mode = sim_tmi::circuit_mode_from_int(fermion);
+        if (!output_path_explicit)
+        {
+            output_path = sim_tmi::default_tmi_output_path(n,
+                                                          realizations,
+                                                          res,
+                                                          p_min,
+                                                          p_max,
+                                                          circuit_mode,
+                                                          all_cycles);
+        }
 
         sim_tmi::run_1d_sim_tmi(n,
                                 periods,

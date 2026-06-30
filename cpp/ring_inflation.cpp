@@ -1,5 +1,4 @@
 #include "density_io.hpp"
-#include "gmn.hpp"
 
 #if __has_include(<scs.h>)
 #include <scs.h>
@@ -98,13 +97,6 @@ namespace
         scs_int status_val = 0;
         scs_int iter = 0;
         double solve_time_ms = 0.0;
-    };
-
-    struct Candidate
-    {
-        std::uint32_t subsystem = 0;
-        std::array<double, RHO_RI_VALUES> rho_ri{};
-        double gmn = -std::numeric_limits<double>::infinity();
     };
 
     void bind_cone_program(ConeProgram &program)
@@ -277,18 +269,24 @@ namespace
         return !(s == "0" || s == "false" || s == "False" || s == "FALSE" || s == "no");
     }
 
-    void set_env_if_missing(const char *name, const char *value)
+    int env_nonnegative_int_zero_ok(const char *name, int default_value)
     {
-        if (std::getenv(name) != nullptr)
+        const char *value = std::getenv(name);
+        if (value == nullptr || *value == '\0')
         {
-            return;
+            return default_value;
         }
-#if defined(_WIN32)
-        _putenv_s(name, value);
-#else
-        setenv(name, value, 0);
-#endif
+        char *end = nullptr;
+        errno = 0;
+        const long parsed = std::strtol(value, &end, 10);
+        if (errno != 0 || end == value || *end != '\0' || parsed < 0 ||
+            parsed > std::numeric_limits<int>::max())
+        {
+            throw std::invalid_argument(std::string(name) + " must be a nonnegative integer.");
+        }
+        return static_cast<int>(parsed);
     }
+
 
     void print_usage(const char *program)
     {
@@ -300,9 +298,8 @@ namespace
             << "  " << program << " [file] [max_iters] [tol] [time_limit_secs] [limit_per_p] [p_min] [p_max] [record_start] [record_stop]\n\n"
             << "Pipeline:\n"
             << "  1. Reads a version-2 MIPT 3-qubit RDM .bin file.\n"
-            << "  2. Runs full complex MOSEK GMN on every stored distance-1 subsystem.\n"
-            << "  3. Runs the level-2 ring-inflation SDP with SCS on each subsystem independently.\n"
-            << "  4. Writes one CSV row per subsystem with columns: p,gmn,inflation_score.\n\n"
+            << "  2. Runs the level-2 ring-inflation SDP with SCS on each subsystem independently.\n"
+            << "  3. Writes one CSV row per subsystem with columns: p,inflation_score.\n\n"
             << "Optional arguments:\n"
             << "  limit_per_p             0 or omitted means no limit; otherwise cap processed records per p after filtering.\n"
             << "  p_min p_max             Inclusive measurement-rate p range. Use 'all all' for all p values.\n"
@@ -318,8 +315,9 @@ namespace
             << "Environment variables:\n"
             << "  RING_OUTPUT_CSV=path       Output CSV path; default ring_inflation.csv.\n"
             << "  RING_SCS_VERBOSE=1         Enable SCS iteration logging.\n"
-            << "  OMP_NUM_THREADS=N          Parallel GMN workers.\n"
-            << "  GMN_MOSEK_NUM_THREADS=N    MOSEK threads per GMN solve; default forced to 1 when OpenMP > 1.\n";
+            << "  OMP_NUM_THREADS=N          Parallel SCS workers across subsystems.\n"
+            << "  RING_SCS_ACCELERATION_LOOKBACK=N\n"
+            << "                              Anderson acceleration lookback; default 10, use 0 to disable.\n";
     }
 
     Options parse_options(int argc, char **argv)
@@ -1070,7 +1068,8 @@ namespace
                                        int max_iters,
                                        double tol,
                                        double time_limit_secs,
-                                       bool verbose)
+                                       bool verbose,
+                                       int acceleration_lookback)
     {
         ConeProgram program = build_ring_inflation_program(rho_ri);
         bind_cone_program(program);
@@ -1084,7 +1083,7 @@ namespace
         settings.time_limit_secs = static_cast<scs_float>(time_limit_secs);
         settings.verbose = verbose ? 1 : 0;
         settings.normalize = 1;
-        settings.acceleration_lookback = 0;
+        settings.acceleration_lookback = static_cast<scs_int>(acceleration_lookback);
         settings.warm_start = 0;
 
         std::vector<scs_float> x(static_cast<std::size_t>(program.cols), 0.0);
@@ -1101,7 +1100,14 @@ namespace
         double raw = static_cast<double>(x[0]);
         if (std::isfinite(raw))
         {
-            raw = std::min(1.0, std::max(0.0, raw));
+            if (raw >= 1.0 - tol)
+            {
+                raw = 1.0;
+            }
+            else
+            {
+                raw = std::min(1.0, std::max(0.0, raw));
+            }
         }
 
         SCSResult result;
@@ -1113,42 +1119,7 @@ namespace
         return result;
     }
 
-    std::vector<Candidate> evaluate_all_subsystems_gmn(const mipt_io::DensityFileMetadata &metadata,
-                                                       const mipt_io::DensityRecord &record)
-    {
-        if (metadata.kept_qubits != 3 || metadata.matrix_dimension != RHO_DIM)
-        {
-            throw std::runtime_error("Input file must contain three-qubit 8x8 reduced density matrices.");
-        }
-        if (record.rho_ri.size() !=
-            static_cast<std::size_t>(metadata.subsystem_count) * RHO_RI_VALUES)
-        {
-            throw std::runtime_error("Density record payload size is inconsistent with metadata.");
-        }
 
-        std::vector<Candidate> candidates(static_cast<std::size_t>(metadata.subsystem_count));
-        for (std::uint32_t s = 0; s < metadata.subsystem_count; ++s)
-        {
-            Candidate &candidate = candidates[static_cast<std::size_t>(s)];
-            candidate.subsystem = s;
-            candidate.gmn = std::numeric_limits<double>::quiet_NaN();
-
-            const double *rho = record.rho_ri.data() +
-                static_cast<std::size_t>(s) * RHO_RI_VALUES;
-            std::copy(rho, rho + RHO_RI_VALUES, candidate.rho_ri.begin());
-        }
-
-#ifdef _OPENMP
-#pragma omp parallel for schedule(dynamic, 1)
-#endif
-        for (std::int64_t s = 0; s < static_cast<std::int64_t>(metadata.subsystem_count); ++s)
-        {
-            Candidate &candidate = candidates[static_cast<std::size_t>(s)];
-            candidate.gmn = compute_gmn_mosek_complex_8x8(candidate.rho_ri.data());
-        }
-
-        return candidates;
-    }
 } // namespace
 
 int main(int argc, char **argv)
@@ -1156,13 +1127,8 @@ int main(int argc, char **argv)
     try
     {
         const Options opts = parse_options(argc, argv);
-
-#ifdef _OPENMP
-        if (omp_get_max_threads() > 1)
-        {
-            set_env_if_missing("GMN_MOSEK_NUM_THREADS", "1");
-        }
-#endif
+        const int scs_acceleration_lookback =
+            env_nonnegative_int_zero_ok("RING_SCS_ACCELERATION_LOOKBACK", 10);
 
         mipt_io::DensityMatrixReader reader(opts.input_file);
         const auto &metadata = reader.metadata();
@@ -1176,15 +1142,16 @@ int main(int argc, char **argv)
         {
             throw std::runtime_error("Could not create output CSV: " + opts.output_csv);
         }
-        out << "p,gmn,inflation_score\n";
+        out << "p,inflation_score\n";
         out << std::setprecision(17);
 
-        std::cout << "Running per-subsystem GMN + level-2 ring inflation from " << opts.input_file << "\n"
+        std::cout << "Running per-subsystem level-2 ring inflation from " << opts.input_file << "\n"
                   << "Records: " << metadata.record_count
                   << "; subsystems per record: " << metadata.subsystem_count
                   << "; SCS max_iters=" << opts.max_iters
                   << "; tol=" << opts.tol
                   << "; time_limit_secs=" << opts.time_limit_secs
+                  << "; acceleration_lookback=" << scs_acceleration_lookback
                   << "; limit_per_p="
                   << (opts.limit_per_p == 0 ? std::string("none") : std::to_string(opts.limit_per_p))
                   << "; p_range="
@@ -1198,12 +1165,7 @@ int main(int argc, char **argv)
                   << "\n"
                   << "Output CSV: " << opts.output_csv << "\n";
 #ifdef _OPENMP
-        std::cout << "OpenMP GMN workers: " << omp_get_max_threads()
-                  << "; GMN_MOSEK_NUM_THREADS="
-                  << (std::getenv("GMN_MOSEK_NUM_THREADS")
-                          ? std::getenv("GMN_MOSEK_NUM_THREADS")
-                          : "MOSEK default")
-                  << "\n";
+        std::cout << "OpenMP SCS workers: " << omp_get_max_threads() << "\n";
 #endif
 
         mipt_io::DensityRecord record;
@@ -1255,14 +1217,29 @@ int main(int argc, char **argv)
                 continue;
             }
 
-            std::vector<Candidate> candidates = evaluate_all_subsystems_gmn(metadata, record);
-            for (const Candidate &candidate : candidates)
+            if (record.rho_ri.size() !=
+                static_cast<std::size_t>(metadata.subsystem_count) * RHO_RI_VALUES)
             {
-                const SCSResult inflation = solve_ring_inflation_scs(
-                    candidate.rho_ri.data(), opts.max_iters, opts.tol, opts.time_limit_secs,
-                    opts.scs_verbose);
+                throw std::runtime_error("Density record payload size is inconsistent with metadata.");
+            }
 
-                out << record.p << ',' << candidate.gmn << ',' << inflation.score << '\n';
+            std::vector<SCSResult> inflations(static_cast<std::size_t>(metadata.subsystem_count));
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic, 1)
+#endif
+            for (std::int64_t s = 0; s < static_cast<std::int64_t>(metadata.subsystem_count); ++s)
+            {
+                const double *rho = record.rho_ri.data() +
+                    static_cast<std::size_t>(s) * RHO_RI_VALUES;
+                inflations[static_cast<std::size_t>(s)] = solve_ring_inflation_scs(
+                    rho, opts.max_iters, opts.tol, opts.time_limit_secs,
+                    opts.scs_verbose, scs_acceleration_lookback);
+            }
+
+            for (std::uint32_t subsystem = 0; subsystem < metadata.subsystem_count; ++subsystem)
+            {
+                const SCSResult &inflation = inflations[static_cast<std::size_t>(subsystem)];
+                out << record.p << ',' << inflation.score << '\n';
                 ++rows_written;
 
                 const auto now = std::chrono::steady_clock::now();
@@ -1277,14 +1254,14 @@ int main(int argc, char **argv)
                 std::cout << "\rWrote row " << rows_written << '/' << progress_total_rows
                           << "; records=" << (records_processed + 1) << '/' << progress_total_records
                           << "; p=" << std::setprecision(6) << record.p
-                          << "; subsystem=" << candidate.subsystem
-                          << "; gmn=" << std::setprecision(6) << candidate.gmn
+                          << "; subsystem=" << subsystem
                           << "; inflation=" << std::setprecision(6) << inflation.score
                           << "; SCS=" << inflation.status
                           << " (" << inflation.iter << " iters)"
                           << "; ETA " << std::fixed << std::setprecision(1) << eta << " s                   "
                           << std::flush;
             }
+            out.flush();
             ++records_processed;
             ++p_count;
         }
