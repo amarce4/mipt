@@ -46,13 +46,16 @@ struct FRGSLayerData
 
     std::vector<int> measure_flags;
 
-    // This flag can be 1 simultaneously with the two-site gate selector.
-    std::vector<int> rot_z_flags;
+    // Per-site gate selector:
+    //   1 -> T gate:             R_Z(pi/4) = exp(-i*pi/8 Z_j)
+    //   2 -> single-site braid:  R_Z(pi/2) = exp(-i*pi/4 Z_j)
+    std::vector<int> local_gate_kind;
 
-    // Exactly one of these should be 1 for each candidate bond.  As in
-    // mipt_fermion.cpp, only the first qubit of each bond selects the gate.
-    std::vector<int> rot_xx_flags;
-    std::vector<int> rot_zz_flags;
+    // Per-bond gate selector. Only the first qubit of each candidate bond
+    // selects the two-site gate; for the wrapping bond this is q[n-1].
+    //   0 -> double-site braid:  R_XX(pi/2) = exp(+i*pi/4 X_j X_{j+1})
+    //   1 -> R_ZZ(pi/4) = exp(+i*pi/8  Z_j Z_{j+1})
+    std::vector<int> bond_gate_kind;
 };
 
 struct MIPTKernel_1D_FRGS
@@ -72,16 +75,29 @@ struct MIPTKernel_1D_FRGS
             {
                 int j = (i + 1) % n;
 
-                if (flayers[layer].rot_z_flags[i])
+                const int local_i = flayers[layer].local_gate_kind[i];
+                if (local_i == 1)
                 {
-                    rz(0.392699081698724154808, q[i]);
+                    rz(0.78539816339744830962, q[i]); // T = R_Z(pi/4)
                 }
-                if (flayers[layer].rot_z_flags[j])
+                else if (local_i == 2)
                 {
-                    rz(0.392699081698724154808, q[j]);
+                    rz(1.57079632679489661923, q[i]); // single-site braid = R_Z(pi/2)
                 }
 
-                if (flayers[layer].rot_xx_flags[i])
+                const int local_j = flayers[layer].local_gate_kind[j];
+                if (local_j == 1)
+                {
+                    rz(0.78539816339744830962, q[j]); // T = R_Z(pi/4)
+                }
+                else if (local_j == 2)
+                {
+                    rz(1.57079632679489661923, q[j]); // single-site braid = R_Z(pi/2)
+                }
+
+                const int bond_gate = flayers[layer].bond_gate_kind[i];
+
+                if (bond_gate == 0) // double-site braid: exp(+i*pi/4 X_i X_j)
                 {
                     if (j < i)
                     {
@@ -94,7 +110,7 @@ struct MIPTKernel_1D_FRGS
                     }
 
                     cx(q[i], q[j]);
-                    rx(0.78539816339744830962, q[i]);
+                    rx(-1.57079632679489661923, q[i]);
                     cx(q[i], q[j]);
 
                     if (j < i)
@@ -107,11 +123,10 @@ struct MIPTKernel_1D_FRGS
                         }
                     }
                 }
-
-                if (flayers[layer].rot_zz_flags[i])
+                else if (bond_gate == 1) // R_ZZ(pi/4): exp(+i*pi/8 Z_i Z_j)
                 {
                     cx(q[i], q[j]);
-                    rz(0.78539816339744830962, q[j]);
+                    rz(-0.78539816339744830962, q[j]);
                     cx(q[i], q[j]);
                 }
             }
@@ -132,22 +147,21 @@ FRGSLayerData make_frgs_mipt_layer(int n,
                                    double p,
                                    std::mt19937 &rng)
 {
-    std::bernoulli_distribution coin_flip(0.5);
+    std::uniform_int_distribution<int> local_gate_dist(1, 2); // T or single-site braid.
+    std::uniform_int_distribution<int> bond_gate_dist(0, 1);  // XX braid or ZZ(pi/4).
     std::bernoulli_distribution measure_dist(p);
 
     FRGSLayerData layer;
     layer.start = start;
 
     layer.measure_flags.resize(n);
-    layer.rot_z_flags.resize(n);
-    layer.rot_xx_flags.resize(n);
-    layer.rot_zz_flags.resize(n);
+    layer.local_gate_kind.resize(n);
+    layer.bond_gate_kind.resize(n);
 
     for (int q = 0; q < n; ++q)
     {
-        layer.rot_z_flags[q] = coin_flip(rng) ? 1 : 0;
-        layer.rot_xx_flags[q] = coin_flip(rng) ? 1 : 0;
-        layer.rot_zz_flags[q] = 1 - layer.rot_xx_flags[q];
+        layer.local_gate_kind[q] = local_gate_dist(rng);
+        layer.bond_gate_kind[q] = bond_gate_dist(rng);
         layer.measure_flags[q] = measure_dist(rng) ? 1 : 0;
     }
 

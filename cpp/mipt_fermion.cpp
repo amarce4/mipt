@@ -1384,19 +1384,22 @@ struct MIPTKernel_2D
     }
 };
 
-struct FRGSLayerData //LayerData for fermions with a reduced gate set
+struct FRGSLayerData // LayerData for fermions with a reduced topological gate set
 {
     int start = 0;
 
     std::vector<int> measure_flags;
 
-    // This flag can be 1 simultaneously with the others, but the others should not overlap with each other.
-    std::vector<int> rot_z_flags;
-    // Exactly one of these should be 1 for each qubit. 
-    // Because these are two-layer gates, only the first qubit of each gate (last qubit if it's the wrapping gate) will determine if
-    // we apply the gate or not.
-    std::vector<int> rot_xx_flags;
-    std::vector<int> rot_zz_flags;
+    // Per-site gate selector:
+    //   1 -> T gate:             R_Z(pi/4) = exp(-i*pi/8 Z_j)
+    //   2 -> single-site braid:  R_Z(pi/2) = exp(-i*pi/4 Z_j)
+    std::vector<int> local_gate_kind;
+
+    // Per-bond gate selector. Only the first qubit of each candidate bond
+    // selects the two-site gate; for the wrapping bond this is q[n-1].
+    //   0 -> double-site braid:  R_XX(pi/2) = exp(+i*pi/4 X_j X_{j+1})
+    //   1 -> R_ZZ(pi/4) = exp(+i*pi/8  Z_j Z_{j+1})
+    std::vector<int> bond_gate_kind;
 };
 
 struct MIPTKernel_1D_FRGS
@@ -1414,49 +1417,67 @@ struct MIPTKernel_1D_FRGS
             const int bond_stop = (closed && start == 1 && n > 2) ? n : (n - 1);
             for (int i = start; i < bond_stop; i += 2)
             {
-                int j = (i+1) % n;
-                // Local rotation on q[i]
-                if (flayers[layer].rot_z_flags[i])
+                int j = (i + 1) % n;
+
+                // CUDA-Q rz(theta) implements exp(-i*theta/2 Z).
+                const int local_i = flayers[layer].local_gate_kind[i];
+                if (local_i == 1)
                 {
-                    rz(0.392699081698724154808, q[i]); //pi/8 Z rotation, i.e. T gate
+                    rz(0.78539816339744830962, q[i]); // T = R_Z(pi/4)
                 }
-                if (flayers[layer].rot_z_flags[j])
+                else if (local_i == 2)
                 {
-                    rz(0.392699081698724154808, q[j]);
+                    rz(1.57079632679489661923, q[i]); // single-site braid = R_Z(pi/2)
                 }
-                // Local XX or ZZ rotation
-                if (flayers[layer].rot_xx_flags[i]) //pi/4 XX rotation (i.e. conjugate of Molmer-Sorensen)
+
+                const int local_j = flayers[layer].local_gate_kind[j];
+                if (local_j == 1)
                 {
-                    if(j < i){// If we're wrapping, we need to apply a Jordan-Wigner string of conditional phase gates
-                        // If q[i] occupancy changes, need to apply a Z to all sites between j and i. We can implement this by
-                        // applying a CZ between q[i] and each site between j and i, and then doing it again after the XX rotation.  
-                        // If the occupancy of q[i] changes, we've effectively applied the Z gates, and if it doesn't change, these gates cancel out.
-                        for(int k = j+1; k < i; k++){
+                    rz(0.78539816339744830962, q[j]); // T = R_Z(pi/4)
+                }
+                else if (local_j == 2)
+                {
+                    rz(1.57079632679489661923, q[j]); // single-site braid = R_Z(pi/2)
+                }
+
+                const int bond_gate = flayers[layer].bond_gate_kind[i];
+
+                if (bond_gate == 0) // double-site braid: exp(+i*pi/4 X_i X_j)
+                {
+                    if (j < i)
+                    {
+                        // Wrapping fermionic bond: apply the Jordan-Wigner string
+                        // around the periodic boundary, then undo it after the gate.
+                        for (int k = j + 1; k < i; k++)
+                        {
                             cz(q[k], q[i]);
                         }
-                        // Also, reversing the order of the Majoranas change it from an XX rotation to a YY rotation, so we apply S gates to
-                        // convert an XX to a YY since S X S^\dag = Y. 
+                        // Reverse Majorana ordering turns XX into YY; conjugate by S.
                         rz(-1.57079632679489661923, q[i]);
                         rz(-1.57079632679489661923, q[j]);
                     }
-                    // This is probably the most efficient way to implement a XX rotation using basic CUDA-Q gates?
-                    //h(q[i]);h(q[j]);
+
+                    // CNOT-RX-CNOT gives exp(-i*theta/2 X_i X_j), so theta=-pi/2
+                    // realizes exp(+i*pi/4 X_i X_j).
                     cx(q[i], q[j]);
-                    rx(0.78539816339744830962, q[i]);
+                    rx(-1.57079632679489661923, q[i]);
                     cx(q[i], q[j]);
-                    //h(q[i]);h(q[j]);
-                    if(j < i){
+
+                    if (j < i)
+                    {
                         s(q[i]);
                         s(q[j]);
-                        for(int k = j+1; k < i; k++){
+                        for (int k = j + 1; k < i; k++)
+                        {
                             cz(q[k], q[i]);
                         }
                     }
                 }
-                if (flayers[layer].rot_zz_flags[i]) //pi/4 ZZ rotation (the only four-Majorana interaction)
+                else if (bond_gate == 1) // R_ZZ(pi/4): exp(+i*pi/8 Z_i Z_j)
                 {
+                    // CNOT-RZ-CNOT gives exp(-i*theta/2 Z_i Z_j), so theta=-pi/4.
                     cx(q[i], q[j]);
-                    rz(0.78539816339744830962, q[j]);
+                    rz(-0.78539816339744830962, q[j]);
                     cx(q[i], q[j]);
                 }
             }
@@ -1465,7 +1486,7 @@ struct MIPTKernel_1D_FRGS
             {
                 if (flayers[layer].measure_flags[i])
                 {
-                    mz(q[i]); // Z measurement preserves fermion parity so this is still all right
+                    mz(q[i]); // Z measurement preserves fermion parity.
                 }
             }
         }
@@ -1542,24 +1563,21 @@ FRGSLayerData make_frgs_mipt_layer(int n,
                           double p,
                           std::mt19937 &rng)
 {
-    std::bernoulli_distribution coin_flip(0.5);
+    std::uniform_int_distribution<int> local_gate_dist(1, 2); // T or single-site braid.
+    std::uniform_int_distribution<int> bond_gate_dist(0, 1);  // XX braid or ZZ(pi/4).
     std::bernoulli_distribution measure_dist(p);
 
     FRGSLayerData layer;
     layer.start = start;
 
     layer.measure_flags.resize(n);
-
-    layer.rot_z_flags.resize(n);
-    layer.rot_xx_flags.resize(n);
-    layer.rot_zz_flags.resize(n);
+    layer.local_gate_kind.resize(n);
+    layer.bond_gate_kind.resize(n);
 
     for (int q = 0; q < n; ++q)
     {
-        layer.rot_z_flags[q] = coin_flip(rng) ? 1 : 0; // Single-site Z rotation on each site with a 50/50 chance;
-        layer.rot_xx_flags[q] = coin_flip(rng) ? 1 : 0; // Apply an XX rotation with a 50/50 chance;
-        layer.rot_zz_flags[q] = 1-layer.rot_xx_flags[q]; // If we're not applying an XX rotation, apply a ZZ rotation instead.
-
+        layer.local_gate_kind[q] = local_gate_dist(rng);
+        layer.bond_gate_kind[q] = bond_gate_dist(rng);
         layer.measure_flags[q] = measure_dist(rng) ? 1 : 0;
     }
 
