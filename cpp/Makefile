@@ -16,12 +16,14 @@
 # OpenBLAS/LAPACK enables the fast exact Schmidt-SVD path; otherwise it falls
 # back to the older reduced-density-matrix path.
 #
-# CPU simulation:
-#   make GPU=0 CUDA_RHO=0
+# Default NVIDIA simulation with GPU reduced-density-matrix/TMI-SVD kernels:
+#   make [target]
+# expands to:
+#   make [target] GPU=1 CUDA_RHO=1 FP64=0
 #
-# NVIDIA simulation with GPU reduced-density-matrix kernels:
+# CPU simulation / double precision examples:
+#   make GPU=0 CUDA_RHO=0
 #   make GPU=1 CUDA_RHO=1 FP64=1
-#   make GPU=1 CUDA_RHO=1 FP64=0
 #
 # GMN analysis:
 #   ./gmn.exe 0 rho3.bin data_real.csv       # real-only GMN on Re(rho)
@@ -37,15 +39,15 @@ MOSEK_HOME ?= $(HOME)/mosek/11.2/tools/platform/linux64x86
 MOSEK_INC  ?= $(MOSEK_HOME)/h
 MOSEK_LIB  ?= $(MOSEK_HOME)/bin
 
-GPU ?= 0
-FP64 ?= 1
+GPU ?= 1
+FP64 ?= 0
 CUDA_RHO ?= $(GPU)
 OPENMP ?= 1
 
 NVQXXFLAGS_COMMON := -std=c++20 -O3 -DNDEBUG -march=native
 CXXFLAGS_COMMON   := -std=c++20 -O3 -DNDEBUG -march=native -I$(MOSEK_INC)
 CFLAGS_COMMON     := -std=c11 -O3 -DNDEBUG -march=native -I$(MOSEK_INC)
-NVCCFLAGS         := -std=c++17 -O3
+NVCCFLAGS         := -std=c++14 -O3
 MOSEK_LDFLAGS     := -L$(MOSEK_LIB) -Wl,-rpath,$(MOSEK_LIB)
 MOSEK_LIBS        := -lmosek64
 DL_LIBS           ?= -ldl
@@ -97,6 +99,7 @@ endif
 ifeq ($(CUDA_RHO),1)
   NVQXXFLAGS_COMMON += -DMIPT_ENABLE_CUDA_RHO
   MIPT_CUDA_LIBS := -lcudart
+  SIM_TMI_CUDA_LIBS := -lcudart -lcusolver -lcublas
 endif
 
 CONFIG := gpu$(GPU)_fp64$(FP64)_rho$(CUDA_RHO)
@@ -116,7 +119,7 @@ SIM_TMI_OBJS := $(MIPT_OBJDIR)/sim_tmi.o
 ENTROPY_OBJS := $(MIPT_OBJDIR)/entropy.o
 ifeq ($(CUDA_RHO),1)
   MIPT_OBJS += $(MIPT_OBJDIR)/rho_reduce.o
-  SIM_TMI_OBJS += $(MIPT_OBJDIR)/rho_reduce.o
+  SIM_TMI_OBJS += $(MIPT_OBJDIR)/rho_reduce.o $(MIPT_OBJDIR)/tmi_cuda_svd.o
   ENTROPY_OBJS += $(MIPT_OBJDIR)/rho_reduce.o
 endif
 
@@ -174,7 +177,7 @@ $(MIPT_BINARY): $(MIPT_OBJS)
 	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $^ $(MIPT_CUDA_LIBS) -o $@
 
 $(SIM_TMI_BINARY): $(SIM_TMI_OBJS)
-	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $^ $(MIPT_CUDA_LIBS) $(DL_LIBS) -o $@
+	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $^ $(MIPT_CUDA_LIBS) $(SIM_TMI_CUDA_LIBS) $(DL_LIBS) -o $@
 
 $(ENTROPY_BINARY): $(ENTROPY_OBJS)
 	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $^ $(MIPT_CUDA_LIBS) $(DL_LIBS) -o $@
@@ -203,13 +206,16 @@ $(TMI_OBJDIR):
 $(MIPT_OBJDIR)/mipt.o: mipt.cpp density_io.hpp rho_reduce.hpp | $(MIPT_OBJDIR)
 	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $(NVQXXFLAGS_COMMON) -c $< -o $@
 
-$(MIPT_OBJDIR)/sim_tmi.o: sim_tmi.cpp mipt.cpp mipt_fermion.cpp density_io.hpp rho_reduce.hpp | $(MIPT_OBJDIR)
+$(MIPT_OBJDIR)/sim_tmi.o: sim_tmi.cpp mipt.cpp mipt_fermion.cpp density_io.hpp rho_reduce.hpp tmi_cuda_svd.hpp | $(MIPT_OBJDIR)
 	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $(NVQXXFLAGS_COMMON) -c $< -o $@
 
 $(MIPT_OBJDIR)/entropy.o: entropy.cpp mipt_fermion.cpp density_io.hpp rho_reduce.hpp | $(MIPT_OBJDIR)
 	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $(NVQXXFLAGS_COMMON) -c $< -o $@
 
 $(MIPT_OBJDIR)/rho_reduce.o: rho_reduce.cu rho_reduce.hpp | $(MIPT_OBJDIR)
+	$(NVCC) $(NVCCFLAGS) -c $< -o $@
+
+$(MIPT_OBJDIR)/tmi_cuda_svd.o: tmi_cuda_svd.cu tmi_cuda_svd.hpp | $(MIPT_OBJDIR)
 	$(NVCC) $(NVCCFLAGS) -c $< -o $@
 
 $(GMN_OBJDIR)/gmn_main.o: gmn_main.cpp density_io.hpp gmn.hpp | $(GMN_OBJDIR)

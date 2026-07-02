@@ -1597,6 +1597,8 @@ void frgs_mipt_frontend_inplace(std::vector<FRGSLayerData> &layers,
         throw std::invalid_argument("Measurement probability p must be in [0,1].");
     }
 
+    // Optional final even layer: included with 50% probability, and if included
+    // its measurements use the same measurement rate p as the bulk layers.
     std::bernoulli_distribution extra_even_layer(0.5);
     const bool add_extra_even_layer = extra_even_layer(rng);
     const std::size_t layer_count = static_cast<std::size_t>(2 * periods + (add_extra_even_layer ? 1 : 0));
@@ -1679,6 +1681,7 @@ std::vector<LayerData> mipt_frontend(int n,
                                      double p)
 {
     std::mt19937 rng(std::random_device{}());
+    std::bernoulli_distribution extra_even_layer(0.5);
 
     std::vector<LayerData> layers;
     layers.reserve(2 * periods + 1);
@@ -1689,8 +1692,12 @@ std::vector<LayerData> mipt_frontend(int n,
         layers.push_back(make_mipt_layer(n, 1, p, rng)); // odd layer
     }
 
-    // MIPT-style final even layer with 50% measurement probability.
-    layers.push_back(make_mipt_layer(n, 0, 0.5, rng));
+    // Optional final even layer: included with 50% probability, and if included
+    // its measurements use the same measurement rate p as the bulk layers.
+    if (extra_even_layer(rng))
+    {
+        layers.push_back(make_mipt_layer(n, 0, p, rng));
+    }
 
     return layers;
 }
