@@ -21,6 +21,11 @@
 # expands to:
 #   make [target] GPU=1 CUDA_RHO=1 FP64=0
 #
+# CUDA .cu compilation uses nvcc when it is available, otherwise falls back
+# to nvq++. This keeps CUDA-Q-only installs usable on machines where nvcc is
+# not installed or not on PATH. Override with, e.g.:
+#   make sim_tmi.exe CUDA_CU_COMPILER=/usr/local/cuda/bin/nvcc
+#
 # CPU simulation / double precision examples:
 #   make GPU=0 CUDA_RHO=0
 #   make GPU=1 CUDA_RHO=1 FP64=1
@@ -102,6 +107,21 @@ ifeq ($(CUDA_RHO),1)
   SIM_TMI_CUDA_LIBS := -lcudart -lcusolver -lcublas
 endif
 
+# ---- CUDA .cu compiler selection ----
+# Some CUDA-Q installs provide nvq++ but not nvcc.  Use nvcc when present;
+# otherwise compile the CUDA helper translation units with nvq++ so GPU builds
+# still work on systems such as CUDA-Q-only RTX 4080 Super setups.
+NVCC_FOUND := $(shell command -v $(NVCC) 2>/dev/null)
+ifeq ($(strip $(NVCC_FOUND)),)
+  CUDA_CU_COMPILER ?= $(NVQXX)
+  CUDA_CU_FLAGS    ?= $(CUDAQ_TARGET_FLAGS) $(NVQXXFLAGS_COMMON)
+  CUDA_CU_BACKEND  := nvq++ fallback (nvcc not found)
+else
+  CUDA_CU_COMPILER ?= $(NVCC)
+  CUDA_CU_FLAGS    ?= $(NVCCFLAGS)
+  CUDA_CU_BACKEND  := nvcc
+endif
+
 CONFIG := gpu$(GPU)_fp64$(FP64)_rho$(CUDA_RHO)
 MIPT_OBJDIR := build/mipt_$(CONFIG)
 GMN_OBJDIR  := build/gmn_capi_omp$(OPENMP)
@@ -140,6 +160,11 @@ gpu:
 print-config:
 	@echo "CONFIG=$(CONFIG)"
 	@echo "NVQXX=$(NVQXX)"
+	@echo "NVCC=$(NVCC)"
+	@echo "NVCC_FOUND=$(NVCC_FOUND)"
+	@echo "CUDA_CU_COMPILER=$(CUDA_CU_COMPILER)"
+	@echo "CUDA_CU_FLAGS=$(CUDA_CU_FLAGS)"
+	@echo "CUDA_CU_BACKEND=$(CUDA_CU_BACKEND)"
 	@echo "CUDAQ_TARGET_FLAGS=$(CUDAQ_TARGET_FLAGS)"
 	@echo "MIPT_OBJDIR=$(MIPT_OBJDIR)"
 	@echo "GMN_OBJDIR=$(GMN_OBJDIR)"
@@ -213,10 +238,10 @@ $(MIPT_OBJDIR)/entropy.o: entropy.cpp mipt_fermion.cpp density_io.hpp rho_reduce
 	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $(NVQXXFLAGS_COMMON) -c $< -o $@
 
 $(MIPT_OBJDIR)/rho_reduce.o: rho_reduce.cu rho_reduce.hpp | $(MIPT_OBJDIR)
-	$(NVCC) $(NVCCFLAGS) -c $< -o $@
+	$(CUDA_CU_COMPILER) $(CUDA_CU_FLAGS) -c $< -o $@
 
 $(MIPT_OBJDIR)/tmi_cuda_svd.o: tmi_cuda_svd.cu tmi_cuda_svd.hpp | $(MIPT_OBJDIR)
-	$(NVCC) $(NVCCFLAGS) -c $< -o $@
+	$(CUDA_CU_COMPILER) $(CUDA_CU_FLAGS) -c $< -o $@
 
 $(GMN_OBJDIR)/gmn_main.o: gmn_main.cpp density_io.hpp gmn.hpp | $(GMN_OBJDIR)
 	$(HOSTCXX) $(CXXFLAGS_COMMON) -c $< -o $@
