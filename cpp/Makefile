@@ -16,19 +16,21 @@
 # OpenBLAS/LAPACK enables the fast exact Schmidt-SVD path; otherwise it falls
 # back to the older reduced-density-matrix path.
 #
-# Default NVIDIA simulation with GPU reduced-density-matrix/TMI-SVD kernels:
+# Default build is CPU-side CUDA-Q simulation.  This is intentionally faster
+# for small/medium TMI jobs such as sim_tmi.exe n=16 all_cycles=1, where GPU
+# launch + cuSOLVER overhead can dominate.
 #   make [target]
 # expands to:
-#   make [target] GPU=1 CUDA_RHO=1 FP64=0
+#   make [target] GPU=0 CUDA_RHO=0 FP64=0
+#
+# GPU simulation / large-N examples:
+#   make sim_tmi.exe GPU=1 CUDA_RHO=1 FP64=0   # useful once N is large enough
+#   make sim_tmi.exe GPU=1 CUDA_RHO=1 FP64=1
 #
 # CUDA .cu compilation uses nvcc when it is available, otherwise falls back
 # to nvq++. This keeps CUDA-Q-only installs usable on machines where nvcc is
 # not installed or not on PATH. Override with, e.g.:
 #   make sim_tmi.exe CUDA_CU_COMPILER=/usr/local/cuda/bin/nvcc
-#
-# CPU simulation / double precision examples:
-#   make GPU=0 CUDA_RHO=0
-#   make GPU=1 CUDA_RHO=1 FP64=1
 #
 # GMN analysis:
 #   ./gmn.exe 0 rho3.bin data_real.csv       # real-only GMN on Re(rho)
@@ -94,6 +96,7 @@ endif
 
 ifeq ($(GPU),1)
   CUDAQ_TARGET_FLAGS := --target nvidia
+  NVQXXFLAGS_COMMON += -DSIM_TMI_GPU_BUILD=1
   ifeq ($(FP64),1)
     CUDAQ_TARGET_FLAGS += --target-option fp64
   else

@@ -26,6 +26,7 @@
 
 #include <cerrno>
 #include <charconv>
+#include <cstdlib>
 #include <cmath>
 #include <cstring>
 #include <sys/stat.h>
@@ -34,6 +35,7 @@
 #include <string_view>
 #include <system_error>
 #include <iomanip>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <type_traits>
@@ -351,6 +353,62 @@ namespace sim_tmi
             return "fermion/reduced gate set from mipt_fermion.cpp";
         }
         return "unknown";
+    }
+
+    long parse_nonnegative_env_long(const char *name, long fallback, long max_value)
+    {
+        const char *value = std::getenv(name);
+        if (value == nullptr || *value == '\0')
+        {
+            return fallback;
+        }
+
+        char *end = nullptr;
+        errno = 0;
+        const long parsed = std::strtol(value, &end, 10);
+        if (errno != 0 || end == value || *end != '\0' || parsed < 0 || parsed > max_value)
+        {
+            return fallback;
+        }
+        return parsed;
+    }
+
+    int cuda_svd_min_kept_modes()
+    {
+        // By default, preserve the CUDA half-cut SVD path when CUDA_RHO is enabled.
+        // Set SIM_TMI_CUDA_SVD_MIN_KEPT to a larger value only when an optimized
+        // host LAPACK/OpenBLAS SVD is known to be faster on that machine.
+        constexpr long default_min_kept_modes = 0;
+        constexpr long max_kept_modes = 30;
+        static const int threshold = static_cast<int>(
+            parse_nonnegative_env_long("SIM_TMI_CUDA_SVD_MIN_KEPT",
+                                       default_min_kept_modes,
+                                       max_kept_modes));
+        return threshold;
+    }
+
+    bool should_try_cuda_svd_for_modes(std::size_t kept_mode_count)
+    {
+        return kept_mode_count >= static_cast<std::size_t>(cuda_svd_min_kept_modes());
+    }
+
+    std::uint64_t csv_flush_row_interval(int n, int cycle_count)
+    {
+        constexpr long max_rows = 1'000'000;
+        const long env_rows = parse_nonnegative_env_long("SIM_TMI_CSV_FLUSH_ROWS", 0, max_rows);
+        if (env_rows > 0)
+        {
+            return static_cast<std::uint64_t>(env_rows);
+        }
+
+        // Small-N jobs can produce huge numbers of rows; batch them.  For N>=16
+        // flush once per circuit by default, so interrupted runs lose at most one
+        // circuit while avoiding one flush per all_cycles row.
+        if (n == 8 || n == 12)
+        {
+            return 1000;
+        }
+        return static_cast<std::uint64_t>(std::max(1, cycle_count));
     }
 
     struct TraceSource
@@ -1796,6 +1854,7 @@ namespace sim_tmi
             double entropy = 0.0;
             int status = 0;
             if (!workspace.cuda_svd_disabled &&
+                should_try_cuda_svd_for_modes(modes.size()) &&
                 entropy_subsystem_svd_from_device_state(device_state_vector,
                                                         device_state_is_fp64,
                                                         n,
@@ -2062,6 +2121,66 @@ namespace sim_tmi
             workspace);
     }
 
+    bool cudaq_state_has_device_tensor(cudaq::state &state)
+    {
+#ifdef MIPT_ENABLE_CUDA_RHO
+        if (!state.is_on_gpu())
+        {
+            return false;
+        }
+        const auto tensor = state.get_tensor();
+        return tensor.data != nullptr && tensor.get_rank() == 1;
+#else
+        (void)state;
+        return false;
+#endif
+    }
+
+    bool host_svd_available_for_state(cudaq::state &state)
+    {
+        const auto precision = state.get_precision();
+        if (precision == cudaq::SimulationState::precision::fp64)
+        {
+            return lapack_runtime::zgesvd() != nullptr;
+        }
+        return lapack_runtime::cgesvd() != nullptr || lapack_runtime::zgesvd() != nullptr;
+    }
+
+    bool fast_state_tmi_available(cudaq::state &state)
+    {
+        // The fast state-vector path always needs zheevd_ for the small A/B/C/D
+        // RDM entropies.  Half-cut entropies can use either host SVD or, when the
+        // state is still on GPU and CUDA_RHO is enabled, the cuSOLVER device SVD.
+        if (lapack_runtime::zheevd() == nullptr)
+        {
+            return false;
+        }
+        return host_svd_available_for_state(state) || cudaq_state_has_device_tensor(state);
+    }
+
+    const char *compile_target_name()
+    {
+#ifdef SIM_TMI_GPU_BUILD
+        return "CUDA-Q NVIDIA target";
+#else
+        return "CPU target";
+#endif
+    }
+
+    const char *cuda_rho_build_name()
+    {
+#ifdef MIPT_ENABLE_CUDA_RHO
+        return "enabled";
+#else
+        return "disabled";
+#endif
+    }
+
+    const char *state_precision_name(cudaq::SimulationState::precision precision)
+    {
+        return precision == cudaq::SimulationState::precision::fp64 ? "fp64" : "fp32";
+    }
+
     std::string format_duration(double seconds)
     {
         if (!std::isfinite(seconds) || seconds < 0.0)
@@ -2151,6 +2270,8 @@ namespace sim_tmi
             throw std::runtime_error("Failed while writing output CSV header.");
         }
 
+        const std::uint64_t flush_rows = csv_flush_row_interval(n, cycle_count);
+
         std::cerr << "Online TMI simulation\n"
                   << "n=" << n
                   << ", periods=" << periods
@@ -2163,16 +2284,34 @@ namespace sim_tmi
                   << ", tmi_cycles_per_circuit=" << cycle_count
                   << ", mode=" << circuit_mode_name(circuit_mode)
                   << ", output=" << output_path << '\n'
+                  << "build_target=" << compile_target_name()
+                  << ", cuda_rho=" << cuda_rho_build_name() << '\n'
                   << "entropy_backend=" << lapack_runtime::status() << '\n'
-                  << "tmi_method="
-                  << ((lapack_runtime::zgesvd() || lapack_runtime::cgesvd())
-                          ? "state-vector Schmidt/SVD for half cuts; FP32 uses cgesvd when available; GPU states try cuSOLVER for half cuts; BLAS HERK small-cut path when available"
-                          : "legacy reduced-density-matrix fallback")
+                  << "tmi_method=selected after first state; fast path requires zheevd plus either host SVD or CUDA device half-SVD" << '\n'
+                  << "cuda_svd_min_kept_modes=" << cuda_svd_min_kept_modes()
+                  << ", csv_flush_rows=" << flush_rows
                   << '\n';
 
         TmiWorkspace workspace;
         std::string line;
         line.reserve(128);
+        std::string csv_buffer;
+        csv_buffer.reserve(static_cast<std::size_t>(std::min<std::uint64_t>(flush_rows, 4096)) * 48u);
+        std::uint64_t buffered_rows = 0;
+        auto flush_csv_buffer = [&]() {
+            if (csv_buffer.empty())
+            {
+                return;
+            }
+            csv.write(csv_buffer.data(), static_cast<std::streamsize>(csv_buffer.size()));
+            csv_buffer.clear();
+            buffered_rows = 0;
+            csv.flush();
+            if (!csv)
+            {
+                throw std::runtime_error("Failed while writing output CSV.");
+            }
+        };
 
         std::mt19937 frgs_rng(std::random_device{}());
         std::vector<FRGSLayerData> frgs_layers;
@@ -2182,6 +2321,7 @@ namespace sim_tmi
         auto last_report = start;
         std::uint64_t processed = 0;
         std::uint64_t last_processed = 0;
+        bool printed_state_backend = false;
 
         for (std::size_t p_index = 0; p_index < ps.size(); ++p_index)
         {
@@ -2204,8 +2344,21 @@ namespace sim_tmi
                     return cudaq::get_state(MIPTKernel_1D{}, n, layers, true);
                 }();
 
+                const bool use_fast_state_tmi = fast_state_tmi_available(state);
+                if (!printed_state_backend)
+                {
+                    const bool device_tensor = cudaq_state_has_device_tensor(state);
+                    std::cerr << "state_backend=" << (state.is_on_gpu() ? "gpu" : "host")
+                              << ", precision=" << state_precision_name(state.get_precision())
+                              << ", device_tensor=" << (device_tensor ? 1 : 0)
+                              << ", host_svd_available=" << (host_svd_available_for_state(state) ? 1 : 0)
+                              << ", fast_state_tmi=" << (use_fast_state_tmi ? 1 : 0)
+                              << '\n';
+                    printed_state_backend = true;
+                }
+
                 std::vector<double> tmi_values;
-                if (lapack_runtime::zgesvd() || lapack_runtime::cgesvd())
+                if (use_fast_state_tmi)
                 {
                     try
                     {
@@ -2226,7 +2379,7 @@ namespace sim_tmi
                 }
                 else
                 {
-                    // Compatibility path for systems without a usable LAPACK SVD.
+                    // Compatibility path for systems without a usable fast state-vector path.
                     // This is exact but much slower because it materializes pair RDMs.
                     tmi_values = tmi_values_from_cudaq_state_payload(state,
                                                                      n,
@@ -2245,12 +2398,8 @@ namespace sim_tmi
                     append_double(line, tmi);
                     line.push_back('\n');
 
-                    csv.write(line.data(), static_cast<std::streamsize>(line.size()));
-                    csv.flush();
-                    if (!csv)
-                    {
-                        throw std::runtime_error("Failed while writing output CSV.");
-                    }
+                    csv_buffer.append(line);
+                    ++buffered_rows;
 
                     ++processed;
                     const auto now = std::chrono::steady_clock::now();
@@ -2271,9 +2420,15 @@ namespace sim_tmi
                         last_processed = processed;
                     }
                 }
+
+                if (buffered_rows >= flush_rows || processed == total)
+                {
+                    flush_csv_buffer();
+                }
             }
         }
 
+        flush_csv_buffer();
         csv.flush();
         if (!csv)
         {
