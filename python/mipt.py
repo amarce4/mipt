@@ -334,14 +334,14 @@ def random_mipt_1d(n, d, p, closed=True):
             if random.random() < p:
                 qc.measure(qubit, qubit)
 
-    if (random.random() < 0.5): 
-    # 50% chance of an extra even layer at the end
-        for qubit in range(0, n, 2):
-            U = UnitaryGate(random_unitary(4))
-            qc.append(U, [qubit, (qubit + 1)])
-        for qubit in range(n):
-            if random.random() < p:
-                qc.measure(qubit, qubit)
+    # if (random.random() < 0.5): 
+    # # 50% chance of an extra even layer at the end
+    #     for qubit in range(0, n, 2):
+    #         U = UnitaryGate(random_unitary(4))
+    #         qc.append(U, [qubit, (qubit + 1)])
+    #     for qubit in range(n):
+    #         if random.random() < p:
+    #             qc.measure(qubit, qubit)
 
     return qc
 
@@ -359,6 +359,109 @@ def _tmi_block_subsystems_1d(n: int) -> list[tuple[int, ...]]:
     return [A + B, A + C, B + C, D]
 
 
+
+def _validate_qubit_subsystems(n: int, subsystems: Sequence[Sequence[int]]) -> list[list[int]]:
+    """Normalize and validate qubit subsystem lists."""
+    out: list[list[int]] = []
+    for i, subsystem in enumerate(subsystems):
+        sub = [int(q) for q in subsystem]
+        if not sub:
+            raise ValueError(f"subsystem {i} is empty")
+        if len(set(sub)) != len(sub):
+            raise ValueError(f"subsystem {i} contains duplicate qubits: {sub}")
+        bad = [q for q in sub if q < 0 or q >= int(n)]
+        if bad:
+            raise ValueError(f"subsystem {i} contains out-of-range qubits {bad}; n={n}")
+        out.append(sub)
+    return out
+
+
+def _as_complex_array(obj) -> np.ndarray:
+    """Return the complex ndarray behind a Qiskit state/density object."""
+    return np.asarray(getattr(obj, "data", obj), dtype=np.complex128)
+
+
+def _extract_single_shot_statevector(saved) -> Statevector:
+    """
+    Extract the unique full-system statevector saved by qc.save_statevector.
+
+    With ``pershot=True`` and ``shots=1``, Aer normally returns a one-element
+    list.  The dict branch is retained defensively for simulator/version
+    variants that wrap saved data by classical keys.
+    """
+    candidates = []
+
+    if isinstance(saved, dict):
+        for value in saved.values():
+            if isinstance(value, (list, tuple)):
+                candidates.extend(value)
+            else:
+                candidates.append(value)
+    elif isinstance(saved, (list, tuple)):
+        candidates.extend(saved)
+    else:
+        candidates.append(saved)
+
+    if len(candidates) != 1:
+        raise RuntimeError(
+            f"Expected exactly one saved statevector for shots=1, got {len(candidates)} entries."
+        )
+
+    arr = _as_complex_array(candidates[0])
+    if arr.ndim != 1:
+        raise RuntimeError(f"Saved statevector has shape {arr.shape}; expected a one-dimensional vector.")
+
+    norm = np.linalg.norm(arr)
+    if not np.isfinite(norm) or norm <= 0.0:
+        raise RuntimeError("Saved statevector has zero or non-finite norm.")
+
+    return Statevector(arr / norm)
+
+
+def _qubit_reduced_density_from_statevector(
+    psi,
+    keep: Sequence[int],
+    n_qubits: int,
+) -> np.ndarray:
+    """
+    Ordinary qubit partial trace of a full pure statevector, keeping ``keep``.
+
+    This uses Qiskit's ``partial_trace`` on the full saved statevector.  The
+    circuit simulator remains responsible for sampling and applying the
+    mid-circuit measurement record; reduction happens only after the final
+    conditional trajectory state has been saved.
+    """
+    n = int(n_qubits)
+    keep_list = _validate_qubit_subsystems(n, [keep])[0]
+    keep_set = set(keep_list)
+    trace_out = [q for q in range(n) if q not in keep_set]
+    rho = partial_trace(psi, trace_out)
+    arr = _as_complex_array(rho)
+    return np.asarray(0.5 * (arr + arr.conjugate().T), dtype=np.complex128)
+
+
+def qubit_partial_trace_keep_density_matrix(
+    rho: np.ndarray,
+    keep: Sequence[int],
+    n_qubits: int,
+) -> np.ndarray:
+    """
+    Ordinary qubit partial trace of a density matrix, keeping local qubits.
+
+    This helper is used by csim_csv.py for secondary reductions such as
+    AB -> A/B and AC -> C.  It uses the same Qiskit partial-trace convention as
+    ``get_mipt_rho_1d``.
+    """
+    n = int(n_qubits)
+    keep_list = _validate_qubit_subsystems(n, [keep])[0]
+    keep_set = set(keep_list)
+    trace_out = [q for q in range(n) if q not in keep_set]
+    rho_dm = rho if hasattr(rho, "data") else np.asarray(rho, dtype=np.complex128)
+    out = partial_trace(rho_dm, trace_out)
+    arr = _as_complex_array(out)
+    return np.asarray(0.5 * (arr + arr.conjugate().T), dtype=np.complex128)
+
+
 def get_mipt_rho_1d(
     n,
     d,
@@ -369,47 +472,61 @@ def get_mipt_rho_1d(
     gpu=False,
     tmi: bool = False,
     transpile_optimization_level: int = 0,
+    subsystem_qubits: Sequence[Sequence[int]] | None = None,
 ):
     """
     Return one trajectory's reduced density matrix/matrices for the qubit MIPT
     circuit.
 
+    This Qiskit-backed implementation intentionally avoids
+    ``save_density_matrix`` after mid-circuit measurements.  In the tested
+    Aer/MPS path, saved density matrices can represent the nonselective
+    post-measurement average even when ``conditional=True`` and ``shots=1``.
+
+    Instead, the circuit is simulated with its measurements intact and the full
+    final state is saved with ``qc.save_statevector(pershot=True)``.  The saved
+    statevector is then reduced with Qiskit's ordinary qubit ``partial_trace``.
+    This keeps the Aer backend in place while computing entropies/GMN from a
+    single sampled monitored trajectory.
+
     tmi=False preserves the previous rho3 behavior.
     tmi=True returns four matrices in the C++ TMI storage order AB, AC, BC, D.
-    These are ordinary qubit partial traces, appropriate for the non-fermionic
-    circuit path.
     """
 
-    if tmi:
-        subsystems = [list(x) for x in _tmi_block_subsystems_1d(int(n))]
+    n = int(n)
+    if subsystem_qubits is not None:
+        subsystems = _validate_qubit_subsystems(n, subsystem_qubits)
+    elif tmi:
+        subsystems = _validate_qubit_subsystems(n, _tmi_block_subsystems_1d(n))
     elif all_matrices and closed:
-        subsystems = [[(i + j) % n for j in range(subsyst)] for i in range(n)]
+        subsystems = _validate_qubit_subsystems(
+            n,
+            [[(i + j) % n for j in range(int(subsyst))] for i in range(n)],
+        )
     else:
-        subsystems = [list(range(subsyst))]
+        subsystems = _validate_qubit_subsystems(n, [list(range(int(subsyst)))])
 
-    if gpu == False:
+    if gpu is False:
         backend = AerSimulator(device="CPU", method="matrix_product_state")
     else:
         backend = AerSimulator(device="GPU", method="matrix_product_state")
 
-    qc = random_mipt_1d(n=n, d=d, p=float(p), closed=closed)
-
-    for i, subsystem in enumerate(subsystems):
-        qc.save_density_matrix(
-            qubits=subsystem,
-            label=f"final_state_{i}",
-            pershot=True,
-        )
+    qc = random_mipt_1d(n=n, d=int(d), p=float(p), closed=closed)
+    qc.save_statevector(label="final_state", pershot=True)
 
     tqc = transpile(qc, backend, optimization_level=transpile_optimization_level)
-
-    # One conditional outcome trajectory for this independently drawn circuit.
     result = backend.run(tqc, shots=1).result()
+    psi = _extract_single_shot_statevector(result.data(0)["final_state"])
 
-    if len(subsystems) == 1:
-        return result.data(0)["final_state_0"][0]
+    rhos = [
+        _qubit_reduced_density_from_statevector(psi, subsystem, n)
+        for subsystem in subsystems
+    ]
 
-    return [result.data(0)[f"final_state_{i}"][0] for i in range(len(subsystems))]
+    if len(rhos) == 1:
+        return rhos[0]
+
+    return rhos
 
 def random_mipt_2d(x, y, d, p):
     """p must be between 0 and 1."""
@@ -491,11 +608,6 @@ def run_1d_p_scan(n, depth, res, realisations, p_min=0, p_max=1, use_gpu=False, 
 
     subsystem = [i for i in range(0, 2*d+1, d)]
     
-    if (use_gpu):
-        backend = AerSimulator(device='GPU', method='matrix_product_state')
-    else:
-        backend = AerSimulator(device='CPU', method='matrix_product_state')
-
     ps = np.linspace(p_min, p_max, res)
     ents = []
     ent_stds = []
@@ -510,14 +622,14 @@ def run_1d_p_scan(n, depth, res, realisations, p_min=0, p_max=1, use_gpu=False, 
         this_gmn = []
     
         for _ in range(realisations):
-            qc = random_mipt_1d(n, depth, p, closed=True)
-            # qc.save_statevector(label='final_state')
-            qc.save_density_matrix(qubits=subsystem, label='final_state')
-            transpiled_qc = transpile(qc, backend)
-
-            result = backend.run(transpiled_qc).result()
-
-            sub_m = result.data(0)['final_state']
+            sub_m = get_mipt_rho_1d(
+                n,
+                depth,
+                p,
+                closed=True,
+                gpu=use_gpu,
+                subsystem_qubits=[subsystem],
+            )
             ent.append(entropy(sub_m))
             mi.append(tmi(sub_m))
             this_gmn.append(gmn(sub_m))
@@ -536,11 +648,6 @@ def run_1d_distance_scan(n, depth, p, realisations, d_min=1, d_max=None, use_gpu
     if d_max is None:
         d_max = n // 2
 
-    if (use_gpu):
-        backend = AerSimulator(device='GPU', method='matrix_product_state')
-    else:
-        backend = AerSimulator(device='CPU', method='matrix_product_state')
-
     d_values = range(d_min, d_max + 1)
     ents = []
     ent_stds = []
@@ -556,14 +663,14 @@ def run_1d_distance_scan(n, depth, p, realisations, d_min=1, d_max=None, use_gpu
         mi = []
         this_gmn = []
         for _ in range(realisations):
-            qc = random_mipt_1d(n, depth, p, closed=True)
-            # qc.save_statevector(label='final_state')
-            qc.save_density_matrix(qubits=subsystem, label='final_state')
-            transpiled_qc = transpile(qc, backend)
-
-            result = backend.run(transpiled_qc).result()
-
-            sub_m = result.data(0)['final_state']
+            sub_m = get_mipt_rho_1d(
+                n,
+                depth,
+                p,
+                closed=True,
+                gpu=use_gpu,
+                subsystem_qubits=[subsystem],
+            )
             ent.append(entropy(sub_m))
             mi.append(tmi(sub_m))
             this_gmn.append(gmn(sub_m))

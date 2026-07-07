@@ -10,7 +10,9 @@
 //
 //   p,tmi
 //
-// to CSV.  The fast path avoids materializing the half-system reduced density
+// to CSV, one TMI value per line.  With all_cycles=1 it writes N/4 cyclic
+// TMI values per circuit, still as separate p,tmi rows.  The fast path avoids
+// materializing the half-system reduced density
 // matrices: S(AB), S(AC), and S(BC) are computed from Schmidt singular values,
 // while the small one-block entropies use BLAS Hermitian rank-k updates when
 // BLAS is available at runtime.
@@ -22,10 +24,21 @@
 #endif
 #endif
 
+#include <cerrno>
 #include <charconv>
+#include <cstdlib>
+#include <cmath>
+#include <cstring>
+#include <sys/stat.h>
+#include <sys/types.h>
 #include <mutex>
 #include <string_view>
 #include <system_error>
+#include <iomanip>
+#include <limits>
+#include <sstream>
+#include <stdexcept>
+#include <type_traits>
 
 // Reuse the existing CUDA-Q kernels, random circuit frontends, fermionic gates,
 // and TMI density-matrix reducers.  Rename mipt.cpp's CLI entry point so this
@@ -34,9 +47,265 @@
 #include "mipt.cpp"
 #undef main
 
+#ifdef MIPT_ENABLE_CUDA_RHO
+#include "tmi_cuda_svd.hpp"
+#endif
+
+
+// Fermionic reduced-gate-set architecture imported from mipt_fermion.cpp for
+// sim_tmi.exe fermion=2.  This intentionally leaves mipt.cpp's existing
+// fermion=1 Haar parity-preserving architecture unchanged.
+struct FRGSLayerData // LayerData for fermions with a reduced topological gate set
+{
+    int start = 0;
+
+    std::vector<int> measure_flags;
+
+    // Per-active-bond local gate selectors.  These vectors are indexed by the
+    // compact brickwork-bond index, not by the absolute site index, so no RNG
+    // or host->kernel payload is spent on unused q entries.
+    //   0 -> T gate:             R_Z(pi/4) = exp(-i*pi/8 Z_j)
+    //   1 -> single-site braid:  R_Z(pi/2) = exp(-i*pi/4 Z_j)
+    std::vector<int> local_left_kind;
+    std::vector<int> local_right_kind;
+
+    // Per-active-bond two-site gate selector:
+    //   0 -> double-site braid:  R_XX(pi/2) = exp(+i*pi/4 X_j X_{j+1})
+    //   1 -> R_ZZ(pi/4) = exp(+i*pi/8 Z_j Z_{j+1})
+    std::vector<int> bond_gate_kind;
+};
+
+struct MIPTKernel_1D_FRGS
+{
+    void operator()(int n,
+                    const std::vector<FRGSLayerData> &flayers,
+                    bool closed) __qpu__
+    {
+        cudaq::qvector q(n);
+
+        for (std::size_t layer = 0; layer < flayers.size(); ++layer)
+        {
+            const int start = flayers[layer].start;
+            const int bond_stop = (closed && start == 1 && n > 2) ? n : (n - 1);
+
+            int bond_index = 0;
+            for (int i = start; i < bond_stop; i += 2)
+            {
+                const int j = (i + 1) % n;
+                const int local_i = flayers[layer].local_left_kind[bond_index];
+                const int local_j = flayers[layer].local_right_kind[bond_index];
+                const int bond_gate = flayers[layer].bond_gate_kind[bond_index];
+                const bool wrapping_bond = (j < i);
+
+                if (bond_gate == 0 && wrapping_bond) // double-site braid across periodic boundary
+                {
+                    // Wrapping fermionic bond: apply the Jordan-Wigner string
+                    // around the periodic boundary, then undo it after the gate.
+                    for (int k = j + 1; k < i; ++k)
+                    {
+                        z<cudaq::ctrl>(q[k], q[i]);
+                    }
+
+                    // The wrapping XX implementation needs S^dagger on both
+                    // endpoints before the XX rotation.  Fuse that diagonal
+                    // phase with the sampled local gate:
+                    //   local S  * S^dagger -> identity, up to global phase
+                    //   local T  * S^dagger -> R_Z(-pi/4), up to global phase
+                    if (local_i == 0)
+                    {
+                        t<cudaq::adj>(q[i]);
+                    }
+                    if (local_j == 0)
+                    {
+                        t<cudaq::adj>(q[j]);
+                    }
+
+                    cx(q[i], q[j]);
+                    rx(-1.57079632679489661923, q[i]);
+                    cx(q[i], q[j]);
+
+                    s(q[i]);
+                    s(q[j]);
+                    for (int k = j + 1; k < i; ++k)
+                    {
+                        z<cudaq::ctrl>(q[k], q[i]);
+                    }
+                }
+                else
+                {
+                    // CUDA-Q T and S differ from R_Z(pi/4) and R_Z(pi/2)
+                    // only by one-qubit global phases, so observables and
+                    // reduced density matrices are unchanged while the
+                    // simulator gets native phase gates instead of generic RZs.
+                    if (local_i == 0)
+                    {
+                        t(q[i]);
+                    }
+                    else
+                    {
+                        s(q[i]);
+                    }
+
+                    if (local_j == 0)
+                    {
+                        t(q[j]);
+                    }
+                    else
+                    {
+                        s(q[j]);
+                    }
+
+                    if (bond_gate == 0) // double-site braid: exp(+i*pi/4 X_i X_j)
+                    {
+                        cx(q[i], q[j]);
+                        rx(-1.57079632679489661923, q[i]);
+                        cx(q[i], q[j]);
+                    }
+                    else // R_ZZ(pi/4): exp(+i*pi/8 Z_i Z_j)
+                    {
+                        cx(q[i], q[j]);
+                        t<cudaq::adj>(q[j]);
+                        cx(q[i], q[j]);
+                    }
+                }
+                ++bond_index;
+            }
+
+            for (int i = 0; i < n; ++i)
+            {
+                if (flayers[layer].measure_flags[i])
+                {
+                    mz(q[i]); // Z measurement preserves fermion parity.
+                }
+            }
+        }
+    }
+};
+
+int frgs_active_bond_count(int n, int start, bool closed = true)
+{
+    const int bond_stop = (closed && start == 1 && n > 2) ? n : (n - 1);
+    if (bond_stop <= start)
+    {
+        return 0;
+    }
+    return (bond_stop - start + 1) / 2;
+}
+
+inline int frgs_rng_bit(std::mt19937 &rng)
+{
+    return static_cast<int>((rng() >> 31) & 1u);
+}
+
+void fill_frgs_mipt_layer(FRGSLayerData &layer,
+                          int n,
+                          int start,
+                          double p,
+                          std::mt19937 &rng,
+                          bool closed = true)
+{
+    std::bernoulli_distribution measure_dist(p);
+
+    layer.start = start;
+    layer.measure_flags.resize(n);
+
+    const int bond_count = frgs_active_bond_count(n, start, closed);
+    layer.local_left_kind.resize(bond_count);
+    layer.local_right_kind.resize(bond_count);
+    layer.bond_gate_kind.resize(bond_count);
+
+    for (int b = 0; b < bond_count; ++b)
+    {
+        // 50/50 local T vs single-site braid on each endpoint, independently.
+        layer.local_left_kind[b] = frgs_rng_bit(rng);
+        layer.local_right_kind[b] = frgs_rng_bit(rng);
+
+        // 50/50 double-site braid vs R_ZZ(pi/4).
+        layer.bond_gate_kind[b] = frgs_rng_bit(rng);
+    }
+
+    if (p <= 0.0)
+    {
+        std::fill(layer.measure_flags.begin(), layer.measure_flags.end(), 0);
+    }
+    else if (p >= 1.0)
+    {
+        std::fill(layer.measure_flags.begin(), layer.measure_flags.end(), 1);
+    }
+    else
+    {
+        for (int qidx = 0; qidx < n; ++qidx)
+        {
+            layer.measure_flags[qidx] = measure_dist(rng) ? 1 : 0;
+        }
+    }
+}
+
+FRGSLayerData make_frgs_mipt_layer(int n,
+                                   int start,
+                                   double p,
+                                   std::mt19937 &rng,
+                                   bool closed = true)
+{
+    FRGSLayerData layer;
+    fill_frgs_mipt_layer(layer, n, start, p, rng, closed);
+    return layer;
+}
+
+void frgs_mipt_frontend_inplace(std::vector<FRGSLayerData> &layers,
+                                int n,
+                                int periods,
+                                double p,
+                                std::mt19937 &rng,
+                                bool closed = true)
+{
+    if ((n % 2) != 0)
+    {
+        throw std::invalid_argument("FRGS fermionic 1D simulation requires even n.");
+    }
+    if (p < 0.0 || p > 1.0)
+    {
+        throw std::invalid_argument("Measurement probability p must be in [0,1].");
+    }
+
+    // Optional final even layer: included with 50% probability, and if included
+    // its measurements use the same measurement rate p as the bulk layers.
+    std::bernoulli_distribution extra_even_layer(0.5);
+    const bool add_extra_even_layer = extra_even_layer(rng);
+    const std::size_t layer_count = static_cast<std::size_t>(2 * periods + (add_extra_even_layer ? 1 : 0));
+
+    // resize() preserves the inner vector capacities for existing layers,
+    // avoiding thousands of small allocations during large realization sweeps.
+    layers.resize(layer_count);
+
+    std::size_t idx = 0;
+    for (int period = 0; period < periods; ++period)
+    {
+        fill_frgs_mipt_layer(layers[idx++], n, 0, p, rng, closed);
+        fill_frgs_mipt_layer(layers[idx++], n, 1, p, rng, closed);
+    }
+
+    if (add_extra_even_layer)
+    {
+        fill_frgs_mipt_layer(layers[idx++], n, 0, p, rng, closed);
+    }
+}
+
+std::vector<FRGSLayerData> frgs_mipt_frontend(int n,
+                                              int periods,
+                                              double p,
+                                              bool closed = true)
+{
+    std::mt19937 rng(std::random_device{}());
+    std::vector<FRGSLayerData> layers;
+    frgs_mipt_frontend_inplace(layers, n, periods, p, rng, closed);
+    return layers;
+}
+
 namespace sim_tmi
 {
     using C64 = std::complex<double>;
+    using C32 = std::complex<float>;
     constexpr double LOG2_EPS = 1.0e-15;
 
     enum class TraceMode
@@ -44,6 +313,153 @@ namespace sim_tmi
         Qubit,
         Fermion
     };
+
+    enum class CircuitMode
+    {
+        QubitMms = 0,
+        FermionHaar = 1,
+        FermionReducedGateSet = 2
+    };
+
+    CircuitMode circuit_mode_from_int(int value)
+    {
+        switch (value)
+        {
+        case 0:
+            return CircuitMode::QubitMms;
+        case 1:
+            return CircuitMode::FermionHaar;
+        case 2:
+            return CircuitMode::FermionReducedGateSet;
+        default:
+            throw std::invalid_argument("fermion must be 0, 1, or 2.");
+        }
+    }
+
+    bool uses_fermionic_trace(CircuitMode mode)
+    {
+        return mode != CircuitMode::QubitMms;
+    }
+
+    const char *circuit_mode_name(CircuitMode mode)
+    {
+        switch (mode)
+        {
+        case CircuitMode::QubitMms:
+            return "qubit/MMS";
+        case CircuitMode::FermionHaar:
+            return "fermion/Haar parity-preserving + JW FSWAP";
+        case CircuitMode::FermionReducedGateSet:
+            return "fermion/reduced gate set from mipt_fermion.cpp";
+        }
+        return "unknown";
+    }
+
+    long parse_nonnegative_env_long(const char *name, long fallback, long max_value)
+    {
+        const char *value = std::getenv(name);
+        if (value == nullptr || *value == '\0')
+        {
+            return fallback;
+        }
+
+        char *end = nullptr;
+        errno = 0;
+        const long parsed = std::strtol(value, &end, 10);
+        if (errno != 0 || end == value || *end != '\0' || parsed < 0 || parsed > max_value)
+        {
+            return fallback;
+        }
+        return parsed;
+    }
+
+    bool parse_bool01_env(const char *name, bool fallback)
+    {
+        const char *value = std::getenv(name);
+        if (value == nullptr || *value == '\0')
+        {
+            return fallback;
+        }
+        if (std::strcmp(value, "1") == 0 ||
+            std::strcmp(value, "true") == 0 ||
+            std::strcmp(value, "TRUE") == 0 ||
+            std::strcmp(value, "yes") == 0 ||
+            std::strcmp(value, "YES") == 0)
+        {
+            return true;
+        }
+        if (std::strcmp(value, "0") == 0 ||
+            std::strcmp(value, "false") == 0 ||
+            std::strcmp(value, "FALSE") == 0 ||
+            std::strcmp(value, "no") == 0 ||
+            std::strcmp(value, "NO") == 0)
+        {
+            return false;
+        }
+        return fallback;
+    }
+
+    int cuda_svd_min_kept_modes()
+    {
+        // Default policy:
+        //   N=8,12  -> keep half-cut SVDs on host LAPACK/OpenBLAS.
+        //   N>=16   -> allow the CUDA/cuSOLVER half-cut path.
+        //
+        // The kept-mode threshold is 8 because the N=16 half-cuts have
+        // 2 * block_qubits = 8 kept modes.  N=8 and N=12 are still protected
+        // by the explicit small-N guard below, so leaving
+        // SIM_TMI_CUDA_SVD_MIN_KEPT=2 in your shell will not accidentally put
+        // those sizes back onto cuSOLVER.
+        constexpr long default_min_kept_modes = 8;
+        constexpr long max_kept_modes = 30;
+        static const int threshold = static_cast<int>(
+            parse_nonnegative_env_long("SIM_TMI_CUDA_SVD_MIN_KEPT",
+                                       default_min_kept_modes,
+                                       max_kept_modes));
+        return threshold;
+    }
+
+    bool force_cuda_svd_for_small_n()
+    {
+        static const bool force = parse_bool01_env("SIM_TMI_FORCE_CUDA_SVD_SMALL_N", false);
+        return force;
+    }
+
+    bool cuda_svd_disabled_for_small_n(int n)
+    {
+        // N=8 and N=12 were faster before the GPU-SVD implementation.  Keep
+        // their TMI half-cut SVDs on the CPU by default while retaining GPU
+        // circuit simulation when the executable is built with GPU=1.
+        return !force_cuda_svd_for_small_n() && (n == 8 || n == 12);
+    }
+
+    bool should_try_cuda_svd_for_problem(int n, std::size_t kept_mode_count)
+    {
+        if (cuda_svd_disabled_for_small_n(n))
+        {
+            return false;
+        }
+        return kept_mode_count >= static_cast<std::size_t>(cuda_svd_min_kept_modes());
+    }
+
+    std::uint64_t csv_flush_row_interval(int n, int cycle_count)
+    {
+        constexpr long max_rows = 1'000'000;
+        const long env_rows = parse_nonnegative_env_long("SIM_TMI_CSV_FLUSH_ROWS", 0, max_rows);
+        if (env_rows > 0)
+        {
+            return static_cast<std::uint64_t>(env_rows);
+        }
+
+        // Small-N jobs can produce huge numbers of rows; batch them.  For N>=16
+        // flush once per circuit by default, so interrupted runs lose at most one
+        // circuit while avoiding one flush per all_cycles row.
+        if (n == 8 || n == 12)
+        {
+            return 1000;
+        }
+        return static_cast<std::uint64_t>(std::max(1, cycle_count));
+    }
 
     struct TraceSource
     {
@@ -214,6 +630,7 @@ namespace sim_tmi
     {
         using zheevd_fn = void (*)(char *, char *, int *, C64 *, int *, double *, C64 *, int *, double *, int *, int *, int *, int *);
         using zgesvd_fn = void (*)(char *, char *, int *, int *, C64 *, int *, double *, C64 *, int *, C64 *, int *, C64 *, int *, double *, int *);
+        using cgesvd_fn = void (*)(char *, char *, int *, int *, C32 *, int *, float *, C32 *, int *, C32 *, int *, C32 *, int *, float *, int *);
         using zherk_fn = void (*)(char *, char *, int *, int *, double *, C64 *, int *, double *, C64 *, int *);
 
         struct Handle
@@ -222,6 +639,7 @@ namespace sim_tmi
             std::vector<void *> libraries;
             zheevd_fn zheevd = nullptr;
             zgesvd_fn zgesvd = nullptr;
+            cgesvd_fn cgesvd = nullptr;
             zherk_fn zherk = nullptr;
             std::string status;
         };
@@ -260,6 +678,10 @@ namespace sim_tmi
                 {
                     h.zgesvd = reinterpret_cast<zgesvd_fn>(dlsym(lib, "zgesvd_"));
                 }
+                if (!h.cgesvd)
+                {
+                    h.cgesvd = reinterpret_cast<cgesvd_fn>(dlsym(lib, "cgesvd_"));
+                }
                 if (!h.zherk)
                 {
                     h.zherk = reinterpret_cast<zherk_fn>(dlsym(lib, "zherk_"));
@@ -269,6 +691,7 @@ namespace sim_tmi
             h.status = "LAPACK/BLAS:";
             h.status += h.zheevd ? " zheevd" : " no-zheevd";
             h.status += h.zgesvd ? " zgesvd" : " no-zgesvd";
+            h.status += h.cgesvd ? " cgesvd" : " no-cgesvd";
             h.status += h.zherk ? " zherk" : " no-zherk";
             if (!h.zheevd || !h.zgesvd)
             {
@@ -291,6 +714,13 @@ namespace sim_tmi
             auto &h = handle();
             std::call_once(h.init_once, initialize);
             return h.zgesvd;
+        }
+
+        cgesvd_fn cgesvd()
+        {
+            auto &h = handle();
+            std::call_once(h.init_once, initialize);
+            return h.cgesvd;
         }
 
         zherk_fn zherk()
@@ -442,15 +872,36 @@ namespace sim_tmi
         std::vector<double> rwork;
     };
 
-    double entropy_from_singular_values(const std::vector<double> &singular_values)
+    struct SvdWorkspaceF32
+    {
+        std::size_t rows = 0;
+        std::size_t cols = 0;
+        std::vector<float> singular_values;
+        std::vector<C32> work;
+        std::vector<float> rwork;
+    };
+
+    template <typename Real>
+    double entropy_from_singular_values_raw(const std::vector<Real> &singular_values)
     {
         double entropy = 0.0;
-        for (double sigma : singular_values)
+        for (Real sigma_value : singular_values)
         {
+            const double sigma = static_cast<double>(sigma_value);
             const double lambda = sigma * sigma;
             entropy += entropy_from_eigenvalue(lambda);
         }
         return finish_entropy(entropy);
+    }
+
+    double entropy_from_singular_values(const std::vector<double> &singular_values)
+    {
+        return entropy_from_singular_values_raw(singular_values);
+    }
+
+    double entropy_from_singular_values(const std::vector<float> &singular_values)
+    {
+        return entropy_from_singular_values_raw(singular_values);
     }
 
     void prepare_zgesvd_workspace(std::size_t rows, std::size_t cols, SvdWorkspace &ws)
@@ -541,6 +992,97 @@ namespace sim_tmi
         if (info != 0)
         {
             throw std::runtime_error("LAPACK zgesvd failed while computing a Schmidt spectrum.");
+        }
+        return entropy_from_singular_values(ws.singular_values);
+    }
+
+
+    void prepare_cgesvd_workspace(std::size_t rows, std::size_t cols, SvdWorkspaceF32 &ws)
+    {
+        if (ws.rows == rows && ws.cols == cols)
+        {
+            return;
+        }
+        if (rows == 0 || cols == 0 ||
+            rows > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
+            cols > static_cast<std::size_t>(std::numeric_limits<int>::max()))
+        {
+            throw std::runtime_error("Invalid matrix dimensions for LAPACK cgesvd.");
+        }
+
+        auto cgesvd = lapack_runtime::cgesvd();
+        if (!cgesvd)
+        {
+            throw std::runtime_error("LAPACK cgesvd_ is unavailable.");
+        }
+
+        int m = static_cast<int>(rows);
+        int n = static_cast<int>(cols);
+        int lda = static_cast<int>(rows);
+        int min_dim = std::min(m, n);
+        int ldu = 1;
+        int ldvt = 1;
+        int lwork = -1;
+        int info = 0;
+        char jobu = 'N';
+        char jobvt = 'N';
+        C32 dummy_a(0.0f, 0.0f);
+        C32 dummy_u(0.0f, 0.0f);
+        C32 dummy_vt(0.0f, 0.0f);
+        C32 work_query(0.0f, 0.0f);
+        std::vector<float> query_s(static_cast<std::size_t>(min_dim), 0.0f);
+        std::vector<float> query_rwork(static_cast<std::size_t>(std::max(1, 5 * min_dim)), 0.0f);
+
+        cgesvd(&jobu, &jobvt, &m, &n, &dummy_a, &lda, query_s.data(),
+               &dummy_u, &ldu, &dummy_vt, &ldvt, &work_query, &lwork,
+               query_rwork.data(), &info);
+        if (info != 0)
+        {
+            throw std::runtime_error("LAPACK cgesvd workspace query failed.");
+        }
+
+        const int lwork_opt = std::max(1, static_cast<int>(std::ceil(work_query.real())));
+        ws.rows = rows;
+        ws.cols = cols;
+        ws.singular_values.assign(static_cast<std::size_t>(min_dim), 0.0f);
+        ws.work.assign(static_cast<std::size_t>(lwork_opt), C32(0.0f, 0.0f));
+        ws.rwork.assign(static_cast<std::size_t>(std::max(1, 5 * min_dim)), 0.0f);
+    }
+
+    double entropy_svd_inplace(std::vector<C32> &matrix_col_major,
+                               std::size_t rows,
+                               std::size_t cols,
+                               SvdWorkspaceF32 &ws)
+    {
+        if (matrix_col_major.size() != rows * cols)
+        {
+            throw std::invalid_argument("Invalid matrix size passed to entropy_svd_inplace.");
+        }
+        if (rows == 1 || cols == 1)
+        {
+            return 0.0;
+        }
+
+        prepare_cgesvd_workspace(rows, cols, ws);
+        auto cgesvd = lapack_runtime::cgesvd();
+        int m = static_cast<int>(rows);
+        int n = static_cast<int>(cols);
+        int lda = static_cast<int>(rows);
+        int ldu = 1;
+        int ldvt = 1;
+        int lwork = static_cast<int>(ws.work.size());
+        int info = 0;
+        char jobu = 'N';
+        char jobvt = 'N';
+        C32 dummy_u(0.0f, 0.0f);
+        C32 dummy_vt(0.0f, 0.0f);
+
+        cgesvd(&jobu, &jobvt, &m, &n, matrix_col_major.data(), &lda,
+               ws.singular_values.data(), &dummy_u, &ldu, &dummy_vt, &ldvt,
+               ws.work.data(), &lwork, ws.rwork.data(), &info);
+        if (info != 0)
+        {
+            throw std::runtime_error("LAPACK cgesvd failed while computing a single-precision Schmidt spectrum.");
         }
         return entropy_from_singular_values(ws.singular_values);
     }
@@ -654,11 +1196,18 @@ namespace sim_tmi
                    static_cast<double>(std::imag(z)));
     }
 
+    inline C32 state_value_as_c32(const std::complex<float> &z)
+    {
+        return C32(std::real(z), std::imag(z));
+    }
+
     struct StateEntropyWorkspace
     {
         SvdWorkspace svd;
+        SvdWorkspaceF32 svd_f32;
         EntropyWorkspace entropy;
         std::vector<C64> matrix_col_major;
+        std::vector<C32> matrix_col_major_f32;
         std::vector<C64> coeff_chunk_col_major;
         std::vector<C64> rdm_col_major;
         std::vector<C64> rdm_row_major;
@@ -709,6 +1258,46 @@ namespace sim_tmi
         }
     }
 
+    void build_coefficient_matrix_col_major_f32(const std::complex<float> *psi,
+                                                int n,
+                                                const std::vector<int> &kept_modes,
+                                                bool fermion_trace,
+                                                StateEntropyWorkspace &ws)
+    {
+        const std::vector<int> env_modes = complement_modes(n, kept_modes);
+        const std::size_t rows = std::size_t{1} << kept_modes.size();
+        const std::size_t cols = std::size_t{1} << env_modes.size();
+        ws.row_offsets = basis_offsets(kept_modes);
+        ws.env_offsets = basis_offsets(env_modes);
+        if (fermion_trace)
+        {
+            ws.row_cross_masks = fermion_cross_masks_by_row(kept_modes, env_modes);
+        }
+        else
+        {
+            ws.row_cross_masks.assign(rows, 0);
+        }
+
+        if (cols != 0 && rows > std::numeric_limits<std::size_t>::max() / cols)
+        {
+            throw std::bad_alloc();
+        }
+        ws.matrix_col_major_f32.resize(rows * cols);
+        for (std::size_t col = 0; col < cols; ++col)
+        {
+            const std::uint64_t env_offset = ws.env_offsets[col];
+            for (std::size_t row = 0; row < rows; ++row)
+            {
+                C32 value = state_value_as_c32(psi[env_offset | ws.row_offsets[row]]);
+                if (fermion_trace && odd_popcount(static_cast<std::uint64_t>(col) & ws.row_cross_masks[row]))
+                {
+                    value = -value;
+                }
+                ws.matrix_col_major_f32[row + col * rows] = value;
+            }
+        }
+    }
+
     template <typename Real>
     double entropy_subsystem_svd_from_state(const std::complex<Real> *psi,
                                             int n,
@@ -716,14 +1305,24 @@ namespace sim_tmi
                                             bool fermion_trace,
                                             StateEntropyWorkspace &ws)
     {
-        if (!lapack_runtime::zgesvd())
-        {
-            throw std::runtime_error("Fast state-vector TMI needs LAPACK zgesvd_.");
-        }
-        build_coefficient_matrix_col_major(psi, n, kept_modes, fermion_trace, ws);
         const std::vector<int> env_modes = complement_modes(n, kept_modes);
         const std::size_t rows = std::size_t{1} << kept_modes.size();
         const std::size_t cols = std::size_t{1} << env_modes.size();
+
+        if constexpr (std::is_same_v<Real, float>)
+        {
+            if (lapack_runtime::cgesvd())
+            {
+                build_coefficient_matrix_col_major_f32(psi, n, kept_modes, fermion_trace, ws);
+                return entropy_svd_inplace(ws.matrix_col_major_f32, rows, cols, ws.svd_f32);
+            }
+        }
+
+        if (!lapack_runtime::zgesvd())
+        {
+            throw std::runtime_error("Fast state-vector TMI needs LAPACK zgesvd_ or cgesvd_.");
+        }
+        build_coefficient_matrix_col_major(psi, n, kept_modes, fermion_trace, ws);
         return entropy_svd_inplace(ws.matrix_col_major, rows, cols, ws.svd);
     }
 
@@ -1064,6 +1663,62 @@ namespace sim_tmi
         };
     }
 
+    std::vector<int> cyclic_mode_range(int begin, int count, int n)
+    {
+        if (n <= 0)
+        {
+            throw std::invalid_argument("cyclic_mode_range requires positive n.");
+        }
+        if (count < 0 || count > n)
+        {
+            throw std::invalid_argument("Invalid cyclic subsystem block size.");
+        }
+
+        std::vector<int> modes;
+        modes.reserve(static_cast<std::size_t>(count));
+        for (int i = 0; i < count; ++i)
+        {
+            int q = (begin + i) % n;
+            if (q < 0)
+            {
+                q += n;
+            }
+            modes.push_back(q);
+        }
+        return modes;
+    }
+
+    std::vector<TmiMatrixTerm> tmi_terms_1d_cycle(int n, int cycle_offset)
+    {
+        if (n < 4 || (n % 4) != 0)
+        {
+            throw std::invalid_argument("TMI output requires N=L >= 4 and divisible by 4.");
+        }
+
+        const int block = n / 4;
+        if (cycle_offset < 0 || cycle_offset >= block)
+        {
+            throw std::invalid_argument("TMI cycle offset is out of range.");
+        }
+
+        const std::vector<int> A = cyclic_mode_range(cycle_offset + 0 * block, block, n);
+        const std::vector<int> B = cyclic_mode_range(cycle_offset + 1 * block, block, n);
+        const std::vector<int> C = cyclic_mode_range(cycle_offset + 2 * block, block, n);
+        const std::vector<int> D = cyclic_mode_range(cycle_offset + 3 * block, block, n);
+
+        return {
+            {"AB", concatenate_modes(A, B)},
+            {"AC", concatenate_modes(A, C)},
+            {"BC", concatenate_modes(B, C)},
+            {"D", D},
+        };
+    }
+
+    int tmi_cycle_count(int n, bool all_cycles)
+    {
+        return all_cycles ? (n / 4) : 1;
+    }
+
     struct TmiWorkspace
     {
         EntropyWorkspace entropy;
@@ -1076,9 +1731,11 @@ namespace sim_tmi
         StateEntropyWorkspace entropy_b;
         StateEntropyWorkspace entropy_c;
         StateEntropyWorkspace entropy_d;
-        StateEntropyWorkspace entropy_ab;
-        StateEntropyWorkspace entropy_ac;
-        StateEntropyWorkspace entropy_bc;
+        // Reused for AB, AC, and BC half-cut Schmidt SVDs.  For N=24 this
+        // avoids retaining three separate 4096x4096 complex work matrices.
+        StateEntropyWorkspace entropy_half;
+        bool cuda_svd_disabled = false;
+        int cuda_svd_failure_status = 0;
         std::vector<std::complex<double>> host_state_f64;
         std::vector<std::complex<float>> host_state_f32;
     };
@@ -1128,14 +1785,20 @@ namespace sim_tmi
     double tmi_from_statevector(const std::complex<Real> *psi,
                                 int n,
                                 std::uint32_t block_qubits,
+                                int cycle_offset,
                                 bool fermion_trace,
                                 TmiWorkspace &workspace)
     {
         const int block = static_cast<int>(block_qubits);
-        const std::vector<int> A = mode_range(0 * block, block);
-        const std::vector<int> B = mode_range(1 * block, block);
-        const std::vector<int> C = mode_range(2 * block, block);
-        const std::vector<int> D = mode_range(3 * block, block);
+        if (cycle_offset < 0 || cycle_offset >= block)
+        {
+            throw std::invalid_argument("TMI cycle offset is out of range.");
+        }
+
+        const std::vector<int> A = cyclic_mode_range(cycle_offset + 0 * block, block, n);
+        const std::vector<int> B = cyclic_mode_range(cycle_offset + 1 * block, block, n);
+        const std::vector<int> C = cyclic_mode_range(cycle_offset + 2 * block, block, n);
+        const std::vector<int> D = cyclic_mode_range(cycle_offset + 3 * block, block, n);
         const std::vector<int> AB = concatenate_modes(A, B);
         const std::vector<int> AC = concatenate_modes(A, C);
         const std::vector<int> BC = concatenate_modes(B, C);
@@ -1150,20 +1813,201 @@ namespace sim_tmi
             psi, n, D, fermion_trace, workspace.entropy_d);
 
         const double s_ab = entropy_subsystem_svd_from_state(
-            psi, n, AB, fermion_trace, workspace.entropy_ab);
+            psi, n, AB, fermion_trace, workspace.entropy_half);
         const double s_ac = entropy_subsystem_svd_from_state(
-            psi, n, AC, fermion_trace, workspace.entropy_ac);
+            psi, n, AC, fermion_trace, workspace.entropy_half);
         const double s_bc = entropy_subsystem_svd_from_state(
-            psi, n, BC, fermion_trace, workspace.entropy_bc);
+            psi, n, BC, fermion_trace, workspace.entropy_half);
 
         return s_a + s_b + s_c + s_d - s_ab - s_ac - s_bc;
     }
 
-    double tmi_from_cudaq_state_fast(cudaq::state &state,
-                                     int n,
-                                     std::uint32_t block_qubits,
-                                     bool fermion_trace,
-                                     TmiWorkspace &workspace)
+
+    bool entropy_subsystem_svd_from_device_state(const void *device_state_vector,
+                                                 bool device_state_is_fp64,
+                                                 int n,
+                                                 const std::vector<int> &kept_modes,
+                                                 bool fermion_trace,
+                                                 double &entropy_out,
+                                                 int &status_out)
+    {
+        status_out = 0;
+#ifdef MIPT_ENABLE_CUDA_RHO
+        if (device_state_vector == nullptr || kept_modes.empty() ||
+            kept_modes.size() > static_cast<std::size_t>(std::numeric_limits<int>::max()))
+        {
+            status_out = -1;
+            return false;
+        }
+
+        const int status = device_state_is_fp64
+                               ? mipt_cuda_entropy_svd_f64(device_state_vector,
+                                                           n,
+                                                           kept_modes.data(),
+                                                           static_cast<int>(kept_modes.size()),
+                                                           fermion_trace ? 1 : 0,
+                                                           &entropy_out)
+                               : mipt_cuda_entropy_svd_f32(device_state_vector,
+                                                           n,
+                                                           kept_modes.data(),
+                                                           static_cast<int>(kept_modes.size()),
+                                                           fermion_trace ? 1 : 0,
+                                                           &entropy_out);
+        status_out = status;
+        return status == 0 && std::isfinite(entropy_out);
+#else
+        (void)device_state_vector;
+        (void)device_state_is_fp64;
+        (void)n;
+        (void)kept_modes;
+        (void)fermion_trace;
+        (void)entropy_out;
+        status_out = -1;
+        return false;
+#endif
+    }
+
+    template <typename Real>
+    double tmi_from_statevector_hybrid_gpu_half_svd(const std::complex<Real> *host_psi,
+                                                    const void *device_state_vector,
+                                                    bool device_state_is_fp64,
+                                                    int n,
+                                                    std::uint32_t block_qubits,
+                                                    int cycle_offset,
+                                                    bool fermion_trace,
+                                                    TmiWorkspace &workspace)
+    {
+        const int block = static_cast<int>(block_qubits);
+        if (cycle_offset < 0 || cycle_offset >= block)
+        {
+            throw std::invalid_argument("TMI cycle offset is out of range.");
+        }
+
+        const std::vector<int> A = cyclic_mode_range(cycle_offset + 0 * block, block, n);
+        const std::vector<int> B = cyclic_mode_range(cycle_offset + 1 * block, block, n);
+        const std::vector<int> C = cyclic_mode_range(cycle_offset + 2 * block, block, n);
+        const std::vector<int> D = cyclic_mode_range(cycle_offset + 3 * block, block, n);
+        const std::vector<int> AB = concatenate_modes(A, B);
+        const std::vector<int> AC = concatenate_modes(A, C);
+        const std::vector<int> BC = concatenate_modes(B, C);
+
+        const double s_a = entropy_subsystem_rdm_from_state(
+            host_psi, n, A, fermion_trace, workspace.entropy_a);
+        const double s_b = entropy_subsystem_rdm_from_state(
+            host_psi, n, B, fermion_trace, workspace.entropy_b);
+        const double s_c = entropy_subsystem_rdm_from_state(
+            host_psi, n, C, fermion_trace, workspace.entropy_c);
+        const double s_d = entropy_subsystem_rdm_from_state(
+            host_psi, n, D, fermion_trace, workspace.entropy_d);
+
+        auto half_entropy = [&](const std::vector<int> &modes) -> double {
+            double entropy = 0.0;
+            int status = 0;
+            if (!workspace.cuda_svd_disabled &&
+                should_try_cuda_svd_for_problem(n, modes.size()) &&
+                entropy_subsystem_svd_from_device_state(device_state_vector,
+                                                        device_state_is_fp64,
+                                                        n,
+                                                        modes,
+                                                        fermion_trace,
+                                                        entropy,
+                                                        status))
+            {
+                return entropy;
+            }
+
+            if (!workspace.cuda_svd_disabled && status != 0)
+            {
+                workspace.cuda_svd_disabled = true;
+                workspace.cuda_svd_failure_status = status;
+            }
+            return entropy_subsystem_svd_from_state(
+                host_psi, n, modes, fermion_trace, workspace.entropy_half);
+        };
+
+        const double s_ab = half_entropy(AB);
+        const double s_ac = half_entropy(AC);
+        const double s_bc = half_entropy(BC);
+
+        return s_a + s_b + s_c + s_d - s_ab - s_ac - s_bc;
+    }
+
+    template <typename Real>
+    std::vector<double> tmi_values_from_statevector_hybrid_gpu_half_svd(const std::complex<Real> *host_psi,
+                                                                        const void *device_state_vector,
+                                                                        bool device_state_is_fp64,
+                                                                        int n,
+                                                                        std::uint32_t block_qubits,
+                                                                        int cycle_count,
+                                                                        bool fermion_trace,
+                                                                        TmiWorkspace &workspace)
+    {
+        std::vector<double> values;
+        values.reserve(static_cast<std::size_t>(cycle_count));
+        for (int cycle_offset = 0; cycle_offset < cycle_count; ++cycle_offset)
+        {
+            values.push_back(tmi_from_statevector_hybrid_gpu_half_svd(host_psi,
+                                                                      device_state_vector,
+                                                                      device_state_is_fp64,
+                                                                      n,
+                                                                      block_qubits,
+                                                                      cycle_offset,
+                                                                      fermion_trace,
+                                                                      workspace));
+        }
+        return values;
+    }
+
+    template <typename Real>
+    std::vector<double> tmi_values_from_statevector_fast(const std::complex<Real> *psi,
+                                                         int n,
+                                                         std::uint32_t block_qubits,
+                                                         int cycle_count,
+                                                         bool fermion_trace,
+                                                         TmiWorkspace &workspace)
+    {
+        std::vector<double> values;
+        values.reserve(static_cast<std::size_t>(cycle_count));
+        for (int cycle_offset = 0; cycle_offset < cycle_count; ++cycle_offset)
+        {
+            values.push_back(tmi_from_statevector(psi,
+                                                  n,
+                                                  block_qubits,
+                                                  cycle_offset,
+                                                  fermion_trace,
+                                                  workspace));
+        }
+        return values;
+    }
+
+    template <typename Real>
+    std::vector<double> tmi_values_from_statevector_payload(const std::complex<Real> *psi,
+                                                            int n,
+                                                            std::uint32_t block_qubits,
+                                                            int cycle_count,
+                                                            bool fermion_trace,
+                                                            const TmiPlans &plans,
+                                                            TmiWorkspace &workspace)
+    {
+        std::vector<double> values;
+        values.reserve(static_cast<std::size_t>(cycle_count));
+        std::vector<double> payload;
+
+        for (int cycle_offset = 0; cycle_offset < cycle_count; ++cycle_offset)
+        {
+            const std::vector<TmiMatrixTerm> terms = tmi_terms_1d_cycle(n, cycle_offset);
+            tmi_density_matrices_from_host_statevector(psi, n, terms, payload, fermion_trace);
+            values.push_back(tmi_from_payload(payload, block_qubits, terms, plans, workspace));
+        }
+        return values;
+    }
+
+    std::vector<double> tmi_values_from_cudaq_state_fast(cudaq::state &state,
+                                                         int n,
+                                                         std::uint32_t block_qubits,
+                                                         int cycle_count,
+                                                         bool fermion_trace,
+                                                         TmiWorkspace &workspace)
     {
         const std::uint64_t dim_u64 = checked_pow2_u64(n);
         if (dim_u64 > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()))
@@ -1185,32 +2029,215 @@ namespace sim_tmi
             {
                 workspace.host_state_f64.resize(dim);
                 state.to_host(workspace.host_state_f64.data(), workspace.host_state_f64.size());
-                return tmi_from_statevector(workspace.host_state_f64.data(), n, block_qubits,
-                                            fermion_trace, workspace);
+                if (tensor.data != nullptr)
+                {
+                    return tmi_values_from_statevector_hybrid_gpu_half_svd(workspace.host_state_f64.data(),
+                                                                           tensor.data,
+                                                                           true,
+                                                                           n,
+                                                                           block_qubits,
+                                                                           cycle_count,
+                                                                           fermion_trace,
+                                                                           workspace);
+                }
+                return tmi_values_from_statevector_fast(workspace.host_state_f64.data(),
+                                                        n,
+                                                        block_qubits,
+                                                        cycle_count,
+                                                        fermion_trace,
+                                                        workspace);
             }
             if (tensor.data == nullptr)
             {
                 throw std::runtime_error("CUDA-Q state tensor has a null data pointer.");
             }
-            return tmi_from_statevector(
+            return tmi_values_from_statevector_fast(
                 reinterpret_cast<const std::complex<double> *>(tensor.data),
-                n, block_qubits, fermion_trace, workspace);
+                n,
+                block_qubits,
+                cycle_count,
+                fermion_trace,
+                workspace);
         }
 
         if (state.is_on_gpu())
         {
             workspace.host_state_f32.resize(dim);
             state.to_host(workspace.host_state_f32.data(), workspace.host_state_f32.size());
-            return tmi_from_statevector(workspace.host_state_f32.data(), n, block_qubits,
-                                        fermion_trace, workspace);
+            if (tensor.data != nullptr)
+            {
+                return tmi_values_from_statevector_hybrid_gpu_half_svd(workspace.host_state_f32.data(),
+                                                                       tensor.data,
+                                                                       false,
+                                                                       n,
+                                                                       block_qubits,
+                                                                       cycle_count,
+                                                                       fermion_trace,
+                                                                       workspace);
+            }
+            return tmi_values_from_statevector_fast(workspace.host_state_f32.data(),
+                                                    n,
+                                                    block_qubits,
+                                                    cycle_count,
+                                                    fermion_trace,
+                                                    workspace);
         }
         if (tensor.data == nullptr)
         {
             throw std::runtime_error("CUDA-Q state tensor has a null data pointer.");
         }
-        return tmi_from_statevector(
+        return tmi_values_from_statevector_fast(
             reinterpret_cast<const std::complex<float> *>(tensor.data),
-            n, block_qubits, fermion_trace, workspace);
+            n,
+            block_qubits,
+            cycle_count,
+            fermion_trace,
+            workspace);
+    }
+
+    std::vector<double> tmi_values_from_cudaq_state_payload(cudaq::state &state,
+                                                            int n,
+                                                            std::uint32_t block_qubits,
+                                                            int cycle_count,
+                                                            bool fermion_trace,
+                                                            const TmiPlans &plans,
+                                                            TmiWorkspace &workspace)
+    {
+        const std::uint64_t dim_u64 = checked_pow2_u64(n);
+        if (dim_u64 > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()))
+        {
+            throw std::invalid_argument("State-vector dimension does not fit in size_t.");
+        }
+        const std::size_t dim = static_cast<std::size_t>(dim_u64);
+        const auto precision = state.get_precision();
+        const auto tensor = state.get_tensor();
+
+        if (tensor.get_rank() != 1 || tensor.get_num_elements() < dim)
+        {
+            throw std::runtime_error("Expected a contiguous rank-1 CUDA-Q statevector tensor.");
+        }
+
+        if (precision == cudaq::SimulationState::precision::fp64)
+        {
+            if (state.is_on_gpu())
+            {
+                workspace.host_state_f64.resize(dim);
+                state.to_host(workspace.host_state_f64.data(), workspace.host_state_f64.size());
+                return tmi_values_from_statevector_payload(workspace.host_state_f64.data(),
+                                                           n,
+                                                           block_qubits,
+                                                           cycle_count,
+                                                           fermion_trace,
+                                                           plans,
+                                                           workspace);
+            }
+            if (tensor.data == nullptr)
+            {
+                throw std::runtime_error("CUDA-Q state tensor has a null data pointer.");
+            }
+            return tmi_values_from_statevector_payload(
+                reinterpret_cast<const std::complex<double> *>(tensor.data),
+                n,
+                block_qubits,
+                cycle_count,
+                fermion_trace,
+                plans,
+                workspace);
+        }
+
+        if (state.is_on_gpu())
+        {
+            workspace.host_state_f32.resize(dim);
+            state.to_host(workspace.host_state_f32.data(), workspace.host_state_f32.size());
+            return tmi_values_from_statevector_payload(workspace.host_state_f32.data(),
+                                                       n,
+                                                       block_qubits,
+                                                       cycle_count,
+                                                       fermion_trace,
+                                                       plans,
+                                                       workspace);
+        }
+        if (tensor.data == nullptr)
+        {
+            throw std::runtime_error("CUDA-Q state tensor has a null data pointer.");
+        }
+        return tmi_values_from_statevector_payload(
+            reinterpret_cast<const std::complex<float> *>(tensor.data),
+            n,
+            block_qubits,
+            cycle_count,
+            fermion_trace,
+            plans,
+            workspace);
+    }
+
+    bool cudaq_state_has_device_tensor(cudaq::state &state)
+    {
+#ifdef MIPT_ENABLE_CUDA_RHO
+        if (!state.is_on_gpu())
+        {
+            return false;
+        }
+        const auto tensor = state.get_tensor();
+        return tensor.data != nullptr && tensor.get_rank() == 1;
+#else
+        (void)state;
+        return false;
+#endif
+    }
+
+    bool host_svd_available_for_state(cudaq::state &state)
+    {
+        const auto precision = state.get_precision();
+        if (precision == cudaq::SimulationState::precision::fp64)
+        {
+            return lapack_runtime::zgesvd() != nullptr;
+        }
+        return lapack_runtime::cgesvd() != nullptr || lapack_runtime::zgesvd() != nullptr;
+    }
+
+    bool fast_state_tmi_available(cudaq::state &state, int n, std::uint32_t block_qubits)
+    {
+        // The fast state-vector path always needs zheevd_ for the small A/B/C/D
+        // RDM entropies.  Half-cut entropies can use either host SVD or, when the
+        // state is still on GPU and CUDA_RHO is enabled, the cuSOLVER device SVD.
+        // The N=8/N=12 small-N CPU override must be included here; otherwise a
+        // GPU state with no host SVD could incorrectly enter the fast path and
+        // fail after the CUDA half-SVD is intentionally skipped.
+        if (lapack_runtime::zheevd() == nullptr)
+        {
+            return false;
+        }
+        if (host_svd_available_for_state(state))
+        {
+            return true;
+        }
+        const std::size_t half_cut_kept_modes = 2u * static_cast<std::size_t>(block_qubits);
+        return cudaq_state_has_device_tensor(state) &&
+               should_try_cuda_svd_for_problem(n, half_cut_kept_modes);
+    }
+
+    const char *compile_target_name()
+    {
+#ifdef SIM_TMI_GPU_BUILD
+        return "CUDA-Q NVIDIA target";
+#else
+        return "CPU target";
+#endif
+    }
+
+    const char *cuda_rho_build_name()
+    {
+#ifdef MIPT_ENABLE_CUDA_RHO
+        return "enabled";
+#else
+        return "disabled";
+#endif
+    }
+
+    const char *state_precision_name(cudaq::SimulationState::precision precision)
+    {
+        return precision == cudaq::SimulationState::precision::fp64 ? "fp64" : "fp32";
     }
 
     std::string format_duration(double seconds)
@@ -1264,24 +2291,31 @@ namespace sim_tmi
         }
     }
 
+    void ensure_output_parent_directory(const std::string &output_path);
+
     void run_1d_sim_tmi(int n,
                         int periods,
                         int realizations,
                         int res,
                         double p_min,
                         double p_max,
-                        bool fermion,
+                        CircuitMode circuit_mode,
+                        bool all_cycles,
                         const std::string &output_path)
     {
         validate_sim_args(n, periods, realizations, res, p_min, p_max);
 
         const std::uint32_t block_qubits = static_cast<std::uint32_t>(n / 4);
-        const std::vector<TmiMatrixTerm> terms = tmi_terms_1d(n);
+        const int cycle_count = tmi_cycle_count(n, all_cycles);
+        const bool fermion_trace = uses_fermionic_trace(circuit_mode);
         const TmiPlans plans = make_tmi_plans(block_qubits,
-                                             fermion ? TraceMode::Fermion : TraceMode::Qubit);
+                                             fermion_trace ? TraceMode::Fermion : TraceMode::Qubit);
         const std::vector<double> ps = linspace(p_min, p_max, res);
         const std::uint64_t total = static_cast<std::uint64_t>(res) *
-                                    static_cast<std::uint64_t>(realizations);
+                                    static_cast<std::uint64_t>(realizations) *
+                                    static_cast<std::uint64_t>(cycle_count);
+
+        ensure_output_parent_directory(output_path);
 
         std::ofstream csv(output_path, std::ios::binary | std::ios::trunc);
         if (!csv)
@@ -1289,6 +2323,13 @@ namespace sim_tmi
             throw std::runtime_error("Could not create output CSV: " + output_path);
         }
         csv << "p,tmi\n";
+        csv.flush();
+        if (!csv)
+        {
+            throw std::runtime_error("Failed while writing output CSV header.");
+        }
+
+        const std::uint64_t flush_rows = csv_flush_row_interval(n, cycle_count);
 
         std::cerr << "Online TMI simulation\n"
                   << "n=" << n
@@ -1298,23 +2339,50 @@ namespace sim_tmi
                   << ", p_min=" << p_min
                   << ", p_max=" << p_max
                   << ", block_qubits=" << block_qubits
-                  << ", mode=" << (fermion ? "fermion" : "qubit/MMS")
+                  << ", all_cycles=" << (all_cycles ? 1 : 0)
+                  << ", tmi_cycles_per_circuit=" << cycle_count
+                  << ", mode=" << circuit_mode_name(circuit_mode)
                   << ", output=" << output_path << '\n'
+                  << "build_target=" << compile_target_name()
+                  << ", cuda_rho=" << cuda_rho_build_name() << '\n'
                   << "entropy_backend=" << lapack_runtime::status() << '\n'
-                  << "tmi_method="
-                  << (lapack_runtime::zgesvd()
-                          ? "state-vector Schmidt/SVD for half cuts + BLAS HERK small-cut path when available"
-                          : "legacy reduced-density-matrix fallback")
+                  << "tmi_method=selected after first state; fast path requires zheevd plus either host SVD or enabled CUDA device half-SVD" << '\n'
+                  << "cuda_svd_min_kept_modes=" << cuda_svd_min_kept_modes()
+                  << ", small_n_cuda_svd_policy="
+                  << (force_cuda_svd_for_small_n() ? "forced-on" : "cpu-for-n8-n12")
+                  << ", csv_flush_rows=" << flush_rows
                   << '\n';
 
         TmiWorkspace workspace;
-        std::string line_buffer;
-        line_buffer.reserve(1u << 20);
+        std::string line;
+        line.reserve(128);
+        std::string csv_buffer;
+        csv_buffer.reserve(static_cast<std::size_t>(std::min<std::uint64_t>(flush_rows, 4096)) * 48u);
+        std::uint64_t buffered_rows = 0;
+        auto flush_csv_buffer = [&]() {
+            if (csv_buffer.empty())
+            {
+                return;
+            }
+            csv.write(csv_buffer.data(), static_cast<std::streamsize>(csv_buffer.size()));
+            csv_buffer.clear();
+            buffered_rows = 0;
+            csv.flush();
+            if (!csv)
+            {
+                throw std::runtime_error("Failed while writing output CSV.");
+            }
+        };
+
+        std::mt19937 frgs_rng(std::random_device{}());
+        std::vector<FRGSLayerData> frgs_layers;
+        frgs_layers.reserve(static_cast<std::size_t>(2 * periods + 1));
 
         const auto start = std::chrono::steady_clock::now();
         auto last_report = start;
         std::uint64_t processed = 0;
         std::uint64_t last_processed = 0;
+        bool printed_state_backend = false;
 
         for (std::size_t p_index = 0; p_index < ps.size(); ++p_index)
         {
@@ -1322,7 +2390,12 @@ namespace sim_tmi
             for (int r = 0; r < realizations; ++r)
             {
                 auto state = [&]() {
-                    if (fermion)
+                    if (circuit_mode == CircuitMode::FermionReducedGateSet)
+                    {
+                        frgs_mipt_frontend_inplace(frgs_layers, n, periods, p, frgs_rng, true);
+                        return cudaq::get_state(MIPTKernel_1D_FRGS{}, n, frgs_layers, true);
+                    }
+                    if (circuit_mode == CircuitMode::FermionHaar)
                     {
                         auto layers = mipt_fermion_frontend(n, periods, p, true);
                         return cudaq::get_state(MIPTFermionKernel_1D{}, n, layers);
@@ -1332,12 +2405,43 @@ namespace sim_tmi
                     return cudaq::get_state(MIPTKernel_1D{}, n, layers, true);
                 }();
 
-                double tmi = 0.0;
-                if (lapack_runtime::zgesvd())
+                const bool use_fast_state_tmi = fast_state_tmi_available(state, n, block_qubits);
+                if (!printed_state_backend)
+                {
+                    const bool device_tensor = cudaq_state_has_device_tensor(state);
+                    const bool host_svd_available = host_svd_available_for_state(state);
+                    const std::size_t half_cut_kept_modes = 2u * static_cast<std::size_t>(block_qubits);
+                    const bool small_n_cuda_svd_disabled = cuda_svd_disabled_for_small_n(n);
+                    const bool cuda_half_svd_enabled = device_tensor &&
+                                                       should_try_cuda_svd_for_problem(n, half_cut_kept_modes);
+                    const char *half_cut_backend = cuda_half_svd_enabled
+                                                       ? "CUDA/cuSOLVER"
+                                                       : (small_n_cuda_svd_disabled
+                                                              ? "host LAPACK (N=8/12 CPU override)"
+                                                              : (host_svd_available ? "host LAPACK" : "legacy RDM fallback"));
+                    std::cerr << "state_backend=" << (state.is_on_gpu() ? "gpu" : "host")
+                              << ", precision=" << state_precision_name(state.get_precision())
+                              << ", device_tensor=" << (device_tensor ? 1 : 0)
+                              << ", host_svd_available=" << (host_svd_available ? 1 : 0)
+                              << ", small_n_cuda_svd_disabled=" << (small_n_cuda_svd_disabled ? 1 : 0)
+                              << ", cuda_half_svd_enabled=" << (cuda_half_svd_enabled ? 1 : 0)
+                              << ", half_cut_backend=" << half_cut_backend
+                              << ", fast_state_tmi=" << (use_fast_state_tmi ? 1 : 0)
+                              << '\n';
+                    printed_state_backend = true;
+                }
+
+                std::vector<double> tmi_values;
+                if (use_fast_state_tmi)
                 {
                     try
                     {
-                        tmi = tmi_from_cudaq_state_fast(state, n, block_qubits, fermion, workspace);
+                        tmi_values = tmi_values_from_cudaq_state_fast(state,
+                                                                      n,
+                                                                      block_qubits,
+                                                                      cycle_count,
+                                                                      fermion_trace,
+                                                                      workspace);
                     }
                     catch (const std::bad_alloc &)
                     {
@@ -1349,70 +2453,244 @@ namespace sim_tmi
                 }
                 else
                 {
-                    // Compatibility path for systems without a usable LAPACK SVD.
+                    // Compatibility path for systems without a usable fast state-vector path.
                     // This is exact but much slower because it materializes pair RDMs.
-                    std::vector<double> payload;
-                    cudaq_tmi_density_matrices(state, n, terms, payload, fermion);
-                    tmi = tmi_from_payload(payload, block_qubits, terms, plans, workspace);
+                    tmi_values = tmi_values_from_cudaq_state_payload(state,
+                                                                     n,
+                                                                     block_qubits,
+                                                                     cycle_count,
+                                                                     fermion_trace,
+                                                                     plans,
+                                                                     workspace);
                 }
 
-                append_double(line_buffer, p);
-                line_buffer.push_back(',');
-                append_double(line_buffer, tmi);
-                line_buffer.push_back('\n');
-
-                if (line_buffer.size() >= (1u << 20))
+                for (double tmi : tmi_values)
                 {
-                    csv.write(line_buffer.data(), static_cast<std::streamsize>(line_buffer.size()));
-                    if (!csv)
+                    line.clear();
+                    append_double(line, p);
+                    line.push_back(',');
+                    append_double(line, tmi);
+                    line.push_back('\n');
+
+                    csv_buffer.append(line);
+                    ++buffered_rows;
+
+                    ++processed;
+                    const auto now = std::chrono::steady_clock::now();
+                    const double since_last = std::chrono::duration<double>(now - last_report).count();
+                    if (since_last >= 1.0 || processed == total)
                     {
-                        throw std::runtime_error("Failed while writing output CSV.");
+                        const double elapsed = std::max(1.0e-12, std::chrono::duration<double>(now - start).count());
+                        const double avg = static_cast<double>(processed) / elapsed;
+                        const double recent = static_cast<double>(processed - last_processed) / std::max(1.0e-12, since_last);
+                        const double eta = avg > 0.0 ? static_cast<double>(total - processed) / avg : 0.0;
+                        std::cerr << '\r'
+                                  << "processed TMI " << processed << '/' << total
+                                  << " | avg " << std::fixed << std::setprecision(2) << avg << "/s"
+                                  << " | recent " << std::fixed << std::setprecision(2) << recent << "/s"
+                                  << " | ETA " << format_duration(eta)
+                                  << "          " << std::flush;
+                        last_report = now;
+                        last_processed = processed;
                     }
-                    line_buffer.clear();
                 }
 
-                ++processed;
-                const auto now = std::chrono::steady_clock::now();
-                const double since_last = std::chrono::duration<double>(now - last_report).count();
-                if (since_last >= 1.0 || processed == total)
+                if (buffered_rows >= flush_rows || processed == total)
                 {
-                    const double elapsed = std::max(1.0e-12, std::chrono::duration<double>(now - start).count());
-                    const double avg = static_cast<double>(processed) / elapsed;
-                    const double recent = static_cast<double>(processed - last_processed) / std::max(1.0e-12, since_last);
-                    const double eta = avg > 0.0 ? static_cast<double>(total - processed) / avg : 0.0;
-                    std::cerr << '\r'
-                              << "processed " << processed << '/' << total
-                              << " | avg " << std::fixed << std::setprecision(2) << avg << "/s"
-                              << " | recent " << std::fixed << std::setprecision(2) << recent << "/s"
-                              << " | ETA " << format_duration(eta)
-                              << "          " << std::flush;
-                    last_report = now;
-                    last_processed = processed;
+                    flush_csv_buffer();
                 }
             }
         }
 
-        if (!line_buffer.empty())
-        {
-            csv.write(line_buffer.data(), static_cast<std::streamsize>(line_buffer.size()));
-            line_buffer.clear();
-        }
+        flush_csv_buffer();
         csv.flush();
         if (!csv)
         {
             throw std::runtime_error("Failed while finalizing output CSV.");
         }
         std::cerr << '\n';
+        if (workspace.cuda_svd_disabled)
+        {
+            std::cerr << "Warning: cuSOLVER half-cut SVD was disabled after status "
+                      << workspace.cuda_svd_failure_status
+                      << "; using host LAPACK SVD for half cuts.\n";
+        }
+    }
+
+    bool is_bool01_arg(std::string_view value)
+    {
+        return value == "0" || value == "1";
+    }
+
+    bool parse_bool01_arg(std::string_view value, const char *name)
+    {
+        if (value == "0")
+        {
+            return false;
+        }
+        if (value == "1")
+        {
+            return true;
+        }
+        throw std::invalid_argument(std::string(name) + " must be 0 or 1.");
+    }
+
+    std::string format_number_for_filename(double value)
+    {
+        if (std::abs(value) < 1.0e-15)
+        {
+            value = 0.0;
+        }
+
+        std::ostringstream out;
+        out << std::fixed << std::setprecision(12) << value;
+        std::string text = out.str();
+
+        const std::size_t dot = text.find('.');
+        if (dot != std::string::npos)
+        {
+            while (!text.empty() && text.back() == '0')
+            {
+                text.pop_back();
+            }
+            if (!text.empty() && text.back() == '.')
+            {
+                text.pop_back();
+            }
+        }
+
+        if (text == "-0")
+        {
+            text = "0";
+        }
+        return text;
+    }
+
+    std::string tmi_output_tag(CircuitMode circuit_mode, bool all_cycles)
+    {
+        std::string tag;
+        switch (circuit_mode)
+        {
+        case CircuitMode::QubitMms:
+            tag = "qubit";
+            break;
+        case CircuitMode::FermionHaar:
+            tag = "fermion1";
+            break;
+        case CircuitMode::FermionReducedGateSet:
+            tag = "fermion2";
+            break;
+        default:
+            throw std::invalid_argument("Unsupported fermion mode for TMI output naming.");
+        }
+
+        if (all_cycles)
+        {
+            tag += "c";
+        }
+        return tag;
+    }
+
+    std::string default_tmi_output_path(int n,
+                                        int realizations,
+                                        int res,
+                                        double p_min,
+                                        double p_max,
+                                        CircuitMode circuit_mode,
+                                        bool all_cycles)
+    {
+        const std::string tag = tmi_output_tag(circuit_mode, all_cycles);
+
+        std::ostringstream filename;
+        filename << "tmi_" << tag
+                 << "_n_" << n
+                 << "_real_" << realizations
+                 << '_' << format_number_for_filename(p_min)
+                 << '_' << format_number_for_filename(p_max)
+                 << "_res_" << res
+                 << ".csv";
+
+        return std::string("csv/tmi/") + tag + "/" + filename.str();
+    }
+
+    void make_directory_if_needed(const std::string &path)
+    {
+        if (path.empty())
+        {
+            return;
+        }
+
+        if (::mkdir(path.c_str(), 0755) == 0)
+        {
+            return;
+        }
+
+        if (errno == EEXIST)
+        {
+            return;
+        }
+
+        throw std::runtime_error("Could not create output directory: " + path + " (" + std::strerror(errno) + ")");
+    }
+
+    void ensure_output_parent_directory(const std::string &output_path)
+    {
+        const std::size_t slash = output_path.find_last_of("/\\");
+        if (slash == std::string::npos)
+        {
+            return;
+        }
+
+        const std::string parent = output_path.substr(0, slash);
+        if (parent.empty())
+        {
+            return;
+        }
+
+        std::string current;
+        std::size_t pos = 0;
+        if (parent[0] == '/')
+        {
+            current = "/";
+            pos = 1;
+        }
+
+        while (pos < parent.size())
+        {
+            const std::size_t next = parent.find_first_of("/\\", pos);
+            const std::string part = parent.substr(pos, next == std::string::npos ? std::string::npos : next - pos);
+            if (!part.empty())
+            {
+                if (!current.empty() && current.back() != '/')
+                {
+                    current += '/';
+                }
+                current += part;
+                make_directory_if_needed(current);
+            }
+            if (next == std::string::npos)
+            {
+                break;
+            }
+            pos = next + 1;
+        }
     }
 
     void print_usage(const char *argv0)
     {
         std::cerr
             << "Usage:\n"
-            << "  " << argv0 << " [n = 10] [periods = 10] [realizations = 10] [resolution = 5] [p_min = 0.0] [p_max = 1.0] [fermion = 0] [output.csv = tmi.csv]\n\n"
+            << "  " << argv0 << " [n = 10] [periods = 10] [realizations = 10] [resolution = 5] [p_min = 0.0] [p_max = 1.0] [fermion = 0] [all_cycles = 0] [output.csv = auto]\n\n"
             << "Arguments:\n"
             << "  fermion = 0 uses the existing MMS/qubit circuit.\n"
-            << "  fermion = 1 uses parity-preserving fermionic gates with JW FSWAP boundaries.\n\n"
+            << "  fermion = 1 uses parity-preserving fermionic gates with JW FSWAP boundaries.\n"
+            << "  fermion = 2 uses the reduced-gate-set fermionic architecture from mipt_fermion.cpp.\n"
+            << "  all_cycles = 0 computes the original offset only.\n"
+            << "  all_cycles = 1 computes N/4 cyclic offsets; e.g. N=8 gives [0,1]|[2,3]|[4,5]|[6,7] and [1,2]|[3,4]|[5,6]|[7,0].\n"
+            << "  For backward compatibility, output.csv may also be supplied before all_cycles.\n"
+            << "  If output.csv is omitted, the default path is:\n"
+            << "    csv/tmi/<tag>/tmi_<tag>_n_<n>_real_<realizations>_<p_min>_<p_max>_res_<resolution>.csv\n"
+            << "  Tags are qubit, fermion1, or fermion2; all_cycles=1 appends c, e.g. fermion2c.\n\n"
             << "Output CSV columns:\n"
             << "  p,tmi\n";
     }
@@ -1429,7 +2707,7 @@ int main(int argc, char **argv)
             sim_tmi::print_usage(argv[0]);
             return 0;
         }
-        if (argc > 9)
+        if (argc > 10)
         {
             std::cerr << "Too many arguments. Use --help for usage.\n";
             return 2;
@@ -1442,11 +2720,43 @@ int main(int argc, char **argv)
         const double p_min = (argc > 5) ? std::stod(argv[5]) : 0.0;
         const double p_max = (argc > 6) ? std::stod(argv[6]) : 1.0;
         const int fermion = (argc > 7) ? std::stoi(argv[7]) : 0;
-        const std::string output_path = (argc > 8) ? argv[8] : "tmi.csv";
 
-        if (fermion != 0 && fermion != 1)
+        bool all_cycles = false;
+        std::string output_path;
+        bool output_path_explicit = false;
+        if (argc > 8)
         {
-            throw std::invalid_argument("fermion must be 0 or 1.");
+            const std::string_view arg8(argv[8]);
+            if (sim_tmi::is_bool01_arg(arg8))
+            {
+                all_cycles = sim_tmi::parse_bool01_arg(arg8, "all_cycles");
+                if (argc > 9)
+                {
+                    output_path = argv[9];
+                    output_path_explicit = true;
+                }
+            }
+            else
+            {
+                output_path = argv[8];
+                output_path_explicit = true;
+                if (argc > 9)
+                {
+                    all_cycles = sim_tmi::parse_bool01_arg(argv[9], "all_cycles");
+                }
+            }
+        }
+
+        const sim_tmi::CircuitMode circuit_mode = sim_tmi::circuit_mode_from_int(fermion);
+        if (!output_path_explicit)
+        {
+            output_path = sim_tmi::default_tmi_output_path(n,
+                                                          realizations,
+                                                          res,
+                                                          p_min,
+                                                          p_max,
+                                                          circuit_mode,
+                                                          all_cycles);
         }
 
         sim_tmi::run_1d_sim_tmi(n,
@@ -1455,7 +2765,8 @@ int main(int argc, char **argv)
                                 res,
                                 p_min,
                                 p_max,
-                                fermion != 0,
+                                circuit_mode,
+                                all_cycles,
                                 output_path);
         return 0;
     }

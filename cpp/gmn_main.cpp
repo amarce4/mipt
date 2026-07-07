@@ -134,6 +134,113 @@ namespace
         return out;
     }
 
+    struct MatrixSanitizeResult
+    {
+        std::uint64_t nonfinite_values = 0;
+        bool changed = false;
+    };
+
+    bool finite_complex_entry(double re, double im)
+    {
+        return std::isfinite(re) && std::isfinite(im);
+    }
+
+    MatrixSanitizeResult sanitize_hermitian_complex_matrix(
+        std::array<double, RHO3_VALUES> &rho_ri)
+    {
+        MatrixSanitizeResult result;
+        constexpr std::size_t dim = 8;
+
+        for (std::size_t row = 0; row < dim; ++row)
+        {
+            const std::size_t k = 2u * (row * dim + row);
+            if (!std::isfinite(rho_ri[k]))
+            {
+                rho_ri[k] = 0.0;
+                ++result.nonfinite_values;
+                result.changed = true;
+            }
+            if (!std::isfinite(rho_ri[k + 1]))
+            {
+                ++result.nonfinite_values;
+                result.changed = true;
+            }
+            if (rho_ri[k + 1] != 0.0)
+            {
+                rho_ri[k + 1] = 0.0;
+                result.changed = true;
+            }
+        }
+
+        for (std::size_t row = 0; row < dim; ++row)
+        {
+            for (std::size_t col = row + 1; col < dim; ++col)
+            {
+                const std::size_t a = 2u * (row * dim + col);
+                const std::size_t b = 2u * (col * dim + row);
+
+                const double are = rho_ri[a + 0];
+                const double aim = rho_ri[a + 1];
+                const double bre = rho_ri[b + 0];
+                const double bim = rho_ri[b + 1];
+
+                result.nonfinite_values += std::isfinite(are) ? 0u : 1u;
+                result.nonfinite_values += std::isfinite(aim) ? 0u : 1u;
+                result.nonfinite_values += std::isfinite(bre) ? 0u : 1u;
+                result.nonfinite_values += std::isfinite(bim) ? 0u : 1u;
+
+                const bool a_finite = finite_complex_entry(are, aim);
+                const bool b_finite = finite_complex_entry(bre, bim);
+
+                double re = 0.0;
+                double im = 0.0;
+                if (a_finite && b_finite)
+                {
+                    /* Hermitize by averaging rho[row,col] with conj(rho[col,row]). */
+                    re = 0.5 * (are + bre);
+                    im = 0.5 * (aim - bim);
+                }
+                else if (a_finite)
+                {
+                    re = are;
+                    im = aim;
+                }
+                else if (b_finite)
+                {
+                    re = bre;
+                    im = -bim;
+                }
+
+                if (rho_ri[a + 0] != re || rho_ri[a + 1] != im ||
+                    rho_ri[b + 0] != re || rho_ri[b + 1] != -im)
+                {
+                    result.changed = true;
+                }
+
+                rho_ri[a + 0] = re;
+                rho_ri[a + 1] = im;
+                rho_ri[b + 0] = re;
+                rho_ri[b + 1] = -im;
+            }
+        }
+
+        return result;
+    }
+
+    double csv_safe_gmn(double value)
+    {
+        /* Keep the CSV numeric, but do not skip valid solves before this point.
+         * Non-finite density-matrix entries are sanitized matrix-entry-wise
+         * before MOSEK is called; this fallback only handles actual solver
+         * failures or non-finite objectives.
+         */
+        if (!std::isfinite(value))
+        {
+            return 0.0;
+        }
+        return (value < 0.0 && value > -1.0e-10) ? 0.0 : value;
+    }
+
     EvaluationMode parse_mode(const char *arg)
     {
         const std::string value(arg);
@@ -161,7 +268,9 @@ namespace
     void append_jobs_from_record(const mipt_io::DensityFileMetadata &metadata,
                                  const mipt_io::DensityRecord &record,
                                  std::vector<GmnJob> &jobs,
-                                 double &max_imag_norm)
+                                 double &max_imag_norm,
+                                 std::uint64_t &nonfinite_input_value_count,
+                                 std::uint64_t &sanitized_matrix_count)
     {
         for (std::uint32_t subsystem = 0;
              subsystem < metadata.subsystem_count;
@@ -169,7 +278,17 @@ namespace
         {
             const double *rho_ri = record.rho_ri.data() +
                 static_cast<std::size_t>(subsystem) * RHO3_VALUES;
-            const double imag_norm = imaginary_frobenius_norm(rho_ri);
+            std::array<double, RHO3_VALUES> rho_complex =
+                complex_matrix(rho_ri);
+            const MatrixSanitizeResult sanitize_result =
+                sanitize_hermitian_complex_matrix(rho_complex);
+            nonfinite_input_value_count += sanitize_result.nonfinite_values;
+            if (sanitize_result.changed)
+            {
+                ++sanitized_matrix_count;
+            }
+
+            const double imag_norm = imaginary_frobenius_norm(rho_complex.data());
             max_imag_norm = std::max(max_imag_norm, imag_norm);
 
             const std::size_t q_offset =
@@ -184,8 +303,8 @@ namespace
             job.q1 = metadata.subsystem_qubits[q_offset + 1];
             job.q2 = metadata.subsystem_qubits[q_offset + 2];
             job.imag_norm = imag_norm;
-            job.rho_real = real_matrix(rho_ri);
-            job.rho_ri = complex_matrix(rho_ri);
+            job.rho_ri = rho_complex;
+            job.rho_real = real_matrix(job.rho_ri.data());
             jobs.push_back(job);
         }
     }
@@ -230,6 +349,8 @@ int main(int argc, char *argv[])
         }
 #endif
 
+        gmn_mosek_reset_diagnostics();
+
         mipt_io::DensityMatrixReader reader(input_path);
         const auto &metadata = reader.metadata();
 
@@ -245,7 +366,7 @@ int main(int argc, char *argv[])
             throw std::runtime_error("Could not create output CSV: " + output_path);
         }
 
-        outfile << "p,gmn,p_index,realization,subsystem_index,q0,q1,q2\n";
+        outfile << "p,gmn\n";
         outfile << std::setprecision(17);
 
         const std::uint64_t total_solves =
@@ -275,6 +396,10 @@ int main(int argc, char *argv[])
         mipt_io::DensityRecord record;
         std::uint64_t processed = 0;
         double max_imag_norm = 0.0;
+        std::uint64_t nonfinite_input_value_count = 0;
+        std::uint64_t sanitized_matrix_count = 0;
+        std::uint64_t nonfinite_gmn_count = 0;
+        std::uint64_t clipped_negative_gmn_count = 0;
         const auto start = std::chrono::steady_clock::now();
         auto interval_start = start;
         std::uint64_t interval_processed = 0;
@@ -286,7 +411,9 @@ int main(int argc, char *argv[])
             int records_in_batch = 0;
             while (records_in_batch < batch_records && reader.read_record(record))
             {
-                append_jobs_from_record(metadata, record, jobs, max_imag_norm);
+                append_jobs_from_record(metadata, record, jobs, max_imag_norm,
+                                        nonfinite_input_value_count,
+                                        sanitized_matrix_count);
                 ++records_in_batch;
             }
 
@@ -302,28 +429,35 @@ int main(int argc, char *argv[])
 #endif
             for (std::int64_t i = 0; i < static_cast<std::int64_t>(jobs.size()); ++i)
             {
+                const GmnJob &job = jobs[static_cast<std::size_t>(i)];
                 if (mode == EvaluationMode::Complex)
                 {
                     gmn_values[static_cast<std::size_t>(i)] =
-                        compute_gmn_mosek_complex_8x8(
-                            jobs[static_cast<std::size_t>(i)].rho_ri.data());
+                        compute_gmn_mosek_complex_8x8(job.rho_ri.data());
                 }
                 else
                 {
                     gmn_values[static_cast<std::size_t>(i)] =
-                        compute_gmn_mosek_real_8x8(
-                            jobs[static_cast<std::size_t>(i)].rho_real.data());
+                        compute_gmn_mosek_real_8x8(job.rho_real.data());
                 }
             }
 
             for (std::size_t i = 0; i < jobs.size(); ++i)
             {
                 const GmnJob &job = jobs[i];
-                outfile << job.p << ',' << gmn_values[i] << ','
-                        << job.p_index << ',' << job.realization << ','
-                        << job.subsystem << ','
-                        << job.q0 << ',' << job.q1 << ',' << job.q2 << '\n';
+                const double raw_gmn = gmn_values[i];
+                const double safe_gmn = csv_safe_gmn(raw_gmn);
+                if (!std::isfinite(raw_gmn))
+                {
+                    ++nonfinite_gmn_count;
+                }
+                else if (safe_gmn != raw_gmn)
+                {
+                    ++clipped_negative_gmn_count;
+                }
+                outfile << job.p << ',' << safe_gmn << '\n';
             }
+            outfile.flush();
 
             processed += jobs.size();
             interval_processed += jobs.size();
@@ -361,6 +495,58 @@ int main(int argc, char *argv[])
                   << "Maximum imaginary Frobenius norm in input records: "
                   << std::scientific << std::setprecision(6)
                   << max_imag_norm << "\n";
+
+        if (nonfinite_input_value_count > 0)
+        {
+            std::cerr
+                << "Warning: replaced " << nonfinite_input_value_count
+                << " non-finite density-matrix value(s) with 0 before solving; "
+                << sanitized_matrix_count << " matrix/matrices were sanitized.\n";
+        }
+
+        if (nonfinite_gmn_count > 0)
+        {
+            std::cerr
+                << "Warning: solver returned " << nonfinite_gmn_count
+                << " non-finite GMN value(s); those CSV entries were written as 0.\n";
+        }
+        if (clipped_negative_gmn_count > 0)
+        {
+            std::cerr
+                << "Warning: clipped " << clipped_negative_gmn_count
+                << " tiny negative GMN value(s) to 0.\n";
+        }
+
+        const GmnMosekDiagnostics mosek_diag = gmn_mosek_get_diagnostics();
+        if (mosek_diag.workspace_failures > 0)
+        {
+            std::cerr
+                << "Warning: MOSEK workspace creation failed "
+                << mosek_diag.workspace_failures << " time(s). Check MOSEK_HOME, "
+                << "license availability, and runtime library path.\n";
+        }
+        if (mosek_diag.optimize_errors > 0)
+        {
+            std::cerr
+                << "Warning: MOSEK optimize/update returned an error "
+                << mosek_diag.optimize_errors << " time(s).\n";
+        }
+        if (mosek_diag.nonfinite_objectives > 0)
+        {
+            std::cerr
+                << "Warning: MOSEK returned/exposed a non-finite objective "
+                << mosek_diag.nonfinite_objectives << " time(s).\n";
+        }
+        if (mosek_diag.accepted_nonoptimal_solutions > 0)
+        {
+            std::cerr
+                << "Warning: accepted "
+                << mosek_diag.accepted_nonoptimal_solutions
+                << " finite MOSEK primal objective(s) with non-OPTIMAL "
+                << "solution status. This avoids false zeroing of complex-mode "
+                << "results; rerun a small batch with OMP_NUM_THREADS=1 "
+                << "if you want to isolate individual MOSEK behavior.\n";
+        }
 
         if (mode == EvaluationMode::RealOnly && max_imag_norm > 1.0e-10)
         {

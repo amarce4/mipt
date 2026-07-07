@@ -8,17 +8,29 @@
 #   ./ring_inflation.exe - selects max-GMN subsystem per record and solves level-2 ring inflation with SCS
 #   ./tmi.exe  - reads rho_tmi.bin and computes TMI to p,tmi CSV
 #   ./sim_tmi.exe - simulates circuits and computes TMI online to p,tmi CSV
+#                 accepts fermion=0 (MMS/qubit), 1 (Haar fermion), or 2 (FRGS fermion)
+#                 accepts all_cycles=0/1 to emit one or N/4 cyclic TMI values per circuit
+#   ./entropy.exe - simulates circuits and emits cyclic von Neumann entropy CSV rows
 #
 # sim_tmi.exe dynamically loads LAPACK/BLAS symbols at runtime.  Installing
 # OpenBLAS/LAPACK enables the fast exact Schmidt-SVD path; otherwise it falls
 # back to the older reduced-density-matrix path.
 #
-# CPU simulation:
-#   make GPU=0 CUDA_RHO=0
+# Default build is CPU-side CUDA-Q simulation.  This is intentionally faster
+# for small/medium TMI jobs such as sim_tmi.exe n=16 all_cycles=1, where GPU
+# launch + cuSOLVER overhead can dominate.
+#   make [target]
+# expands to:
+#   make [target] GPU=0 CUDA_RHO=0 FP64=0
 #
-# NVIDIA simulation with GPU reduced-density-matrix kernels:
-#   make GPU=1 CUDA_RHO=1 FP64=1
-#   make GPU=1 CUDA_RHO=1 FP64=0
+# GPU simulation / large-N examples:
+#   make sim_tmi.exe GPU=1 CUDA_RHO=1 FP64=0   # useful once N is large enough
+#   make sim_tmi.exe GPU=1 CUDA_RHO=1 FP64=1
+#
+# CUDA .cu compilation uses nvcc when it is available, otherwise falls back
+# to nvq++. This keeps CUDA-Q-only installs usable on machines where nvcc is
+# not installed or not on PATH. Override with, e.g.:
+#   make sim_tmi.exe CUDA_CU_COMPILER=/usr/local/cuda/bin/nvcc
 #
 # GMN analysis:
 #   ./gmn.exe 0 rho3.bin data_real.csv       # real-only GMN on Re(rho)
@@ -34,15 +46,15 @@ MOSEK_HOME ?= $(HOME)/mosek/11.2/tools/platform/linux64x86
 MOSEK_INC  ?= $(MOSEK_HOME)/h
 MOSEK_LIB  ?= $(MOSEK_HOME)/bin
 
-GPU ?= 0
-FP64 ?= 1
+GPU ?= 1
+FP64 ?= 0
 CUDA_RHO ?= $(GPU)
 OPENMP ?= 1
 
 NVQXXFLAGS_COMMON := -std=c++20 -O3 -DNDEBUG -march=native
 CXXFLAGS_COMMON   := -std=c++20 -O3 -DNDEBUG -march=native -I$(MOSEK_INC)
 CFLAGS_COMMON     := -std=c11 -O3 -DNDEBUG -march=native -I$(MOSEK_INC)
-NVCCFLAGS         := -std=c++17 -O3
+NVCCFLAGS         := -std=c++14 -O3
 MOSEK_LDFLAGS     := -L$(MOSEK_LIB) -Wl,-rpath,$(MOSEK_LIB)
 MOSEK_LIBS        := -lmosek64
 DL_LIBS           ?= -ldl
@@ -84,6 +96,7 @@ endif
 
 ifeq ($(GPU),1)
   CUDAQ_TARGET_FLAGS := --target nvidia
+  NVQXXFLAGS_COMMON += -DSIM_TMI_GPU_BUILD=1
   ifeq ($(FP64),1)
     CUDAQ_TARGET_FLAGS += --target-option fp64
   else
@@ -94,6 +107,22 @@ endif
 ifeq ($(CUDA_RHO),1)
   NVQXXFLAGS_COMMON += -DMIPT_ENABLE_CUDA_RHO
   MIPT_CUDA_LIBS := -lcudart
+  SIM_TMI_CUDA_LIBS := -lcudart -lcusolver -lcublas
+endif
+
+# ---- CUDA .cu compiler selection ----
+# Some CUDA-Q installs provide nvq++ but not nvcc.  Use nvcc when present;
+# otherwise compile the CUDA helper translation units with nvq++ so GPU builds
+# still work on systems such as CUDA-Q-only RTX 4080 Super setups.
+NVCC_FOUND := $(shell command -v $(NVCC) 2>/dev/null)
+ifeq ($(strip $(NVCC_FOUND)),)
+  CUDA_CU_COMPILER ?= $(NVQXX)
+  CUDA_CU_FLAGS    ?= $(CUDAQ_TARGET_FLAGS) $(NVQXXFLAGS_COMMON)
+  CUDA_CU_BACKEND  := nvq++ fallback (nvcc not found)
+else
+  CUDA_CU_COMPILER ?= $(NVCC)
+  CUDA_CU_FLAGS    ?= $(NVCCFLAGS)
+  CUDA_CU_BACKEND  := nvcc
 endif
 
 CONFIG := gpu$(GPU)_fp64$(FP64)_rho$(CUDA_RHO)
@@ -103,24 +132,27 @@ RING_OBJDIR := build/ring_scs_omp$(OPENMP)
 TMI_OBJDIR  := build/tmi_omp$(OPENMP)
 MIPT_BINARY := $(MIPT_OBJDIR)/mipt.exe
 SIM_TMI_BINARY := $(MIPT_OBJDIR)/sim_tmi.exe
+ENTROPY_BINARY := $(MIPT_OBJDIR)/entropy.exe
 GMN_BINARY  := $(GMN_OBJDIR)/gmn.exe
 RING_BINARY := $(RING_OBJDIR)/ring_inflation.exe
 TMI_BINARY  := $(TMI_OBJDIR)/tmi.exe
 
 MIPT_OBJS := $(MIPT_OBJDIR)/mipt.o
 SIM_TMI_OBJS := $(MIPT_OBJDIR)/sim_tmi.o
+ENTROPY_OBJS := $(MIPT_OBJDIR)/entropy.o
 ifeq ($(CUDA_RHO),1)
   MIPT_OBJS += $(MIPT_OBJDIR)/rho_reduce.o
-  SIM_TMI_OBJS += $(MIPT_OBJDIR)/rho_reduce.o
+  SIM_TMI_OBJS += $(MIPT_OBJDIR)/rho_reduce.o $(MIPT_OBJDIR)/tmi_cuda_svd.o
+  ENTROPY_OBJS += $(MIPT_OBJDIR)/rho_reduce.o
 endif
 
 GMN_OBJS := $(GMN_OBJDIR)/gmn_main.o $(GMN_OBJDIR)/gmn_mosek_c.o
 RING_OBJS := $(RING_OBJDIR)/ring_inflation.o $(RING_OBJDIR)/gmn_mosek_c.o
 TMI_OBJS := $(TMI_OBJDIR)/tmi.o
 
-.PHONY: all clean cpu gpu print-config mipt.exe sim_tmi.exe gmn.exe ring_inflation.exe tmi.exe
+.PHONY: all clean cpu gpu print-config mipt.exe sim_tmi.exe entropy.exe gmn.exe ring_inflation.exe tmi.exe
 
-all: mipt.exe sim_tmi.exe gmn.exe ring_inflation.exe tmi.exe
+all: mipt.exe sim_tmi.exe entropy.exe gmn.exe ring_inflation.exe tmi.exe
 
 cpu:
 	$(MAKE) all GPU=0 CUDA_RHO=0
@@ -131,12 +163,18 @@ gpu:
 print-config:
 	@echo "CONFIG=$(CONFIG)"
 	@echo "NVQXX=$(NVQXX)"
+	@echo "NVCC=$(NVCC)"
+	@echo "NVCC_FOUND=$(NVCC_FOUND)"
+	@echo "CUDA_CU_COMPILER=$(CUDA_CU_COMPILER)"
+	@echo "CUDA_CU_FLAGS=$(CUDA_CU_FLAGS)"
+	@echo "CUDA_CU_BACKEND=$(CUDA_CU_BACKEND)"
 	@echo "CUDAQ_TARGET_FLAGS=$(CUDAQ_TARGET_FLAGS)"
 	@echo "MIPT_OBJDIR=$(MIPT_OBJDIR)"
 	@echo "GMN_OBJDIR=$(GMN_OBJDIR)"
 	@echo "RING_OBJDIR=$(RING_OBJDIR)"
 	@echo "MIPT_BINARY=$(MIPT_BINARY)"
 	@echo "SIM_TMI_BINARY=$(SIM_TMI_BINARY)"
+	@echo "ENTROPY_BINARY=$(ENTROPY_BINARY)"
 	@echo "GMN_BINARY=$(GMN_BINARY)"
 	@echo "RING_BINARY=$(RING_BINARY)"
 	@echo "TMI_BINARY=$(TMI_BINARY)"
@@ -151,6 +189,9 @@ mipt.exe: $(MIPT_BINARY)
 sim_tmi.exe: $(SIM_TMI_BINARY)
 	cp $(SIM_TMI_BINARY) $@
 
+entropy.exe: $(ENTROPY_BINARY)
+	cp $(ENTROPY_BINARY) $@
+
 gmn.exe: $(GMN_BINARY)
 	cp $(GMN_BINARY) $@
 
@@ -164,6 +205,9 @@ $(MIPT_BINARY): $(MIPT_OBJS)
 	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $^ $(MIPT_CUDA_LIBS) -o $@
 
 $(SIM_TMI_BINARY): $(SIM_TMI_OBJS)
+	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $^ $(MIPT_CUDA_LIBS) $(SIM_TMI_CUDA_LIBS) $(DL_LIBS) -o $@
+
+$(ENTROPY_BINARY): $(ENTROPY_OBJS)
 	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $^ $(MIPT_CUDA_LIBS) $(DL_LIBS) -o $@
 
 $(TMI_BINARY): $(TMI_OBJS)
@@ -190,11 +234,17 @@ $(TMI_OBJDIR):
 $(MIPT_OBJDIR)/mipt.o: mipt.cpp density_io.hpp rho_reduce.hpp | $(MIPT_OBJDIR)
 	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $(NVQXXFLAGS_COMMON) -c $< -o $@
 
-$(MIPT_OBJDIR)/sim_tmi.o: sim_tmi.cpp mipt.cpp density_io.hpp rho_reduce.hpp | $(MIPT_OBJDIR)
+$(MIPT_OBJDIR)/sim_tmi.o: sim_tmi.cpp mipt.cpp mipt_fermion.cpp density_io.hpp rho_reduce.hpp tmi_cuda_svd.hpp | $(MIPT_OBJDIR)
+	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $(NVQXXFLAGS_COMMON) -c $< -o $@
+
+$(MIPT_OBJDIR)/entropy.o: entropy.cpp mipt_fermion.cpp density_io.hpp rho_reduce.hpp | $(MIPT_OBJDIR)
 	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $(NVQXXFLAGS_COMMON) -c $< -o $@
 
 $(MIPT_OBJDIR)/rho_reduce.o: rho_reduce.cu rho_reduce.hpp | $(MIPT_OBJDIR)
-	$(NVCC) $(NVCCFLAGS) -c $< -o $@
+	$(CUDA_CU_COMPILER) $(CUDA_CU_FLAGS) -c $< -o $@
+
+$(MIPT_OBJDIR)/tmi_cuda_svd.o: tmi_cuda_svd.cu tmi_cuda_svd.hpp | $(MIPT_OBJDIR)
+	$(CUDA_CU_COMPILER) $(CUDA_CU_FLAGS) -c $< -o $@
 
 $(GMN_OBJDIR)/gmn_main.o: gmn_main.cpp density_io.hpp gmn.hpp | $(GMN_OBJDIR)
 	$(HOSTCXX) $(CXXFLAGS_COMMON) -c $< -o $@
@@ -212,4 +262,4 @@ $(TMI_OBJDIR)/tmi.o: tmi.cpp | $(TMI_OBJDIR)
 	$(HOSTCXX) $(CXXFLAGS_COMMON) -c $< -o $@
 
 clean:
-	rm -rf build mipt.exe sim_tmi.exe gmn.exe ring_inflation.exe tmi.exe *.tmp
+	rm -rf build mipt.exe sim_tmi.exe entropy.exe gmn.exe ring_inflation.exe tmi.exe *.tmp
