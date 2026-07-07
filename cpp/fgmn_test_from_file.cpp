@@ -286,6 +286,7 @@ int main(int argc, char *argv[])
 
         std::vector<FgmnJob> jobs;
         make_jobs_from_input_file(input_path, jobs);
+        std::printf("Loaded %zu jobs from input file %s\n", jobs.size(), input_path.c_str());
         std::vector<double> fgmn_values(jobs.size(),0);
         std::vector<double> gmn_values(jobs.size(),0);
         
@@ -296,22 +297,22 @@ int main(int argc, char *argv[])
         //auto interval_start = start;
         //std::uint64_t interval_processed = 0;
 
-        fgmn::GmnWorkspace fgmn_workspace(true, true);
-        fgmn::GmnWorkspace gmn_workspace(true, false);
+        // fgmn::GmnWorkspace fgmn_workspace(true, true);
+        // fgmn::GmnWorkspace gmn_workspace(true, false);
 
 #ifdef _OPENMP
 #pragma omp parallel for schedule(dynamic, 1)
 #endif
         for (std::size_t i = 0; i < static_cast<std::size_t>(jobs.size()); ++i)
         {
-            // fgmn_values[i] =
-            //     compute_fgmn_mosek_8x8_cpp(
-            //         jobs[i].rho_ri.data());
-            // gmn_values[i] =
-            //     compute_gmn_mosek_complex_8x8_cpp(
-            //         jobs[i].rho_ri.data());
-            fgmn_values[i] = fgmn_workspace.solve(jobs[i].rho_ri.data());
-            gmn_values[i] = gmn_workspace.solve(jobs[i].rho_ri.data());
+            fgmn_values[i] =
+                compute_fgmn_mosek_8x8_cpp(
+                    jobs[i].rho_ri.data());
+            gmn_values[i] =
+                compute_gmn_mosek_complex_8x8_cpp(
+                    jobs[i].rho_ri.data());
+            // fgmn_values[i] = fgmn_workspace.solve(jobs[i].rho_ri.data());
+            // gmn_values[i] = gmn_workspace.solve(jobs[i].rho_ri.data());
             double fgmn_diff = std::abs(fgmn_values[i]-jobs[i].fgmn);
             double gmn_diff = std::abs(gmn_values[i]-jobs[i].gmn);
             #pragma omp critical
@@ -323,7 +324,6 @@ int main(int argc, char *argv[])
                 std::printf("Found FGMN: %.6f, Expected FGMN: %.6f, Difference: %.6e | ", fgmn_values[i], jobs[i].fgmn, fgmn_diff);
                 std::printf("Found GMN:  %.6f, Expected GMN:  %.6f, Difference: %.6e\n", gmn_values[i], jobs[i].gmn, gmn_diff);
             }
-
         }
 
         const auto now = std::chrono::steady_clock::now();

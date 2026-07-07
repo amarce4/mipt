@@ -977,6 +977,21 @@ namespace fgmn
         static thread_local GmnWorkspace ws(is_complex, is_fermionic);
         return ws;
     }
+    GmnWorkspace &workspace_fermion()
+    {
+        static thread_local GmnWorkspace wsf(true, true);
+        return wsf;
+    }
+    GmnWorkspace &workspace_complex()
+    {
+        static thread_local GmnWorkspace wsc(true, false);
+        return wsc;
+    }
+    GmnWorkspace &workspace_real()
+    {
+        static thread_local GmnWorkspace wsr(false, false);
+        return wsr;
+    }
 }
 
 extern "C" double compute_fgmn_mosek_8x8_cpp( // Implement C linkage version later
@@ -984,7 +999,7 @@ extern "C" double compute_fgmn_mosek_8x8_cpp( // Implement C linkage version lat
 {
     try
     {
-        return fgmn::workspace(true, true).solve(rho_complex_row_major);
+        return fgmn::workspace_fermion().solve(rho_complex_row_major);
     }
     catch (const std::exception& e)
     {
@@ -1003,7 +1018,7 @@ extern "C" double compute_gmn_mosek_complex_8x8_cpp(
 {
     try
     {
-        return fgmn::workspace(true).solve(rho_complex_row_major);
+        return fgmn::workspace_complex().solve(rho_complex_row_major);
     }
     catch (const std::exception& e)
     {
@@ -1022,7 +1037,7 @@ extern "C" double compute_gmn_mosek_real_8x8_cpp(
 {
     try
     {
-        return fgmn::workspace().solve(rho_real_row_major);
+        return fgmn::workspace_real().solve(rho_real_row_major);
     }
     catch (...)
     {
