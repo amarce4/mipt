@@ -373,12 +373,44 @@ namespace sim_tmi
         return parsed;
     }
 
+    bool parse_bool01_env(const char *name, bool fallback)
+    {
+        const char *value = std::getenv(name);
+        if (value == nullptr || *value == '\0')
+        {
+            return fallback;
+        }
+        if (std::strcmp(value, "1") == 0 ||
+            std::strcmp(value, "true") == 0 ||
+            std::strcmp(value, "TRUE") == 0 ||
+            std::strcmp(value, "yes") == 0 ||
+            std::strcmp(value, "YES") == 0)
+        {
+            return true;
+        }
+        if (std::strcmp(value, "0") == 0 ||
+            std::strcmp(value, "false") == 0 ||
+            std::strcmp(value, "FALSE") == 0 ||
+            std::strcmp(value, "no") == 0 ||
+            std::strcmp(value, "NO") == 0)
+        {
+            return false;
+        }
+        return fallback;
+    }
+
     int cuda_svd_min_kept_modes()
     {
-        // By default, preserve the CUDA half-cut SVD path when CUDA_RHO is enabled.
-        // Set SIM_TMI_CUDA_SVD_MIN_KEPT to a larger value only when an optimized
-        // host LAPACK/OpenBLAS SVD is known to be faster on that machine.
-        constexpr long default_min_kept_modes = 0;
+        // Default policy:
+        //   N=8,12  -> keep half-cut SVDs on host LAPACK/OpenBLAS.
+        //   N>=16   -> allow the CUDA/cuSOLVER half-cut path.
+        //
+        // The kept-mode threshold is 8 because the N=16 half-cuts have
+        // 2 * block_qubits = 8 kept modes.  N=8 and N=12 are still protected
+        // by the explicit small-N guard below, so leaving
+        // SIM_TMI_CUDA_SVD_MIN_KEPT=2 in your shell will not accidentally put
+        // those sizes back onto cuSOLVER.
+        constexpr long default_min_kept_modes = 8;
         constexpr long max_kept_modes = 30;
         static const int threshold = static_cast<int>(
             parse_nonnegative_env_long("SIM_TMI_CUDA_SVD_MIN_KEPT",
@@ -387,8 +419,26 @@ namespace sim_tmi
         return threshold;
     }
 
-    bool should_try_cuda_svd_for_modes(std::size_t kept_mode_count)
+    bool force_cuda_svd_for_small_n()
     {
+        static const bool force = parse_bool01_env("SIM_TMI_FORCE_CUDA_SVD_SMALL_N", false);
+        return force;
+    }
+
+    bool cuda_svd_disabled_for_small_n(int n)
+    {
+        // N=8 and N=12 were faster before the GPU-SVD implementation.  Keep
+        // their TMI half-cut SVDs on the CPU by default while retaining GPU
+        // circuit simulation when the executable is built with GPU=1.
+        return !force_cuda_svd_for_small_n() && (n == 8 || n == 12);
+    }
+
+    bool should_try_cuda_svd_for_problem(int n, std::size_t kept_mode_count)
+    {
+        if (cuda_svd_disabled_for_small_n(n))
+        {
+            return false;
+        }
         return kept_mode_count >= static_cast<std::size_t>(cuda_svd_min_kept_modes());
     }
 
@@ -1854,7 +1904,7 @@ namespace sim_tmi
             double entropy = 0.0;
             int status = 0;
             if (!workspace.cuda_svd_disabled &&
-                should_try_cuda_svd_for_modes(modes.size()) &&
+                should_try_cuda_svd_for_problem(n, modes.size()) &&
                 entropy_subsystem_svd_from_device_state(device_state_vector,
                                                         device_state_is_fp64,
                                                         n,
@@ -2146,16 +2196,25 @@ namespace sim_tmi
         return lapack_runtime::cgesvd() != nullptr || lapack_runtime::zgesvd() != nullptr;
     }
 
-    bool fast_state_tmi_available(cudaq::state &state)
+    bool fast_state_tmi_available(cudaq::state &state, int n, std::uint32_t block_qubits)
     {
         // The fast state-vector path always needs zheevd_ for the small A/B/C/D
         // RDM entropies.  Half-cut entropies can use either host SVD or, when the
         // state is still on GPU and CUDA_RHO is enabled, the cuSOLVER device SVD.
+        // The N=8/N=12 small-N CPU override must be included here; otherwise a
+        // GPU state with no host SVD could incorrectly enter the fast path and
+        // fail after the CUDA half-SVD is intentionally skipped.
         if (lapack_runtime::zheevd() == nullptr)
         {
             return false;
         }
-        return host_svd_available_for_state(state) || cudaq_state_has_device_tensor(state);
+        if (host_svd_available_for_state(state))
+        {
+            return true;
+        }
+        const std::size_t half_cut_kept_modes = 2u * static_cast<std::size_t>(block_qubits);
+        return cudaq_state_has_device_tensor(state) &&
+               should_try_cuda_svd_for_problem(n, half_cut_kept_modes);
     }
 
     const char *compile_target_name()
@@ -2287,8 +2346,10 @@ namespace sim_tmi
                   << "build_target=" << compile_target_name()
                   << ", cuda_rho=" << cuda_rho_build_name() << '\n'
                   << "entropy_backend=" << lapack_runtime::status() << '\n'
-                  << "tmi_method=selected after first state; fast path requires zheevd plus either host SVD or CUDA device half-SVD" << '\n'
+                  << "tmi_method=selected after first state; fast path requires zheevd plus either host SVD or enabled CUDA device half-SVD" << '\n'
                   << "cuda_svd_min_kept_modes=" << cuda_svd_min_kept_modes()
+                  << ", small_n_cuda_svd_policy="
+                  << (force_cuda_svd_for_small_n() ? "forced-on" : "cpu-for-n8-n12")
                   << ", csv_flush_rows=" << flush_rows
                   << '\n';
 
@@ -2344,14 +2405,27 @@ namespace sim_tmi
                     return cudaq::get_state(MIPTKernel_1D{}, n, layers, true);
                 }();
 
-                const bool use_fast_state_tmi = fast_state_tmi_available(state);
+                const bool use_fast_state_tmi = fast_state_tmi_available(state, n, block_qubits);
                 if (!printed_state_backend)
                 {
                     const bool device_tensor = cudaq_state_has_device_tensor(state);
+                    const bool host_svd_available = host_svd_available_for_state(state);
+                    const std::size_t half_cut_kept_modes = 2u * static_cast<std::size_t>(block_qubits);
+                    const bool small_n_cuda_svd_disabled = cuda_svd_disabled_for_small_n(n);
+                    const bool cuda_half_svd_enabled = device_tensor &&
+                                                       should_try_cuda_svd_for_problem(n, half_cut_kept_modes);
+                    const char *half_cut_backend = cuda_half_svd_enabled
+                                                       ? "CUDA/cuSOLVER"
+                                                       : (small_n_cuda_svd_disabled
+                                                              ? "host LAPACK (N=8/12 CPU override)"
+                                                              : (host_svd_available ? "host LAPACK" : "legacy RDM fallback"));
                     std::cerr << "state_backend=" << (state.is_on_gpu() ? "gpu" : "host")
                               << ", precision=" << state_precision_name(state.get_precision())
                               << ", device_tensor=" << (device_tensor ? 1 : 0)
-                              << ", host_svd_available=" << (host_svd_available_for_state(state) ? 1 : 0)
+                              << ", host_svd_available=" << (host_svd_available ? 1 : 0)
+                              << ", small_n_cuda_svd_disabled=" << (small_n_cuda_svd_disabled ? 1 : 0)
+                              << ", cuda_half_svd_enabled=" << (cuda_half_svd_enabled ? 1 : 0)
+                              << ", half_cut_backend=" << half_cut_backend
                               << ", fast_state_tmi=" << (use_fast_state_tmi ? 1 : 0)
                               << '\n';
                     printed_state_backend = true;
