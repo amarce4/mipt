@@ -2269,11 +2269,30 @@ bool uses_fermionic_trace(CircuitType circ_type)
 
 using ComplexD = std::complex<double>;
 using Haar4 = std::array<ComplexD, 16>;
+using Matrix2 = std::array<ComplexD, 4>;
+
+struct HaarBondGate
+{
+    int q0 = 0; // Local least-significant basis bit in the historical Haar path.
+    int q1 = 0; // Local most-significant basis bit / multiplexor control.
+    FermionU2Params a0;
+    FermionU2Params a1;
+    FermionU2Params b0;
+    FermionU2Params b1;
+    double theta0 = 0.0;
+    double theta1 = 0.0;
+};
+
+struct HaarLayerData
+{
+    std::vector<HaarBondGate> gates;
+    std::vector<int> measure_flags;
+};
 
 Haar4 haar_unitary_4(std::mt19937 &rng)
 {
     // Draw U(4) from the Haar measure by QR/Gram-Schmidt orthonormalizing
-    // four independent complex Gaussian columns.  The matrix is row-major.
+    // four independent complex Gaussian columns. The matrix is row-major.
     std::normal_distribution<double> normal(0.0, 1.0);
     Haar4 q{};
 
@@ -2303,10 +2322,9 @@ Haar4 haar_unitary_4(std::mt19937 &rng)
         {
             norm2 += std::norm(x);
         }
-        double norm = std::sqrt(norm2);
+        const double norm = std::sqrt(norm2);
         if (norm < 1e-14)
         {
-            // Extremely unlikely rank-deficient draw.  Restart this column.
             --col;
             continue;
         }
@@ -2316,249 +2334,253 @@ Haar4 haar_unitary_4(std::mt19937 &rng)
             q[static_cast<std::size_t>(row * 4 + col)] = v[row] / norm;
         }
     }
-
     return q;
 }
 
-void apply_two_qubit_unitary(std::vector<ComplexD> &psi,
-                             int n,
-                             int q0,
-                             int q1,
-                             const Haar4 &u)
+Matrix2 matrix2_adjoint(const Matrix2 &a)
 {
-    if (q0 == q1 || q0 < 0 || q1 < 0 || q0 >= n || q1 >= n)
+    return {std::conj(a[0]), std::conj(a[2]),
+            std::conj(a[1]), std::conj(a[3])};
+}
+
+Matrix2 matrix2_multiply(const Matrix2 &a, const Matrix2 &b)
+{
+    return {
+        a[0] * b[0] + a[1] * b[2],
+        a[0] * b[1] + a[1] * b[3],
+        a[2] * b[0] + a[3] * b[2],
+        a[2] * b[1] + a[3] * b[3],
+    };
+}
+
+Matrix2 block2(const Haar4 &u, int block_row, int block_col)
+{
+    Matrix2 out{};
+    for (int r = 0; r < 2; ++r)
     {
-        throw std::invalid_argument("Invalid two-qubit Haar gate target.");
+        for (int c = 0; c < 2; ++c)
+        {
+            out[static_cast<std::size_t>(2 * r + c)] =
+                u[static_cast<std::size_t>((2 * block_row + r) * 4 + (2 * block_col + c))];
+        }
+    }
+    return out;
+}
+
+void normalize_vector2(ComplexD &x, ComplexD &y)
+{
+    const double n = std::sqrt(std::norm(x) + std::norm(y));
+    if (!(n > 0.0))
+    {
+        throw std::runtime_error("Degenerate vector in Haar U(4) cosine-sine decomposition.");
+    }
+    x /= n;
+    y /= n;
+}
+
+HaarBondGate decompose_haar_u4_csd(int q0, int q1, const Haar4 &u)
+{
+    // Cosine-sine decomposition in the historical local basis ordering
+    // {00,01,10,11} = {q1 q0}. Thus q1 selects the 2x2 blocks and q0 is
+    // the target of each multiplexed one-qubit operation:
+    // U = (A0 (+) A1) [ C -S; S C ] (B0 (+) B1).
+    const Matrix2 x = block2(u, 0, 0);
+    const Matrix2 u01 = block2(u, 0, 1);
+    const Matrix2 u10 = block2(u, 1, 0);
+
+    const Matrix2 xdag = matrix2_adjoint(x);
+    const Matrix2 h = matrix2_multiply(xdag, x);
+    const double h00 = std::real(h[0]);
+    const double h11 = std::real(h[3]);
+    const ComplexD h01 = h[1];
+    const double trace = h00 + h11;
+    const double disc = std::sqrt(std::max(0.0,
+        (h00 - h11) * (h00 - h11) + 4.0 * std::norm(h01)));
+    const double lambda0 = std::clamp(0.5 * (trace + disc), 0.0, 1.0);
+    const double lambda1 = std::clamp(0.5 * (trace - disc), 0.0, 1.0);
+
+    ComplexD v00, v10, v01, v11;
+    if (std::abs(h01) > 1e-14)
+    {
+        v00 = h01;
+        v10 = lambda0 - h00;
+        normalize_vector2(v00, v10);
+        // Orthogonal complement fixes the second singular vector exactly.
+        v01 = -std::conj(v10);
+        v11 = std::conj(v00);
+    }
+    else if (h00 >= h11)
+    {
+        v00 = 1.0; v10 = 0.0;
+        v01 = 0.0; v11 = 1.0;
+    }
+    else
+    {
+        v00 = 0.0; v10 = 1.0;
+        v01 = 1.0; v11 = 0.0;
     }
 
-    const std::uint64_t dim = checked_pow2_u64(n);
-    const std::uint64_t bit0 = std::uint64_t{1} << q0;
-    const std::uint64_t bit1 = std::uint64_t{1} << q1;
-    const std::uint64_t mask = bit0 | bit1;
-
-    for (std::uint64_t base = 0; base < dim; ++base)
+    const Matrix2 v{v00, v01, v10, v11};
+    const double c0 = std::sqrt(lambda0);
+    const double c1 = std::sqrt(lambda1);
+    const double s0 = std::sqrt(std::max(0.0, 1.0 - lambda0));
+    const double s1 = std::sqrt(std::max(0.0, 1.0 - lambda1));
+    constexpr double eps = 1e-12;
+    if (c0 < eps || c1 < eps || s0 < eps || s1 < eps)
     {
-        if ((base & mask) != 0)
+        // This has probability zero for a Haar-random matrix. Regenerate rather
+        // than introducing an unstable pseudo-inverse into the exact circuit.
+        throw std::runtime_error("Numerically singular Haar U(4) cosine-sine decomposition.");
+    }
+
+    // A0 = X V diag(1/c), B0 = V^dagger.
+    Matrix2 a0 = matrix2_multiply(x, v);
+    a0[0] /= c0; a0[2] /= c0;
+    a0[1] /= c1; a0[3] /= c1;
+    const Matrix2 b0 = matrix2_adjoint(v);
+
+    // A1 = U10 B0^dagger diag(1/s) = U10 V diag(1/s).
+    Matrix2 a1 = matrix2_multiply(u10, v);
+    a1[0] /= s0; a1[2] /= s0;
+    a1[1] /= s1; a1[3] /= s1;
+
+    // B1 = -diag(1/s) A0^dagger U01.
+    Matrix2 b1 = matrix2_multiply(matrix2_adjoint(a0), u01);
+    b1[0] = -b1[0] / s0; b1[1] = -b1[1] / s0;
+    b1[2] = -b1[2] / s1; b1[3] = -b1[3] / s1;
+
+    HaarBondGate gate;
+    gate.q0 = q0;
+    gate.q1 = q1;
+    gate.a0 = decompose_u2_to_u3_phase(a0);
+    gate.a1 = decompose_u2_to_u3_phase(a1);
+    gate.b0 = decompose_u2_to_u3_phase(b0);
+    gate.b1 = decompose_u2_to_u3_phase(b1);
+    gate.theta0 = 2.0 * std::atan2(s0, c0);
+    gate.theta1 = 2.0 * std::atan2(s1, c1);
+    return gate;
+}
+
+HaarBondGate random_haar_bond_gate(int q0, int q1, std::mt19937 &rng)
+{
+    for (;;)
+    {
+        try
         {
-            continue;
+            return decompose_haar_u4_csd(q0, q1, haar_unitary_4(rng));
         }
-
-        const std::array<std::uint64_t, 4> idx{
-            base,
-            base | bit0,
-            base | bit1,
-            base | bit0 | bit1,
-        };
-        const std::array<ComplexD, 4> v{
-            psi[static_cast<std::size_t>(idx[0])],
-            psi[static_cast<std::size_t>(idx[1])],
-            psi[static_cast<std::size_t>(idx[2])],
-            psi[static_cast<std::size_t>(idx[3])],
-        };
-
-        for (int row = 0; row < 4; ++row)
+        catch (const std::runtime_error &)
         {
-            ComplexD accum = 0.0;
-            for (int col = 0; col < 4; ++col)
-            {
-                accum += u[static_cast<std::size_t>(row * 4 + col)] * v[col];
-            }
-            psi[static_cast<std::size_t>(idx[row])] = accum;
+            // Regenerate only for the measure-zero numerically singular case.
         }
     }
 }
 
-void measure_z_projectively(std::vector<ComplexD> &psi,
-                            int n,
-                            int q,
-                            std::mt19937 &rng)
+void fill_haar_layer(HaarLayerData &layer,
+                     int n,
+                     int start,
+                     double p,
+                     bool closed,
+                     std::mt19937 &rng)
 {
-    const std::uint64_t dim = checked_pow2_u64(n);
-    const std::uint64_t bit = std::uint64_t{1} << q;
+    const int bond_stop = (closed && start == 1 && n > 2) ? n : (n - 1);
+    const int bond_count = (bond_stop > start) ? ((bond_stop - start + 1) / 2) : 0;
+    layer.gates.resize(static_cast<std::size_t>(bond_count));
+    layer.measure_flags.resize(static_cast<std::size_t>(n));
 
-    double prob_one = 0.0;
-    for (std::uint64_t idx = 0; idx < dim; ++idx)
+    int b = 0;
+    for (int i = start; i < bond_stop; i += 2)
     {
-        if ((idx & bit) != 0)
-        {
-            prob_one += std::norm(psi[static_cast<std::size_t>(idx)]);
-        }
-    }
-    prob_one = std::clamp(prob_one, 0.0, 1.0);
-
-    std::uniform_real_distribution<double> uniform(0.0, 1.0);
-    int outcome = (uniform(rng) < prob_one) ? 1 : 0;
-    double keep_probability = outcome ? prob_one : (1.0 - prob_one);
-
-    constexpr double tiny = 1e-300;
-    if (keep_probability < tiny)
-    {
-        // Numerical roundoff can make an impossible branch selectable only if
-        // the probability is effectively zero.  Flip to the nonzero branch.
-        outcome = 1 - outcome;
-        keep_probability = outcome ? prob_one : (1.0 - prob_one);
-    }
-    if (keep_probability < tiny)
-    {
-        throw std::runtime_error("Projective measurement encountered a zero-norm branch.");
+        const int j = (i + 1) % n;
+        layer.gates[static_cast<std::size_t>(b++)] = random_haar_bond_gate(i, j, rng);
     }
 
-    const double inv_norm = 1.0 / std::sqrt(keep_probability);
-    for (std::uint64_t idx = 0; idx < dim; ++idx)
-    {
-        const int bit_value = ((idx & bit) != 0) ? 1 : 0;
-        if (bit_value == outcome)
-        {
-            psi[static_cast<std::size_t>(idx)] *= inv_norm;
-        }
-        else
-        {
-            psi[static_cast<std::size_t>(idx)] = 0.0;
-        }
-    }
-}
-
-void apply_measurement_mask_projectively(std::vector<ComplexD> &psi,
-                                        int n,
-                                        std::uint64_t measured_mask,
-                                        std::mt19937 &rng)
-{
-    if (measured_mask == 0)
-    {
-        return;
-    }
-
-    const std::uint64_t dim = checked_pow2_u64(n);
-    std::uniform_real_distribution<double> uniform(0.0, 1.0);
-    const double target = uniform(rng);
-
-    double cumulative = 0.0;
-    std::uint64_t sampled_index = 0;
-    for (std::uint64_t idx = 0; idx < dim; ++idx)
-    {
-        cumulative += std::norm(psi[static_cast<std::size_t>(idx)]);
-        if (cumulative >= target)
-        {
-            sampled_index = idx;
-            break;
-        }
-    }
-
-    const std::uint64_t outcome_masked = sampled_index & measured_mask;
-    double keep_probability = 0.0;
-    for (std::uint64_t idx = 0; idx < dim; ++idx)
-    {
-        if ((idx & measured_mask) == outcome_masked)
-        {
-            keep_probability += std::norm(psi[static_cast<std::size_t>(idx)]);
-        }
-    }
-
-    constexpr double tiny = 1e-300;
-    if (keep_probability < tiny)
-    {
-        throw std::runtime_error("Joint projective measurement encountered a zero-norm branch.");
-    }
-
-    const double inv_norm = 1.0 / std::sqrt(keep_probability);
-    for (std::uint64_t idx = 0; idx < dim; ++idx)
-    {
-        if ((idx & measured_mask) == outcome_masked)
-        {
-            psi[static_cast<std::size_t>(idx)] *= inv_norm;
-        }
-        else
-        {
-            psi[static_cast<std::size_t>(idx)] = 0.0;
-        }
-    }
-}
-
-void apply_measurement_layer(std::vector<ComplexD> &psi,
-                             int n,
-                             double p,
-                             std::mt19937 &rng)
-{
     if (p <= 0.0)
     {
-        return;
+        std::fill(layer.measure_flags.begin(), layer.measure_flags.end(), 0);
     }
-
-    std::uint64_t measured_mask = 0;
-    if (p >= 1.0)
+    else if (p >= 1.0)
     {
-        measured_mask = (n >= 64) ? ~std::uint64_t{0} : ((std::uint64_t{1} << n) - 1u);
+        std::fill(layer.measure_flags.begin(), layer.measure_flags.end(), 1);
     }
     else
     {
         std::bernoulli_distribution measure_dist(p);
         for (int q = 0; q < n; ++q)
         {
-            if (measure_dist(rng))
-            {
-                measured_mask |= std::uint64_t{1} << q;
-            }
+            layer.measure_flags[static_cast<std::size_t>(q)] = measure_dist(rng) ? 1 : 0;
         }
     }
-
-    // All same-layer Z measurements commute.  Sampling/collapsing the joint
-    // projector in one pass preserves the trajectory distribution while avoiding
-    // one full probability scan and one full collapse scan per measured qubit.
-    apply_measurement_mask_projectively(psi, n, measured_mask, rng);
 }
 
-void apply_haar_gate_layer_1d(std::vector<ComplexD> &psi,
-                              int n,
-                              int start,
-                              bool closed,
-                              std::mt19937 &rng)
-{
-    const int bond_stop = (closed && start == 1 && n > 2) ? n : (n - 1);
-    for (int i = start; i < bond_stop; i += 2)
-    {
-        const int j = (i + 1) % n;
-        apply_two_qubit_unitary(psi, n, i, j, haar_unitary_4(rng));
-    }
-}
-
-std::vector<ComplexD> random_haar_state_1d(int n,
-                                           int periods,
-                                           double p,
-                                           std::mt19937 &rng,
-                                           bool closed = true)
+void haar_frontend_inplace(std::vector<HaarLayerData> &layers,
+                           int n,
+                           int periods,
+                           double p,
+                           std::mt19937 &rng,
+                           bool closed = true)
 {
     if ((n % 2) != 0)
     {
-        throw std::invalid_argument("Random Haar 1D simulation requires even n for the periodic brickwork geometry.");
+        throw std::invalid_argument("Random Haar 1D simulation requires even n for periodic brickwork geometry.");
     }
-    if (p < 0.0 || p > 1.0)
-    {
-        throw std::invalid_argument("Measurement probability p must be in [0,1].");
-    }
-
-    const std::uint64_t dim_u64 = checked_pow2_u64(n);
-    if (dim_u64 > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()))
-    {
-        throw std::invalid_argument("State-vector dimension does not fit in size_t.");
-    }
-
-    std::vector<ComplexD> psi(static_cast<std::size_t>(dim_u64), 0.0);
-    psi[0] = 1.0;
-
-    // Brick-layer circuit with periodic boundary conditions: even bonds then
-    // odd bonds, each followed by independent on-site Z measurements with rate p.
-    // This follows the Haar circuit geometry described in arXiv:1911.00008.
+    layers.resize(static_cast<std::size_t>(2 * periods));
+    std::size_t idx = 0;
     for (int period = 0; period < periods; ++period)
     {
-        apply_haar_gate_layer_1d(psi, n, 0, closed, rng);
-        apply_measurement_layer(psi, n, p, rng);
-
-        apply_haar_gate_layer_1d(psi, n, 1, closed, rng);
-        apply_measurement_layer(psi, n, p, rng);
+        fill_haar_layer(layers[idx++], n, 0, p, closed, rng);
+        fill_haar_layer(layers[idx++], n, 1, p, closed, rng);
     }
-
-    return psi;
 }
+
+struct MIPTHaarKernel_1D
+{
+    void operator()(int n, const std::vector<HaarLayerData> &layers) __qpu__
+    {
+        cudaq::qvector q(n);
+        for (std::size_t layer = 0; layer < layers.size(); ++layer)
+        {
+            for (std::size_t gi = 0; gi < layers[layer].gates.size(); ++gi)
+            {
+                const auto gate = layers[layer].gates[gi];
+                // Right block-diagonal factor B0 (+) B1.
+                r1(gate.b1.global_phase, q[gate.q1]);
+                u3<cudaq::ctrl>(gate.b1.theta, gate.b1.phi, gate.b1.lambda,
+                                q[gate.q1], q[gate.q0]);
+                x(q[gate.q1]);
+                r1(gate.b0.global_phase, q[gate.q1]);
+                u3<cudaq::ctrl>(gate.b0.theta, gate.b0.phi, gate.b0.lambda,
+                                q[gate.q1], q[gate.q0]);
+                x(q[gate.q1]);
+
+                // Cosine-sine core: Ry(theta0) for control=0 and
+                // Ry(theta1) for control=1.
+                ry<cudaq::ctrl>(gate.theta1, q[gate.q1], q[gate.q0]);
+                x(q[gate.q1]);
+                ry<cudaq::ctrl>(gate.theta0, q[gate.q1], q[gate.q0]);
+                x(q[gate.q1]);
+
+                // Left block-diagonal factor A0 (+) A1.
+                r1(gate.a1.global_phase, q[gate.q1]);
+                u3<cudaq::ctrl>(gate.a1.theta, gate.a1.phi, gate.a1.lambda,
+                                q[gate.q1], q[gate.q0]);
+                x(q[gate.q1]);
+                r1(gate.a0.global_phase, q[gate.q1]);
+                u3<cudaq::ctrl>(gate.a0.theta, gate.a0.phi, gate.a0.lambda,
+                                q[gate.q1], q[gate.q0]);
+                x(q[gate.q1]);
+            }
+
+            for (int i = 0; i < n; ++i)
+            {
+                if (layers[layer].measure_flags[static_cast<std::size_t>(i)])
+                {
+                    mz(q[i]);
+                }
+            }
+        }
+    }
+};
 
 #include "mipt_native_mps.hpp"
 
@@ -2602,9 +2624,11 @@ void run_1d(int n, int periods, int realizations, int res, double p_min, double 
     std::mt19937 frgs_rng(std::random_device{}());
     std::mt19937 native_mps_rng(std::random_device{}());
     std::vector<LayerData> mms_layers;
+    std::vector<HaarLayerData> haar_layers;
     std::vector<FermionLayerData> fermion_layers;
     std::vector<FRGSLayerData> frgs_layers;
     mms_layers.reserve(static_cast<std::size_t>(2 * periods + 1));
+    haar_layers.reserve(static_cast<std::size_t>(2 * periods));
     fermion_layers.reserve(static_cast<std::size_t>(2 * periods + 1));
     frgs_layers.reserve(static_cast<std::size_t>(2 * periods + 1));
     std::vector<double> rho3_ri(subsystems.size() * RHO3_VALUES);
@@ -2644,39 +2668,32 @@ void run_1d(int n, int periods, int realizations, int res, double p_min, double 
                     lap2 = std::chrono::steady_clock::now();
                 }
             }
-            else if (circ_type == CircuitType::Haar)
-            {
-                if (r == 0)
-                {
-                    lap1 = std::chrono::steady_clock::now();
-                }
-
-                auto psi = random_haar_state_1d(n, periods, p, haar_rng, true);
-
-                if (r == 0)
-                {
-                    lap2 = std::chrono::steady_clock::now();
-                }
-
-                bool rho_reduced_on_cuda = false;
-#ifdef MIPT_ENABLE_CUDA_RHO
-                const int cuda_rho_status = mipt_cuda_rho3_subsystems_complex_host_f64(
-                    psi.data(),
-                    n,
-                    flat_subsystems.data(),
-                    static_cast<int>(subsystems.size()),
-                    rho3_ri.data());
-                rho_reduced_on_cuda = (cuda_rho_status == 0);
-#endif
-                if (!rho_reduced_on_cuda)
-                {
-                    reduced_density_complex_from_host_statevector(
-                        psi.data(), n, subsystems, rho3_ri.data(), false);
-                }
-            }
             else
             {
                 auto state = [&]() {
+                    if (circ_type == CircuitType::Haar)
+                    {
+                        haar_frontend_inplace(haar_layers, n, periods, p, haar_rng, true);
+                        apply_debug_prefix_layer_limit(haar_layers, "Haar");
+                        if (r == 0)
+                        {
+                            lap1 = std::chrono::steady_clock::now();
+                        }
+                        if (mipt_backend::verbose_enabled())
+                        {
+                            mipt_backend::verbose_log("get_state start: Haar n=" + std::to_string(n) +
+                                                      " layers=" + std::to_string(haar_layers.size()));
+                        }
+                        const auto t_get_state = std::chrono::steady_clock::now();
+                        auto state = cudaq::get_state(MIPTHaarKernel_1D{}, n, haar_layers);
+                        if (mipt_backend::verbose_enabled())
+                        {
+                            mipt_backend::verbose_log("get_state done: Haar elapsed_s=" +
+                                                      std::to_string(mipt_backend::seconds_since(t_get_state)));
+                        }
+                        return state;
+                    }
+
                     if (circ_type == CircuitType::FermionRPPU)
                     {
                         const bool direct_boundary = mipt_backend::direct_fermion_boundary_enabled();

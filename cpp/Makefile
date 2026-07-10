@@ -11,7 +11,7 @@
 #   ./sim_tmi.exe - simulates circuits and computes TMI online to p,tmi CSV
 #                 accepts fermion=0 (MMS/qubit), 1 (Haar fermion), or 2 (FRGS fermion)
 #                 accepts all_cycles=0/1 to emit one or N/4 cyclic TMI values per circuit
-#   ./entropy.exe - simulates circuits and emits cyclic von Neumann entropy CSV rows
+#   ./entropy.exe - simulates circuits and emits translation-averaged second-Renyi entropy scaling data
 #
 # sim_tmi.exe dynamically loads LAPACK/BLAS symbols at runtime.  Installing
 # OpenBLAS/LAPACK enables the fast exact Schmidt-SVD path; otherwise it falls
@@ -163,7 +163,8 @@ ENTROPY_OBJS := $(MIPT_OBJDIR)/entropy.o
 ifeq ($(CUDA_RHO),1)
   MIPT_OBJS += $(MIPT_OBJDIR)/rho_reduce.o
   SIM_TMI_OBJS += $(MIPT_OBJDIR)/rho_reduce.o $(MIPT_OBJDIR)/tmi_cuda_svd.o $(MIPT_OBJDIR)/tmi_cuda_rdm.o
-  ENTROPY_OBJS += $(MIPT_OBJDIR)/rho_reduce.o
+  ENTROPY_OBJS += $(MIPT_OBJDIR)/rho_reduce.o $(MIPT_OBJDIR)/entropy_cuda.o
+  ENTROPY_CUDA_LIBS := -lcublas
 endif
 
 GMN_OBJS := $(GMN_OBJDIR)/gmn_main.o $(GMN_OBJDIR)/gmn_mosek_c.o
@@ -235,7 +236,7 @@ $(SIM_TMI_BINARY): $(SIM_TMI_OBJS)
 	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $^ $(MIPT_CUDA_LIBS) $(SIM_TMI_CUDA_LIBS) $(DL_LIBS) -o $@
 
 $(ENTROPY_BINARY): $(ENTROPY_OBJS)
-	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $^ $(MIPT_CUDA_LIBS) $(DL_LIBS) -o $@
+	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $^ $(MIPT_CUDA_LIBS) $(ENTROPY_CUDA_LIBS) $(DL_LIBS) -o $@
 
 $(TMI_BINARY): $(TMI_OBJS)
 	$(HOSTCXX) $(HOST_LDFLAGS) $^ $(DL_LIBS) -o $@
@@ -270,8 +271,11 @@ $(MIPT_OBJDIR)/mipt.o: mipt.cpp density_io.hpp rho_reduce.hpp mipt_backend.hpp m
 $(MIPT_OBJDIR)/sim_tmi.o: sim_tmi.cpp mipt.cpp mipt_fermion.cpp density_io.hpp rho_reduce.hpp tmi_cuda_svd.hpp tmi_cuda_rdm.hpp mipt_backend.hpp mipt_native_mps.hpp | $(MIPT_OBJDIR)
 	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $(NVQXXFLAGS_COMMON) -c $< -o $@
 
-$(MIPT_OBJDIR)/entropy.o: entropy.cpp mipt_fermion.cpp density_io.hpp rho_reduce.hpp | $(MIPT_OBJDIR)
+$(MIPT_OBJDIR)/entropy.o: entropy.cpp entropy_cuda.hpp mipt.cpp mipt_fermion.cpp density_io.hpp rho_reduce.hpp mipt_backend.hpp mipt_native_mps.hpp | $(MIPT_OBJDIR)
 	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $(NVQXXFLAGS_COMMON) -c $< -o $@
+
+$(MIPT_OBJDIR)/entropy_cuda.o: entropy_cuda.cu entropy_cuda.hpp | $(MIPT_OBJDIR)
+	$(CUDA_CU_COMPILER) $(CUDA_CU_FLAGS) -c $< -o $@
 
 $(MIPT_OBJDIR)/rho_reduce.o: rho_reduce.cu rho_reduce.hpp | $(MIPT_OBJDIR)
 	$(CUDA_CU_COMPILER) $(CUDA_CU_FLAGS) -c $< -o $@
