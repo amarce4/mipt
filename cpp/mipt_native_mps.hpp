@@ -668,7 +668,7 @@ namespace mipt_native_mps
         return u;
     }
 
-    inline Gate2 u3_matrix(const FermionU2Params &p)
+    inline Gate2 u3_matrix(const U2Params &p)
     {
         const double c = std::cos(0.5 * p.theta);
         const double s = std::sin(0.5 * p.theta);
@@ -888,6 +888,16 @@ namespace mipt_native_mps
             frgs_mipt_frontend_inplace(layers, n, periods, p, rng, true);
             apply_debug_prefix_layer_limit(layers, "native-MPS RFGS");
             simulate_frgs(mps, n, layers, true, rng);
+        }
+        else if (circ_type == CircuitType::QubitRPPU)
+        {
+            std::vector<FermionLayerData> layers;
+            qrppu_frontend_inplace(layers, n, periods, p, true, rng);
+            apply_debug_prefix_layer_limit(layers, "native-MPS qRPPU");
+            // The direct periodic qRPPU bond is transported with ordinary
+            // qubit SWAPs by MPS::apply_long_range; no fermionic sign string
+            // is inserted. Reduced states are traced as qubits below.
+            simulate_fermion(mps, layers, rng);
         }
         else
         {

@@ -991,113 +991,13 @@ struct LayerData
     std::vector<int> rot_xy_flags;
 };
 
-struct FermionU2Params
+struct U2Params
 {
     // U = exp(i global_phase) * U3(theta, phi, lambda).
     double global_phase = 0.0;
     double theta = 0.0;
     double phi = 0.0;
     double lambda = 0.0;
-};
-
-struct FermionBondGate
-{
-    // kind = 0: adjacent parity-preserving two-mode unitary.
-    // kind = 1: adjacent fermionic swap.
-    // kind = 2: non-adjacent parity-preserving two-mode unitary with
-    //           Jordan-Wigner CZ-string corrections generated in the kernel.
-    int kind = 0;
-    int q0 = 0;
-    int q1 = 0;
-    FermionU2Params even;
-    FermionU2Params odd;
-};
-
-struct FermionLayerData
-{
-    std::vector<FermionBondGate> gates;
-    std::vector<int> measure_flags;
-};
-
-struct MIPTFermionKernel_1D
-{
-    void operator()(int n,
-                    const std::vector<FermionLayerData> &layers) __qpu__
-    {
-        cudaq::qvector q(n);
-
-        for (std::size_t layer = 0; layer < layers.size(); ++layer)
-        {
-            for (std::size_t gi = 0; gi < layers[layer].gates.size(); ++gi)
-            {
-                const auto gate = layers[layer].gates[gi];
-                if (gate.kind == 1)
-                {
-                    // FSWAP = CZ * SWAP in the |00>,|01>,|10>,|11> basis.
-                    z<cudaq::ctrl>(q[gate.q0], q[gate.q1]);
-                    swap(q[gate.q0], q[gate.q1]);
-                    continue;
-                }
-
-                if (gate.kind == 2)
-                {
-                    // Direct Jordan-Wigner representation for the periodic
-                    // boundary fermionic gate.  This is algebraically the
-                    // same nonlocal parity-preserving gate as the historical
-                    // FSWAP-around-the-ring construction, but it avoids moving
-                    // modes through the MPS with a long SWAP network.
-                    const int lo = gate.q0 < gate.q1 ? gate.q0 : gate.q1;
-                    const int hi = gate.q0 < gate.q1 ? gate.q1 : gate.q0;
-                    for (int k = lo + 1; k < hi; ++k)
-                    {
-                        z<cudaq::ctrl>(q[k], q[hi]);
-                    }
-                }
-
-                // Let a=q0 and b=q1.  First map parity sectors with
-                // CNOT(a -> b).  In the mapped basis, b=1 is the original
-                // odd sector {|01>,|10>} and b=0 is the original even
-                // sector {|00>,|11>}.  Controlled U3 on a then implements
-                // the desired 2x2 block; r1 supplies the block-global
-                // phase, which is physically relevant between parity blocks.
-                cx(q[gate.q0], q[gate.q1]);
-
-                r1(gate.odd.global_phase, q[gate.q1]);
-                u3<cudaq::ctrl>(gate.odd.theta,
-                                 gate.odd.phi,
-                                 gate.odd.lambda,
-                                 q[gate.q1], q[gate.q0]);
-
-                x(q[gate.q1]);
-                r1(gate.even.global_phase, q[gate.q1]);
-                u3<cudaq::ctrl>(gate.even.theta,
-                                 gate.even.phi,
-                                 gate.even.lambda,
-                                 q[gate.q1], q[gate.q0]);
-                x(q[gate.q1]);
-
-                cx(q[gate.q0], q[gate.q1]);
-
-                if (gate.kind == 2)
-                {
-                    const int lo = gate.q0 < gate.q1 ? gate.q0 : gate.q1;
-                    const int hi = gate.q0 < gate.q1 ? gate.q1 : gate.q0;
-                    for (int k = lo + 1; k < hi; ++k)
-                    {
-                        z<cudaq::ctrl>(q[k], q[hi]);
-                    }
-                }
-            }
-
-            for (int i = 0; i < n; ++i)
-            {
-                if (layers[layer].measure_flags[i])
-                {
-                    mz(q[i]);
-                }
-            }
-        }
-    }
 };
 
 struct MIPTKernel_1D
@@ -1474,264 +1374,6 @@ struct MIPTKernel_2D
     }
 };
 
-struct FRGSLayerData // LayerData for fermions with a reduced topological gate set
-{
-    int start = 0;
-
-    std::vector<int> measure_flags;
-
-    // Per-active-bond local gate choices.  These vectors are indexed by the
-    // compact brickwork-bond index, not by the absolute site index, so no RNG
-    // or host->kernel payload is spent on unused q entries.
-    //   value 1 -> apply T gate:            R_Z(pi/4) = exp(-i*pi/8 Z_j)
-    //   value 2 -> apply single-site braid: R_Z(pi/2) = exp(-i*pi/4 Z_j)
-    // Each endpoint chooses exactly one of these two gates with 50/50 odds.
-    std::vector<int> local_left_mask;
-    std::vector<int> local_right_mask;
-};
-
-struct MIPTKernel_1D_FRGS
-{
-    void operator()(int n,
-                    const std::vector<FRGSLayerData> &flayers,
-                    bool closed) __qpu__
-    {
-        cudaq::qvector q(n);
-
-        for (std::size_t layer = 0; layer < flayers.size(); ++layer)
-        {
-            const int start = flayers[layer].start;
-            const int bond_stop = (closed && start == 1 && n > 2) ? n : (n - 1);
-
-            int bond_index = 0;
-            for (int i = start; i < bond_stop; i += 2)
-            {
-                const int j = (i + 1) % n;
-                const int local_i = flayers[layer].local_left_mask[bond_index];
-                const int local_j = flayers[layer].local_right_mask[bond_index];
-                const bool wrapping_bond = (j < i);
-
-                if (wrapping_bond) // R_XX(pi/2) across periodic boundary
-                {
-                    // Wrapping fermionic bond: apply the Jordan-Wigner CZ
-                    // string around the periodic boundary, then undo it after
-                    // the R_XX gate.  The following R_ZZ(pi/4) is interleaved
-                    // with the inverse CZ string as far as the gate
-                    // dependencies allow.
-                    for (int k = j + 1; k < i; ++k)
-                    {
-                        cz(q[k], q[i]);
-                    }
-
-                    // The wrapping XX implementation needs S^dagger on both
-                    // endpoints before the XX rotation.  Fuse that diagonal
-                    // phase with the 50/50 local gate choice:
-                    //   local T * S^dagger -> T^dagger
-                    //   local S * S^dagger -> identity
-                    if (local_i == 1)
-                    {
-                        t<cudaq::adj>(q[i]);
-                    }
-
-                    if (local_j == 1)
-                    {
-                        t<cudaq::adj>(q[j]);
-                    }
-
-                    // R_XX(pi/2): exp(+i*pi/4 X_i X_j).
-                    cx(q[i], q[j]);
-                    rx(-1.57079632679489661923, q[i]);
-                    cx(q[i], q[j]);
-
-                    s(q[i]);
-                    s(q[j]);
-
-                    // R_ZZ(pi/4): exp(+i*pi/8 Z_i Z_j).  Put the central
-                    // T^dagger leg inside the inverse CZ string so it can be
-                    // scheduled in parallel with one of those CZ corrections.
-                    cx(q[i], q[j]);
-                    int rzz_phase_applied = 0;
-                    for (int k = j + 1; k < i; ++k)
-                    {
-                        cz(q[k], q[i]);
-                        if (rzz_phase_applied == 0)
-                        {
-                            t<cudaq::adj>(q[j]);
-                            rzz_phase_applied = 1;
-                        }
-                    }
-                    if (rzz_phase_applied == 0)
-                    {
-                        t<cudaq::adj>(q[j]);
-                    }
-                    cx(q[i], q[j]);
-                }
-                else
-                {
-                    // CUDA-Q T and S differ from R_Z(pi/4) and R_Z(pi/2)
-                    // only by one-qubit global phases, so observables and
-                    // reduced density matrices are unchanged while the
-                    // simulator gets native phase gates instead of generic RZs.
-                    if (local_i == 1)
-                    {
-                        t(q[i]);
-                    }
-                    else
-                    {
-                        s(q[i]);
-                    }
-
-                    if (local_j == 1)
-                    {
-                        t(q[j]);
-                    }
-                    else
-                    {
-                        s(q[j]);
-                    }
-
-                    // R_XX(pi/2): exp(+i*pi/4 X_i X_j).
-                    cx(q[i], q[j]);
-                    rx(-1.57079632679489661923, q[i]);
-                    cx(q[i], q[j]);
-
-                    // R_ZZ(pi/4): exp(+i*pi/8 Z_i Z_j).
-                    cx(q[i], q[j]);
-                    t<cudaq::adj>(q[j]);
-                    cx(q[i], q[j]);
-                }
-                ++bond_index;
-            }
-
-            for (int i = 0; i < n; ++i)
-            {
-                if (flayers[layer].measure_flags[i])
-                {
-                    mz(q[i]); // Z measurement preserves fermion parity.
-                }
-            }
-        }
-    }
-};
-
-int frgs_active_bond_count(int n, int start, bool closed = true)
-{
-    const int bond_stop = (closed && start == 1 && n > 2) ? n : (n - 1);
-    if (bond_stop <= start)
-    {
-        return 0;
-    }
-    return (bond_stop - start + 1) / 2;
-}
-
-inline int frgs_rng_bit(std::mt19937 &rng)
-{
-    return static_cast<int>((rng() >> 31) & 1u);
-}
-
-void fill_frgs_mipt_layer(FRGSLayerData &layer,
-                          int n,
-                          int start,
-                          double p,
-                          std::mt19937 &rng,
-                          bool closed = true)
-{
-    std::bernoulli_distribution measure_dist(p);
-
-    layer.start = start;
-    layer.measure_flags.resize(n);
-
-    const int bond_count = frgs_active_bond_count(n, start, closed);
-    layer.local_left_mask.resize(bond_count);
-    layer.local_right_mask.resize(bond_count);
-
-    for (int b = 0; b < bond_count; ++b)
-    {
-        // Each endpoint receives exactly one local gate: T or single-site
-        // braid, selected with 50/50 odds.
-        layer.local_left_mask[b] = frgs_rng_bit(rng) ? 1 : 2;
-        layer.local_right_mask[b] = frgs_rng_bit(rng) ? 1 : 2;
-    }
-
-    if (p <= 0.0)
-    {
-        std::fill(layer.measure_flags.begin(), layer.measure_flags.end(), 0);
-    }
-    else if (p >= 1.0)
-    {
-        std::fill(layer.measure_flags.begin(), layer.measure_flags.end(), 1);
-    }
-    else
-    {
-        for (int qidx = 0; qidx < n; ++qidx)
-        {
-            layer.measure_flags[qidx] = measure_dist(rng) ? 1 : 0;
-        }
-    }
-}
-
-FRGSLayerData make_frgs_mipt_layer(int n,
-                                   int start,
-                                   double p,
-                                   std::mt19937 &rng,
-                                   bool closed = true)
-{
-    FRGSLayerData layer;
-    fill_frgs_mipt_layer(layer, n, start, p, rng, closed);
-    return layer;
-}
-
-void frgs_mipt_frontend_inplace(std::vector<FRGSLayerData> &layers,
-                                int n,
-                                int periods,
-                                double p,
-                                std::mt19937 &rng,
-                                bool closed = true)
-{
-    if ((n % 2) != 0)
-    {
-        throw std::invalid_argument("FRGS fermionic 1D simulation requires even n.");
-    }
-    if (p < 0.0 || p > 1.0)
-    {
-        throw std::invalid_argument("Measurement probability p must be in [0,1].");
-    }
-
-    // Optional final even layer: included with 50% probability, and if included
-    // its measurements use the same measurement rate p as the bulk layers.
-    std::bernoulli_distribution extra_even_layer(0.5);
-    const bool add_extra_even_layer = extra_even_layer(rng);
-    const std::size_t layer_count = static_cast<std::size_t>(2 * periods + (add_extra_even_layer ? 1 : 0));
-
-    // resize() preserves the inner vector capacities for existing layers,
-    // avoiding thousands of small allocations during large realization sweeps.
-    layers.resize(layer_count);
-
-    std::size_t idx = 0;
-    for (int period = 0; period < periods; ++period)
-    {
-        fill_frgs_mipt_layer(layers[idx++], n, 0, p, rng, closed);
-        fill_frgs_mipt_layer(layers[idx++], n, 1, p, rng, closed);
-    }
-
-    if (add_extra_even_layer)
-    {
-        fill_frgs_mipt_layer(layers[idx++], n, 0, p, rng, closed);
-    }
-}
-
-std::vector<FRGSLayerData> frgs_mipt_frontend(int n,
-                                              int periods,
-                                              double p,
-                                              bool closed = true)
-{
-    std::mt19937 rng(std::random_device{}());
-    std::vector<FRGSLayerData> layers;
-    frgs_mipt_frontend_inplace(layers, n, periods, p, rng, closed);
-    return layers;
-}
-
-
 void fill_mipt_layer(LayerData &layer,
                      int n,
                      int start,
@@ -1815,54 +1457,7 @@ std::vector<LayerData> mipt_frontend(int n,
 
 
 
-std::array<std::complex<double>, 4> haar_unitary_2(std::mt19937 &rng)
-{
-    std::normal_distribution<double> normal(0.0, 1.0);
-
-    std::array<std::complex<double>, 4> z{
-        std::complex<double>(normal(rng), normal(rng)),
-        std::complex<double>(normal(rng), normal(rng)),
-        std::complex<double>(normal(rng), normal(rng)),
-        std::complex<double>(normal(rng), normal(rng)),
-    };
-
-    // Columns of z in row-major storage.
-    std::complex<double> z00 = z[0];
-    std::complex<double> z10 = z[2];
-    std::complex<double> z01 = z[1];
-    std::complex<double> z11 = z[3];
-
-    double n0 = std::sqrt(std::norm(z00) + std::norm(z10));
-    if (n0 == 0.0)
-    {
-        z00 = 1.0;
-        z10 = 0.0;
-        n0 = 1.0;
-    }
-
-    std::complex<double> q00 = z00 / n0;
-    std::complex<double> q10 = z10 / n0;
-
-    const std::complex<double> r01 = std::conj(q00) * z01 + std::conj(q10) * z11;
-    std::complex<double> u01 = z01 - q00 * r01;
-    std::complex<double> u11 = z11 - q10 * r01;
-
-    double n1 = std::sqrt(std::norm(u01) + std::norm(u11));
-    if (n1 < 1e-15)
-    {
-        // Extremely unlikely fallback: choose a deterministic orthogonal column.
-        u01 = -std::conj(q10);
-        u11 = std::conj(q00);
-        n1 = std::sqrt(std::norm(u01) + std::norm(u11));
-    }
-
-    std::complex<double> q01 = u01 / n1;
-    std::complex<double> q11 = u11 / n1;
-
-    return {q00, q01, q10, q11};
-}
-
-FermionU2Params decompose_u2_to_u3_phase(const std::array<std::complex<double>, 4> &u)
+U2Params decompose_u2_to_u3_phase(const std::array<std::complex<double>, 4> &u)
 {
     const auto a = u[0];
     const auto b = u[1];
@@ -1871,7 +1466,7 @@ FermionU2Params decompose_u2_to_u3_phase(const std::array<std::complex<double>, 
 
     const double ca = std::abs(a);
     const double sa = std::abs(c);
-    FermionU2Params out;
+    U2Params out;
     out.theta = 2.0 * std::atan2(sa, ca);
 
     constexpr double eps = 1e-12;
@@ -1896,171 +1491,6 @@ FermionU2Params decompose_u2_to_u3_phase(const std::array<std::complex<double>, 
 
     return out;
 }
-
-FermionBondGate random_parity_preserving_gate(int q0, int q1, std::mt19937 &rng)
-{
-    FermionBondGate gate;
-    gate.kind = 0;
-    gate.q0 = q0;
-    gate.q1 = q1;
-    gate.even = decompose_u2_to_u3_phase(haar_unitary_2(rng));
-    gate.odd = decompose_u2_to_u3_phase(haar_unitary_2(rng));
-    return gate;
-}
-
-FermionBondGate random_parity_preserving_jw_string_gate(int q0, int q1, std::mt19937 &rng)
-{
-    FermionBondGate gate = random_parity_preserving_gate(q0, q1, rng);
-    gate.kind = 2;
-    return gate;
-}
-
-FermionBondGate fermionic_swap_gate(int q0, int q1)
-{
-    FermionBondGate gate;
-    gate.kind = 1;
-    gate.q0 = q0;
-    gate.q1 = q1;
-    return gate;
-}
-
-void fill_fermion_layer(FermionLayerData &layer,
-                        int n,
-                        bool odd_layer,
-                        double p,
-                        bool closed,
-                        std::mt19937 &rng,
-                        bool direct_boundary_gate = false)
-{
-    std::bernoulli_distribution measure_dist(p);
-
-    layer.gates.clear();
-    layer.measure_flags.resize(static_cast<std::size_t>(n));
-
-    if (!odd_layer)
-    {
-        layer.gates.reserve(static_cast<std::size_t>(n / 2));
-        for (int qubit = 0; qubit < n; qubit += 2)
-        {
-            layer.gates.push_back(random_parity_preserving_gate(qubit, qubit + 1, rng));
-        }
-    }
-    else
-    {
-        const std::size_t reserve_count = closed
-            ? (direct_boundary_gate
-                   ? static_cast<std::size_t>(1 + (n - 2) / 2)
-                   : static_cast<std::size_t>((n - 2) + 1 + (n - 2) + (n - 2) / 2))
-            : static_cast<std::size_t>((n - 2) / 2);
-        layer.gates.reserve(reserve_count);
-        if (closed)
-        {
-            if (direct_boundary_gate)
-            {
-                layer.gates.push_back(random_parity_preserving_jw_string_gate(0, n - 1, rng));
-            }
-            else
-            {
-                for (int k = n - 2; k > 0; --k)
-                {
-                    layer.gates.push_back(fermionic_swap_gate(k, k + 1));
-                }
-
-                layer.gates.push_back(random_parity_preserving_gate(0, 1, rng));
-
-                for (int k = 1; k < n - 1; ++k)
-                {
-                    layer.gates.push_back(fermionic_swap_gate(k, k + 1));
-                }
-            }
-        }
-
-        for (int qubit = 1; qubit < n - 1; qubit += 2)
-        {
-            layer.gates.push_back(random_parity_preserving_gate(qubit, qubit + 1, rng));
-        }
-    }
-
-    for (int qubit = 0; qubit < n; ++qubit)
-    {
-        if (p <= 0.0)
-        {
-            layer.measure_flags[static_cast<std::size_t>(qubit)] = 0;
-        }
-        else if (p >= 1.0)
-        {
-            layer.measure_flags[static_cast<std::size_t>(qubit)] = 1;
-        }
-        else
-        {
-            layer.measure_flags[static_cast<std::size_t>(qubit)] =
-                measure_dist(rng) ? 1 : 0;
-        }
-    }
-}
-
-FermionLayerData make_fermion_layer(int n,
-                                    bool odd_layer,
-                                    double p,
-                                    bool closed,
-                                    std::mt19937 &rng,
-                                    bool direct_boundary_gate = false)
-{
-    FermionLayerData layer;
-    fill_fermion_layer(layer, n, odd_layer, p, closed, rng, direct_boundary_gate);
-    return layer;
-}
-
-void mipt_fermion_frontend_inplace(std::vector<FermionLayerData> &layers,
-                                   int n,
-                                   int periods,
-                                   double p,
-                                   bool closed,
-                                   std::mt19937 &rng,
-                                   bool direct_boundary_gate = false)
-{
-    if ((n % 2) != 0)
-    {
-        throw std::invalid_argument("Fermionic 1D simulation requires even n.");
-    }
-    if (p < 0.0 || p > 1.0)
-    {
-        throw std::invalid_argument("Measurement probability p must be in [0,1].");
-    }
-
-    std::bernoulli_distribution extra_even_layer(0.5);
-    const bool add_extra_even_layer = extra_even_layer(rng);
-    const std::size_t layer_count = static_cast<std::size_t>(2 * periods + (add_extra_even_layer ? 1 : 0));
-    layers.resize(layer_count);
-
-    std::size_t idx = 0;
-    for (int period = 0; period < periods; ++period)
-    {
-        fill_fermion_layer(layers[idx++], n, false, p, closed, rng, direct_boundary_gate);
-        fill_fermion_layer(layers[idx++], n, true, p, closed, rng, direct_boundary_gate);
-    }
-
-    // Match the Python fermionic circuit: a final even layer is included with
-    // 50% probability, and its measurements still use probability p.
-    if (add_extra_even_layer)
-    {
-        fill_fermion_layer(layers[idx++], n, false, p, closed, rng, direct_boundary_gate);
-    }
-}
-
-std::vector<FermionLayerData> mipt_fermion_frontend(int n,
-                                                    int periods,
-                                                    double p,
-                                                    bool closed = true)
-{
-    std::mt19937 rng(std::random_device{}());
-    std::vector<FermionLayerData> layers;
-    layers.reserve(static_cast<std::size_t>(2 * periods + 1));
-    mipt_fermion_frontend_inplace(layers, n, periods, p, closed, rng, false);
-    return layers;
-}
-
-
 
 struct MiptCircuitWorkStats
 {
@@ -2100,75 +1530,6 @@ MiptCircuitWorkStats circuit_work_stats_mms(const std::vector<LayerData> &layers
     stats.logical_two_site_gates = stats.mms_bonds;
     // Each MMS bond is implemented as two CX gates plus single-qubit basis rotations.
     stats.estimated_cudaq_two_qubit_ops = 2u * stats.mms_bonds;
-    return stats;
-}
-
-MiptCircuitWorkStats circuit_work_stats_fermion(const std::vector<FermionLayerData> &layers)
-{
-    MiptCircuitWorkStats stats;
-    stats.layers = layers.size();
-    for (const auto &layer : layers)
-    {
-        for (int flag : layer.measure_flags)
-        {
-            stats.measurements += (flag != 0) ? 1u : 0u;
-        }
-        for (const auto &gate : layer.gates)
-        {
-            if (gate.kind == 1)
-            {
-                ++stats.fswap_gates;
-            }
-            else if (gate.kind == 2)
-            {
-                ++stats.fermion_parity_gates;
-                ++stats.fermion_jw_boundary_gates;
-                const int distance = std::abs(gate.q1 - gate.q0);
-                stats.fermion_jw_cz_corrections += static_cast<std::size_t>(2 * std::max(0, distance - 1));
-            }
-            else
-            {
-                ++stats.fermion_parity_gates;
-            }
-        }
-    }
-    stats.logical_two_site_gates = stats.fswap_gates + stats.fermion_parity_gates;
-    // Lower-bound primitive count in the CUDA-Q kernel: FSWAP is CZ+SWAP;
-    // a parity-preserving gate uses two CX and two controlled-U3 operations.
-    stats.estimated_cudaq_two_qubit_ops = 2u * stats.fswap_gates +
-                                          4u * stats.fermion_parity_gates +
-                                          stats.fermion_jw_cz_corrections;
-    return stats;
-}
-
-MiptCircuitWorkStats circuit_work_stats_frgs(const std::vector<FRGSLayerData> &layers, int n, bool closed)
-{
-    MiptCircuitWorkStats stats;
-    stats.layers = layers.size();
-    for (const auto &layer : layers)
-    {
-        for (int flag : layer.measure_flags)
-        {
-            stats.measurements += (flag != 0) ? 1u : 0u;
-        }
-        const int start = layer.start;
-        const int bond_stop = (closed && start == 1 && n > 2) ? n : (n - 1);
-        for (int i = start; i < bond_stop; i += 2)
-        {
-            ++stats.frgs_bonds;
-            const int j = (i + 1) % n;
-            if (j < i)
-            {
-                ++stats.wrapping_frgs_bonds;
-                stats.estimated_cudaq_two_qubit_ops += static_cast<std::size_t>(2 * std::max(0, i - j - 1) + 4);
-            }
-            else
-            {
-                stats.estimated_cudaq_two_qubit_ops += 4u;
-            }
-        }
-    }
-    stats.logical_two_site_gates = stats.frgs_bonds;
     return stats;
 }
 
@@ -2235,6 +1596,7 @@ enum class CircuitType : int
     Haar = 1,
     FermionRPPU = 2,
     RFGS = 3,
+    QubitRPPU = 4,
 };
 
 const char *circuit_type_name(CircuitType circ_type)
@@ -2249,15 +1611,19 @@ const char *circuit_type_name(CircuitType circ_type)
         return "Fermionic Random Parity Preserving Unitary";
     case CircuitType::RFGS:
         return "RFGS";
+    case CircuitType::QubitRPPU:
+        return "qRPPU (qubit parity-preserving unitary)";
     }
     return "Unknown";
 }
 
 CircuitType parse_circuit_type(int value)
 {
-    if (value < 0 || value > 3)
+    if (value < 0 || value > 4)
     {
-        throw std::invalid_argument("circ_type must be one of 0=MMS, 1=Random Haar Unitary, 2=Fermionic Random Parity Preserving Unitary, or 3=RFGS.");
+        throw std::invalid_argument(
+            "circ_type must be one of 0=MMS, 1=Random Haar Unitary, "
+            "2=Fermionic RPPU, 3=RFGS, or 4=qRPPU.");
     }
     return static_cast<CircuitType>(value);
 }
@@ -2267,6 +1633,8 @@ bool uses_fermionic_trace(CircuitType circ_type)
     return circ_type == CircuitType::FermionRPPU || circ_type == CircuitType::RFGS;
 }
 
+#include "mipt_fermion.cpp"
+
 using ComplexD = std::complex<double>;
 using Haar4 = std::array<ComplexD, 16>;
 using Matrix2 = std::array<ComplexD, 4>;
@@ -2275,10 +1643,10 @@ struct HaarBondGate
 {
     int q0 = 0; // Local least-significant basis bit in the historical Haar path.
     int q1 = 0; // Local most-significant basis bit / multiplexor control.
-    FermionU2Params a0;
-    FermionU2Params a1;
-    FermionU2Params b0;
-    FermionU2Params b1;
+    U2Params a0;
+    U2Params a1;
+    U2Params b0;
+    U2Params b1;
     double theta0 = 0.0;
     double theta1 = 0.0;
 };
@@ -2582,6 +1950,168 @@ struct MIPTHaarKernel_1D
     }
 };
 
+
+struct CircuitWorkspace1D
+{
+    std::mt19937 mms_rng{std::random_device{}()};
+    std::mt19937 haar_rng{std::random_device{}()};
+    std::mt19937 fermion_rppu_rng{std::random_device{}()};
+    std::mt19937 rfgs_rng{std::random_device{}()};
+    std::mt19937 qrppu_rng{std::random_device{}()};
+
+    std::vector<LayerData> mms_layers;
+    std::vector<HaarLayerData> haar_layers;
+    std::vector<FermionLayerData> fermion_rppu_layers;
+    std::vector<FRGSLayerData> rfgs_layers;
+    std::vector<FermionLayerData> qrppu_layers;
+
+    void reserve(int periods)
+    {
+        mms_layers.reserve(static_cast<std::size_t>(2 * periods + 1));
+        haar_layers.reserve(static_cast<std::size_t>(2 * periods));
+        fermion_rppu_layers.reserve(static_cast<std::size_t>(2 * periods + 1));
+        rfgs_layers.reserve(static_cast<std::size_t>(2 * periods + 1));
+        qrppu_layers.reserve(static_cast<std::size_t>(2 * periods + 1));
+    }
+};
+
+struct CircuitBuildTiming
+{
+    std::chrono::steady_clock::time_point frontend_done{};
+};
+
+cudaq::state build_1d_circuit_state(int n,
+                                    int periods,
+                                    double p,
+                                    CircuitType circ_type,
+                                    CircuitWorkspace1D &workspace,
+                                    const char *context = nullptr,
+                                    CircuitBuildTiming *timing = nullptr)
+{
+    const std::string prefix = (context != nullptr && *context != '\0')
+                                   ? std::string(context) + " "
+                                   : std::string();
+    auto frontend_done = [&]() {
+        if (timing != nullptr)
+        {
+            timing->frontend_done = std::chrono::steady_clock::now();
+        }
+    };
+    auto log_start = [&](const char *name, std::size_t layers) {
+        if (mipt_backend::verbose_enabled())
+        {
+            mipt_backend::verbose_log(prefix + "get_state start: " + name +
+                                      " n=" + std::to_string(n) +
+                                      " layers=" + std::to_string(layers));
+        }
+    };
+    auto log_done = [&](const char *name,
+                        const std::chrono::steady_clock::time_point &start) {
+        if (mipt_backend::verbose_enabled())
+        {
+            mipt_backend::verbose_log(prefix + "get_state done: " + name +
+                                      " elapsed_s=" +
+                                      std::to_string(mipt_backend::seconds_since(start)));
+        }
+    };
+
+    switch (circ_type)
+    {
+    case CircuitType::MMS:
+    {
+        mipt_frontend_inplace(workspace.mms_layers, n, periods, p, workspace.mms_rng);
+        apply_debug_prefix_layer_limit(workspace.mms_layers, (prefix + "MMS").c_str());
+        if (mipt_backend::verbose_enabled())
+        {
+            const auto stats = circuit_work_stats_mms(workspace.mms_layers, n, true);
+            mipt_backend::verbose_log(circuit_work_stats_string(
+                (prefix + "MMS").c_str(), stats, n, periods, p));
+        }
+        frontend_done();
+        log_start("MMS", workspace.mms_layers.size());
+        const auto start = std::chrono::steady_clock::now();
+        auto state = cudaq::get_state(MIPTKernel_1D{}, n, workspace.mms_layers, true);
+        log_done("MMS", start);
+        return state;
+    }
+    case CircuitType::Haar:
+    {
+        haar_frontend_inplace(workspace.haar_layers, n, periods, p, workspace.haar_rng, true);
+        apply_debug_prefix_layer_limit(workspace.haar_layers, (prefix + "Haar").c_str());
+        frontend_done();
+        log_start("Haar", workspace.haar_layers.size());
+        const auto start = std::chrono::steady_clock::now();
+        auto state = cudaq::get_state(MIPTHaarKernel_1D{}, n, workspace.haar_layers);
+        log_done("Haar", start);
+        return state;
+    }
+    case CircuitType::FermionRPPU:
+    {
+        const bool direct_boundary = mipt_backend::direct_fermion_boundary_enabled();
+        mipt_fermion_frontend_inplace(workspace.fermion_rppu_layers,
+                                      n, periods, p, true,
+                                      workspace.fermion_rppu_rng,
+                                      direct_boundary);
+        apply_debug_prefix_layer_limit(workspace.fermion_rppu_layers,
+                                       (prefix + "FermionRPPU").c_str());
+        if (mipt_backend::verbose_enabled())
+        {
+            const auto stats = circuit_work_stats_fermion(workspace.fermion_rppu_layers);
+            mipt_backend::verbose_log(circuit_work_stats_string(
+                (prefix + "FermionRPPU").c_str(), stats, n, periods, p));
+        }
+        frontend_done();
+        log_start("FermionRPPU", workspace.fermion_rppu_layers.size());
+        const auto start = std::chrono::steady_clock::now();
+        auto state = cudaq::get_state(MIPTRPPUKernel_1D{}, n,
+                                      workspace.fermion_rppu_layers);
+        log_done("FermionRPPU", start);
+        return state;
+    }
+    case CircuitType::RFGS:
+    {
+        frgs_mipt_frontend_inplace(workspace.rfgs_layers, n, periods, p,
+                                   workspace.rfgs_rng, true);
+        apply_debug_prefix_layer_limit(workspace.rfgs_layers,
+                                       (prefix + "RFGS").c_str());
+        if (mipt_backend::verbose_enabled())
+        {
+            const auto stats = circuit_work_stats_frgs(workspace.rfgs_layers, n, true);
+            mipt_backend::verbose_log(circuit_work_stats_string(
+                (prefix + "RFGS").c_str(), stats, n, periods, p));
+        }
+        frontend_done();
+        log_start("RFGS", workspace.rfgs_layers.size());
+        const auto start = std::chrono::steady_clock::now();
+        auto state = cudaq::get_state(MIPTKernel_1D_FRGS{}, n,
+                                      workspace.rfgs_layers, true);
+        log_done("RFGS", start);
+        return state;
+    }
+    case CircuitType::QubitRPPU:
+    {
+        qrppu_frontend_inplace(workspace.qrppu_layers, n, periods, p, true,
+                               workspace.qrppu_rng);
+        apply_debug_prefix_layer_limit(workspace.qrppu_layers,
+                                       (prefix + "qRPPU").c_str());
+        if (mipt_backend::verbose_enabled())
+        {
+            const auto stats = circuit_work_stats_fermion(workspace.qrppu_layers);
+            mipt_backend::verbose_log(circuit_work_stats_string(
+                (prefix + "qRPPU").c_str(), stats, n, periods, p));
+        }
+        frontend_done();
+        log_start("qRPPU", workspace.qrppu_layers.size());
+        const auto start = std::chrono::steady_clock::now();
+        auto state = cudaq::get_state(MIPTRPPUKernel_1D{}, n,
+                                      workspace.qrppu_layers);
+        log_done("qRPPU", start);
+        return state;
+    }
+    }
+    throw std::invalid_argument("Unsupported 1D circuit type.");
+}
+
 #include "mipt_native_mps.hpp"
 
 void run_1d(int n, int periods, int realizations, int res, double p_min, double p_max, CircuitType circ_type)
@@ -2593,10 +2123,11 @@ void run_1d(int n, int periods, int realizations, int res, double p_min, double 
     }
     if ((circ_type == CircuitType::Haar ||
          circ_type == CircuitType::FermionRPPU ||
-         circ_type == CircuitType::RFGS) &&
+         circ_type == CircuitType::RFGS ||
+         circ_type == CircuitType::QubitRPPU) &&
         ((n % 2) != 0))
     {
-        throw std::invalid_argument("circ_type 1, 2, and 3 require even n in the periodic 1D brickwork geometry.");
+        throw std::invalid_argument("circ_type 1, 2, 3, and 4 require even n in the periodic 1D brickwork geometry.");
     }
 
     const bool fermion_trace = uses_fermionic_trace(circ_type);
@@ -2618,19 +2149,9 @@ void run_1d(int n, int periods, int realizations, int res, double p_min, double 
         density_metadata(1, n, periods, realizations, res,
                          p_min, p_max, n, 1, subsystems));
 
-    std::mt19937 haar_rng(std::random_device{}());
-    std::mt19937 mms_rng(std::random_device{}());
-    std::mt19937 fermion_rng(std::random_device{}());
-    std::mt19937 frgs_rng(std::random_device{}());
+    CircuitWorkspace1D circuit_workspace;
+    circuit_workspace.reserve(periods);
     std::mt19937 native_mps_rng(std::random_device{}());
-    std::vector<LayerData> mms_layers;
-    std::vector<HaarLayerData> haar_layers;
-    std::vector<FermionLayerData> fermion_layers;
-    std::vector<FRGSLayerData> frgs_layers;
-    mms_layers.reserve(static_cast<std::size_t>(2 * periods + 1));
-    haar_layers.reserve(static_cast<std::size_t>(2 * periods));
-    fermion_layers.reserve(static_cast<std::size_t>(2 * periods + 1));
-    frgs_layers.reserve(static_cast<std::size_t>(2 * periods + 1));
     std::vector<double> rho3_ri(subsystems.size() * RHO3_VALUES);
 
     for (std::size_t p_index = 0; p_index < ps.size(); ++p_index)
@@ -2670,104 +2191,14 @@ void run_1d(int n, int periods, int realizations, int res, double p_min, double 
             }
             else
             {
-                auto state = [&]() {
-                    if (circ_type == CircuitType::Haar)
-                    {
-                        haar_frontend_inplace(haar_layers, n, periods, p, haar_rng, true);
-                        apply_debug_prefix_layer_limit(haar_layers, "Haar");
-                        if (r == 0)
-                        {
-                            lap1 = std::chrono::steady_clock::now();
-                        }
-                        if (mipt_backend::verbose_enabled())
-                        {
-                            mipt_backend::verbose_log("get_state start: Haar n=" + std::to_string(n) +
-                                                      " layers=" + std::to_string(haar_layers.size()));
-                        }
-                        const auto t_get_state = std::chrono::steady_clock::now();
-                        auto state = cudaq::get_state(MIPTHaarKernel_1D{}, n, haar_layers);
-                        if (mipt_backend::verbose_enabled())
-                        {
-                            mipt_backend::verbose_log("get_state done: Haar elapsed_s=" +
-                                                      std::to_string(mipt_backend::seconds_since(t_get_state)));
-                        }
-                        return state;
-                    }
-
-                    if (circ_type == CircuitType::FermionRPPU)
-                    {
-                        const bool direct_boundary = mipt_backend::direct_fermion_boundary_enabled();
-                        mipt_fermion_frontend_inplace(fermion_layers, n, periods, p, true, fermion_rng, direct_boundary);
-                        if (direct_boundary && r == 0 && mipt_backend::verbose_enabled())
-                        {
-                            mipt_backend::verbose_log("FermionRPPU direct JW-CZ boundary enabled; set MIPT_DIRECT_FERMION_BOUNDARY=0 to force historical FSWAP chains.");
-                        }
-                        apply_debug_prefix_layer_limit(fermion_layers, "FermionRPPU");
-                        if (r == 0)
-                        {
-                            lap1 = std::chrono::steady_clock::now();
-                        }
-                        if (mipt_backend::verbose_enabled())
-                        {
-                            const auto stats = circuit_work_stats_fermion(fermion_layers);
-                            mipt_backend::verbose_log(circuit_work_stats_string("FermionRPPU", stats, n, periods, p));
-                            mipt_backend::verbose_log("get_state start: FermionRPPU n=" + std::to_string(n) + " layers=" + std::to_string(fermion_layers.size()));
-                        }
-                        const auto t_get_state = std::chrono::steady_clock::now();
-                        auto state = cudaq::get_state(MIPTFermionKernel_1D{}, n, fermion_layers);
-                        if (mipt_backend::verbose_enabled())
-                        {
-                            mipt_backend::verbose_log("get_state done: FermionRPPU elapsed_s=" + std::to_string(mipt_backend::seconds_since(t_get_state)));
-                        }
-                        return state;
-                    }
-
-                    if (circ_type == CircuitType::RFGS)
-                    {
-                        frgs_mipt_frontend_inplace(frgs_layers, n, periods, p, frgs_rng, true);
-                        apply_debug_prefix_layer_limit(frgs_layers, "RFGS");
-                        if (r == 0)
-                        {
-                            lap1 = std::chrono::steady_clock::now();
-                        }
-                        if (mipt_backend::verbose_enabled())
-                        {
-                            const auto stats = circuit_work_stats_frgs(frgs_layers, n, true);
-                            mipt_backend::verbose_log(circuit_work_stats_string("RFGS", stats, n, periods, p));
-                            mipt_backend::verbose_log("get_state start: RFGS n=" + std::to_string(n) + " layers=" + std::to_string(frgs_layers.size()));
-                        }
-                        const auto t_get_state = std::chrono::steady_clock::now();
-                        auto state = cudaq::get_state(MIPTKernel_1D_FRGS{}, n, frgs_layers, true);
-                        if (mipt_backend::verbose_enabled())
-                        {
-                            mipt_backend::verbose_log("get_state done: RFGS elapsed_s=" + std::to_string(mipt_backend::seconds_since(t_get_state)));
-                        }
-                        return state;
-                    }
-
-                    mipt_frontend_inplace(mms_layers, n, periods, p, mms_rng);
-                    apply_debug_prefix_layer_limit(mms_layers, "MMS");
-                    if (r == 0)
-                    {
-                        lap1 = std::chrono::steady_clock::now();
-                    }
-                    if (mipt_backend::verbose_enabled())
-                    {
-                        const auto stats = circuit_work_stats_mms(mms_layers, n, true);
-                        mipt_backend::verbose_log(circuit_work_stats_string("MMS", stats, n, periods, p));
-                        mipt_backend::verbose_log("get_state start: MMS n=" + std::to_string(n) + " layers=" + std::to_string(mms_layers.size()));
-                    }
-                    const auto t_get_state = std::chrono::steady_clock::now();
-                    auto state = cudaq::get_state(MIPTKernel_1D{}, n, mms_layers, true);
-                    if (mipt_backend::verbose_enabled())
-                    {
-                        mipt_backend::verbose_log("get_state done: MMS elapsed_s=" + std::to_string(mipt_backend::seconds_since(t_get_state)));
-                    }
-                    return state;
-                }();
+                CircuitBuildTiming build_timing;
+                auto state = build_1d_circuit_state(
+                    n, periods, p, circ_type, circuit_workspace,
+                    nullptr, r == 0 ? &build_timing : nullptr);
 
                 if (r == 0)
                 {
+                    lap1 = build_timing.frontend_done;
                     lap2 = std::chrono::steady_clock::now();
                 }
 
@@ -2986,6 +2417,7 @@ int main(int argc, char *argv[])
         std::cout << "    1 = Random Haar Unitary brickwork circuit\n";
         std::cout << "    2 = Fermionic Random Parity Preserving Unitary\n";
         std::cout << "    3 = RFGS from mipt_fermion.cpp\n";
+        std::cout << "    4 = qRPPU: parity-preserving gates, no JW/CZ chains, qubit partial trace\n";
         std::cout << "  For d=2, only circ_type=0 is supported.\n";
         return 0;
     }

@@ -265,7 +265,7 @@ $(RING_OBJDIR):
 $(TMI_OBJDIR):
 	mkdir -p $@
 
-$(MIPT_OBJDIR)/mipt.o: mipt.cpp density_io.hpp rho_reduce.hpp mipt_backend.hpp mipt_native_mps.hpp | $(MIPT_OBJDIR)
+$(MIPT_OBJDIR)/mipt.o: mipt.cpp mipt_fermion.cpp density_io.hpp rho_reduce.hpp mipt_backend.hpp mipt_native_mps.hpp | $(MIPT_OBJDIR)
 	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $(NVQXXFLAGS_COMMON) -c $< -o $@
 
 $(MIPT_OBJDIR)/sim_tmi.o: sim_tmi.cpp mipt.cpp mipt_fermion.cpp density_io.hpp rho_reduce.hpp tmi_cuda_svd.hpp tmi_cuda_rdm.hpp mipt_backend.hpp mipt_native_mps.hpp | $(MIPT_OBJDIR)

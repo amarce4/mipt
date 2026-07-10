@@ -70,47 +70,6 @@ namespace sim_tmi
         Fermion
     };
 
-    enum class CircuitMode
-    {
-        QubitMms = 0,
-        FermionHaar = 1,
-        FermionReducedGateSet = 2
-    };
-
-    CircuitMode circuit_mode_from_int(int value)
-    {
-        switch (value)
-        {
-        case 0:
-            return CircuitMode::QubitMms;
-        case 1:
-            return CircuitMode::FermionHaar;
-        case 2:
-            return CircuitMode::FermionReducedGateSet;
-        default:
-            throw std::invalid_argument("fermion must be 0, 1, or 2.");
-        }
-    }
-
-    bool uses_fermionic_trace(CircuitMode mode)
-    {
-        return mode != CircuitMode::QubitMms;
-    }
-
-    const char *circuit_mode_name(CircuitMode mode)
-    {
-        switch (mode)
-        {
-        case CircuitMode::QubitMms:
-            return "qubit/MMS";
-        case CircuitMode::FermionHaar:
-            return "fermion/Haar parity-preserving + JW FSWAP";
-        case CircuitMode::FermionReducedGateSet:
-            return "fermion/reduced gate set from mipt_fermion.cpp";
-        }
-        return "unknown";
-    }
-
     long parse_nonnegative_env_long(const char *name, long fallback, long max_value)
     {
         const char *value = std::getenv(name);
@@ -2458,11 +2417,16 @@ namespace sim_tmi
                         int res,
                         double p_min,
                         double p_max,
-                        CircuitMode circuit_mode,
+                        CircuitType circuit_mode,
                         bool all_cycles,
                         const std::string &output_path)
     {
         validate_sim_args(n, periods, realizations, res, p_min, p_max);
+        if (circuit_mode != CircuitType::MMS && (n % 2) != 0)
+        {
+            throw std::invalid_argument(
+                "circ_type 1, 2, 3, and 4 require even n in the periodic 1D brickwork geometry.");
+        }
 
         const std::uint32_t block_qubits = static_cast<std::uint32_t>(n / 4);
         const int cycle_count = tmi_cycle_count(n, all_cycles);
@@ -2503,7 +2467,7 @@ namespace sim_tmi
                   << ", block_qubits=" << block_qubits
                   << ", all_cycles=" << (all_cycles ? 1 : 0)
                   << ", tmi_cycles_per_circuit=" << cycle_count
-                  << ", mode=" << circuit_mode_name(circuit_mode)
+                  << ", mode=" << circuit_type_name(circuit_mode)
                   << ", output=" << output_path << '\n'
                   << "build_target=" << compile_target_name()
                   << ", cuda_rho=" << cuda_rho_build_name()
@@ -2546,15 +2510,8 @@ namespace sim_tmi
             }
         };
 
-        std::mt19937 mms_rng(std::random_device{}());
-        std::mt19937 fermion_rng(std::random_device{}());
-        std::mt19937 frgs_rng(std::random_device{}());
-        std::vector<LayerData> mms_layers;
-        std::vector<FermionLayerData> fermion_layers;
-        std::vector<FRGSLayerData> frgs_layers;
-        mms_layers.reserve(static_cast<std::size_t>(2 * periods + 1));
-        fermion_layers.reserve(static_cast<std::size_t>(2 * periods + 1));
-        frgs_layers.reserve(static_cast<std::size_t>(2 * periods + 1));
+        CircuitWorkspace1D circuit_workspace;
+        circuit_workspace.reserve(periods);
 
         const auto start = std::chrono::steady_clock::now();
         auto last_report = start;
@@ -2608,65 +2565,8 @@ namespace sim_tmi
             {
                 wait_if_host_paused();
 
-                auto state = [&]() {
-                    if (circuit_mode == CircuitMode::FermionReducedGateSet)
-                    {
-                        frgs_mipt_frontend_inplace(frgs_layers, n, periods, p, frgs_rng, true);
-                        apply_debug_prefix_layer_limit(frgs_layers, "sim_tmi RFGS");
-                        if (mipt_backend::verbose_enabled())
-                        {
-                            const auto stats = circuit_work_stats_frgs(frgs_layers, n, true);
-                            mipt_backend::verbose_log(circuit_work_stats_string("sim_tmi RFGS", stats, n, periods, p));
-                            mipt_backend::verbose_log("sim_tmi get_state start: RFGS n=" + std::to_string(n) + " layers=" + std::to_string(frgs_layers.size()));
-                        }
-                        const auto t_get_state = std::chrono::steady_clock::now();
-                        auto state = cudaq::get_state(MIPTKernel_1D_FRGS{}, n, frgs_layers, true);
-                        if (mipt_backend::verbose_enabled())
-                        {
-                            mipt_backend::verbose_log("sim_tmi get_state done: RFGS elapsed_s=" + std::to_string(mipt_backend::seconds_since(t_get_state)));
-                        }
-                        return state;
-                    }
-                    if (circuit_mode == CircuitMode::FermionHaar)
-                    {
-                        const bool direct_boundary = mipt_backend::direct_fermion_boundary_enabled();
-                        mipt_fermion_frontend_inplace(fermion_layers, n, periods, p, true, fermion_rng, direct_boundary);
-                        if (direct_boundary && r == 0 && sim_tmi::parse_bool01_env("SIM_TMI_VERBOSE", false))
-                        {
-                            std::cerr << "[sim_tmi-debug] FermionRPPU direct JW-CZ boundary enabled; set MIPT_DIRECT_FERMION_BOUNDARY=0 to force historical FSWAP chains.\n";
-                        }
-                        apply_debug_prefix_layer_limit(fermion_layers, "sim_tmi FermionHaar");
-                        if (mipt_backend::verbose_enabled())
-                        {
-                            const auto stats = circuit_work_stats_fermion(fermion_layers);
-                            mipt_backend::verbose_log(circuit_work_stats_string("sim_tmi FermionHaar", stats, n, periods, p));
-                            mipt_backend::verbose_log("sim_tmi get_state start: FermionHaar n=" + std::to_string(n) + " layers=" + std::to_string(fermion_layers.size()));
-                        }
-                        const auto t_get_state = std::chrono::steady_clock::now();
-                        auto state = cudaq::get_state(MIPTFermionKernel_1D{}, n, fermion_layers);
-                        if (mipt_backend::verbose_enabled())
-                        {
-                            mipt_backend::verbose_log("sim_tmi get_state done: FermionHaar elapsed_s=" + std::to_string(mipt_backend::seconds_since(t_get_state)));
-                        }
-                        return state;
-                    }
-
-                    mipt_frontend_inplace(mms_layers, n, periods, p, mms_rng);
-                    apply_debug_prefix_layer_limit(mms_layers, "sim_tmi MMS");
-                    if (mipt_backend::verbose_enabled())
-                    {
-                        const auto stats = circuit_work_stats_mms(mms_layers, n, true);
-                        mipt_backend::verbose_log(circuit_work_stats_string("sim_tmi MMS", stats, n, periods, p));
-                        mipt_backend::verbose_log("sim_tmi get_state start: MMS n=" + std::to_string(n) + " layers=" + std::to_string(mms_layers.size()));
-                    }
-                    const auto t_get_state = std::chrono::steady_clock::now();
-                    auto state = cudaq::get_state(MIPTKernel_1D{}, n, mms_layers, true);
-                    if (mipt_backend::verbose_enabled())
-                    {
-                        mipt_backend::verbose_log("sim_tmi get_state done: MMS elapsed_s=" + std::to_string(mipt_backend::seconds_since(t_get_state)));
-                    }
-                    return state;
-                }();
+                auto state = build_1d_circuit_state(
+                    n, periods, p, circuit_mode, circuit_workspace, "sim_tmi");
 
                 const bool use_fast_state_tmi = fast_state_tmi_available(state, n, block_qubits);
                 if (!printed_state_backend)
@@ -2843,22 +2743,26 @@ namespace sim_tmi
         return text;
     }
 
-    std::string tmi_output_tag(CircuitMode circuit_mode, bool all_cycles)
+    std::string tmi_output_tag(CircuitType circuit_mode, bool all_cycles)
     {
         std::string tag;
         switch (circuit_mode)
         {
-        case CircuitMode::QubitMms:
-            tag = "qubit";
+        case CircuitType::MMS:
+            tag = "mms";
             break;
-        case CircuitMode::FermionHaar:
-            tag = "fermion1";
+        case CircuitType::Haar:
+            tag = "haar";
             break;
-        case CircuitMode::FermionReducedGateSet:
-            tag = "fermion2";
+        case CircuitType::FermionRPPU:
+            tag = "rppu";
             break;
-        default:
-            throw std::invalid_argument("Unsupported fermion mode for TMI output naming.");
+        case CircuitType::RFGS:
+            tag = "rfgs";
+            break;
+        case CircuitType::QubitRPPU:
+            tag = "qrppu";
+            break;
         }
 
         if (all_cycles)
@@ -2873,7 +2777,7 @@ namespace sim_tmi
                                         int res,
                                         double p_min,
                                         double p_max,
-                                        CircuitMode circuit_mode,
+                                        CircuitType circuit_mode,
                                         bool all_cycles)
     {
         const std::string tag = tmi_output_tag(circuit_mode, all_cycles);
@@ -2957,17 +2861,19 @@ namespace sim_tmi
     {
         std::cerr
             << "Usage:\n"
-            << "  " << argv0 << " [n = 10] [periods = 10] [realizations = 10] [resolution = 5] [p_min = 0.0] [p_max = 1.0] [fermion = 0] [all_cycles = 0] [output.csv = auto]\n\n"
+            << "  " << argv0 << " [n = 10] [periods = 10] [realizations = 10] [resolution = 5] [p_min = 0.0] [p_max = 1.0] [circ_type = 0] [all_cycles = 0] [output.csv = auto]\n\n"
             << "Arguments:\n"
-            << "  fermion = 0 uses the existing MMS/qubit circuit.\n"
-            << "  fermion = 1 uses parity-preserving fermionic gates with JW FSWAP boundaries.\n"
-            << "  fermion = 2 uses the reduced-gate-set fermionic architecture from mipt_fermion.cpp.\n"
+            << "  circ_type = 0 uses the MMS gate set.\n"
+            << "  circ_type = 1 uses random Haar U(4) brickwork gates.\n"
+            << "  circ_type = 2 uses fermionic RPPU gates and fermionic partial tracing.\n"
+            << "  circ_type = 3 uses the fermionic reduced gate set (RFGS).\n"
+            << "  circ_type = 4 uses qRPPU: the RPPU gates as ordinary qubit gates, with no JW/CZ chains and qubit partial tracing.\n"
             << "  all_cycles = 0 computes the original offset only.\n"
             << "  all_cycles = 1 computes N/4 cyclic offsets; e.g. N=8 gives [0,1]|[2,3]|[4,5]|[6,7] and [1,2]|[3,4]|[5,6]|[7,0].\n"
             << "  For backward compatibility, output.csv may also be supplied before all_cycles.\n"
             << "  If output.csv is omitted, the default path is:\n"
             << "    csv/tmi/<tag>/tmi_<tag>_n_<n>_real_<realizations>_<p_min>_<p_max>_res_<resolution>.csv\n"
-            << "  Tags are qubit, fermion1, or fermion2; all_cycles=1 appends c, e.g. fermion2c.\n\n"
+            << "  Tags are mms, haar, rppu, rfgs, and qrppu; all_cycles=1 appends c.\n\n"
             << "Output CSV columns:\n"
             << "  p,tmi\n\n"
             << "Host pause control:\n"
@@ -3000,7 +2906,7 @@ int main(int argc, char **argv)
         const int res = (argc > 4) ? std::stoi(argv[4]) : 5;
         const double p_min = (argc > 5) ? std::stod(argv[5]) : 0.0;
         const double p_max = (argc > 6) ? std::stod(argv[6]) : 1.0;
-        const int fermion = (argc > 7) ? std::stoi(argv[7]) : 0;
+        const int circ_type_value = (argc > 7) ? std::stoi(argv[7]) : 0;
 
         bool all_cycles = false;
         std::string output_path;
@@ -3028,7 +2934,7 @@ int main(int argc, char **argv)
             }
         }
 
-        const sim_tmi::CircuitMode circuit_mode = sim_tmi::circuit_mode_from_int(fermion);
+        const CircuitType circuit_mode = parse_circuit_type(circ_type_value);
         if (!output_path_explicit)
         {
             output_path = sim_tmi::default_tmi_output_path(n,
