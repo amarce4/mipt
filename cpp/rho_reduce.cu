@@ -19,6 +19,101 @@ namespace
         Real im;
     };
 
+    __host__ __device__ __forceinline__ bool odd_popcount64(std::uint64_t x)
+    {
+#if defined(__CUDA_ARCH__)
+        return (__popcll(static_cast<unsigned long long>(x)) & 1) != 0;
+#elif defined(__GNUG__) || defined(__clang__)
+        return (__builtin_popcountll(static_cast<unsigned long long>(x)) & 1) != 0;
+#else
+        bool parity = false;
+        while (x)
+        {
+            parity = !parity;
+            x &= x - 1;
+        }
+        return parity;
+#endif
+    }
+
+    __device__ __forceinline__ bool is_retained_mode(int q, int q0, int q1, int q2)
+    {
+        return q == q0 || q == q1 || q == q2;
+    }
+
+    __device__ __forceinline__ int retained_mode_for_local_bit(int local_bit,
+                                                               int q0,
+                                                               int q1,
+                                                               int q2)
+    {
+        return local_bit == 0 ? q0 : (local_bit == 1 ? q1 : q2);
+    }
+
+    __device__ __forceinline__ bool fermion_kept_internal_odd(
+        int local_basis,
+        int q0,
+        int q1,
+        int q2)
+    {
+        const int q[RETAINED_QUBITS] = {q0, q1, q2};
+        bool parity = false;
+        for (int i = 0; i < RETAINED_QUBITS; ++i)
+        {
+            if (((local_basis >> i) & 1) == 0)
+            {
+                continue;
+            }
+            for (int j = i + 1; j < RETAINED_QUBITS; ++j)
+            {
+                if (((local_basis >> j) & 1) && q[i] > q[j])
+                {
+                    parity = !parity;
+                }
+            }
+        }
+        return parity;
+    }
+
+    __device__ __forceinline__ std::uint64_t fermion_env_cross_mask(
+        int local_basis,
+        int n_qubits,
+        int q0,
+        int q1,
+        int q2)
+    {
+        // The host fermionic trace first orders modes as
+        //   kept_modes(q0,q1,q2) + environment_modes(ascending).
+        // Moving the occupied kept modes ahead of occupied environment modes
+        // contributes one sign flip for each occupied env mode below an
+        // occupied kept mode.  This mask is expressed in environment-basis
+        // bit coordinates, matching embed_environment_bits().
+        std::uint64_t mask = 0;
+        int env_bit = 0;
+        for (int q = 0; q < n_qubits; ++q)
+        {
+            if (is_retained_mode(q, q0, q1, q2))
+            {
+                continue;
+            }
+
+            bool crosses = false;
+            for (int k = 0; k < RETAINED_QUBITS; ++k)
+            {
+                const int kept_q = retained_mode_for_local_bit(k, q0, q1, q2);
+                if (((local_basis >> k) & 1) && q < kept_q)
+                {
+                    crosses = !crosses;
+                }
+            }
+            if (crosses)
+            {
+                mask |= std::uint64_t{1} << env_bit;
+            }
+            ++env_bit;
+        }
+        return mask;
+    }
+
     __device__ __forceinline__ std::uint64_t embed_environment_bits(
         std::uint64_t env,
         int n_qubits,
@@ -56,7 +151,8 @@ namespace
         int n_qubits,
         std::uint64_t env_dim,
         const int *__restrict__ subsystems,
-        double *__restrict__ rho_ri)
+        double *__restrict__ rho_ri,
+        int fermion_trace)
     {
         const int subsystem = static_cast<int>(blockIdx.x) / RHO_ELEMENTS;
         const int element = static_cast<int>(blockIdx.x) % RHO_ELEMENTS;
@@ -67,6 +163,18 @@ namespace
         const int q2 = subsystems[3 * subsystem + 2];
         const std::uint64_t row_offset = embed_retained_bits(row, q0, q1, q2);
         const std::uint64_t col_offset = embed_retained_bits(col, q0, q1, q2);
+        const std::uint64_t row_cross_mask = fermion_trace
+                                                 ? fermion_env_cross_mask(row, n_qubits, q0, q1, q2)
+                                                 : 0;
+        const std::uint64_t col_cross_mask = fermion_trace
+                                                 ? fermion_env_cross_mask(col, n_qubits, q0, q1, q2)
+                                                 : 0;
+        const bool row_kept_odd = fermion_trace
+                                      ? fermion_kept_internal_odd(row, q0, q1, q2)
+                                      : false;
+        const bool col_kept_odd = fermion_trace
+                                      ? fermion_kept_internal_odd(col, q0, q1, q2)
+                                      : false;
 
         double sum_re = 0.0;
         double sum_im = 0.0;
@@ -78,10 +186,15 @@ namespace
                 embed_environment_bits(env, n_qubits, q0, q1, q2);
             const Cx<Real> a = psi[base | row_offset];
             const Cx<Real> b = psi[base | col_offset];
-            sum_re += static_cast<double>(a.re) * static_cast<double>(b.re) +
-                      static_cast<double>(a.im) * static_cast<double>(b.im);
-            sum_im += static_cast<double>(a.im) * static_cast<double>(b.re) -
-                      static_cast<double>(a.re) * static_cast<double>(b.im);
+            const bool row_odd = row_kept_odd != odd_popcount64(env & row_cross_mask);
+            const bool col_odd = col_kept_odd != odd_popcount64(env & col_cross_mask);
+            const double sign = (fermion_trace && (row_odd != col_odd)) ? -1.0 : 1.0;
+            sum_re += sign *
+                      (static_cast<double>(a.re) * static_cast<double>(b.re) +
+                       static_cast<double>(a.im) * static_cast<double>(b.im));
+            sum_im += sign *
+                      (static_cast<double>(a.im) * static_cast<double>(b.re) -
+                       static_cast<double>(a.re) * static_cast<double>(b.im));
         }
 
         __shared__ double scratch_re[THREADS];
@@ -144,7 +257,8 @@ namespace
         int n_qubits,
         const int *host_subsystems,
         int subsystem_count,
-        double *host_rho_ri_row_major)
+        double *host_rho_ri_row_major,
+        int fermion_trace)
     {
         if (device_state_vector == nullptr || host_subsystems == nullptr ||
             host_rho_ri_row_major == nullptr || subsystem_count <= 0 ||
@@ -204,7 +318,8 @@ namespace
             n_qubits,
             env_dim,
             d_subsystems,
-            d_rho);
+            d_rho,
+            fermion_trace ? 1 : 0);
 
         status = cudaGetLastError();
         if (status != cudaSuccess)
@@ -217,6 +332,50 @@ namespace
                             output_values * sizeof(double),
                             cudaMemcpyDeviceToHost);
         return static_cast<int>(status);
+    }
+
+    template <typename Real>
+    int launch_rho3_subsystems_complex_from_host(
+        const void *host_state_vector,
+        int n_qubits,
+        const int *host_subsystems,
+        int subsystem_count,
+        double *host_rho_ri_row_major,
+        int fermion_trace)
+    {
+        if (host_state_vector == nullptr || n_qubits < RETAINED_QUBITS ||
+            n_qubits >= 63)
+        {
+            return static_cast<int>(cudaErrorInvalidValue);
+        }
+
+        static thread_local Cx<Real> *d_state = nullptr;
+        static thread_local std::size_t state_capacity = 0;
+
+        cudaError_t status = cudaSuccess;
+        const std::size_t state_values =
+            static_cast<std::size_t>(std::uint64_t{1} << n_qubits);
+        if (thread_buffer(state_values, d_state, state_capacity, status) == nullptr)
+        {
+            return static_cast<int>(status);
+        }
+
+        status = cudaMemcpy(d_state,
+                            host_state_vector,
+                            state_values * sizeof(Cx<Real>),
+                            cudaMemcpyHostToDevice);
+        if (status != cudaSuccess)
+        {
+            return static_cast<int>(status);
+        }
+
+        return launch_rho3_subsystems_complex<Real>(
+            d_state,
+            n_qubits,
+            host_subsystems,
+            subsystem_count,
+            host_rho_ri_row_major,
+            fermion_trace);
     }
 }
 
@@ -232,7 +391,8 @@ extern "C" int mipt_cuda_rho3_subsystems_complex_f64(
         n_qubits,
         host_subsystems,
         subsystem_count,
-        host_rho_ri_row_major);
+        host_rho_ri_row_major,
+        0);
 }
 
 extern "C" int mipt_cuda_rho3_subsystems_complex_f32(
@@ -247,5 +407,102 @@ extern "C" int mipt_cuda_rho3_subsystems_complex_f32(
         n_qubits,
         host_subsystems,
         subsystem_count,
-        host_rho_ri_row_major);
+        host_rho_ri_row_major,
+        0);
+}
+
+extern "C" int mipt_cuda_rho3_subsystems_complex_fermion_f64(
+    const void *device_state_vector,
+    int n_qubits,
+    const int *host_subsystems,
+    int subsystem_count,
+    double *host_rho_ri_row_major)
+{
+    return launch_rho3_subsystems_complex<double>(
+        device_state_vector,
+        n_qubits,
+        host_subsystems,
+        subsystem_count,
+        host_rho_ri_row_major,
+        1);
+}
+
+extern "C" int mipt_cuda_rho3_subsystems_complex_fermion_f32(
+    const void *device_state_vector,
+    int n_qubits,
+    const int *host_subsystems,
+    int subsystem_count,
+    double *host_rho_ri_row_major)
+{
+    return launch_rho3_subsystems_complex<float>(
+        device_state_vector,
+        n_qubits,
+        host_subsystems,
+        subsystem_count,
+        host_rho_ri_row_major,
+        1);
+}
+
+extern "C" int mipt_cuda_rho3_subsystems_complex_host_f64(
+    const void *host_state_vector,
+    int n_qubits,
+    const int *host_subsystems,
+    int subsystem_count,
+    double *host_rho_ri_row_major)
+{
+    return launch_rho3_subsystems_complex_from_host<double>(
+        host_state_vector,
+        n_qubits,
+        host_subsystems,
+        subsystem_count,
+        host_rho_ri_row_major,
+        0);
+}
+
+extern "C" int mipt_cuda_rho3_subsystems_complex_host_f32(
+    const void *host_state_vector,
+    int n_qubits,
+    const int *host_subsystems,
+    int subsystem_count,
+    double *host_rho_ri_row_major)
+{
+    return launch_rho3_subsystems_complex_from_host<float>(
+        host_state_vector,
+        n_qubits,
+        host_subsystems,
+        subsystem_count,
+        host_rho_ri_row_major,
+        0);
+}
+
+extern "C" int mipt_cuda_rho3_subsystems_complex_host_fermion_f64(
+    const void *host_state_vector,
+    int n_qubits,
+    const int *host_subsystems,
+    int subsystem_count,
+    double *host_rho_ri_row_major)
+{
+    return launch_rho3_subsystems_complex_from_host<double>(
+        host_state_vector,
+        n_qubits,
+        host_subsystems,
+        subsystem_count,
+        host_rho_ri_row_major,
+        1);
+}
+
+extern "C" int mipt_cuda_rho3_subsystems_complex_host_fermion_f32(
+    const void *host_state_vector,
+    int n_qubits,
+    const int *host_subsystems,
+    int subsystem_count,
+    double *host_rho_ri_row_major)
+{
+    return launch_rho3_subsystems_complex_from_host<float>(
+        host_state_vector,
+        n_qubits,
+        host_subsystems,
+        subsystem_count,
+        host_rho_ri_row_major,
+        1);
 }

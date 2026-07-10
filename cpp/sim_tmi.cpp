@@ -24,6 +24,7 @@
 #endif
 #endif
 
+#include <chrono>
 #include <cerrno>
 #include <charconv>
 #include <cstdlib>
@@ -31,6 +32,7 @@
 #include <cstring>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <unistd.h>
 #include <mutex>
 #include <string_view>
 #include <system_error>
@@ -38,6 +40,7 @@
 #include <limits>
 #include <sstream>
 #include <stdexcept>
+#include <thread>
 #include <type_traits>
 
 // Reuse the existing CUDA-Q kernels, random circuit frontends, fermionic gates,
@@ -49,258 +52,11 @@
 
 #ifdef MIPT_ENABLE_CUDA_RHO
 #include "tmi_cuda_svd.hpp"
+#include "tmi_cuda_rdm.hpp"
 #endif
 
 
-// Fermionic reduced-gate-set architecture imported from mipt_fermion.cpp for
-// sim_tmi.exe fermion=2.  This intentionally leaves mipt.cpp's existing
-// fermion=1 Haar parity-preserving architecture unchanged.
-struct FRGSLayerData // LayerData for fermions with a reduced topological gate set
-{
-    int start = 0;
-
-    std::vector<int> measure_flags;
-
-    // Per-active-bond local gate selectors.  These vectors are indexed by the
-    // compact brickwork-bond index, not by the absolute site index, so no RNG
-    // or host->kernel payload is spent on unused q entries.
-    //   0 -> T gate:             R_Z(pi/4) = exp(-i*pi/8 Z_j)
-    //   1 -> single-site braid:  R_Z(pi/2) = exp(-i*pi/4 Z_j)
-    std::vector<int> local_left_kind;
-    std::vector<int> local_right_kind;
-
-    // Per-active-bond two-site gate selector:
-    //   0 -> double-site braid:  R_XX(pi/2) = exp(+i*pi/4 X_j X_{j+1})
-    //   1 -> R_ZZ(pi/4) = exp(+i*pi/8 Z_j Z_{j+1})
-    std::vector<int> bond_gate_kind;
-};
-
-struct MIPTKernel_1D_FRGS
-{
-    void operator()(int n,
-                    const std::vector<FRGSLayerData> &flayers,
-                    bool closed) __qpu__
-    {
-        cudaq::qvector q(n);
-
-        for (std::size_t layer = 0; layer < flayers.size(); ++layer)
-        {
-            const int start = flayers[layer].start;
-            const int bond_stop = (closed && start == 1 && n > 2) ? n : (n - 1);
-
-            int bond_index = 0;
-            for (int i = start; i < bond_stop; i += 2)
-            {
-                const int j = (i + 1) % n;
-                const int local_i = flayers[layer].local_left_kind[bond_index];
-                const int local_j = flayers[layer].local_right_kind[bond_index];
-                const int bond_gate = flayers[layer].bond_gate_kind[bond_index];
-                const bool wrapping_bond = (j < i);
-
-                if (bond_gate == 0 && wrapping_bond) // double-site braid across periodic boundary
-                {
-                    // Wrapping fermionic bond: apply the Jordan-Wigner string
-                    // around the periodic boundary, then undo it after the gate.
-                    for (int k = j + 1; k < i; ++k)
-                    {
-                        z<cudaq::ctrl>(q[k], q[i]);
-                    }
-
-                    // The wrapping XX implementation needs S^dagger on both
-                    // endpoints before the XX rotation.  Fuse that diagonal
-                    // phase with the sampled local gate:
-                    //   local S  * S^dagger -> identity, up to global phase
-                    //   local T  * S^dagger -> R_Z(-pi/4), up to global phase
-                    if (local_i == 0)
-                    {
-                        t<cudaq::adj>(q[i]);
-                    }
-                    if (local_j == 0)
-                    {
-                        t<cudaq::adj>(q[j]);
-                    }
-
-                    cx(q[i], q[j]);
-                    rx(-1.57079632679489661923, q[i]);
-                    cx(q[i], q[j]);
-
-                    s(q[i]);
-                    s(q[j]);
-                    for (int k = j + 1; k < i; ++k)
-                    {
-                        z<cudaq::ctrl>(q[k], q[i]);
-                    }
-                }
-                else
-                {
-                    // CUDA-Q T and S differ from R_Z(pi/4) and R_Z(pi/2)
-                    // only by one-qubit global phases, so observables and
-                    // reduced density matrices are unchanged while the
-                    // simulator gets native phase gates instead of generic RZs.
-                    if (local_i == 0)
-                    {
-                        t(q[i]);
-                    }
-                    else
-                    {
-                        s(q[i]);
-                    }
-
-                    if (local_j == 0)
-                    {
-                        t(q[j]);
-                    }
-                    else
-                    {
-                        s(q[j]);
-                    }
-
-                    if (bond_gate == 0) // double-site braid: exp(+i*pi/4 X_i X_j)
-                    {
-                        cx(q[i], q[j]);
-                        rx(-1.57079632679489661923, q[i]);
-                        cx(q[i], q[j]);
-                    }
-                    else // R_ZZ(pi/4): exp(+i*pi/8 Z_i Z_j)
-                    {
-                        cx(q[i], q[j]);
-                        t<cudaq::adj>(q[j]);
-                        cx(q[i], q[j]);
-                    }
-                }
-                ++bond_index;
-            }
-
-            for (int i = 0; i < n; ++i)
-            {
-                if (flayers[layer].measure_flags[i])
-                {
-                    mz(q[i]); // Z measurement preserves fermion parity.
-                }
-            }
-        }
-    }
-};
-
-int frgs_active_bond_count(int n, int start, bool closed = true)
-{
-    const int bond_stop = (closed && start == 1 && n > 2) ? n : (n - 1);
-    if (bond_stop <= start)
-    {
-        return 0;
-    }
-    return (bond_stop - start + 1) / 2;
-}
-
-inline int frgs_rng_bit(std::mt19937 &rng)
-{
-    return static_cast<int>((rng() >> 31) & 1u);
-}
-
-void fill_frgs_mipt_layer(FRGSLayerData &layer,
-                          int n,
-                          int start,
-                          double p,
-                          std::mt19937 &rng,
-                          bool closed = true)
-{
-    std::bernoulli_distribution measure_dist(p);
-
-    layer.start = start;
-    layer.measure_flags.resize(n);
-
-    const int bond_count = frgs_active_bond_count(n, start, closed);
-    layer.local_left_kind.resize(bond_count);
-    layer.local_right_kind.resize(bond_count);
-    layer.bond_gate_kind.resize(bond_count);
-
-    for (int b = 0; b < bond_count; ++b)
-    {
-        // 50/50 local T vs single-site braid on each endpoint, independently.
-        layer.local_left_kind[b] = frgs_rng_bit(rng);
-        layer.local_right_kind[b] = frgs_rng_bit(rng);
-
-        // 50/50 double-site braid vs R_ZZ(pi/4).
-        layer.bond_gate_kind[b] = frgs_rng_bit(rng);
-    }
-
-    if (p <= 0.0)
-    {
-        std::fill(layer.measure_flags.begin(), layer.measure_flags.end(), 0);
-    }
-    else if (p >= 1.0)
-    {
-        std::fill(layer.measure_flags.begin(), layer.measure_flags.end(), 1);
-    }
-    else
-    {
-        for (int qidx = 0; qidx < n; ++qidx)
-        {
-            layer.measure_flags[qidx] = measure_dist(rng) ? 1 : 0;
-        }
-    }
-}
-
-FRGSLayerData make_frgs_mipt_layer(int n,
-                                   int start,
-                                   double p,
-                                   std::mt19937 &rng,
-                                   bool closed = true)
-{
-    FRGSLayerData layer;
-    fill_frgs_mipt_layer(layer, n, start, p, rng, closed);
-    return layer;
-}
-
-void frgs_mipt_frontend_inplace(std::vector<FRGSLayerData> &layers,
-                                int n,
-                                int periods,
-                                double p,
-                                std::mt19937 &rng,
-                                bool closed = true)
-{
-    if ((n % 2) != 0)
-    {
-        throw std::invalid_argument("FRGS fermionic 1D simulation requires even n.");
-    }
-    if (p < 0.0 || p > 1.0)
-    {
-        throw std::invalid_argument("Measurement probability p must be in [0,1].");
-    }
-
-    // Optional final even layer: included with 50% probability, and if included
-    // its measurements use the same measurement rate p as the bulk layers.
-    std::bernoulli_distribution extra_even_layer(0.5);
-    const bool add_extra_even_layer = extra_even_layer(rng);
-    const std::size_t layer_count = static_cast<std::size_t>(2 * periods + (add_extra_even_layer ? 1 : 0));
-
-    // resize() preserves the inner vector capacities for existing layers,
-    // avoiding thousands of small allocations during large realization sweeps.
-    layers.resize(layer_count);
-
-    std::size_t idx = 0;
-    for (int period = 0; period < periods; ++period)
-    {
-        fill_frgs_mipt_layer(layers[idx++], n, 0, p, rng, closed);
-        fill_frgs_mipt_layer(layers[idx++], n, 1, p, rng, closed);
-    }
-
-    if (add_extra_even_layer)
-    {
-        fill_frgs_mipt_layer(layers[idx++], n, 0, p, rng, closed);
-    }
-}
-
-std::vector<FRGSLayerData> frgs_mipt_frontend(int n,
-                                              int periods,
-                                              double p,
-                                              bool closed = true)
-{
-    std::mt19937 rng(std::random_device{}());
-    std::vector<FRGSLayerData> layers;
-    frgs_mipt_frontend_inplace(layers, n, periods, p, rng, closed);
-    return layers;
-}
+// FRGS data structures and kernels are provided by mipt.cpp, which is included above.
 
 namespace sim_tmi
 {
@@ -397,6 +153,68 @@ namespace sim_tmi
             return false;
         }
         return fallback;
+    }
+
+    bool env_value_disables_path(const char *value)
+    {
+        return value != nullptr &&
+               (std::strcmp(value, "0") == 0 ||
+                std::strcmp(value, "off") == 0 ||
+                std::strcmp(value, "OFF") == 0 ||
+                std::strcmp(value, "none") == 0 ||
+                std::strcmp(value, "NONE") == 0 ||
+                std::strcmp(value, "disabled") == 0 ||
+                std::strcmp(value, "DISABLED") == 0);
+    }
+
+    std::string sim_tmi_pause_file_path()
+    {
+        const char *value = std::getenv("SIM_TMI_PAUSE_FILE");
+        if (env_value_disables_path(value))
+        {
+            return {};
+        }
+        if (value != nullptr && *value != '\0')
+        {
+            return std::string(value);
+        }
+        return "PAUSE_MIPT";
+    }
+
+    bool file_exists_for_pause(const std::string &path)
+    {
+        if (path.empty())
+        {
+            return false;
+        }
+        struct stat st;
+        return ::stat(path.c_str(), &st) == 0;
+    }
+
+    bool is_absolute_path(const std::string &path)
+    {
+        return !path.empty() && path.front() == '/';
+    }
+
+    std::string pause_file_display_path(const std::string &path)
+    {
+        if (path.empty() || is_absolute_path(path))
+        {
+            return path;
+        }
+
+        const char *pwd = std::getenv("PWD");
+        if (pwd != nullptr && *pwd != '\0')
+        {
+            return std::string(pwd) + "/" + path;
+        }
+
+        char cwd[4096];
+        if (::getcwd(cwd, sizeof(cwd)) != nullptr)
+        {
+            return std::string(cwd) + "/" + path;
+        }
+        return path;
     }
 
     int cuda_svd_min_kept_modes()
@@ -1736,6 +1554,9 @@ namespace sim_tmi
         StateEntropyWorkspace entropy_half;
         bool cuda_svd_disabled = false;
         int cuda_svd_failure_status = 0;
+        bool cuda_small_rdm_disabled = false;
+        int cuda_small_rdm_failure_status = 0;
+        std::vector<double> device_rdm_ri;
         std::vector<std::complex<double>> host_state_f64;
         std::vector<std::complex<float>> host_state_f32;
     };
@@ -1865,6 +1686,196 @@ namespace sim_tmi
         status_out = -1;
         return false;
 #endif
+    }
+
+    bool device_small_rdm_enabled()
+    {
+        // Off by default because the optimal threshold is hardware dependent.
+        // Enable with SIM_TMI_DEVICE_SMALL_RDM=1 to avoid full GPU->host
+        // statevector copies for the A/B/C/D small-block entropies.
+        static const bool enabled = mipt_backend::env_bool("SIM_TMI_DEVICE_SMALL_RDM", false);
+        return enabled;
+    }
+
+    bool entropy_subsystem_rdm_from_device_state(const void *device_state_vector,
+                                                 bool device_state_is_fp64,
+                                                 int n,
+                                                 const std::vector<int> &kept_modes,
+                                                 bool fermion_trace,
+                                                 double &entropy_out,
+                                                 int &status_out,
+                                                 TmiWorkspace &workspace)
+    {
+        status_out = 0;
+#ifdef MIPT_ENABLE_CUDA_RHO
+        if (device_state_vector == nullptr || kept_modes.empty() ||
+            kept_modes.size() > static_cast<std::size_t>(std::numeric_limits<int>::max()))
+        {
+            status_out = -1;
+            return false;
+        }
+
+        const std::size_t dim = std::size_t{1} << kept_modes.size();
+        if (dim == 0 || dim > (std::numeric_limits<std::size_t>::max() / dim / 2u))
+        {
+            status_out = -1;
+            return false;
+        }
+        workspace.device_rdm_ri.assign(2u * dim * dim, 0.0);
+
+        const int status = device_state_is_fp64
+                               ? mipt_cuda_rdm_subsystem_f64(device_state_vector,
+                                                             n,
+                                                             kept_modes.data(),
+                                                             static_cast<int>(kept_modes.size()),
+                                                             fermion_trace ? 1 : 0,
+                                                             workspace.device_rdm_ri.data())
+                               : mipt_cuda_rdm_subsystem_f32(device_state_vector,
+                                                             n,
+                                                             kept_modes.data(),
+                                                             static_cast<int>(kept_modes.size()),
+                                                             fermion_trace ? 1 : 0,
+                                                             workspace.device_rdm_ri.data());
+        status_out = status;
+        if (status != 0)
+        {
+            return false;
+        }
+        entropy_out = entropy_ri_ptr(workspace.device_rdm_ri.data(),
+                                     dim,
+                                     workspace.direct_matrix,
+                                     workspace.entropy);
+        return std::isfinite(entropy_out);
+#else
+        (void)device_state_vector;
+        (void)device_state_is_fp64;
+        (void)n;
+        (void)kept_modes;
+        (void)fermion_trace;
+        (void)entropy_out;
+        (void)workspace;
+        status_out = -1;
+        return false;
+#endif
+    }
+
+    bool tmi_from_device_state_hybrid_gpu(const void *device_state_vector,
+                                          bool device_state_is_fp64,
+                                          int n,
+                                          std::uint32_t block_qubits,
+                                          int cycle_offset,
+                                          bool fermion_trace,
+                                          TmiWorkspace &workspace,
+                                          double &tmi_out)
+    {
+        if (!device_small_rdm_enabled() || workspace.cuda_small_rdm_disabled ||
+            device_state_vector == nullptr)
+        {
+            return false;
+        }
+
+        const int block = static_cast<int>(block_qubits);
+        if (cycle_offset < 0 || cycle_offset >= block)
+        {
+            throw std::invalid_argument("TMI cycle offset is out of range.");
+        }
+
+        const std::vector<int> A = cyclic_mode_range(cycle_offset + 0 * block, block, n);
+        const std::vector<int> B = cyclic_mode_range(cycle_offset + 1 * block, block, n);
+        const std::vector<int> C = cyclic_mode_range(cycle_offset + 2 * block, block, n);
+        const std::vector<int> D = cyclic_mode_range(cycle_offset + 3 * block, block, n);
+        const std::vector<int> AB = concatenate_modes(A, B);
+        const std::vector<int> AC = concatenate_modes(A, C);
+        const std::vector<int> BC = concatenate_modes(B, C);
+
+        auto small_entropy = [&](const std::vector<int> &modes, double &entropy) -> bool {
+            int status = 0;
+            if (entropy_subsystem_rdm_from_device_state(device_state_vector,
+                                                        device_state_is_fp64,
+                                                        n,
+                                                        modes,
+                                                        fermion_trace,
+                                                        entropy,
+                                                        status,
+                                                        workspace))
+            {
+                return true;
+            }
+            workspace.cuda_small_rdm_disabled = true;
+            workspace.cuda_small_rdm_failure_status = status;
+            return false;
+        };
+
+        auto half_entropy = [&](const std::vector<int> &modes, double &entropy) -> bool {
+            int status = 0;
+            if (!workspace.cuda_svd_disabled &&
+                should_try_cuda_svd_for_problem(n, modes.size()) &&
+                entropy_subsystem_svd_from_device_state(device_state_vector,
+                                                        device_state_is_fp64,
+                                                        n,
+                                                        modes,
+                                                        fermion_trace,
+                                                        entropy,
+                                                        status))
+            {
+                return true;
+            }
+            if (!workspace.cuda_svd_disabled && status != 0)
+            {
+                workspace.cuda_svd_disabled = true;
+                workspace.cuda_svd_failure_status = status;
+            }
+            return false;
+        };
+
+        double s_a = 0.0;
+        double s_b = 0.0;
+        double s_c = 0.0;
+        double s_d = 0.0;
+        double s_ab = 0.0;
+        double s_ac = 0.0;
+        double s_bc = 0.0;
+        if (!small_entropy(A, s_a) || !small_entropy(B, s_b) ||
+            !small_entropy(C, s_c) || !small_entropy(D, s_d) ||
+            !half_entropy(AB, s_ab) || !half_entropy(AC, s_ac) ||
+            !half_entropy(BC, s_bc))
+        {
+            return false;
+        }
+
+        tmi_out = s_a + s_b + s_c + s_d - s_ab - s_ac - s_bc;
+        return true;
+    }
+
+    bool tmi_values_from_device_state_hybrid_gpu(const void *device_state_vector,
+                                                 bool device_state_is_fp64,
+                                                 int n,
+                                                 std::uint32_t block_qubits,
+                                                 int cycle_count,
+                                                 bool fermion_trace,
+                                                 TmiWorkspace &workspace,
+                                                 std::vector<double> &values)
+    {
+        values.clear();
+        values.reserve(static_cast<std::size_t>(cycle_count));
+        for (int cycle_offset = 0; cycle_offset < cycle_count; ++cycle_offset)
+        {
+            double tmi = 0.0;
+            if (!tmi_from_device_state_hybrid_gpu(device_state_vector,
+                                                  device_state_is_fp64,
+                                                  n,
+                                                  block_qubits,
+                                                  cycle_offset,
+                                                  fermion_trace,
+                                                  workspace,
+                                                  tmi))
+            {
+                values.clear();
+                return false;
+            }
+            values.push_back(tmi);
+        }
+        return true;
     }
 
     template <typename Real>
@@ -2002,6 +2013,99 @@ namespace sim_tmi
         return values;
     }
 
+
+    void dense_state_from_cudaq_amplitudes(cudaq::state &state,
+                                           int n,
+                                           std::vector<std::complex<double>> &out)
+    {
+        if (n > static_cast<int>(mipt_backend::mps_tmi_dense_max_qubits()))
+        {
+            throw std::runtime_error(
+                "CUDA-Q tensor/MPS target did not expose a dense state tensor for TMI. "
+                "The fallback can reconstruct a dense state from backend-native amplitudes only up to "
+                "SIM_TMI_MPS_DENSE_MAX_QUBITS. Increase that variable for small validation jobs, "
+                "or use the default nvidia statevector target for exact high-N TMI.");
+        }
+        const std::uint64_t dim_u64 = checked_pow2_u64(n);
+        if (dim_u64 > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()))
+        {
+            throw std::invalid_argument("State-vector dimension does not fit in size_t.");
+        }
+        const std::size_t dim = static_cast<std::size_t>(dim_u64);
+        out.resize(dim);
+        double norm2 = 0.0;
+        const std::uint64_t batch_size = static_cast<std::uint64_t>(mipt_backend::mps_amplitude_batch_size());
+        std::vector<std::uint64_t> basis_indices;
+        std::vector<std::complex<double>> amplitudes;
+        if (mipt_backend::verbose_enabled())
+        {
+            mipt_backend::verbose_log(
+                "TMI dense reconstruction: n=" + std::to_string(n) +
+                " dim=" + std::to_string(dim_u64) +
+                " amplitude_batch=" + std::to_string(batch_size));
+        }
+        for (std::uint64_t idx0 = 0; idx0 < dim_u64; idx0 += batch_size)
+        {
+            const std::uint64_t chunk = std::min<std::uint64_t>(batch_size, dim_u64 - idx0);
+            basis_indices.clear();
+            basis_indices.reserve(static_cast<std::size_t>(chunk));
+            for (std::uint64_t k = 0; k < chunk; ++k)
+            {
+                basis_indices.push_back(idx0 + k);
+            }
+            cudaq_state_amplitudes_by_indices(state, n, basis_indices, amplitudes);
+            for (std::uint64_t k = 0; k < chunk; ++k)
+            {
+                const auto amp = amplitudes[static_cast<std::size_t>(k)];
+                out[static_cast<std::size_t>(idx0 + k)] = amp;
+                norm2 += std::norm(amp);
+            }
+        }
+        if (norm2 > 0.0 && std::isfinite(norm2))
+        {
+            const double inv_norm = 1.0 / std::sqrt(norm2);
+            for (auto &amp : out)
+            {
+                amp *= inv_norm;
+            }
+        }
+        mipt_backend::warn_mps_amplitude_path_once("TMI dense-state reconstruction", n, false, 0);
+    }
+
+    std::vector<double> tmi_values_from_cudaq_state_amplitude_dense(cudaq::state &state,
+                                                                    int n,
+                                                                    std::uint32_t block_qubits,
+                                                                    int cycle_count,
+                                                                    bool fermion_trace,
+                                                                    TmiWorkspace &workspace)
+    {
+        dense_state_from_cudaq_amplitudes(state, n, workspace.host_state_f64);
+        return tmi_values_from_statevector_fast(workspace.host_state_f64.data(),
+                                                n,
+                                                block_qubits,
+                                                cycle_count,
+                                                fermion_trace,
+                                                workspace);
+    }
+
+    std::vector<double> tmi_values_from_cudaq_state_payload_amplitude_dense(cudaq::state &state,
+                                                                            int n,
+                                                                            std::uint32_t block_qubits,
+                                                                            int cycle_count,
+                                                                            bool fermion_trace,
+                                                                            const TmiPlans &plans,
+                                                                            TmiWorkspace &workspace)
+    {
+        dense_state_from_cudaq_amplitudes(state, n, workspace.host_state_f64);
+        return tmi_values_from_statevector_payload(workspace.host_state_f64.data(),
+                                                   n,
+                                                   block_qubits,
+                                                   cycle_count,
+                                                   fermion_trace,
+                                                   plans,
+                                                   workspace);
+    }
+
     std::vector<double> tmi_values_from_cudaq_state_fast(cudaq::state &state,
                                                          int n,
                                                          std::uint32_t block_qubits,
@@ -2018,15 +2122,44 @@ namespace sim_tmi
         const auto precision = state.get_precision();
         const auto tensor = state.get_tensor();
 
-        if (tensor.get_rank() != 1 || tensor.get_num_elements() < dim)
+        if (mipt_backend::verbose_enabled())
         {
-            throw std::runtime_error("Expected a contiguous rank-1 CUDA-Q statevector tensor.");
+            mipt_backend::verbose_log(
+                "tmi_values_from_cudaq_state_fast: n=" + std::to_string(n) +
+                " num_tensors=" + std::to_string(state.get_num_tensors()) +
+                " tensor0_rank=" + std::to_string(tensor.get_rank()) +
+                " tensor0_elements=" + std::to_string(tensor.get_num_elements()) +
+                " tensor0_data=" + std::to_string(tensor.data != nullptr ? 1 : 0) +
+                " state_on_gpu=" + std::to_string(state.is_on_gpu() ? 1 : 0));
+        }
+
+        const bool has_dense_rank1_tensor =
+            tensor.get_rank() == 1 && tensor.get_num_elements() >= dim && tensor.data != nullptr;
+        if (!has_dense_rank1_tensor)
+        {
+            return tmi_values_from_cudaq_state_amplitude_dense(
+                state, n, block_qubits, cycle_count, fermion_trace, workspace);
         }
 
         if (precision == cudaq::SimulationState::precision::fp64)
         {
             if (state.is_on_gpu())
             {
+                if (tensor.data != nullptr)
+                {
+                    std::vector<double> device_values;
+                    if (tmi_values_from_device_state_hybrid_gpu(tensor.data,
+                                                                true,
+                                                                n,
+                                                                block_qubits,
+                                                                cycle_count,
+                                                                fermion_trace,
+                                                                workspace,
+                                                                device_values))
+                    {
+                        return device_values;
+                    }
+                }
                 workspace.host_state_f64.resize(dim);
                 state.to_host(workspace.host_state_f64.data(), workspace.host_state_f64.size());
                 if (tensor.data != nullptr)
@@ -2062,6 +2195,21 @@ namespace sim_tmi
 
         if (state.is_on_gpu())
         {
+            if (tensor.data != nullptr)
+            {
+                std::vector<double> device_values;
+                if (tmi_values_from_device_state_hybrid_gpu(tensor.data,
+                                                            false,
+                                                            n,
+                                                            block_qubits,
+                                                            cycle_count,
+                                                            fermion_trace,
+                                                            workspace,
+                                                            device_values))
+                {
+                    return device_values;
+                }
+            }
             workspace.host_state_f32.resize(dim);
             state.to_host(workspace.host_state_f32.data(), workspace.host_state_f32.size());
             if (tensor.data != nullptr)
@@ -2112,9 +2260,23 @@ namespace sim_tmi
         const auto precision = state.get_precision();
         const auto tensor = state.get_tensor();
 
-        if (tensor.get_rank() != 1 || tensor.get_num_elements() < dim)
+        if (mipt_backend::verbose_enabled())
         {
-            throw std::runtime_error("Expected a contiguous rank-1 CUDA-Q statevector tensor.");
+            mipt_backend::verbose_log(
+                "tmi_values_from_cudaq_state_fast: n=" + std::to_string(n) +
+                " num_tensors=" + std::to_string(state.get_num_tensors()) +
+                " tensor0_rank=" + std::to_string(tensor.get_rank()) +
+                " tensor0_elements=" + std::to_string(tensor.get_num_elements()) +
+                " tensor0_data=" + std::to_string(tensor.data != nullptr ? 1 : 0) +
+                " state_on_gpu=" + std::to_string(state.is_on_gpu() ? 1 : 0));
+        }
+
+        const bool has_dense_rank1_tensor =
+            tensor.get_rank() == 1 && tensor.get_num_elements() >= dim && tensor.data != nullptr;
+        if (!has_dense_rank1_tensor)
+        {
+            return tmi_values_from_cudaq_state_payload_amplitude_dense(
+                state, n, block_qubits, cycle_count, fermion_trace, plans, workspace);
         }
 
         if (precision == cudaq::SimulationState::precision::fp64)
@@ -2214,16 +2376,13 @@ namespace sim_tmi
         }
         const std::size_t half_cut_kept_modes = 2u * static_cast<std::size_t>(block_qubits);
         return cudaq_state_has_device_tensor(state) &&
-               should_try_cuda_svd_for_problem(n, half_cut_kept_modes);
+               should_try_cuda_svd_for_problem(n, half_cut_kept_modes) &&
+               device_small_rdm_enabled();
     }
 
     const char *compile_target_name()
     {
-#ifdef SIM_TMI_GPU_BUILD
-        return "CUDA-Q NVIDIA target";
-#else
-        return "CPU target";
-#endif
+        return mipt_backend::compiled_cudaq_backend();
     }
 
     const char *cuda_rho_build_name()
@@ -2330,6 +2489,9 @@ namespace sim_tmi
         }
 
         const std::uint64_t flush_rows = csv_flush_row_interval(n, cycle_count);
+        const std::string pause_file = sim_tmi_pause_file_path();
+        mipt_backend::print_backend_banner_once("sim_tmi.exe");
+        const std::string pause_file_display = pause_file_display_path(pause_file);
 
         std::cerr << "Online TMI simulation\n"
                   << "n=" << n
@@ -2344,7 +2506,8 @@ namespace sim_tmi
                   << ", mode=" << circuit_mode_name(circuit_mode)
                   << ", output=" << output_path << '\n'
                   << "build_target=" << compile_target_name()
-                  << ", cuda_rho=" << cuda_rho_build_name() << '\n'
+                  << ", cuda_rho=" << cuda_rho_build_name()
+                  << ", device_small_rdm=" << (device_small_rdm_enabled() ? 1 : 0) << '\n'
                   << "entropy_backend=" << lapack_runtime::status() << '\n'
                   << "tmi_method=selected after first state; fast path requires zheevd plus either host SVD or enabled CUDA device half-SVD" << '\n'
                   << "cuda_svd_min_kept_modes=" << cuda_svd_min_kept_modes()
@@ -2352,6 +2515,15 @@ namespace sim_tmi
                   << (force_cuda_svd_for_small_n() ? "forced-on" : "cpu-for-n8-n12")
                   << ", csv_flush_rows=" << flush_rows
                   << '\n';
+        if (pause_file.empty())
+        {
+            std::cerr << "host_pause_control=disabled by SIM_TMI_PAUSE_FILE\n";
+        }
+        else
+        {
+            std::cerr << "host_pause_file=" << pause_file_display
+                      << " ; create this file to pause at the next safe checkpoint, remove it to resume\n";
+        }
 
         TmiWorkspace workspace;
         std::string line;
@@ -2374,35 +2546,126 @@ namespace sim_tmi
             }
         };
 
+        std::mt19937 mms_rng(std::random_device{}());
+        std::mt19937 fermion_rng(std::random_device{}());
         std::mt19937 frgs_rng(std::random_device{}());
+        std::vector<LayerData> mms_layers;
+        std::vector<FermionLayerData> fermion_layers;
         std::vector<FRGSLayerData> frgs_layers;
+        mms_layers.reserve(static_cast<std::size_t>(2 * periods + 1));
+        fermion_layers.reserve(static_cast<std::size_t>(2 * periods + 1));
         frgs_layers.reserve(static_cast<std::size_t>(2 * periods + 1));
 
         const auto start = std::chrono::steady_clock::now();
         auto last_report = start;
+        double paused_seconds = 0.0;
         std::uint64_t processed = 0;
         std::uint64_t last_processed = 0;
         bool printed_state_backend = false;
+
+        auto wait_if_host_paused = [&]() {
+            if (pause_file.empty() || !file_exists_for_pause(pause_file))
+            {
+                return;
+            }
+
+            flush_csv_buffer();
+            const auto pause_start = std::chrono::steady_clock::now();
+            auto last_pause_notice = pause_start;
+            std::cerr << "\nPAUSED by host: found pause file \"" << pause_file_display << "\". "
+                      << "CSV output is flushed. Remove the file to resume.\n"
+                      << std::flush;
+
+            while (file_exists_for_pause(pause_file))
+            {
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+                const auto now = std::chrono::steady_clock::now();
+                if (std::chrono::duration<double>(now - last_pause_notice).count() >= 30.0)
+                {
+                    std::cerr << "Still paused by host for "
+                              << format_duration(std::chrono::duration<double>(now - pause_start).count())
+                              << "; remove \"" << pause_file_display << "\" to resume.\n"
+                              << std::flush;
+                    last_pause_notice = now;
+                }
+            }
+
+            const auto pause_end = std::chrono::steady_clock::now();
+            const auto pause_duration = pause_end - pause_start;
+            const double this_pause_seconds = std::chrono::duration<double>(pause_duration).count();
+            paused_seconds += this_pause_seconds;
+            last_report += std::chrono::duration_cast<std::chrono::steady_clock::duration>(pause_duration);
+
+            std::cerr << "RESUMED after host pause of " << format_duration(this_pause_seconds)
+                      << "; progress rates and ETA exclude paused time.\n"
+                      << std::flush;
+        };
 
         for (std::size_t p_index = 0; p_index < ps.size(); ++p_index)
         {
             const double p = ps[p_index];
             for (int r = 0; r < realizations; ++r)
             {
+                wait_if_host_paused();
+
                 auto state = [&]() {
                     if (circuit_mode == CircuitMode::FermionReducedGateSet)
                     {
                         frgs_mipt_frontend_inplace(frgs_layers, n, periods, p, frgs_rng, true);
-                        return cudaq::get_state(MIPTKernel_1D_FRGS{}, n, frgs_layers, true);
+                        apply_debug_prefix_layer_limit(frgs_layers, "sim_tmi RFGS");
+                        if (mipt_backend::verbose_enabled())
+                        {
+                            const auto stats = circuit_work_stats_frgs(frgs_layers, n, true);
+                            mipt_backend::verbose_log(circuit_work_stats_string("sim_tmi RFGS", stats, n, periods, p));
+                            mipt_backend::verbose_log("sim_tmi get_state start: RFGS n=" + std::to_string(n) + " layers=" + std::to_string(frgs_layers.size()));
+                        }
+                        const auto t_get_state = std::chrono::steady_clock::now();
+                        auto state = cudaq::get_state(MIPTKernel_1D_FRGS{}, n, frgs_layers, true);
+                        if (mipt_backend::verbose_enabled())
+                        {
+                            mipt_backend::verbose_log("sim_tmi get_state done: RFGS elapsed_s=" + std::to_string(mipt_backend::seconds_since(t_get_state)));
+                        }
+                        return state;
                     }
                     if (circuit_mode == CircuitMode::FermionHaar)
                     {
-                        auto layers = mipt_fermion_frontend(n, periods, p, true);
-                        return cudaq::get_state(MIPTFermionKernel_1D{}, n, layers);
+                        const bool direct_boundary = mipt_backend::direct_fermion_boundary_enabled();
+                        mipt_fermion_frontend_inplace(fermion_layers, n, periods, p, true, fermion_rng, direct_boundary);
+                        if (direct_boundary && r == 0 && sim_tmi::parse_bool01_env("SIM_TMI_VERBOSE", false))
+                        {
+                            std::cerr << "[sim_tmi-debug] FermionRPPU direct JW-CZ boundary enabled; set MIPT_DIRECT_FERMION_BOUNDARY=0 to force historical FSWAP chains.\n";
+                        }
+                        apply_debug_prefix_layer_limit(fermion_layers, "sim_tmi FermionHaar");
+                        if (mipt_backend::verbose_enabled())
+                        {
+                            const auto stats = circuit_work_stats_fermion(fermion_layers);
+                            mipt_backend::verbose_log(circuit_work_stats_string("sim_tmi FermionHaar", stats, n, periods, p));
+                            mipt_backend::verbose_log("sim_tmi get_state start: FermionHaar n=" + std::to_string(n) + " layers=" + std::to_string(fermion_layers.size()));
+                        }
+                        const auto t_get_state = std::chrono::steady_clock::now();
+                        auto state = cudaq::get_state(MIPTFermionKernel_1D{}, n, fermion_layers);
+                        if (mipt_backend::verbose_enabled())
+                        {
+                            mipt_backend::verbose_log("sim_tmi get_state done: FermionHaar elapsed_s=" + std::to_string(mipt_backend::seconds_since(t_get_state)));
+                        }
+                        return state;
                     }
 
-                    auto layers = mipt_frontend(n, periods, p);
-                    return cudaq::get_state(MIPTKernel_1D{}, n, layers, true);
+                    mipt_frontend_inplace(mms_layers, n, periods, p, mms_rng);
+                    apply_debug_prefix_layer_limit(mms_layers, "sim_tmi MMS");
+                    if (mipt_backend::verbose_enabled())
+                    {
+                        const auto stats = circuit_work_stats_mms(mms_layers, n, true);
+                        mipt_backend::verbose_log(circuit_work_stats_string("sim_tmi MMS", stats, n, periods, p));
+                        mipt_backend::verbose_log("sim_tmi get_state start: MMS n=" + std::to_string(n) + " layers=" + std::to_string(mms_layers.size()));
+                    }
+                    const auto t_get_state = std::chrono::steady_clock::now();
+                    auto state = cudaq::get_state(MIPTKernel_1D{}, n, mms_layers, true);
+                    if (mipt_backend::verbose_enabled())
+                    {
+                        mipt_backend::verbose_log("sim_tmi get_state done: MMS elapsed_s=" + std::to_string(mipt_backend::seconds_since(t_get_state)));
+                    }
+                    return state;
                 }();
 
                 const bool use_fast_state_tmi = fast_state_tmi_available(state, n, block_qubits);
@@ -2425,6 +2688,7 @@ namespace sim_tmi
                               << ", host_svd_available=" << (host_svd_available ? 1 : 0)
                               << ", small_n_cuda_svd_disabled=" << (small_n_cuda_svd_disabled ? 1 : 0)
                               << ", cuda_half_svd_enabled=" << (cuda_half_svd_enabled ? 1 : 0)
+                              << ", device_small_rdm=" << (device_small_rdm_enabled() ? 1 : 0)
                               << ", half_cut_backend=" << half_cut_backend
                               << ", fast_state_tmi=" << (use_fast_state_tmi ? 1 : 0)
                               << '\n';
@@ -2480,8 +2744,9 @@ namespace sim_tmi
                     const double since_last = std::chrono::duration<double>(now - last_report).count();
                     if (since_last >= 1.0 || processed == total)
                     {
-                        const double elapsed = std::max(1.0e-12, std::chrono::duration<double>(now - start).count());
-                        const double avg = static_cast<double>(processed) / elapsed;
+                        const double wall_elapsed = std::chrono::duration<double>(now - start).count();
+                        const double active_elapsed = std::max(1.0e-12, wall_elapsed - paused_seconds);
+                        const double avg = static_cast<double>(processed) / active_elapsed;
                         const double recent = static_cast<double>(processed - last_processed) / std::max(1.0e-12, since_last);
                         const double eta = avg > 0.0 ? static_cast<double>(total - processed) / avg : 0.0;
                         std::cerr << '\r'
@@ -2508,7 +2773,19 @@ namespace sim_tmi
         {
             throw std::runtime_error("Failed while finalizing output CSV.");
         }
-        std::cerr << '\n';
+        const auto finish = std::chrono::steady_clock::now();
+        const double wall_total = std::chrono::duration<double>(finish - start).count();
+        const double active_total = std::max(1.0e-12, wall_total - paused_seconds);
+        std::cerr << '\n'
+                  << "Completed " << processed << " TMI row(s) in "
+                  << format_duration(active_total) << " active time";
+        if (paused_seconds > 0.0)
+        {
+            std::cerr << " plus " << format_duration(paused_seconds) << " paused by host";
+        }
+        std::cerr << ". Overall active throughput "
+                  << std::fixed << std::setprecision(2)
+                  << (static_cast<double>(processed) / active_total) << "/s.\n";
         if (workspace.cuda_svd_disabled)
         {
             std::cerr << "Warning: cuSOLVER half-cut SVD was disabled after status "
@@ -2692,7 +2969,11 @@ namespace sim_tmi
             << "    csv/tmi/<tag>/tmi_<tag>_n_<n>_real_<realizations>_<p_min>_<p_max>_res_<resolution>.csv\n"
             << "  Tags are qubit, fermion1, or fermion2; all_cycles=1 appends c, e.g. fermion2c.\n\n"
             << "Output CSV columns:\n"
-            << "  p,tmi\n";
+            << "  p,tmi\n\n"
+            << "Host pause control:\n"
+            << "  By default, creating PAUSE_MIPT in the process working directory pauses at the next safe checkpoint.\n"
+            << "  Removing PAUSE_MIPT resumes the run. Set SIM_TMI_PAUSE_FILE=/path/to/file to use another sentinel,\n"
+            << "  or SIM_TMI_PAUSE_FILE=0 to disable this mechanism. Progress rates exclude paused time.\n";
     }
 } // namespace sim_tmi
 

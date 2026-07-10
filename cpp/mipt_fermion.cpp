@@ -1390,18 +1390,14 @@ struct FRGSLayerData // LayerData for fermions with a reduced topological gate s
 
     std::vector<int> measure_flags;
 
-    // Per-active-bond local gate selectors.  These vectors are indexed by the
+    // Per-active-bond local gate choices.  These vectors are indexed by the
     // compact brickwork-bond index, not by the absolute site index, so no RNG
     // or host->kernel payload is spent on unused q entries.
-    //   0 -> T gate:             R_Z(pi/4) = exp(-i*pi/8 Z_j)
-    //   1 -> single-site braid:  R_Z(pi/2) = exp(-i*pi/4 Z_j)
-    std::vector<int> local_left_kind;
-    std::vector<int> local_right_kind;
-
-    // Per-active-bond two-site gate selector:
-    //   0 -> double-site braid:  R_XX(pi/2) = exp(+i*pi/4 X_j X_{j+1})
-    //   1 -> R_ZZ(pi/4) = exp(+i*pi/8 Z_j Z_{j+1})
-    std::vector<int> bond_gate_kind;
+    //   value 1 -> apply T gate:            R_Z(pi/4) = exp(-i*pi/8 Z_j)
+    //   value 2 -> apply single-site braid: R_Z(pi/2) = exp(-i*pi/4 Z_j)
+    // Each endpoint chooses exactly one of these two gates with 50/50 odds.
+    std::vector<int> local_left_mask;
+    std::vector<int> local_right_mask;
 };
 
 struct MIPTKernel_1D_FRGS
@@ -1421,15 +1417,17 @@ struct MIPTKernel_1D_FRGS
             for (int i = start; i < bond_stop; i += 2)
             {
                 const int j = (i + 1) % n;
-                const int local_i = flayers[layer].local_left_kind[bond_index];
-                const int local_j = flayers[layer].local_right_kind[bond_index];
-                const int bond_gate = flayers[layer].bond_gate_kind[bond_index];
+                const int local_i = flayers[layer].local_left_mask[bond_index];
+                const int local_j = flayers[layer].local_right_mask[bond_index];
                 const bool wrapping_bond = (j < i);
 
-                if (bond_gate == 0 && wrapping_bond) // double-site braid across periodic boundary
+                if (wrapping_bond) // R_XX(pi/2) across periodic boundary
                 {
-                    // Wrapping fermionic bond: apply the Jordan-Wigner string
-                    // around the periodic boundary, then undo it after the gate.
+                    // Wrapping fermionic bond: apply the Jordan-Wigner CZ
+                    // string around the periodic boundary, then undo it after
+                    // the R_XX gate.  The following R_ZZ(pi/4) is interleaved
+                    // with the inverse CZ string as far as the gate
+                    // dependencies allow.
                     for (int k = j + 1; k < i; ++k)
                     {
                         cz(q[k], q[i]);
@@ -1437,28 +1435,46 @@ struct MIPTKernel_1D_FRGS
 
                     // The wrapping XX implementation needs S^dagger on both
                     // endpoints before the XX rotation.  Fuse that diagonal
-                    // phase with the sampled local gate:
-                    //   local S  * S^dagger -> identity, up to global phase
-                    //   local T  * S^dagger -> R_Z(-pi/4), up to global phase
-                    if (local_i == 0)
+                    // phase with the 50/50 local gate choice:
+                    //   local T * S^dagger -> T^dagger
+                    //   local S * S^dagger -> identity
+                    if (local_i == 1)
                     {
                         t<cudaq::adj>(q[i]);
                     }
-                    if (local_j == 0)
+
+                    if (local_j == 1)
                     {
                         t<cudaq::adj>(q[j]);
                     }
 
+                    // R_XX(pi/2): exp(+i*pi/4 X_i X_j).
                     cx(q[i], q[j]);
                     rx(-1.57079632679489661923, q[i]);
                     cx(q[i], q[j]);
 
                     s(q[i]);
                     s(q[j]);
+
+                    // R_ZZ(pi/4): exp(+i*pi/8 Z_i Z_j).  Put the central
+                    // T^dagger leg inside the inverse CZ string so it can be
+                    // scheduled in parallel with one of those CZ corrections.
+                    cx(q[i], q[j]);
+                    int rzz_phase_applied = 0;
                     for (int k = j + 1; k < i; ++k)
                     {
                         cz(q[k], q[i]);
+                        if (rzz_phase_applied == 0)
+                        {
+                            t<cudaq::adj>(q[j]);
+                            rzz_phase_applied = 1;
+                        }
                     }
+                    if (rzz_phase_applied == 0)
+                    {
+                        t<cudaq::adj>(q[j]);
+                    }
+                    cx(q[i], q[j]);
                 }
                 else
                 {
@@ -1466,7 +1482,7 @@ struct MIPTKernel_1D_FRGS
                     // only by one-qubit global phases, so observables and
                     // reduced density matrices are unchanged while the
                     // simulator gets native phase gates instead of generic RZs.
-                    if (local_i == 0)
+                    if (local_i == 1)
                     {
                         t(q[i]);
                     }
@@ -1475,7 +1491,7 @@ struct MIPTKernel_1D_FRGS
                         s(q[i]);
                     }
 
-                    if (local_j == 0)
+                    if (local_j == 1)
                     {
                         t(q[j]);
                     }
@@ -1484,18 +1500,15 @@ struct MIPTKernel_1D_FRGS
                         s(q[j]);
                     }
 
-                    if (bond_gate == 0) // double-site braid: exp(+i*pi/4 X_i X_j)
-                    {
-                        cx(q[i], q[j]);
-                        rx(-1.57079632679489661923, q[i]);
-                        cx(q[i], q[j]);
-                    }
-                    else // R_ZZ(pi/4): exp(+i*pi/8 Z_i Z_j)
-                    {
-                        cx(q[i], q[j]);
-                        t<cudaq::adj>(q[j]);
-                        cx(q[i], q[j]);
-                    }
+                    // R_XX(pi/2): exp(+i*pi/4 X_i X_j).
+                    cx(q[i], q[j]);
+                    rx(-1.57079632679489661923, q[i]);
+                    cx(q[i], q[j]);
+
+                    // R_ZZ(pi/4): exp(+i*pi/8 Z_i Z_j).
+                    cx(q[i], q[j]);
+                    t<cudaq::adj>(q[j]);
+                    cx(q[i], q[j]);
                 }
                 ++bond_index;
             }
@@ -1539,18 +1552,15 @@ void fill_frgs_mipt_layer(FRGSLayerData &layer,
     layer.measure_flags.resize(n);
 
     const int bond_count = frgs_active_bond_count(n, start, closed);
-    layer.local_left_kind.resize(bond_count);
-    layer.local_right_kind.resize(bond_count);
-    layer.bond_gate_kind.resize(bond_count);
+    layer.local_left_mask.resize(bond_count);
+    layer.local_right_mask.resize(bond_count);
 
     for (int b = 0; b < bond_count; ++b)
     {
-        // 50/50 local T vs single-site braid on each endpoint, independently.
-        layer.local_left_kind[b] = frgs_rng_bit(rng);
-        layer.local_right_kind[b] = frgs_rng_bit(rng);
-
-        // 50/50 double-site braid vs R_ZZ(pi/4).
-        layer.bond_gate_kind[b] = frgs_rng_bit(rng);
+        // Each endpoint receives exactly one local gate: T or single-site
+        // braid, selected with 50/50 odds.
+        layer.local_left_mask[b] = frgs_rng_bit(rng) ? 1 : 2;
+        layer.local_right_mask[b] = frgs_rng_bit(rng) ? 1 : 2;
     }
 
     if (p <= 0.0)
