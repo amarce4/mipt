@@ -1,4 +1,4 @@
-#include "rho_reduce.hpp"
+#include "mipt/cuda/rho_reduce.hpp"
 
 #include <cstddef>
 #include <cstdint>

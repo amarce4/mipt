@@ -1,4 +1,4 @@
-#include "tmi_cuda_svd.hpp"
+#include "mipt/cuda/tmi_cuda_svd.hpp"
 
 #include <stddef.h>
 #include <stdint.h>

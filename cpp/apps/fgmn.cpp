@@ -1,5 +1,6 @@
-#include "density_io.hpp"
-#include "fgmn.hpp"
+#include "mipt/density.hpp"
+#include "mipt/env.hpp"
+#include "mipt/analysis/fgmn.hpp"
 
 #include <algorithm>
 #include <array>
@@ -79,33 +80,16 @@ namespace
             << "  FGMN_DISABLE_CRASH_HANDLER=1 Disable SIGSEGV/SIGABRT diagnostic handler.\n";
     }
 
-    int parse_positive_env_one(const char *name, int default_value)
-    {
-        const char *s = std::getenv(name);
-        if (s == nullptr || *s == '\0')
-        {
-            return default_value;
-        }
-
-        char *end = nullptr;
-        errno = 0;
-        const long value = std::strtol(s, &end, 10);
-        if (errno != 0 || end == s || *end != '\0' || value <= 0 ||
-            value > std::numeric_limits<int>::max())
-        {
-            return default_value;
-        }
-        return static_cast<int>(value);
-    }
-
     int parse_batch_records()
     {
-        const int from_fgmn = parse_positive_env_one("FGMN_BATCH_RECORDS", -1);
+        const int from_fgmn = static_cast<int>(mipt::env::integer(
+            "FGMN_BATCH_RECORDS", -1, 1, std::numeric_limits<int>::max()));
         if (from_fgmn > 0)
         {
             return from_fgmn;
         }
-        return parse_positive_env_one("GMN_BATCH_RECORDS", 256);
+        return static_cast<int>(mipt::env::integer(
+            "GMN_BATCH_RECORDS", 256, 1, std::numeric_limits<int>::max()));
     }
 
     std::uint64_t parse_nonnegative_u64(const char *text, const char *name)
@@ -151,19 +135,16 @@ namespace
             return default_value;
         }
 
-        const std::string value(s);
-        if (value == "1" || value == "true" || value == "TRUE" ||
-            value == "yes" || value == "YES" || value == "on" || value == "ON")
+        if (mipt::env::truthy(s))
         {
             return true;
         }
-        if (value == "0" || value == "false" || value == "FALSE" ||
-            value == "no" || value == "NO" || value == "off" || value == "OFF")
+        if (mipt::env::falsey(s))
         {
             return false;
         }
 
-        std::cerr << "Warning: ignoring invalid " << name << "='" << value
+        std::cerr << "Warning: ignoring invalid " << name << "='" << s
                   << "'. Expected 0/1, true/false, yes/no, or on/off.\n";
         return default_value;
     }
@@ -205,25 +186,6 @@ namespace
         return settings;
     }
 
-    void set_env_if_missing(const char *name, const char *value)
-    {
-        if (std::getenv(name) != nullptr)
-        {
-            return;
-        }
-
-#if defined(_WIN32)
-        _putenv_s(name, value);
-#else
-        setenv(name, value, 0);
-#endif
-    }
-
-    bool env_is_set_nonempty(const char *name)
-    {
-        const char *s = std::getenv(name);
-        return s != nullptr && *s != '\0';
-    }
 
 #if !defined(_WIN32)
     void crash_signal_handler(int signal_number)
@@ -270,8 +232,8 @@ namespace
         return out;
     }
 
-    void append_jobs_from_record(const mipt_io::DensityFileMetadata &metadata,
-                                 const mipt_io::DensityRecord &record,
+    void append_jobs_from_record(const mipt::io::DensityFileMetadata &metadata,
+                                 const mipt::io::DensityRecord &record,
                                  std::vector<FgmnJob> &jobs,
                                  double &max_imag_norm)
     {
@@ -337,7 +299,7 @@ int main(int argc, char *argv[])
         // explicitly requested a different MOSEK thread count.
         if (omp_get_max_threads() > 1)
         {
-            set_env_if_missing("GMN_MOSEK_NUM_THREADS", "1");
+            mipt::env::set_if_unset("GMN_MOSEK_NUM_THREADS", "1");
         }
         // Empirically, MOSEK Fusion 11.2 can segfault under some 4+ OpenMP
         // concurrent in-process workloads even when numThreads=1 per solve.
@@ -345,14 +307,14 @@ int main(int argc, char *argv[])
         // FGMN_MAX_CONCURRENT_MOSEK=0 to explicitly restore the old behavior,
         // or =1 for maximum stability.
         if (omp_get_max_threads() >= 4 &&
-            !env_is_set_nonempty("FGMN_MAX_CONCURRENT_MOSEK") &&
-            !env_is_set_nonempty("FGMN_MAX_CONCURRENT_FUSION"))
+            !mipt::env::has_value("FGMN_MAX_CONCURRENT_MOSEK") &&
+            !mipt::env::has_value("FGMN_MAX_CONCURRENT_FUSION"))
         {
-            set_env_if_missing("FGMN_MAX_CONCURRENT_MOSEK", "2");
+            mipt::env::set_if_unset("FGMN_MAX_CONCURRENT_MOSEK", "2");
         }
 #endif
 
-        mipt_io::DensityMatrixReader reader(input_path);
+        mipt::io::DensityMatrixReader reader(input_path);
         const auto &metadata = reader.metadata();
 
         if (metadata.kept_qubits != 3 || metadata.matrix_dimension != 8)
@@ -429,7 +391,7 @@ int main(int argc, char *argv[])
         std::vector<double> fgmn_values;
         std::vector<unsigned char> prefilter_skipped_flags;
 
-        mipt_io::DensityRecord record;
+        mipt::io::DensityRecord record;
         std::vector<std::uint64_t> accepted_records_per_p(metadata.resolution, 0);
         std::uint64_t records_scanned = 0;
         std::uint64_t records_evaluated = 0;

@@ -1,14 +1,23 @@
-// mipt_fermion.cpp
-//
-// Reusable fermionic-family circuit architecture for mipt.cpp and sim_tmi.cpp.
-// This file is intentionally included by mipt.cpp; it does not define a CLI.
-// RPPU and RFGS use fermionic boundary handling. qRPPU uses the same random
-// parity-preserving two-qubit gates with an ordinary direct periodic qubit bond.
+#pragma once
 
-#ifndef MIPT_FERMION_CIRCUITS_IMPLEMENTATION
-#define MIPT_FERMION_CIRCUITS_IMPLEMENTATION
+// RPPU, RFGS, and qRPPU circuit definitions. qRPPU shares the parity-
+// preserving gates but uses a direct qubit boundary bond and qubit trace.
 
-struct FermionBondGate
+#include "mipt/types.hpp"
+
+#include <cudaq.h>
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <complex>
+#include <random>
+#include <stdexcept>
+#include <vector>
+
+namespace mipt
+{
+struct RppuBondGate
 {
     // kind = 0: adjacent parity-preserving two-mode unitary.
     // kind = 1: adjacent fermionic swap.
@@ -21,16 +30,16 @@ struct FermionBondGate
     U2Params odd;
 };
 
-struct FermionLayerData
+struct RppuLayer
 {
-    std::vector<FermionBondGate> gates;
+    std::vector<RppuBondGate> gates;
     std::vector<int> measure_flags;
 };
 
-struct MIPTRPPUKernel_1D
+struct RppuKernel1D
 {
     void operator()(int n,
-                    const std::vector<FermionLayerData> &layers) __qpu__
+                    const std::vector<RppuLayer> &layers) __qpu__
     {
         cudaq::qvector q(n);
 
@@ -109,9 +118,7 @@ struct MIPTRPPUKernel_1D
 };
 
 
-using MIPTFermionKernel_1D = MIPTRPPUKernel_1D;
-
-struct FRGSLayerData // LayerData for fermions with a reduced topological gate set
+struct RfgsLayer // Layer data for the reduced fermionic gate set.
 {
     int start = 0;
 
@@ -127,10 +134,10 @@ struct FRGSLayerData // LayerData for fermions with a reduced topological gate s
     std::vector<int> local_right_mask;
 };
 
-struct MIPTKernel_1D_FRGS
+struct RfgsKernel1D
 {
     void operator()(int n,
-                    const std::vector<FRGSLayerData> &flayers,
+                    const std::vector<RfgsLayer> &flayers,
                     bool closed) __qpu__
     {
         cudaq::qvector q(n);
@@ -251,7 +258,7 @@ struct MIPTKernel_1D_FRGS
     }
 };
 
-int frgs_active_bond_count(int n, int start, bool closed = true)
+inline int rfgs_active_bond_count(int n, int start, bool closed = true)
 {
     const int bond_stop = (closed && start == 1 && n > 2) ? n : (n - 1);
     if (bond_stop <= start)
@@ -261,12 +268,12 @@ int frgs_active_bond_count(int n, int start, bool closed = true)
     return (bond_stop - start + 1) / 2;
 }
 
-inline int frgs_rng_bit(std::mt19937 &rng)
+inline int rfgs_rng_bit(std::mt19937 &rng)
 {
     return static_cast<int>((rng() >> 31) & 1u);
 }
 
-void fill_frgs_mipt_layer(FRGSLayerData &layer,
+inline void fill_rfgs_layer(RfgsLayer &layer,
                           int n,
                           int start,
                           double p,
@@ -278,7 +285,7 @@ void fill_frgs_mipt_layer(FRGSLayerData &layer,
     layer.start = start;
     layer.measure_flags.resize(n);
 
-    const int bond_count = frgs_active_bond_count(n, start, closed);
+    const int bond_count = rfgs_active_bond_count(n, start, closed);
     layer.local_left_mask.resize(bond_count);
     layer.local_right_mask.resize(bond_count);
 
@@ -286,8 +293,8 @@ void fill_frgs_mipt_layer(FRGSLayerData &layer,
     {
         // Each endpoint receives exactly one local gate: T or single-site
         // braid, selected with 50/50 odds.
-        layer.local_left_mask[b] = frgs_rng_bit(rng) ? 1 : 2;
-        layer.local_right_mask[b] = frgs_rng_bit(rng) ? 1 : 2;
+        layer.local_left_mask[b] = rfgs_rng_bit(rng) ? 1 : 2;
+        layer.local_right_mask[b] = rfgs_rng_bit(rng) ? 1 : 2;
     }
 
     if (p <= 0.0)
@@ -307,18 +314,18 @@ void fill_frgs_mipt_layer(FRGSLayerData &layer,
     }
 }
 
-FRGSLayerData make_frgs_mipt_layer(int n,
+inline RfgsLayer make_rfgs_layer(int n,
                                    int start,
                                    double p,
                                    std::mt19937 &rng,
                                    bool closed = true)
 {
-    FRGSLayerData layer;
-    fill_frgs_mipt_layer(layer, n, start, p, rng, closed);
+    RfgsLayer layer;
+    fill_rfgs_layer(layer, n, start, p, rng, closed);
     return layer;
 }
 
-void frgs_mipt_frontend_inplace(std::vector<FRGSLayerData> &layers,
+inline void build_rfgs_layers(std::vector<RfgsLayer> &layers,
                                 int n,
                                 int periods,
                                 double p,
@@ -327,7 +334,7 @@ void frgs_mipt_frontend_inplace(std::vector<FRGSLayerData> &layers,
 {
     if ((n % 2) != 0)
     {
-        throw std::invalid_argument("FRGS fermionic 1D simulation requires even n.");
+        throw std::invalid_argument("RFGS fermionic 1D simulation requires even n.");
     }
     if (p < 0.0 || p > 1.0)
     {
@@ -347,29 +354,29 @@ void frgs_mipt_frontend_inplace(std::vector<FRGSLayerData> &layers,
     std::size_t idx = 0;
     for (int period = 0; period < periods; ++period)
     {
-        fill_frgs_mipt_layer(layers[idx++], n, 0, p, rng, closed);
-        fill_frgs_mipt_layer(layers[idx++], n, 1, p, rng, closed);
+        fill_rfgs_layer(layers[idx++], n, 0, p, rng, closed);
+        fill_rfgs_layer(layers[idx++], n, 1, p, rng, closed);
     }
 
     if (add_extra_even_layer)
     {
-        fill_frgs_mipt_layer(layers[idx++], n, 0, p, rng, closed);
+        fill_rfgs_layer(layers[idx++], n, 0, p, rng, closed);
     }
 }
 
-std::vector<FRGSLayerData> frgs_mipt_frontend(int n,
+inline std::vector<RfgsLayer> make_rfgs_layers(int n,
                                               int periods,
                                               double p,
                                               bool closed = true)
 {
     std::mt19937 rng(std::random_device{}());
-    std::vector<FRGSLayerData> layers;
-    frgs_mipt_frontend_inplace(layers, n, periods, p, rng, closed);
+    std::vector<RfgsLayer> layers;
+    build_rfgs_layers(layers, n, periods, p, rng, closed);
     return layers;
 }
 
 
-std::array<std::complex<double>, 4> haar_unitary_2(std::mt19937 &rng)
+inline std::array<std::complex<double>, 4> haar_unitary_2(std::mt19937 &rng)
 {
     std::normal_distribution<double> normal(0.0, 1.0);
 
@@ -416,16 +423,16 @@ std::array<std::complex<double>, 4> haar_unitary_2(std::mt19937 &rng)
     return {q00, q01, q10, q11};
 }
 
-enum class RPPUBoundaryMode : int
+enum class RppuBoundaryMode : int
 {
     FermionicFSwap = 0,
     FermionicJWString = 1,
     QubitDirect = 2,
 };
 
-FermionBondGate random_parity_preserving_gate(int q0, int q1, std::mt19937 &rng)
+inline RppuBondGate random_parity_preserving_gate(int q0, int q1, std::mt19937 &rng)
 {
-    FermionBondGate gate;
+    RppuBondGate gate;
     gate.kind = 0;
     gate.q0 = q0;
     gate.q1 = q1;
@@ -434,29 +441,29 @@ FermionBondGate random_parity_preserving_gate(int q0, int q1, std::mt19937 &rng)
     return gate;
 }
 
-FermionBondGate random_parity_preserving_jw_string_gate(int q0, int q1, std::mt19937 &rng)
+inline RppuBondGate random_parity_preserving_jw_string_gate(int q0, int q1, std::mt19937 &rng)
 {
-    FermionBondGate gate = random_parity_preserving_gate(q0, q1, rng);
+    RppuBondGate gate = random_parity_preserving_gate(q0, q1, rng);
     gate.kind = 2;
     return gate;
 }
 
-FermionBondGate fermionic_swap_gate(int q0, int q1)
+inline RppuBondGate fermionic_swap_gate(int q0, int q1)
 {
-    FermionBondGate gate;
+    RppuBondGate gate;
     gate.kind = 1;
     gate.q0 = q0;
     gate.q1 = q1;
     return gate;
 }
 
-void fill_rppu_layer(FermionLayerData &layer,
+inline void fill_rppu_layer(RppuLayer &layer,
                      int n,
                      bool odd_layer,
                      double p,
                      bool closed,
                      std::mt19937 &rng,
-                     RPPUBoundaryMode boundary_mode)
+                     RppuBoundaryMode boundary_mode)
 {
     std::bernoulli_distribution measure_dist(p);
 
@@ -473,7 +480,7 @@ void fill_rppu_layer(FermionLayerData &layer,
     }
     else
     {
-        const bool compact_boundary = boundary_mode != RPPUBoundaryMode::FermionicFSwap;
+        const bool compact_boundary = boundary_mode != RppuBoundaryMode::FermionicFSwap;
         const std::size_t reserve_count = closed
             ? (compact_boundary
                    ? static_cast<std::size_t>(1 + (n - 2) / 2)
@@ -483,11 +490,11 @@ void fill_rppu_layer(FermionLayerData &layer,
 
         if (closed)
         {
-            if (boundary_mode == RPPUBoundaryMode::FermionicJWString)
+            if (boundary_mode == RppuBoundaryMode::FermionicJWString)
             {
                 layer.gates.push_back(random_parity_preserving_jw_string_gate(0, n - 1, rng));
             }
-            else if (boundary_mode == RPPUBoundaryMode::QubitDirect)
+            else if (boundary_mode == RppuBoundaryMode::QubitDirect)
             {
                 // qRPPU: this is an ordinary non-local qubit gate.  No
                 // Jordan-Wigner parity string and no FSWAP transport is used.
@@ -533,13 +540,13 @@ void fill_rppu_layer(FermionLayerData &layer,
     }
 }
 
-void rppu_frontend_inplace(std::vector<FermionLayerData> &layers,
+inline void build_rppu_layers_with_boundary(std::vector<RppuLayer> &layers,
                            int n,
                            int periods,
                            double p,
                            bool closed,
                            std::mt19937 &rng,
-                           RPPUBoundaryMode boundary_mode)
+                           RppuBoundaryMode boundary_mode)
 {
     if ((n % 2) != 0)
     {
@@ -569,7 +576,7 @@ void rppu_frontend_inplace(std::vector<FermionLayerData> &layers,
     }
 }
 
-void mipt_fermion_frontend_inplace(std::vector<FermionLayerData> &layers,
+inline void build_rppu_layers(std::vector<RppuLayer> &layers,
                                    int n,
                                    int periods,
                                    double p,
@@ -577,50 +584,50 @@ void mipt_fermion_frontend_inplace(std::vector<FermionLayerData> &layers,
                                    std::mt19937 &rng,
                                    bool direct_boundary_gate = false)
 {
-    rppu_frontend_inplace(
+    build_rppu_layers_with_boundary(
         layers, n, periods, p, closed, rng,
-        direct_boundary_gate ? RPPUBoundaryMode::FermionicJWString
-                             : RPPUBoundaryMode::FermionicFSwap);
+        direct_boundary_gate ? RppuBoundaryMode::FermionicJWString
+                             : RppuBoundaryMode::FermionicFSwap);
 }
 
-void qrppu_frontend_inplace(std::vector<FermionLayerData> &layers,
+inline void build_qrppu_layers(std::vector<RppuLayer> &layers,
                             int n,
                             int periods,
                             double p,
                             bool closed,
                             std::mt19937 &rng)
 {
-    rppu_frontend_inplace(
-        layers, n, periods, p, closed, rng, RPPUBoundaryMode::QubitDirect);
+    build_rppu_layers_with_boundary(
+        layers, n, periods, p, closed, rng, RppuBoundaryMode::QubitDirect);
 }
 
-std::vector<FermionLayerData> mipt_fermion_frontend(int n,
+inline std::vector<RppuLayer> make_rppu_layers(int n,
                                                     int periods,
                                                     double p,
                                                     bool closed = true)
 {
     std::mt19937 rng(std::random_device{}());
-    std::vector<FermionLayerData> layers;
+    std::vector<RppuLayer> layers;
     layers.reserve(static_cast<std::size_t>(2 * periods + 1));
-    mipt_fermion_frontend_inplace(layers, n, periods, p, closed, rng, false);
+    build_rppu_layers(layers, n, periods, p, closed, rng, false);
     return layers;
 }
 
-std::vector<FermionLayerData> qrppu_frontend(int n,
+inline std::vector<RppuLayer> make_qrppu_layers(int n,
                                              int periods,
                                              double p,
                                              bool closed = true)
 {
     std::mt19937 rng(std::random_device{}());
-    std::vector<FermionLayerData> layers;
+    std::vector<RppuLayer> layers;
     layers.reserve(static_cast<std::size_t>(2 * periods + 1));
-    qrppu_frontend_inplace(layers, n, periods, p, closed, rng);
+    build_qrppu_layers(layers, n, periods, p, closed, rng);
     return layers;
 }
 
-MiptCircuitWorkStats circuit_work_stats_fermion(const std::vector<FermionLayerData> &layers)
+inline CircuitWorkStats circuit_work_stats_rppu(const std::vector<RppuLayer> &layers)
 {
-    MiptCircuitWorkStats stats;
+    CircuitWorkStats stats;
     stats.layers = layers.size();
     for (const auto &layer : layers)
     {
@@ -656,9 +663,9 @@ MiptCircuitWorkStats circuit_work_stats_fermion(const std::vector<FermionLayerDa
     return stats;
 }
 
-MiptCircuitWorkStats circuit_work_stats_frgs(const std::vector<FRGSLayerData> &layers, int n, bool closed)
+inline CircuitWorkStats circuit_work_stats_rfgs(const std::vector<RfgsLayer> &layers, int n, bool closed)
 {
-    MiptCircuitWorkStats stats;
+    CircuitWorkStats stats;
     stats.layers = layers.size();
     for (const auto &layer : layers)
     {
@@ -670,11 +677,11 @@ MiptCircuitWorkStats circuit_work_stats_frgs(const std::vector<FRGSLayerData> &l
         const int bond_stop = (closed && start == 1 && n > 2) ? n : (n - 1);
         for (int i = start; i < bond_stop; i += 2)
         {
-            ++stats.frgs_bonds;
+            ++stats.rfgs_bonds;
             const int j = (i + 1) % n;
             if (j < i)
             {
-                ++stats.wrapping_frgs_bonds;
+                ++stats.wrapping_rfgs_bonds;
                 stats.estimated_cudaq_two_qubit_ops += static_cast<std::size_t>(2 * std::max(0, i - j - 1) + 4);
             }
             else
@@ -683,9 +690,10 @@ MiptCircuitWorkStats circuit_work_stats_frgs(const std::vector<FRGSLayerData> &l
             }
         }
     }
-    stats.logical_two_site_gates = stats.frgs_bonds;
+    stats.logical_two_site_gates = stats.rfgs_bonds;
     return stats;
 }
 
 
-#endif // MIPT_FERMION_CIRCUITS_IMPLEMENTATION
+
+} // namespace mipt

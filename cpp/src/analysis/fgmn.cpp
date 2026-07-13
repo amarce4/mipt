@@ -1,4 +1,4 @@
-#include "fgmn.hpp"
+#include "mipt/analysis/fgmn.hpp"
 
 #include <algorithm>
 #include <array>
@@ -161,7 +161,7 @@ namespace fgmn
                 }
 
                 t[subsystem] = pick;
-                
+
             }
             //std::printf("\n");
 
@@ -276,7 +276,7 @@ namespace fgmn
     const std::array<Int2D, 2*PARTIES> &parity_violation_pick_tables()
     {
         //Picks out all elements (r,c) of a D by D matrix for which the parity of r and c differ on the bits corresponding to the given subsystem.
-        
+
         static const std::array<Int2D, 2*PARTIES> tables = []()
         {
             std::array<Int2D, 2*PARTIES> t{};
@@ -379,7 +379,7 @@ namespace fgmn
         for(int dim : Xshape) std::printf("%d ",dim);
         std::printf(")%s", endstring.c_str());
     }
-    
+
     Variable::t psd_slice(Variable::t X, int k)
     {
         return X->slice(
@@ -429,9 +429,9 @@ namespace fgmn
             Q_imag->pick(partial_transpose_pick_table(subsystem)),
             matrix_shape());
         // For fermionic systems, the partial transpose includes an additional factor of i if the local parity is violated.
-        // This can be implemented by swapping the real and imaginary parts of the parts of Q that violate parity, 
+        // This can be implemented by swapping the real and imaginary parts of the parts of Q that violate parity,
         // and applying a sign flip to the new real part.
-        
+
         // std::printf("Picking out parity preserving/violating parts...");
         // Pick out real and imaginary parity preserving and violating parts of Q separately so we can recombine them with the correct factors at the end.
         Expression::t Q_real_pp = Q_real_pt->pick(parity_violation_pick_table(subsystem, false));
@@ -454,7 +454,7 @@ namespace fgmn
         // std::printf("Reshaping real/imag matrices...");
         Expression::t Q_real_mat = Expr::reshape(Q_real_recombined->pick(parity_recollection_pick_table(subsystem)), matrix_shape());
         Expression::t Q_imag_mat = Expr::reshape(Q_imag_recombined->pick(parity_recollection_pick_table(subsystem)), matrix_shape());
-        
+
         // std::printf("Restacking matrix...\n");
         // Block the real and imaginary parts together into a single matrix
         Expression::t Q_fpt = Expr::vstack(Expr::hstack(Q_real_mat, Expr::neg(Q_imag_mat)), Expr::hstack(Q_imag_mat, Q_real_mat));
@@ -487,7 +487,7 @@ namespace fgmn
         Expression::t Q_real,
         Expression::t Q_imag,
         int subsystem)
-    {   
+    {
         auto Qrt = partial_transpose_expr(Q_real, subsystem);
         auto Qit = partial_transpose_expr(Q_imag, subsystem);
         auto Qt_complex = Expr::vstack(Expr::hstack(Qrt, Expr::neg(Qit)), Expr::hstack(Qit, Qrt));
@@ -504,7 +504,7 @@ namespace fgmn
         Expression::t Q_real,
         Expression::t Q_imag,
         int subsystem)
-    {   
+    {
         Expression::t Qt_complex = fermionic_partial_transpose_expr(Q_real, Q_imag, subsystem);
         Expression::t P_complex = Expr::vstack(Expr::hstack(P_real, Expr::neg(P_imag)), Expr::hstack(P_imag, P_real));
         return Expr::add(P_complex, Qt_complex);
@@ -574,7 +574,7 @@ namespace fgmn
 
     //Combine vectorized/upper triangular real and imaginary parts of X into a 2dim*2dim matrix
     // Expression::t complex_vec_M(Expression::t ReX, Expression::t ImX, std::size_t dim){
-    //     Int1D combiner_pick_table; //Pick table that 
+    //     Int1D combiner_pick_table; //Pick table that
     // }
 
     void add_psd_upper_bound(
@@ -1097,7 +1097,7 @@ namespace fgmn
             // Each slice is an 8x8 symmetric PSD matrix.
             int num_psd = PSD_MATRICES;
             //if(is_complex) num_psd *= 2; //For complex mode, we need to double the size of each PSD matrix to capture the real and imaginary parts together and enforce the correct structure.
-            
+
             int psds_per_subsystem = 2;
             //Matrix::t adjusted_identity = is_complex ? double_identity() : identity_matrix();
 
@@ -1117,14 +1117,14 @@ namespace fgmn
                     P_imag[subsystem] = psd_slice(X, psds_per_subsystem*subsystem*2 + 2);
                     Q_imag[subsystem] = psd_slice(X, psds_per_subsystem*subsystem*2 + 3);
                     // Imaginary components are used to construct the full realified PSD variables
-                    // by stacking the real and imaginary parts in the [A -B; B A] pattern. 
+                    // by stacking the real and imaginary parts in the [A -B; B A] pattern.
                     Expression::t P_complex = Expr::vstack(Expr::hstack(P[subsystem], Expr::neg(P_imag[subsystem])), Expr::hstack(P_imag[subsystem], P[subsystem]));
                     Expression::t Q_complex = Expr::vstack(Expr::hstack(Q[subsystem], Expr::neg(Q_imag[subsystem])), Expr::hstack(Q_imag[subsystem], Q[subsystem]));
                     if (is_fermionic){
                         Expression::t Qshift = Expr::sub(Expr::mul(2,Q_complex), double_identity()); //2Q-I
                         // BigQ is the matrix [I, 2Q-I; (2Q-I)', I]. If ||2Q-I||<=1, BigQ needs to be PSD.
                         Expression::t BigQ = Expr::vstack(Expr::hstack(double_identity_expr(), Qshift), Expr::hstack(Expr::transpose(Qshift), double_identity_expr())); //The transpose here is actually the full realified conjugate transpose, since Qshift is symmetric in the real part and antisymmetric in the imaginary part.
-                        
+
                         M->constraint(P_complex,Domain::inPSDCone(2*D)); //Real part is automatically taken by the constraint
                         // M->constraint(
                         //     Expr::sub(double_identity(), Expr::mul(0.1,P_complex)),
@@ -1157,7 +1157,7 @@ namespace fgmn
                 }
             }
 
-            
+
             // Instead of creating an explicit dense unbounded W variable and
             // imposing W = P_s + PT_s(Q_s) for all s, use subsystem A as the
             // anchor witness:
@@ -1165,8 +1165,8 @@ namespace fgmn
             //     W := P_A + PT_A(Q_A)
             //
             // and impose equality with the B and C decompositions.
-            
-            
+
+
             //std::printf("\nBuilding witness...\n");
             Expression::t W_anchor;
             if(is_fermionic){
@@ -1191,7 +1191,7 @@ namespace fgmn
                     Q[ANCHOR_SUBSYSTEM],
                     ANCHOR_SUBSYSTEM);
             }
-            
+
 
             if(is_complex){ //Assume, for now, that the W matrix isn't symmetric or Hermitian in the complex case.
                 Expression::t W_anchor_unravel = Expr::reshape(W_anchor, 4*D2);
@@ -1228,7 +1228,7 @@ namespace fgmn
 
                 M->objective(
                     ObjectiveSense::Minimize,
-                    Expr::dot(objective_coeffs, W_anchor_unravel)); 
+                    Expr::dot(objective_coeffs, W_anchor_unravel));
 
                 M->acceptedSolutionStatus(AccSolutionStatus::Optimal);
                 coeff_values = std::make_shared<ndarray<double, 1>>(shape(4*D2));
@@ -1266,10 +1266,10 @@ namespace fgmn
                     objective_coeffs = M->parameter(UPPER_COUNT);
                     M->objective(
                         ObjectiveSense::Minimize,
-                        Expr::dot(objective_coeffs, W_ut)); //Wouldn't this effectively double-count the diagonal entries of W? 
-                        // Yes, but the fill_upper_objective_coefficients function accounts for this by only putting the original 
-                        // rho coefficients on the diagonal entries of W_ut, and putting the sum of the symmetric rho coefficients 
-                        // on the off-diagonal entries of W_ut, so that the dot product with objective_coeffs correctly computes the 
+                        Expr::dot(objective_coeffs, W_ut)); //Wouldn't this effectively double-count the diagonal entries of W?
+                        // Yes, but the fill_upper_objective_coefficients function accounts for this by only putting the original
+                        // rho coefficients on the diagonal entries of W_ut, and putting the sum of the symmetric rho coefficients
+                        // on the off-diagonal entries of W_ut, so that the dot product with objective_coeffs correctly computes the
                         // trace of rho with the full witness matrix W.
 
                     M->acceptedSolutionStatus(AccSolutionStatus::Optimal);
@@ -1303,7 +1303,7 @@ namespace fgmn
 
             M->solve();
 
-            
+
             // Potential variable-printing templates for testing
             // if(M->hasVariable("Witness")){
             //     std::printf("Optimal witness: \n");
@@ -1317,7 +1317,7 @@ namespace fgmn
             //         std::printf("\n");
             //     }
             // }
-            
+
             // if(M->hasVariable("X")){
             //     auto Xvals = M->getVariable("X")->level();
             //     int X_index = 0;

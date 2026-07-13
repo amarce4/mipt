@@ -1,5 +1,9 @@
 #pragma once
 
+#include "mipt/circuit.hpp"
+#include "mipt/env.hpp"
+#include "mipt/rdm.hpp"
+
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -13,94 +17,48 @@
 #include <string>
 #include <vector>
 
-namespace mipt_native_mps
+namespace mipt::native_mps
 {
     using C = std::complex<double>;
     using Gate2 = std::array<C, 4>;
     using Gate4 = std::array<C, 16>;
 
-    inline bool truthy(const char *v)
-    {
-        return v != nullptr &&
-               (std::strcmp(v, "1") == 0 || std::strcmp(v, "true") == 0 ||
-                std::strcmp(v, "TRUE") == 0 || std::strcmp(v, "yes") == 0 ||
-                std::strcmp(v, "YES") == 0 || std::strcmp(v, "on") == 0 ||
-                std::strcmp(v, "ON") == 0);
-    }
-
-    inline bool falsey(const char *v)
-    {
-        return v != nullptr &&
-               (std::strcmp(v, "0") == 0 || std::strcmp(v, "false") == 0 ||
-                std::strcmp(v, "FALSE") == 0 || std::strcmp(v, "no") == 0 ||
-                std::strcmp(v, "NO") == 0 || std::strcmp(v, "off") == 0 ||
-                std::strcmp(v, "OFF") == 0);
-    }
-
-    inline bool env_bool(const char *name, bool fallback)
-    {
-        const char *v = std::getenv(name);
-        if (truthy(v)) return true;
-        if (falsey(v)) return false;
-        return fallback;
-    }
-
-    inline long env_long(const char *name, long fallback, long lo, long hi)
-    {
-        const char *v = std::getenv(name);
-        if (!v || *v == '\0') return fallback;
-        char *end = nullptr;
-        long x = std::strtol(v, &end, 10);
-        if (end == v || *end != '\0' || x < lo || x > hi) return fallback;
-        return x;
-    }
-
-    inline double env_double(const char *name, double fallback, double lo, double hi)
-    {
-        const char *v = std::getenv(name);
-        if (!v || *v == '\0') return fallback;
-        char *end = nullptr;
-        double x = std::strtod(v, &end);
-        if (end == v || *end != '\0' || !std::isfinite(x) || x < lo || x > hi) return fallback;
-        return x;
-    }
-
     inline bool enabled()
     {
-        return env_bool("MIPT_NATIVE_MPS", false) || env_bool("MIPT_NATIVE_TEBD", false);
+        return env::boolean("MIPT_NATIVE_MPS", false) || env::boolean("MIPT_NATIVE_TEBD", false);
     }
 
     inline int max_bond()
     {
-        long fallback = env_long("CUDAQ_MPS_MAX_BOND", 64, 1, 4096);
-        return static_cast<int>(env_long("MIPT_NATIVE_MPS_MAX_BOND", fallback, 1, 4096));
+        long fallback = env::integer("CUDAQ_MPS_MAX_BOND", 64, 1, 4096);
+        return static_cast<int>(env::integer("MIPT_NATIVE_MPS_MAX_BOND", fallback, 1, 4096));
     }
 
     inline double abs_cutoff()
     {
-        double fallback = env_double("CUDAQ_MPS_ABS_CUTOFF", 1.0e-10, 0.0, 1.0);
-        return env_double("MIPT_NATIVE_MPS_ABS_CUTOFF", fallback, 0.0, 1.0);
+        double fallback = env::real("CUDAQ_MPS_ABS_CUTOFF", 1.0e-10, 0.0, 1.0);
+        return env::real("MIPT_NATIVE_MPS_ABS_CUTOFF", fallback, 0.0, 1.0);
     }
 
     inline double rel_cutoff()
     {
-        double fallback = env_double("CUDAQ_MPS_RELATIVE_CUTOFF", 1.0e-10, 0.0, 1.0);
-        return env_double("MIPT_NATIVE_MPS_RELATIVE_CUTOFF", fallback, 0.0, 1.0);
+        double fallback = env::real("CUDAQ_MPS_RELATIVE_CUTOFF", 1.0e-10, 0.0, 1.0);
+        return env::real("MIPT_NATIVE_MPS_RELATIVE_CUTOFF", fallback, 0.0, 1.0);
     }
 
     inline bool verbose()
     {
-        return env_bool("MIPT_VERBOSE", false) || env_bool("MIPT_NATIVE_MPS_VERBOSE", false);
+        return env::boolean("MIPT_VERBOSE", false) || env::boolean("MIPT_NATIVE_MPS_VERBOSE", false);
     }
 
     inline int prefix_layers()
     {
-        return static_cast<int>(env_long("MIPT_DEBUG_PREFIX_LAYERS", 0, 0, 1000000));
+        return static_cast<int>(env::integer("MIPT_DEBUG_PREFIX_LAYERS", 0, 0, 1000000));
     }
 
     inline int normalize_interval()
     {
-        return static_cast<int>(env_long("MIPT_NATIVE_MPS_NORMALIZE_INTERVAL", 1, 1, 1000000));
+        return static_cast<int>(env::integer("MIPT_NATIVE_MPS_NORMALIZE_INTERVAL", 1, 1, 1000000));
     }
 
     inline void log(const std::string &msg)
@@ -225,12 +183,16 @@ namespace mipt_native_mps
             for (int site = 0; site < n; ++site)
             {
                 const Tensor &t = a[static_cast<std::size_t>(site)];
-                std::vector<C> next(static_cast<std::size_t>(t.dr) * static_cast<std::size_t>(t.dr), C(0.0, 0.0));
+                std::vector<C> next(
+                    static_cast<std::size_t>(t.dr) * static_cast<std::size_t>(t.dr),
+                    C(0.0, 0.0));
                 for (int lb = 0; lb < t.dl; ++lb)
                 {
                     for (int lk = 0; lk < t.dl; ++lk)
                     {
-                        const C e = env[static_cast<std::size_t>(lb) * static_cast<std::size_t>(dim) + static_cast<std::size_t>(lk)];
+                        const C e = env[static_cast<std::size_t>(lb) *
+                                            static_cast<std::size_t>(dim) +
+                                        static_cast<std::size_t>(lk)];
                         if (std::abs(e) == 0.0) continue;
                         for (int s = 0; s < 2; ++s)
                         {
@@ -240,7 +202,10 @@ namespace mipt_native_mps
                                 if (std::abs(vb) == 0.0) continue;
                                 for (int rk = 0; rk < t.dr; ++rk)
                                 {
-                                    next[static_cast<std::size_t>(rb) * static_cast<std::size_t>(t.dr) + static_cast<std::size_t>(rk)] += e * vb * std::conj(t(lk, s, rk));
+                                    next[static_cast<std::size_t>(rb) *
+                                             static_cast<std::size_t>(t.dr) +
+                                         static_cast<std::size_t>(rk)] +=
+                                        e * vb * std::conj(t(lk, s, rk));
                                 }
                             }
                         }
@@ -314,18 +279,28 @@ namespace mipt_native_mps
                     std::vector<unsigned char> parity_twist(static_cast<std::size_t>(n), 0);
                     if (fermion_trace)
                     {
-                        fixed_sign = static_cast<double>(fermion_internal_sign(keep, row_bits) * fermion_internal_sign(keep, col_bits));
+                        fixed_sign = static_cast<double>(
+                            fermion_internal_sign(keep, row_bits) *
+                            fermion_internal_sign(keep, col_bits));
                         for (int k = 0; k < 3; ++k)
                         {
                             if ((row_bits[k] ^ col_bits[k]) == 0) continue;
                             for (int q = 0; q < n; ++q)
                             {
-                                if (q == keep[0] || q == keep[1] || q == keep[2]) continue;
+                                if (q == keep[0] || q == keep[1] || q == keep[2])
+                                {
+                                    continue;
+                                }
                                 if (q < keep[k]) parity_twist[static_cast<std::size_t>(q)] ^= 1u;
                             }
                         }
                     }
-                    const C value = contract_fixed(keep, row_bits, col_bits, 3, fermion_trace, fixed_sign, parity_twist.empty() ? nullptr : parity_twist.data()) / nrm;
+                    const C value =
+                        contract_fixed(keep, row_bits, col_bits, 3,
+                                       fermion_trace, fixed_sign,
+                                       parity_twist.empty() ? nullptr
+                                                            : parity_twist.data()) /
+                        nrm;
                     const std::size_t off = 2u * static_cast<std::size_t>(row * 8 + col);
                     out_ri[off + 0] = value.real();
                     out_ri[off + 1] = value.imag();
@@ -481,7 +456,11 @@ namespace mipt_native_mps
                     for (int r = 0; r < dr; ++r)
                     {
                         const int col = sp * dr + r;
-                        R(aidx, sp, r) = s[static_cast<std::size_t>(aidx)] * vt[static_cast<std::size_t>(aidx) + static_cast<std::size_t>(col) * static_cast<std::size_t>(k)];
+                        R(aidx, sp, r) =
+                            s[static_cast<std::size_t>(aidx)] *
+                            vt[static_cast<std::size_t>(aidx) +
+                               static_cast<std::size_t>(col) *
+                                   static_cast<std::size_t>(k)];
                     }
                 }
             }
@@ -503,22 +482,32 @@ namespace mipt_native_mps
             return parity ? -1 : 1;
         }
 
-        C contract_fixed(const int *keep, const int *row_bits, const int *col_bits, int kept_count, bool use_twist, double fixed_sign, const unsigned char *twist = nullptr) const
+        C contract_fixed(const int *keep, const int *row_bits,
+                         const int *col_bits, int kept_count, bool use_twist,
+                         double fixed_sign,
+                         const unsigned char *twist = nullptr) const
         {
             std::vector<int> keep_pos(static_cast<std::size_t>(n), -1);
-            for (int k = 0; k < kept_count; ++k) keep_pos[static_cast<std::size_t>(keep[k])] = k;
+            for (int k = 0; k < kept_count; ++k)
+            {
+                keep_pos[static_cast<std::size_t>(keep[k])] = k;
+            }
             std::vector<C> env(1, C(fixed_sign, 0.0));
             int dim = 1;
             for (int site = 0; site < n; ++site)
             {
                 const Tensor &t = a[static_cast<std::size_t>(site)];
-                std::vector<C> next(static_cast<std::size_t>(t.dr) * static_cast<std::size_t>(t.dr), C(0.0, 0.0));
+                std::vector<C> next(
+                    static_cast<std::size_t>(t.dr) * static_cast<std::size_t>(t.dr),
+                    C(0.0, 0.0));
                 const int kp = keep_pos[static_cast<std::size_t>(site)];
                 for (int lb = 0; lb < t.dl; ++lb)
                 {
                     for (int lk = 0; lk < t.dl; ++lk)
                     {
-                        const C e = env[static_cast<std::size_t>(lb) * static_cast<std::size_t>(dim) + static_cast<std::size_t>(lk)];
+                        const C e = env[static_cast<std::size_t>(lb) *
+                                            static_cast<std::size_t>(dim) +
+                                        static_cast<std::size_t>(lk)];
                         if (std::abs(e) == 0.0) continue;
                         if (kp >= 0)
                         {
@@ -530,7 +519,10 @@ namespace mipt_native_mps
                                 if (std::abs(vb) == 0.0) continue;
                                 for (int rk = 0; rk < t.dr; ++rk)
                                 {
-                                    next[static_cast<std::size_t>(rb) * static_cast<std::size_t>(t.dr) + static_cast<std::size_t>(rk)] += e * vb * std::conj(t(lk, sk, rk));
+                                    next[static_cast<std::size_t>(rb) *
+                                             static_cast<std::size_t>(t.dr) +
+                                         static_cast<std::size_t>(rk)] +=
+                                        e * vb * std::conj(t(lk, sk, rk));
                                 }
                             }
                         }
@@ -538,14 +530,23 @@ namespace mipt_native_mps
                         {
                             for (int s = 0; s < 2; ++s)
                             {
-                                const double factor = (use_twist && twist != nullptr && twist[static_cast<std::size_t>(site)] && s == 1) ? -1.0 : 1.0;
+                                const double factor =
+                                    (use_twist && twist != nullptr &&
+                                     twist[static_cast<std::size_t>(site)] &&
+                                     s == 1)
+                                        ? -1.0
+                                        : 1.0;
                                 for (int rb = 0; rb < t.dr; ++rb)
                                 {
                                     const C vb = t(lb, s, rb);
                                     if (std::abs(vb) == 0.0) continue;
                                     for (int rk = 0; rk < t.dr; ++rk)
                                     {
-                                        next[static_cast<std::size_t>(rb) * static_cast<std::size_t>(t.dr) + static_cast<std::size_t>(rk)] += factor * e * vb * std::conj(t(lk, s, rk));
+                                        next[static_cast<std::size_t>(rb) *
+                                                 static_cast<std::size_t>(t.dr) +
+                                             static_cast<std::size_t>(rk)] +=
+                                            factor * e * vb *
+                                            std::conj(t(lk, s, rk));
                                     }
                                 }
                             }
@@ -679,7 +680,7 @@ namespace mipt_native_mps
                 phase * (ephi * C(s, 0.0)), phase * (ephi * elam * C(c, 0.0))};
     }
 
-    inline Gate4 parity_preserving_gate_matrix(const FermionBondGate &gate)
+    inline Gate4 parity_preserving_gate_matrix(const RppuBondGate &gate)
     {
         const Gate2 even = u3_matrix(gate.even);
         const Gate2 odd = u3_matrix(gate.odd);
@@ -704,7 +705,7 @@ namespace mipt_native_mps
         return u;
     }
 
-    inline void apply_mms_bond(MPS &mps, int i, int j, const LayerData &layer)
+    inline void apply_mms_bond(MPS &mps, int i, int j, const MmsLayer &layer)
     {
         auto apply_local_choice = [&](int q) {
             if (layer.rot_x_flags[static_cast<std::size_t>(q)]) mps.apply_one_site(q, gate_rx(M_PI / 2.0));
@@ -721,7 +722,7 @@ namespace mipt_native_mps
         mps.apply_two_site(i, j, rxx_gate(M_PI / 2.0));
     }
 
-    inline void simulate_mms(MPS &mps, int n, const std::vector<LayerData> &layers, std::mt19937 &rng)
+    inline void simulate_mms(MPS &mps, int n, const std::vector<MmsLayer> &layers, std::mt19937 &rng)
     {
         int gate_counter = 0;
         const int norm_every = normalize_interval();
@@ -774,7 +775,7 @@ namespace mipt_native_mps
         }
     }
 
-    inline void simulate_fermion(MPS &mps, const std::vector<FermionLayerData> &layers, std::mt19937 &rng)
+    inline void simulate_fermion(MPS &mps, const std::vector<RppuLayer> &layers, std::mt19937 &rng)
     {
         int gate_counter = 0;
         const int norm_every = normalize_interval();
@@ -802,7 +803,7 @@ namespace mipt_native_mps
         }
     }
 
-    inline void simulate_frgs(MPS &mps, int n, const std::vector<FRGSLayerData> &layers, bool closed, std::mt19937 &rng)
+    inline void simulate_rfgs(MPS &mps, int n, const std::vector<RfgsLayer> &layers, bool closed, std::mt19937 &rng)
     {
         (void)rng;
         int gate_counter = 0;
@@ -863,8 +864,8 @@ namespace mipt_native_mps
 
         if (circ_type == CircuitType::MMS)
         {
-            std::vector<LayerData> layers;
-            mipt_frontend_inplace(layers, n, periods, p, rng);
+            std::vector<MmsLayer> layers;
+            build_mms_layers(layers, n, periods, p, rng);
             apply_debug_prefix_layer_limit(layers, "native-MPS MMS");
             simulate_mms(mps, n, layers, rng);
         }
@@ -874,25 +875,25 @@ namespace mipt_native_mps
         }
         else if (circ_type == CircuitType::FermionRPPU)
         {
-            std::vector<FermionLayerData> layers;
+            std::vector<RppuLayer> layers;
             // Use adjacent FSWAP chains in the native MPS path; this avoids
             // nonlocal JW-CZ tensor contractions while preserving the original
             // closed-boundary construction.
-            mipt_fermion_frontend_inplace(layers, n, periods, p, true, rng, false);
+            build_rppu_layers(layers, n, periods, p, true, rng, false);
             apply_debug_prefix_layer_limit(layers, "native-MPS FermionRPPU");
             simulate_fermion(mps, layers, rng);
         }
         else if (circ_type == CircuitType::RFGS)
         {
-            std::vector<FRGSLayerData> layers;
-            frgs_mipt_frontend_inplace(layers, n, periods, p, rng, true);
+            std::vector<RfgsLayer> layers;
+            build_rfgs_layers(layers, n, periods, p, rng, true);
             apply_debug_prefix_layer_limit(layers, "native-MPS RFGS");
-            simulate_frgs(mps, n, layers, true, rng);
+            simulate_rfgs(mps, n, layers, true, rng);
         }
         else if (circ_type == CircuitType::QubitRPPU)
         {
-            std::vector<FermionLayerData> layers;
-            qrppu_frontend_inplace(layers, n, periods, p, true, rng);
+            std::vector<RppuLayer> layers;
+            build_qrppu_layers(layers, n, periods, p, true, rng);
             apply_debug_prefix_layer_limit(layers, "native-MPS qRPPU");
             // The direct periodic qRPPU bond is transported with ordinary
             // qubit SWAPs by MPS::apply_long_range; no fermionic sign string

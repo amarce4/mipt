@@ -1,7 +1,5 @@
 #pragma once
 
-#include "fusion.h"
-
 #ifdef __cplusplus
 extern "C" {
 #endif

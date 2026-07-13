@@ -1,5 +1,6 @@
-#include "density_io.hpp"
-#include "gmn.hpp"
+#include "mipt/density.hpp"
+#include "mipt/env.hpp"
+#include "mipt/analysis/gmn.hpp"
 
 #include <algorithm>
 #include <array>
@@ -72,39 +73,6 @@ namespace
             << "The former leading argument '3' has been removed. Use mode 0 or 1.\n"
             << "Six-qubit retained-subsystem analysis is not implemented; input must contain\n"
             << "three-qubit 8x8 reduced density matrices.\n";
-    }
-
-    int parse_positive_env(const char *name, int default_value)
-    {
-        const char *s = std::getenv(name);
-        if (s == nullptr || *s == '\0')
-        {
-            return default_value;
-        }
-
-        char *end = nullptr;
-        errno = 0;
-        const long value = std::strtol(s, &end, 10);
-        if (errno != 0 || end == s || *end != '\0' || value <= 0 ||
-            value > std::numeric_limits<int>::max())
-        {
-            return default_value;
-        }
-        return static_cast<int>(value);
-    }
-
-    void set_env_if_missing(const char *name, const char *value)
-    {
-        if (std::getenv(name) != nullptr)
-        {
-            return;
-        }
-
-#if defined(_WIN32)
-        _putenv_s(name, value);
-#else
-        setenv(name, value, 0);
-#endif
     }
 
     double imaginary_frobenius_norm(const double *rho_ri)
@@ -265,8 +233,8 @@ namespace
         throw std::invalid_argument("First argument must be evaluation mode 0 or 1.");
     }
 
-    void append_jobs_from_record(const mipt_io::DensityFileMetadata &metadata,
-                                 const mipt_io::DensityRecord &record,
+    void append_jobs_from_record(const mipt::io::DensityFileMetadata &metadata,
+                                 const mipt::io::DensityRecord &record,
                                  std::vector<GmnJob> &jobs,
                                  double &max_imag_norm,
                                  std::uint64_t &nonfinite_input_value_count,
@@ -345,13 +313,13 @@ int main(int argc, char *argv[])
          */
         if (omp_get_max_threads() > 1)
         {
-            set_env_if_missing("GMN_MOSEK_NUM_THREADS", "1");
+            mipt::env::set_if_unset("GMN_MOSEK_NUM_THREADS", "1");
         }
 #endif
 
         gmn_mosek_reset_diagnostics();
 
-        mipt_io::DensityMatrixReader reader(input_path);
+        mipt::io::DensityMatrixReader reader(input_path);
         const auto &metadata = reader.metadata();
 
         if (metadata.kept_qubits != 3 || metadata.matrix_dimension != 8)
@@ -388,12 +356,13 @@ int main(int argc, char *argv[])
         std::cout << "OpenMP is not enabled in this build; GMN solves are serial.\n";
 #endif
 
-        const int batch_records = parse_positive_env("GMN_BATCH_RECORDS", 256);
+        const int batch_records = static_cast<int>(mipt::env::integer(
+            "GMN_BATCH_RECORDS", 256, 1, std::numeric_limits<int>::max()));
         std::vector<GmnJob> jobs;
         jobs.reserve(static_cast<std::size_t>(batch_records) * metadata.subsystem_count);
         std::vector<double> gmn_values;
 
-        mipt_io::DensityRecord record;
+        mipt::io::DensityRecord record;
         std::uint64_t processed = 0;
         double max_imag_norm = 0.0;
         std::uint64_t nonfinite_input_value_count = 0;

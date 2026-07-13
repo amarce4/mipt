@@ -1,4 +1,6 @@
-#include "density_io.hpp"
+#include "mipt/analysis/ring_inflation.hpp"
+#include "mipt/density.hpp"
+#include "mipt/env.hpp"
 
 #if __has_include(<scs.h>)
 #include <scs.h>
@@ -194,7 +196,7 @@ namespace
         return p + eps >= opts.p_min_select && p - eps <= opts.p_max_select;
     }
 
-    double p_value_for_index(const mipt_io::DensityFileMetadata &metadata, std::uint32_t p_index)
+    double p_value_for_index(const mipt::io::DensityFileMetadata &metadata, std::uint32_t p_index)
     {
         if (metadata.resolution <= 1)
         {
@@ -204,7 +206,7 @@ namespace
         return metadata.p_min + alpha * (metadata.p_max - metadata.p_min);
     }
 
-    std::uint64_t records_per_p_estimate(const mipt_io::DensityFileMetadata &metadata)
+    std::uint64_t records_per_p_estimate(const mipt::io::DensityFileMetadata &metadata)
     {
         if (metadata.realizations > 0)
         {
@@ -239,7 +241,7 @@ namespace
         return count;
     }
 
-    std::uint64_t estimate_progress_total(const mipt_io::DensityFileMetadata &metadata, const Options &opts)
+    std::uint64_t estimate_progress_total(const mipt::io::DensityFileMetadata &metadata, const Options &opts)
     {
         if (metadata.resolution == 0)
         {
@@ -256,17 +258,6 @@ namespace
             }
         }
         return std::min(metadata.record_count, selected_p_values * per_p);
-    }
-
-    bool env_flag(const char *name, bool default_value = false)
-    {
-        const char *value = std::getenv(name);
-        if (value == nullptr || *value == '\0')
-        {
-            return default_value;
-        }
-        const std::string s(value);
-        return !(s == "0" || s == "false" || s == "False" || s == "FALSE" || s == "no");
     }
 
     int env_nonnegative_int_zero_ok(const char *name, int default_value)
@@ -379,7 +370,7 @@ namespace
         {
             throw std::invalid_argument("record_stop must be greater than record_start. The window is [start, stop).");
         }
-        opts.scs_verbose = env_flag("RING_SCS_VERBOSE", false);
+        opts.scs_verbose = mipt::env::boolean("RING_SCS_VERBOSE", false);
 
         if (const char *out = std::getenv("RING_OUTPUT_CSV"); out != nullptr && *out != '\0')
         {
@@ -1122,7 +1113,7 @@ namespace
 
 } // namespace
 
-int main(int argc, char **argv)
+int mipt::analysis::run_ring_inflation_cli(int argc, char **argv)
 {
     try
     {
@@ -1130,7 +1121,7 @@ int main(int argc, char **argv)
         const int scs_acceleration_lookback =
             env_nonnegative_int_zero_ok("RING_SCS_ACCELERATION_LOOKBACK", 10);
 
-        mipt_io::DensityMatrixReader reader(opts.input_file);
+        mipt::io::DensityMatrixReader reader(opts.input_file);
         const auto &metadata = reader.metadata();
         if (metadata.kept_qubits != 3 || metadata.matrix_dimension != RHO_DIM)
         {
@@ -1168,7 +1159,7 @@ int main(int argc, char **argv)
         std::cout << "OpenMP SCS workers: " << omp_get_max_threads() << "\n";
 #endif
 
-        mipt_io::DensityRecord record;
+        mipt::io::DensityRecord record;
         std::uint64_t records_processed = 0;
         std::uint64_t rows_written = 0;
         std::uint64_t skipped_by_p_range = 0;

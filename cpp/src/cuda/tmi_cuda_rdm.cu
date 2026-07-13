@@ -1,4 +1,4 @@
-#include "tmi_cuda_rdm.hpp"
+#include "mipt/cuda/tmi_cuda_rdm.hpp"
 
 #include <stddef.h>
 #include <stdint.h>

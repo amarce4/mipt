@@ -7,7 +7,7 @@
 #include <string>
 #include <vector>
 
-namespace mipt_io
+namespace mipt::io
 {
     constexpr std::uint32_t RHO_FILE_VERSION = 2;
     constexpr std::uint32_t RHO_ENDIAN_MARKER = 0x01020304u;
@@ -334,4 +334,4 @@ namespace mipt_io
         std::uint64_t records_read_ = 0;
         std::ifstream stream_;
     };
-} // namespace mipt_io
+} // namespace mipt::io

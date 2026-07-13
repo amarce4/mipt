@@ -1,5 +1,7 @@
 #pragma once
 
+#include "mipt/env.hpp"
+
 #include <cstdlib>
 #include <cstring>
 #include <chrono>
@@ -11,90 +13,24 @@
 #define MIPT_CUDAQ_BACKEND_NAME "unknown"
 #endif
 
-namespace mipt_backend
+namespace mipt::backend
 {
-    inline bool env_truthy(const char *value)
-    {
-        return value != nullptr &&
-               (std::strcmp(value, "1") == 0 ||
-                std::strcmp(value, "true") == 0 ||
-                std::strcmp(value, "TRUE") == 0 ||
-                std::strcmp(value, "yes") == 0 ||
-                std::strcmp(value, "YES") == 0 ||
-                std::strcmp(value, "on") == 0 ||
-                std::strcmp(value, "ON") == 0);
-    }
-
-    inline bool env_falsey(const char *value)
-    {
-        return value != nullptr &&
-               (std::strcmp(value, "0") == 0 ||
-                std::strcmp(value, "false") == 0 ||
-                std::strcmp(value, "FALSE") == 0 ||
-                std::strcmp(value, "no") == 0 ||
-                std::strcmp(value, "NO") == 0 ||
-                std::strcmp(value, "off") == 0 ||
-                std::strcmp(value, "OFF") == 0);
-    }
-
-    inline bool env_bool(const char *name, bool fallback)
-    {
-        const char *value = std::getenv(name);
-        if (env_truthy(value))
-        {
-            return true;
-        }
-        if (env_falsey(value))
-        {
-            return false;
-        }
-        return fallback;
-    }
-
-
-    inline long env_long(const char *name, long fallback, long min_value, long max_value)
-    {
-        const char *value = std::getenv(name);
-        if (value == nullptr || *value == '\0')
-        {
-            return fallback;
-        }
-        char *end = nullptr;
-        const long parsed = std::strtol(value, &end, 10);
-        if (end == value || *end != '\0' || parsed < min_value || parsed > max_value)
-        {
-            return fallback;
-        }
-        return parsed;
-    }
-
-
-    inline std::string env_string(const char *name, const char *fallback = "")
-    {
-        const char *value = std::getenv(name);
-        if (value == nullptr || *value == '\0')
-        {
-            return std::string(fallback);
-        }
-        return std::string(value);
-    }
-
     inline long debug_prefix_layers()
     {
-        return env_long("MIPT_DEBUG_PREFIX_LAYERS", 0, 0, 1000000L);
+        return env::integer("MIPT_DEBUG_PREFIX_LAYERS", 0, 0, 1000000L);
     }
 
 
     inline bool verbose_enabled()
     {
-        return env_bool("MIPT_VERBOSE", false) ||
-               env_bool("MIPT_MPS_VERBOSE", false) ||
-               env_bool("SIM_TMI_VERBOSE", false);
+        return env::boolean("MIPT_VERBOSE", false) ||
+               env::boolean("MIPT_MPS_VERBOSE", false) ||
+               env::boolean("SIM_TMI_VERBOSE", false);
     }
 
     inline long mps_amplitude_batch_size()
     {
-        return env_long("MIPT_MPS_AMPLITUDE_BATCH", 4096, 1, 1000000L);
+        return env::integer("MIPT_MPS_AMPLITUDE_BATCH", 4096, 1, 1000000L);
     }
 
     inline double seconds_since(std::chrono::steady_clock::time_point start)
@@ -112,22 +48,22 @@ namespace mipt_backend
 
     inline int amplitude_reverse_bits()
     {
-        return env_bool("MIPT_STATE_AMPLITUDE_REVERSE_BITS", false) ? 1 : 0;
+        return env::boolean("MIPT_STATE_AMPLITUDE_REVERSE_BITS", false) ? 1 : 0;
     }
 
     inline long mps_exact_observable_max_qubits()
     {
-        return env_long("MIPT_MPS_EXACT_OBSERVABLE_MAX_QUBITS", 16, 3, 62);
+        return env::integer("MIPT_MPS_EXACT_OBSERVABLE_MAX_QUBITS", 16, 3, 62);
     }
 
     inline long mps_rdm_mc_samples()
     {
-        return env_long("MIPT_MPS_RDM_MC_SAMPLES", 8192, 0, 1000000000L);
+        return env::integer("MIPT_MPS_RDM_MC_SAMPLES", 8192, 0, 1000000000L);
     }
 
     inline long mps_tmi_dense_max_qubits()
     {
-        return env_long("SIM_TMI_MPS_DENSE_MAX_QUBITS", 16, 4, 30);
+        return env::integer("SIM_TMI_MPS_DENSE_MAX_QUBITS", 16, 4, 30);
     }
 
     inline void warn_mps_amplitude_path_once(const char *operation, int n, bool monte_carlo, long samples)
@@ -181,7 +117,7 @@ namespace mipt_backend
         // experimental tensor/MPS builds because it is an exact gate-count
         // reduction for the same periodic fermionic boundary operation.  Set
         // MIPT_DIRECT_FERMION_BOUNDARY=0 to reproduce the old FSWAP-chain path.
-        return env_bool("MIPT_DIRECT_FERMION_BOUNDARY", true);
+        return env::boolean("MIPT_DIRECT_FERMION_BOUNDARY", true);
     }
 
     inline void print_backend_banner_once(const char *program_name)
@@ -202,14 +138,14 @@ namespace mipt_backend
             std::cerr << ", MIPT_TENSOR_BACKEND=" << requested;
         }
 
-        if (env_bool("MIPT_NATIVE_MPS", false) || env_bool("MIPT_NATIVE_TEBD", false))
+        if (env::boolean("MIPT_NATIVE_MPS", false) || env::boolean("MIPT_NATIVE_TEBD", false))
         {
-            const std::string fallback_abs = env_string("CUDAQ_MPS_ABS_CUTOFF", "1e-10");
-            const std::string fallback_rel = env_string("CUDAQ_MPS_RELATIVE_CUTOFF", "1e-10");
+            const std::string fallback_abs = env::text("CUDAQ_MPS_ABS_CUTOFF", "1e-10");
+            const std::string fallback_rel = env::text("CUDAQ_MPS_RELATIVE_CUTOFF", "1e-10");
             std::cerr << ", native_mps=1"
-                      << ", MIPT_NATIVE_MPS_MAX_BOND=" << env_long("MIPT_NATIVE_MPS_MAX_BOND", env_long("CUDAQ_MPS_MAX_BOND", 64, 1, 4096), 1, 4096)
-                      << ", MIPT_NATIVE_MPS_ABS_CUTOFF=" << env_string("MIPT_NATIVE_MPS_ABS_CUTOFF", fallback_abs.c_str())
-                      << ", MIPT_NATIVE_MPS_RELATIVE_CUTOFF=" << env_string("MIPT_NATIVE_MPS_RELATIVE_CUTOFF", fallback_rel.c_str());
+                      << ", MIPT_NATIVE_MPS_MAX_BOND=" << env::integer("MIPT_NATIVE_MPS_MAX_BOND", env::integer("CUDAQ_MPS_MAX_BOND", 64, 1, 4096), 1, 4096)
+                      << ", MIPT_NATIVE_MPS_ABS_CUTOFF=" << env::text("MIPT_NATIVE_MPS_ABS_CUTOFF", fallback_abs.c_str())
+                      << ", MIPT_NATIVE_MPS_RELATIVE_CUTOFF=" << env::text("MIPT_NATIVE_MPS_RELATIVE_CUTOFF", fallback_rel.c_str());
         }
 
         if (compiled_for_mps_backend())
@@ -270,4 +206,4 @@ namespace mipt_backend
         }
         return msg;
     }
-} // namespace mipt_backend
+} // namespace mipt::backend

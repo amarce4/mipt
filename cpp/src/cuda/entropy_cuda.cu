@@ -1,4 +1,4 @@
-#include "entropy_cuda.hpp"
+#include "mipt/cuda/entropy_cuda.hpp"
 
 #include <cuda_runtime.h>
 #include <cublas_v2.h>

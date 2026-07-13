@@ -1,4 +1,4 @@
-#include "gmn.hpp"
+#include "mipt/analysis/gmn.hpp"
 
 #include <errno.h>
 #include <limits.h>
