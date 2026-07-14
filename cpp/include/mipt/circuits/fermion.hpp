@@ -36,15 +36,12 @@ struct RppuLayer
     std::vector<int> measure_flags;
 };
 
-struct RppuKernel1D
+__qpu__ inline void apply_rppu_layers(cudaq::qvector<> &q,
+                                     int n,
+                                     const std::vector<RppuLayer> &layers)
 {
-    void operator()(int n,
-                    const std::vector<RppuLayer> &layers) __qpu__
+    for (std::size_t layer = 0; layer < layers.size(); ++layer)
     {
-        cudaq::qvector q(n);
-
-        for (std::size_t layer = 0; layer < layers.size(); ++layer)
-        {
             for (std::size_t gi = 0; gi < layers[layer].gates.size(); ++gi)
             {
                 const auto gate = layers[layer].gates[gi];
@@ -113,7 +110,16 @@ struct RppuKernel1D
                     mz(q[i]);
                 }
             }
-        }
+    }
+}
+
+struct RppuKernel1D
+{
+    void operator()(int n,
+                    const std::vector<RppuLayer> &layers) __qpu__
+    {
+        cudaq::qvector q(n);
+        apply_rppu_layers(q, n, layers);
     }
 };
 
@@ -134,16 +140,13 @@ struct RfgsLayer // Layer data for the reduced fermionic gate set.
     std::vector<int> local_right_mask;
 };
 
-struct RfgsKernel1D
+__qpu__ inline void apply_rfgs_layers(cudaq::qvector<> &q,
+                                     int n,
+                                     const std::vector<RfgsLayer> &flayers,
+                                     bool closed)
 {
-    void operator()(int n,
-                    const std::vector<RfgsLayer> &flayers,
-                    bool closed) __qpu__
+    for (std::size_t layer = 0; layer < flayers.size(); ++layer)
     {
-        cudaq::qvector q(n);
-
-        for (std::size_t layer = 0; layer < flayers.size(); ++layer)
-        {
             const int start = flayers[layer].start;
             const int bond_stop = (closed && start == 1 && n > 2) ? n : (n - 1);
 
@@ -254,7 +257,17 @@ struct RfgsKernel1D
                     mz(q[i]); // Z measurement preserves fermion parity.
                 }
             }
-        }
+    }
+}
+
+struct RfgsKernel1D
+{
+    void operator()(int n,
+                    const std::vector<RfgsLayer> &flayers,
+                    bool closed) __qpu__
+    {
+        cudaq::qvector q(n);
+        apply_rfgs_layers(q, n, flayers, closed);
     }
 };
 

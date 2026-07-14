@@ -107,6 +107,7 @@ BUILD := build/$(CONFIG)
 HOST_BUILD := build/host_omp$(OPENMP)
 
 MIPT_BIN := $(BUILD)/mipt.exe
+MIPT_PROBED_BIN := $(BUILD)/mipt_probed.exe
 SIM_TMI_BIN := $(BUILD)/sim_tmi.exe
 ENTROPY_BIN := $(BUILD)/entropy.exe
 GMN_BIN := $(HOST_BUILD)/gmn.exe
@@ -116,6 +117,7 @@ EXP_VALS_BIN := $(HOST_BUILD)/exp_vals.exe
 CORE_TEST_BIN := $(HOST_BUILD)/core_tests
 
 MIPT_OBJS := $(BUILD)/mipt.o
+MIPT_PROBED_OBJS := $(BUILD)/mipt_probed.o
 SIM_TMI_OBJS := $(BUILD)/sim_tmi.o
 ENTROPY_OBJS := $(BUILD)/entropy.o
 GMN_OBJS := $(HOST_BUILD)/gmn.o $(HOST_BUILD)/gmn_mosek.o $(HOST_BUILD)/fgmn.o
@@ -126,19 +128,20 @@ CORE_TEST_OBJS := $(HOST_BUILD)/core_tests.o
 
 ifeq ($(CUDA_RHO),1)
   MIPT_OBJS += $(BUILD)/rho_reduce.o
+  MIPT_PROBED_OBJS += $(BUILD)/rho_reduce.o
   SIM_TMI_OBJS += $(BUILD)/rho_reduce.o $(BUILD)/tmi_cuda_svd.o $(BUILD)/tmi_cuda_rdm.o
   ENTROPY_OBJS += $(BUILD)/rho_reduce.o $(BUILD)/entropy_cuda.o
 endif
 
-ALL_OBJS := $(MIPT_OBJS) $(SIM_TMI_OBJS) $(ENTROPY_OBJS) \
+ALL_OBJS := $(MIPT_OBJS) $(MIPT_PROBED_OBJS) $(SIM_TMI_OBJS) $(ENTROPY_OBJS) \
   $(GMN_OBJS) $(FGMN_OBJS) $(RING_OBJS) $(EXP_VALS_OBJS) $(CORE_TEST_OBJS)
 DEPS := $(ALL_OBJS:.o=.d)
 
 .PHONY: all simulation analysis clean cpu gpu print-config format test-core \
-  mipt.exe sim_tmi.exe entropy.exe gmn.exe fgmn.exe ring_inflation.exe exp_vals.exe
+  mipt.exe mipt_probed.exe sim_tmi.exe entropy.exe gmn.exe fgmn.exe ring_inflation.exe exp_vals.exe
 
 all: simulation analysis
-simulation: mipt.exe sim_tmi.exe entropy.exe
+simulation: mipt.exe mipt_probed.exe sim_tmi.exe entropy.exe
 analysis: gmn.exe fgmn.exe ring_inflation.exe exp_vals.exe
 cpu:
 	$(MAKE) all GPU=0 CUDA_RHO=0
@@ -146,6 +149,8 @@ gpu:
 	$(MAKE) all GPU=1 CUDA_RHO=1 FP64=$(FP64)
 
 mipt.exe: $(MIPT_BIN)
+	cp $< $@
+mipt_probed.exe: $(MIPT_PROBED_BIN)
 	cp $< $@
 sim_tmi.exe: $(SIM_TMI_BIN)
 	cp $< $@
@@ -161,6 +166,8 @@ exp_vals.exe: $(EXP_VALS_BIN)
 	cp $< $@
 
 $(MIPT_BIN): $(MIPT_OBJS)
+	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $^ $(MIPT_CUDA_LIBS) $(DL_LIBS) -o $@
+$(MIPT_PROBED_BIN): $(MIPT_PROBED_OBJS)
 	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $^ $(MIPT_CUDA_LIBS) $(DL_LIBS) -o $@
 $(SIM_TMI_BIN): $(SIM_TMI_OBJS)
 	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $^ $(MIPT_CUDA_LIBS) $(SIM_TMI_CUDA_LIBS) $(DL_LIBS) -o $@
@@ -185,6 +192,8 @@ $(BUILD) $(HOST_BUILD):
 	mkdir -p $@
 
 $(BUILD)/mipt.o: apps/mipt.cpp | $(BUILD)
+	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $(NVQXXFLAGS_COMMON) -c $< -o $@
+$(BUILD)/mipt_probed.o: apps/mipt_probed.cpp | $(BUILD)
 	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $(NVQXXFLAGS_COMMON) -c $< -o $@
 $(BUILD)/sim_tmi.o: apps/sim_tmi.cpp | $(BUILD)
 	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $(NVQXXFLAGS_COMMON) -c $< -o $@

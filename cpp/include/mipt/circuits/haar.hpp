@@ -280,13 +280,12 @@ inline void build_haar_layers(std::vector<HaarLayer> &layers,
     }
 }
 
-struct HaarKernel1D
+__qpu__ inline void apply_haar_layers(cudaq::qvector<> &q,
+                                     int n,
+                                     const std::vector<HaarLayer> &layers)
 {
-    void operator()(int n, const std::vector<HaarLayer> &layers) __qpu__
+    for (std::size_t layer = 0; layer < layers.size(); ++layer)
     {
-        cudaq::qvector q(n);
-        for (std::size_t layer = 0; layer < layers.size(); ++layer)
-        {
             for (std::size_t gi = 0; gi < layers[layer].gates.size(); ++gi)
             {
                 const auto gate = layers[layer].gates[gi];
@@ -325,7 +324,15 @@ struct HaarKernel1D
                     mz(q[i]);
                 }
             }
-        }
+    }
+}
+
+struct HaarKernel1D
+{
+    void operator()(int n, const std::vector<HaarLayer> &layers) __qpu__
+    {
+        cudaq::qvector q(n);
+        apply_haar_layers(q, n, layers);
     }
 };
 

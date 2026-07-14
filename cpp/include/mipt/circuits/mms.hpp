@@ -22,16 +22,13 @@ struct MmsLayer
 };
 
 
-struct MmsKernel1D
+__qpu__ inline void apply_mms_layers(cudaq::qvector<> &q,
+                                    int n,
+                                    const std::vector<MmsLayer> &layers,
+                                    bool closed)
 {
-    void operator()(int n,
-                    const std::vector<MmsLayer> &layers,
-                    bool closed) __qpu__
+    for (std::size_t layer = 0; layer < layers.size(); ++layer)
     {
-        cudaq::qvector q(n);
-
-        for (std::size_t layer = 0; layer < layers.size(); ++layer)
-        {
             int start = layers[layer].start;
 
             for (int i = start; i < n - 1; i += 2)
@@ -145,7 +142,17 @@ struct MmsKernel1D
                     mz(q[i]);
                 }
             }
-        }
+    }
+}
+
+struct MmsKernel1D
+{
+    void operator()(int n,
+                    const std::vector<MmsLayer> &layers,
+                    bool closed) __qpu__
+    {
+        cudaq::qvector q(n);
+        apply_mms_layers(q, n, layers, closed);
     }
 };
 
