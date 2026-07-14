@@ -62,7 +62,7 @@ namespace
             << "  Maximum number of full records/realizations evaluated per p-value.\n"
             << "  Use 0, or omit it, for no per-p limit.\n\n"
             << "Output columns:\n"
-            << "  p,fgmn\n\n"
+            << "  p,fgmn,bipneg\n\n"
             << "Environment variables:\n"
             << "  OMP_NUM_THREADS=N          Number of parallel fGMN worker threads.\n"
             << "  GMN_MOSEK_NUM_THREADS=N    MOSEK threads per fGMN solve; use 1 when OMP > 1.\n"
@@ -328,7 +328,7 @@ int main(int argc, char *argv[])
         {
             throw std::runtime_error("Could not create output CSV: " + output_path);
         }
-        outfile << "p,fgmn\n";
+        outfile << "p,fgmn,bipneg\n";
         outfile << std::setprecision(17);
 
         const std::uint64_t max_records_evaluated = [&]() -> std::uint64_t {
@@ -389,6 +389,7 @@ int main(int argc, char *argv[])
         std::vector<FgmnJob> jobs;
         jobs.reserve(static_cast<std::size_t>(batch_records) * metadata.subsystem_count);
         std::vector<double> fgmn_values;
+        std::vector<double> bipneg_values;
         std::vector<unsigned char> prefilter_skipped_flags;
 
         mipt::io::DensityRecord record;
@@ -452,6 +453,7 @@ int main(int argc, char *argv[])
             }
 
             fgmn_values.assign(jobs.size(), std::numeric_limits<double>::quiet_NaN());
+            bipneg_values.assign(jobs.size(), std::numeric_limits<double>::quiet_NaN());
             prefilter_skipped_flags.assign(jobs.size(), 0);
 
 #ifdef _OPENMP
@@ -462,17 +464,17 @@ int main(int argc, char *argv[])
                 const std::size_t idx = static_cast<std::size_t>(i);
                 const double *rho = jobs[idx].rho_ri.data();
 
-                if (zero_prefilter.enabled)
+                const double min_bipartite_fneg =
+                    compute_min_bipartite_fermionic_negativity_8x8_cpp(rho);
+                bipneg_values[idx] = min_bipartite_fneg;
+
+                if (zero_prefilter.enabled &&
+                    std::isfinite(min_bipartite_fneg) &&
+                    min_bipartite_fneg <= zero_prefilter.tolerance)
                 {
-                    const double min_bipartite_fneg =
-                        compute_min_bipartite_fermionic_negativity_8x8_cpp(rho);
-                    if (std::isfinite(min_bipartite_fneg) &&
-                        min_bipartite_fneg <= zero_prefilter.tolerance)
-                    {
-                        fgmn_values[idx] = 0.0;
-                        prefilter_skipped_flags[idx] = 1;
-                        continue;
-                    }
+                    fgmn_values[idx] = 0.0;
+                    prefilter_skipped_flags[idx] = 1;
+                    continue;
                 }
 
                 fgmn_values[idx] = compute_fgmn_mosek_8x8_cpp(rho);
@@ -490,7 +492,7 @@ int main(int argc, char *argv[])
                 {
                     ++nonfinite_count;
                 }
-                outfile << job.p << ',' << value << '\n';
+                outfile << job.p << ',' << value << ',' << bipneg_values[i] << '\n';
             }
             outfile.flush();
 

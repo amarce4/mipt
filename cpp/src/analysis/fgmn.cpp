@@ -973,7 +973,7 @@ namespace fgmn
         return trace_sqrt;
     }
 
-    double bipartite_fermionic_negativity_numeric(const double *rho, int subsystem)
+    double bipartite_negativity_numeric(const double *rho, int subsystem, bool fermionic)
     {
         if (rho == nullptr)
         {
@@ -1000,7 +1000,7 @@ namespace fgmn
                 // after the ordinary partial transpose, entries that violate the
                 // local parity of the transposed subsystem acquire a factor of i.
                 const bool parity_violation = ((r & mask) != 0) ^ ((c & mask) != 0);
-                if (parity_violation)
+                if (fermionic && parity_violation)
                 {
                     value = std::complex<double>(-value.imag(), value.real());
                 }
@@ -1056,12 +1056,13 @@ namespace fgmn
         return negativity;
     }
 
-    double min_bipartite_fermionic_negativity_numeric(const double *rho)
+    double min_bipartite_negativity_numeric(const double *rho, bool fermionic)
     {
         double best = std::numeric_limits<double>::infinity();
         for (int subsystem = 0; subsystem < PARTIES; ++subsystem)
         {
-            const double value = bipartite_fermionic_negativity_numeric(rho, subsystem);
+            const double value =
+                bipartite_negativity_numeric(rho, subsystem, fermionic);
             if (!std::isfinite(value))
             {
                 return std::numeric_limits<double>::quiet_NaN();
@@ -1069,6 +1070,16 @@ namespace fgmn
             best = std::min(best, value);
         }
         return best;
+    }
+
+    double min_bipartite_negativity_numeric(const double *rho)
+    {
+        return min_bipartite_negativity_numeric(rho, false);
+    }
+
+    double min_bipartite_fermionic_negativity_numeric(const double *rho)
+    {
+        return min_bipartite_negativity_numeric(rho, true);
     }
 
     struct GmnWorkspace
@@ -1381,6 +1392,19 @@ namespace fgmn
             return workspace_complex();
         }
         return workspace_real();
+    }
+}
+
+extern "C" double compute_min_bipartite_negativity_8x8_cpp(
+    const double *rho_complex_row_major)
+{
+    try
+    {
+        return fgmn::min_bipartite_negativity_numeric(rho_complex_row_major);
+    }
+    catch (...)
+    {
+        return std::numeric_limits<double>::quiet_NaN();
     }
 }
 

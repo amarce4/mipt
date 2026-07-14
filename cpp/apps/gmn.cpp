@@ -1,6 +1,7 @@
 #include "mipt/density.hpp"
 #include "mipt/env.hpp"
 #include "mipt/analysis/gmn.hpp"
+#include "mipt/analysis/fgmn.hpp"
 
 #include <algorithm>
 #include <array>
@@ -24,6 +25,7 @@
 namespace
 {
     constexpr std::size_t RHO3_VALUES = 2u * 8u * 8u;
+    constexpr double GMN_ZERO_PREFILTER_TOL = 1.0e-10;
 
     enum class EvaluationMode
     {
@@ -53,7 +55,8 @@ namespace
     void print_usage(const char *program)
     {
         std::cout
-            << "Usage: " << program << " [0|1] [input_file] [output_csv]\n\n"
+            << "Usage: " << program
+            << " [0|1] [input_file] [output_csv] [limit_per_p]\n\n"
             << "Modes:\n"
             << "  0    Real-only SDP using Re(rho). Fast legacy path.\n"
             << "  1    Complex Hermitian SDP using the full complex rho.\n\n"
@@ -64,11 +67,16 @@ namespace
             << "Examples:\n"
             << "  " << program << " 0 rho3.bin data_real.csv\n"
             << "  " << program << " 1 rho3.bin data_complex.csv\n"
-            << "  " << program << " 1 rho3_2d.bin data2_complex.csv\n\n"
+            << "  " << program << " 1 rho3_2d.bin data2_complex.csv\n"
+            << "  " << program << " 1 rho3.bin data_limited.csv 1000\n\n"
+            << "limit_per_p:\n"
+            << "  Maximum number of full records/realizations evaluated per p-value.\n"
+            << "  Use 0, or omit it, for no per-p limit.\n\n"
             << "Environment variables:\n"
             << "  OMP_NUM_THREADS=N          Number of parallel GMN worker threads.\n"
             << "  GMN_MOSEK_NUM_THREADS=N    MOSEK threads per GMN solve; use 1 when OMP > 1.\n"
             << "  GMN_BATCH_RECORDS=N        Records per parallel batch; default 256.\n"
+            << "  GMN_LIMIT_PER_P=N          Fallback per-p record limit; 0 or unset means no limit.\n"
             << "  GMN_MOSEK_RECYCLE=N        Rebuild cached task every N solves/thread; default 10000, 0 disables.\n\n"
             << "The former leading argument '3' has been removed. Use mode 0 or 1.\n"
             << "Six-qubit retained-subsystem analysis is not implemented; input must contain\n"
@@ -209,6 +217,44 @@ namespace
         return (value < 0.0 && value > -1.0e-10) ? 0.0 : value;
     }
 
+    std::uint64_t parse_nonnegative_u64(const char *value, const char *name)
+    {
+        if (value == nullptr || *value == '\0' || value[0] == '-')
+        {
+            throw std::invalid_argument(
+                std::string(name) + " must be a non-negative integer.");
+        }
+
+        char *end = nullptr;
+        errno = 0;
+        const unsigned long long parsed = std::strtoull(value, &end, 10);
+        if (errno != 0 || end == value || *end != '\0')
+        {
+            throw std::invalid_argument(
+                std::string(name) + " must be a non-negative integer.");
+        }
+
+        return static_cast<std::uint64_t>(parsed);
+    }
+
+    std::uint64_t parse_limit_per_p(int argc, char *argv[], int argument_index)
+    {
+        if (argc > argument_index)
+        {
+            return parse_nonnegative_u64(
+                argv[argument_index],
+                "limit_per_p");
+        }
+
+        const char *value = std::getenv("GMN_LIMIT_PER_P");
+        if (value != nullptr && *value != '\0')
+        {
+            return parse_nonnegative_u64(value, "GMN_LIMIT_PER_P");
+        }
+
+        return 0;
+    }
+
     EvaluationMode parse_mode(const char *arg)
     {
         const std::string value(arg);
@@ -302,7 +348,9 @@ int main(int argc, char *argv[])
             (argc > next_argument) ? argv[next_argument] : "rho3.bin";
         const std::string output_path =
             (argc > next_argument + 1) ? argv[next_argument + 1] : "data.csv";
-        if (argc > next_argument + 2)
+        const std::uint64_t limit_per_p =
+            parse_limit_per_p(argc, argv, next_argument + 2);
+        if (argc > next_argument + 3)
         {
             throw std::invalid_argument("Too many command-line arguments.");
         }
@@ -334,16 +382,44 @@ int main(int argc, char *argv[])
             throw std::runtime_error("Could not create output CSV: " + output_path);
         }
 
-        outfile << "p,gmn\n";
+        outfile << "p,gmn,bipneg\n";
         outfile << std::setprecision(17);
 
+        const std::uint64_t max_records_evaluated = [&]() -> std::uint64_t {
+            if (limit_per_p == 0)
+            {
+                return metadata.record_count;
+            }
+
+            const std::uint64_t resolution =
+                static_cast<std::uint64_t>(metadata.resolution);
+            const std::uint64_t maximum_limited_records =
+                (resolution != 0 &&
+                 limit_per_p >
+                     std::numeric_limits<std::uint64_t>::max() / resolution)
+                    ? std::numeric_limits<std::uint64_t>::max()
+                    : limit_per_p * resolution;
+
+            return std::min<std::uint64_t>(
+                metadata.record_count,
+                maximum_limited_records);
+        }();
+
         const std::uint64_t total_solves =
-            metadata.record_count * static_cast<std::uint64_t>(metadata.subsystem_count);
+            max_records_evaluated *
+            static_cast<std::uint64_t>(metadata.subsystem_count);
+
         std::cout << "Calculating three-qubit " << mode_name(mode)
                   << " GMN values from " << input_path
-                  << " (" << metadata.record_count << " trajectories, "
+                  << " (" << metadata.record_count << " input records, "
                   << metadata.subsystem_count << " retained subsystems each, "
-                  << total_solves << " total solves).\n";
+                  << "up to " << total_solves << " total solves";
+        if (limit_per_p != 0)
+        {
+            std::cout << "; limit_per_p=" << limit_per_p
+                      << " records/p-value";
+        }
+        std::cout << ").\n";
 
 #ifdef _OPENMP
         std::cout << "OpenMP GMN workers: " << omp_get_max_threads()
@@ -361,52 +437,119 @@ int main(int argc, char *argv[])
         std::vector<GmnJob> jobs;
         jobs.reserve(static_cast<std::size_t>(batch_records) * metadata.subsystem_count);
         std::vector<double> gmn_values;
+        std::vector<double> bipneg_values;
+        std::vector<unsigned char> prefilter_skipped_flags;
 
         mipt::io::DensityRecord record;
+        std::vector<std::uint64_t> accepted_records_per_p(
+            metadata.resolution,
+            0);
+        std::uint64_t records_scanned = 0;
+        std::uint64_t records_evaluated = 0;
+        std::uint64_t records_skipped_by_limit = 0;
+        bool reader_exhausted = false;
         std::uint64_t processed = 0;
         double max_imag_norm = 0.0;
         std::uint64_t nonfinite_input_value_count = 0;
         std::uint64_t sanitized_matrix_count = 0;
         std::uint64_t nonfinite_gmn_count = 0;
         std::uint64_t clipped_negative_gmn_count = 0;
+        std::uint64_t zero_prefilter_skipped = 0;
         const auto start = std::chrono::steady_clock::now();
         auto interval_start = start;
         std::uint64_t interval_processed = 0;
 
-        while (processed < total_solves)
+        while (processed < total_solves && !reader_exhausted)
         {
             jobs.clear();
 
             int records_in_batch = 0;
-            while (records_in_batch < batch_records && reader.read_record(record))
+            while (records_in_batch < batch_records)
             {
+                if (!reader.read_record(record))
+                {
+                    reader_exhausted = true;
+                    break;
+                }
+
+                ++records_scanned;
+                ++records_in_batch;
+
+                if (record.p_index >= accepted_records_per_p.size())
+                {
+                    throw std::runtime_error(
+                        "Input record has p_index outside metadata.resolution.");
+                }
+
+                if (limit_per_p != 0 &&
+                    accepted_records_per_p[record.p_index] >= limit_per_p)
+                {
+                    ++records_skipped_by_limit;
+                    continue;
+                }
+
+                ++accepted_records_per_p[record.p_index];
+                ++records_evaluated;
                 append_jobs_from_record(metadata, record, jobs, max_imag_norm,
                                         nonfinite_input_value_count,
                                         sanitized_matrix_count);
-                ++records_in_batch;
             }
 
             if (jobs.empty())
             {
+                if (!reader_exhausted)
+                {
+                    std::cout
+                        << "\rScanned " << records_scanned
+                        << " records; skipped " << records_skipped_by_limit
+                        << " by limit_per_p; waiting for the next accepted "
+                           "p-record...        "
+                        << std::flush;
+                    continue;
+                }
                 break;
             }
 
             gmn_values.assign(jobs.size(), std::numeric_limits<double>::quiet_NaN());
+            bipneg_values.assign(jobs.size(), std::numeric_limits<double>::quiet_NaN());
+            prefilter_skipped_flags.assign(jobs.size(), 0);
 
 #ifdef _OPENMP
 #pragma omp parallel for schedule(dynamic, 1)
 #endif
             for (std::int64_t i = 0; i < static_cast<std::int64_t>(jobs.size()); ++i)
             {
-                const GmnJob &job = jobs[static_cast<std::size_t>(i)];
+                const std::size_t idx = static_cast<std::size_t>(i);
+                const GmnJob &job = jobs[idx];
+
+                std::array<double, RHO3_VALUES> bipneg_rho = job.rho_ri;
+                if (mode == EvaluationMode::RealOnly)
+                {
+                    for (std::size_t k = 1; k < RHO3_VALUES; k += 2)
+                    {
+                        bipneg_rho[k] = 0.0;
+                    }
+                }
+
+                const double min_bipneg =
+                    compute_min_bipartite_negativity_8x8_cpp(bipneg_rho.data());
+                bipneg_values[idx] = min_bipneg;
+                if (std::isfinite(min_bipneg) &&
+                    min_bipneg <= GMN_ZERO_PREFILTER_TOL)
+                {
+                    gmn_values[idx] = 0.0;
+                    prefilter_skipped_flags[idx] = 1;
+                    continue;
+                }
+
                 if (mode == EvaluationMode::Complex)
                 {
-                    gmn_values[static_cast<std::size_t>(i)] =
+                    gmn_values[idx] =
                         compute_gmn_mosek_complex_8x8(job.rho_ri.data());
                 }
                 else
                 {
-                    gmn_values[static_cast<std::size_t>(i)] =
+                    gmn_values[idx] =
                         compute_gmn_mosek_real_8x8(job.rho_real.data());
                 }
             }
@@ -416,6 +559,10 @@ int main(int argc, char *argv[])
                 const GmnJob &job = jobs[i];
                 const double raw_gmn = gmn_values[i];
                 const double safe_gmn = csv_safe_gmn(raw_gmn);
+                if (prefilter_skipped_flags[i] != 0)
+                {
+                    ++zero_prefilter_skipped;
+                }
                 if (!std::isfinite(raw_gmn))
                 {
                     ++nonfinite_gmn_count;
@@ -424,7 +571,7 @@ int main(int argc, char *argv[])
                 {
                     ++clipped_negative_gmn_count;
                 }
-                outfile << job.p << ',' << safe_gmn << '\n';
+                outfile << job.p << ',' << safe_gmn << ',' << bipneg_values[i] << '\n';
             }
             outfile.flush();
 
@@ -446,7 +593,14 @@ int main(int argc, char *argv[])
                     : 0.0;
 
             std::cout << "\rProcessed " << processed << "/"
-                      << total_solves << " matrices; avg "
+                      << total_solves << " matrices from "
+                      << records_evaluated << " records";
+            if (records_skipped_by_limit != 0)
+            {
+                std::cout << " (skipped " << records_skipped_by_limit
+                          << " by limit)";
+            }
+            std::cout << "; avg "
                       << std::fixed << std::setprecision(2)
                       << average_rate << "/s, recent "
                       << recent_rate << "/s, ETA "
@@ -461,6 +615,12 @@ int main(int argc, char *argv[])
         }
 
         std::cout << "\nWrote " << output_path << ".\n"
+                  << "Records scanned: " << records_scanned
+                  << "; records evaluated: " << records_evaluated
+                  << "; records skipped by limit_per_p: "
+                  << records_skipped_by_limit << "\n"
+                  << "Matrices skipped by bipartite-negativity zero prefilter: "
+                  << zero_prefilter_skipped << "\n"
                   << "Maximum imaginary Frobenius norm in input records: "
                   << std::scientific << std::setprecision(6)
                   << max_imag_norm << "\n";

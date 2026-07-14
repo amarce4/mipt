@@ -16,6 +16,10 @@ extern "C" {
  */
 double compute_fgmn_mosek_8x8_cpp(const double *rho_ri_row_major);
 
+/* Minimum ordinary bipartite negativity over the three one-vs-rest cuts. */
+double compute_min_bipartite_negativity_8x8_cpp(
+    const double *rho_ri_row_major);
+
 /*
  * Cheap upper-bound prefilter helper.  Returns
  *   min_s N_F_s(rho)

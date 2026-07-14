@@ -1,8 +1,5 @@
 /build/
 /*.exe
 /*.tmp
-/info.csv
-/info2.csv
-/rho3.bin
-/rho3_2d.bin
-/csv/
+/*.csv
+/*.bin
