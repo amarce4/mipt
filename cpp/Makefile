@@ -112,6 +112,7 @@ ENTROPY_BIN := $(BUILD)/entropy.exe
 GMN_BIN := $(HOST_BUILD)/gmn.exe
 FGMN_BIN := $(HOST_BUILD)/fgmn.exe
 RING_BIN := $(HOST_BUILD)/ring_inflation.exe
+EXP_VALS_BIN := $(HOST_BUILD)/exp_vals.exe
 CORE_TEST_BIN := $(HOST_BUILD)/core_tests
 
 MIPT_OBJS := $(BUILD)/mipt.o
@@ -120,6 +121,7 @@ ENTROPY_OBJS := $(BUILD)/entropy.o
 GMN_OBJS := $(HOST_BUILD)/gmn.o $(HOST_BUILD)/gmn_mosek.o $(HOST_BUILD)/fgmn.o
 FGMN_OBJS := $(HOST_BUILD)/fgmn_main.o $(HOST_BUILD)/fgmn.o
 RING_OBJS := $(HOST_BUILD)/ring_inflation_main.o $(HOST_BUILD)/ring_inflation.o $(HOST_BUILD)/gmn_mosek.o
+EXP_VALS_OBJS := $(HOST_BUILD)/exp_vals_main.o $(HOST_BUILD)/exp_vals_analysis.o
 CORE_TEST_OBJS := $(HOST_BUILD)/core_tests.o
 
 ifeq ($(CUDA_RHO),1)
@@ -129,15 +131,15 @@ ifeq ($(CUDA_RHO),1)
 endif
 
 ALL_OBJS := $(MIPT_OBJS) $(SIM_TMI_OBJS) $(ENTROPY_OBJS) \
-  $(GMN_OBJS) $(FGMN_OBJS) $(RING_OBJS) $(CORE_TEST_OBJS)
+  $(GMN_OBJS) $(FGMN_OBJS) $(RING_OBJS) $(EXP_VALS_OBJS) $(CORE_TEST_OBJS)
 DEPS := $(ALL_OBJS:.o=.d)
 
 .PHONY: all simulation analysis clean cpu gpu print-config format test-core \
-  mipt.exe sim_tmi.exe entropy.exe gmn.exe fgmn.exe ring_inflation.exe
+  mipt.exe sim_tmi.exe entropy.exe gmn.exe fgmn.exe ring_inflation.exe exp_vals.exe
 
 all: simulation analysis
 simulation: mipt.exe sim_tmi.exe entropy.exe
-analysis: gmn.exe fgmn.exe ring_inflation.exe
+analysis: gmn.exe fgmn.exe ring_inflation.exe exp_vals.exe
 cpu:
 	$(MAKE) all GPU=0 CUDA_RHO=0
 gpu:
@@ -155,6 +157,8 @@ fgmn.exe: $(FGMN_BIN)
 	cp $< $@
 ring_inflation.exe: $(RING_BIN)
 	cp $< $@
+exp_vals.exe: $(EXP_VALS_BIN)
+	cp $< $@
 
 $(MIPT_BIN): $(MIPT_OBJS)
 	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $^ $(MIPT_CUDA_LIBS) $(DL_LIBS) -o $@
@@ -168,6 +172,8 @@ $(FGMN_BIN): $(FGMN_OBJS)
 	$(HOSTCXX) $(HOST_LDFLAGS) $^ $(MOSEK_LDFLAGS) $(MOSEK_LIBS) -o $@
 $(RING_BIN): $(RING_OBJS)
 	$(HOSTCXX) $(HOST_LDFLAGS) $^ $(MOSEK_LDFLAGS) $(MOSEK_LIBS) $(SCS_LDFLAGS) -o $@
+$(EXP_VALS_BIN): $(EXP_VALS_OBJS)
+	$(HOSTCXX) $(HOST_LDFLAGS) $^ -o $@
 
 $(CORE_TEST_BIN): $(CORE_TEST_OBJS)
 	$(HOSTCXX) $^ -o $@
@@ -204,6 +210,10 @@ $(HOST_BUILD)/ring_inflation_main.o: apps/ring_inflation.cpp | $(HOST_BUILD)
 	$(HOSTCXX) $(CXXFLAGS_COMMON) -c $< -o $@
 $(HOST_BUILD)/ring_inflation.o: src/analysis/ring_inflation.cpp | $(HOST_BUILD)
 	$(HOSTCXX) $(CXXFLAGS_COMMON) $(SCS_CFLAGS) -c $< -o $@
+$(HOST_BUILD)/exp_vals_main.o: apps/exp_vals.cpp | $(HOST_BUILD)
+	$(HOSTCXX) $(CXXFLAGS_COMMON) -c $< -o $@
+$(HOST_BUILD)/exp_vals_analysis.o: src/analysis/exp_vals.cpp | $(HOST_BUILD)
+	$(HOSTCXX) $(CXXFLAGS_COMMON) -c $< -o $@
 $(HOST_BUILD)/gmn_mosek.o: src/analysis/gmn_mosek.c | $(HOST_BUILD)
 	$(HOSTCC) $(CFLAGS_COMMON) $(MOSEK_CPPFLAGS) -c $< -o $@
 $(HOST_BUILD)/core_tests.o: tests/core_tests.cpp | $(HOST_BUILD)
