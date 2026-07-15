@@ -184,46 +184,88 @@ class CircuitWorkspace1D
         switch (prepared_type_)
         {
         case CircuitType::MMS:
-            assign_segment(mms_layers_, mms_segment_, first_timestep, timestep_count);
             return finish_logged(
-                cudaq::get_state(MmsAdvanceKernel{}, &state, prepared_n_,
-                                 mms_segment_, true),
+                run_segment(
+                    mms_layers_, mms_segment_, first_timestep, timestep_count,
+                    [&](const std::vector<MmsLayer> &layers)
+                    {
+                        return cudaq::get_state(
+                            MmsAdvanceKernel{}, &state, prepared_n_, layers, true);
+                    }),
                 context, circuit_type_name(prepared_type_), start);
 
         case CircuitType::Haar:
-            assign_segment(haar_layers_, haar_segment_, first_timestep, timestep_count);
             return finish_logged(
-                cudaq::get_state(HaarAdvanceKernel{}, &state, prepared_n_,
-                                 haar_segment_),
+                run_segment(
+                    haar_layers_, haar_segment_, first_timestep, timestep_count,
+                    [&](const std::vector<HaarLayer> &layers)
+                    {
+                        return cudaq::get_state(
+                            HaarAdvanceKernel{}, &state, prepared_n_, layers);
+                    }),
                 context, circuit_type_name(prepared_type_), start);
 
         case CircuitType::FermionRPPU:
         case CircuitType::QubitRPPU:
-            assign_segment(rppu_layers_, rppu_segment_, first_timestep, timestep_count);
             return finish_logged(
-                cudaq::get_state(RppuAdvanceKernel{}, &state, prepared_n_,
-                                 rppu_segment_),
+                run_segment(
+                    rppu_layers_, rppu_segment_, first_timestep, timestep_count,
+                    [&](const std::vector<RppuLayer> &layers)
+                    {
+                        return cudaq::get_state(
+                            RppuAdvanceKernel{}, &state, prepared_n_, layers);
+                    }),
                 context, circuit_type_name(prepared_type_), start);
 
         case CircuitType::RFGS:
-            assign_segment(rfgs_layers_, rfgs_segment_, first_timestep, timestep_count);
             return finish_logged(
-                cudaq::get_state(RfgsAdvanceKernel{}, &state, prepared_n_,
-                                 rfgs_segment_, true),
+                run_segment(
+                    rfgs_layers_, rfgs_segment_, first_timestep, timestep_count,
+                    [&](const std::vector<RfgsLayer> &layers)
+                    {
+                        return cudaq::get_state(
+                            RfgsAdvanceKernel{}, &state, prepared_n_, layers, true);
+                    }),
                 context, circuit_type_name(prepared_type_), start);
         }
         throw std::invalid_argument("Unsupported probed circuit type.");
     }
 
   private:
-    template <typename Layer>
-    static void assign_segment(const std::vector<Layer> &source,
-                               std::vector<Layer> &destination,
-                               int first,
-                               int count)
+    template <typename Layer, typename Runner>
+    static cudaq::state run_segment(std::vector<Layer> &source,
+                                    std::vector<Layer> &destination,
+                                    int first,
+                                    int count,
+                                    Runner &&runner)
     {
+        if (count == 1)
+        {
+            // get_state is synchronous. Swap the selected layer into a reusable
+            // one-element payload, run it, then restore the prepared history.
+            // This moves nested vectors in O(1) instead of deep-copying every
+            // gate and measurement array at every sampled timestep.
+            destination.clear();
+            destination.resize(1);
+            std::swap(destination[0], source[static_cast<std::size_t>(first)]);
+            try
+            {
+                auto result = runner(destination);
+                std::swap(destination[0], source[static_cast<std::size_t>(first)]);
+                return result;
+            }
+            catch (...)
+            {
+                std::swap(destination[0], source[static_cast<std::size_t>(first)]);
+                throw;
+            }
+        }
+
+        // The only normal multi-layer request is the unsampled prefix t_min.
+        // It is copied once per realization, not once per sampled timestep.
         const auto begin = source.begin() + first;
         destination.assign(begin, begin + count);
+        return runner(destination);
     }
 
     void validate_segment(int first, int count) const

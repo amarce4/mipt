@@ -1,7 +1,7 @@
+#include "mipt/ancilla_rdm.hpp"
 #include "mipt/backend.hpp"
 #include "mipt/env.hpp"
 #include "mipt/probed.hpp"
-#include "mipt/rdm.hpp"
 #include "mipt/types.hpp"
 
 #include <algorithm>
@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <cstring>
 #include <fstream>
+#include <future>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -131,92 +132,91 @@ double entropy_from_ancilla_rdm(double rho00,
     return entropy_term(lambda0) + entropy_term(lambda1);
 }
 
-std::complex<double> rho3_element(const std::vector<double> &rho,
-                                  int row,
-                                  int col)
+double ancilla_entropy(cudaq::state &state,
+                        int system_qubits,
+                        CircuitType type)
 {
-    const std::size_t offset =
-        2u * static_cast<std::size_t>(row * RHO3_DIM + col);
-    return {rho[offset], rho[offset + 1]};
+    const auto rho = ancilla::reduced_density_matrix(
+        state,
+        system_qubits + 1,
+        system_qubits,
+        uses_fermionic_trace(type));
+    return entropy_from_ancilla_rdm(rho.rho00, rho.rho11, rho.rho01);
 }
 
-// Retain {ancilla, q0, q1}, use the codebase's existing CPU/GPU RDM path,
-// then trace q0 and q1. On dense CUDA states this invokes rho_reduce.cu and
-// transfers only the 8x8 RDM rather than the full 2^(N+1) statevector.
-double ancilla_entropy_from_rho3(cudaq::state &state, int system_qubits)
+class ProgressReporter
 {
-    const int total_qubits = system_qubits + 1;
-    const std::vector<Subsystem> subsystem{{system_qubits, 0, 1}};
-    std::vector<double> rho(RHO3_VALUES, 0.0);
-    cudaq_three_site_density_matrices(
-        state, total_qubits, subsystem, rho.data(), false);
-
-    double rho00 = 0.0;
-    double rho11 = 0.0;
-    std::complex<double> rho01 = 0.0;
-    for (int environment = 0; environment < 4; ++environment)
+  public:
+    ProgressReporter(std::uint64_t total_layers,
+                     std::chrono::steady_clock::time_point start)
+        : total_layers_(total_layers),
+          start_(start),
+          enabled_(env::boolean("MIPT_PROBED_PROGRESS", true)),
+          interval_(env::integer(
+              "MIPT_PROBED_PROGRESS_MS", 500, 0, 60000))
     {
-        const int row0 = 2 * environment;
-        const int row1 = row0 + 1;
-        rho00 += std::real(rho3_element(rho, row0, row0));
-        rho11 += std::real(rho3_element(rho, row1, row1));
-        rho01 += rho3_element(rho, row0, row1);
-    }
-    return entropy_from_ancilla_rdm(rho00, rho11, rho01);
-}
-
-// MMS permits N=1, for which a three-site RDM cannot be formed. Query the four
-// amplitudes directly as a small fallback. All even-site architectures use the
-// faster/common RDM path above.
-double ancilla_entropy_n1(cudaq::state &state)
-{
-    std::vector<std::uint64_t> indices{0, 1, 2, 3};
-    std::vector<std::complex<double>> amplitudes;
-    cudaq_state_amplitudes_by_indices(state, 2, indices, amplitudes);
-    if (amplitudes.size() != 4)
-    {
-        throw std::runtime_error("Unexpected amplitude count for N=1 ancilla entropy.");
+        last_print_ = start_ - interval_;
     }
 
-    const auto a0 = amplitudes[0];
-    const auto a1 = amplitudes[1];
-    const auto b0 = amplitudes[2];
-    const auto b1 = amplitudes[3];
-    return entropy_from_ancilla_rdm(
-        std::norm(a0) + std::norm(a1),
-        std::norm(b0) + std::norm(b1),
-        a0 * std::conj(b0) + a1 * std::conj(b1));
-}
+    long interval_ms() const
+    {
+        return interval_.count();
+    }
 
-double ancilla_entropy(cudaq::state &state, int system_qubits)
-{
-    return system_qubits >= 2
-        ? ancilla_entropy_from_rho3(state, system_qubits)
-        : ancilla_entropy_n1(state);
-}
+    void update(int realization,
+                int realizations,
+                int timestep,
+                std::uint64_t completed_layers,
+                bool force = false)
+    {
+        if (!enabled_)
+        {
+            return;
+        }
 
-void print_progress(int realization,
-                    int realizations,
-                    int timestep,
-                    std::uint64_t completed_layers,
-                    std::uint64_t total_layers,
-                    std::chrono::steady_clock::time_point start)
-{
-    const double elapsed = std::chrono::duration<double>(
-        std::chrono::steady_clock::now() - start).count();
-    const double rate = elapsed > 0.0
-        ? static_cast<double>(completed_layers) / elapsed
-        : 0.0;
-    const double eta = rate > 0.0
-        ? static_cast<double>(total_layers - completed_layers) / rate
-        : 0.0;
+        const auto now = std::chrono::steady_clock::now();
+        if (!force && now - last_print_ < interval_)
+        {
+            return;
+        }
+        last_print_ = now;
+        printed_ = true;
 
-    std::cout << "\rrealization=" << realization + 1 << '/' << realizations
-              << ", t=" << timestep
-              << ", layers/s=" << std::fixed << std::setprecision(2) << rate
-              << ", ETA=" << static_cast<std::uint64_t>(eta)
-              << "s                    " << std::flush;
-}
+        const double elapsed =
+            std::chrono::duration<double>(now - start_).count();
+        const double rate = elapsed > 0.0
+            ? static_cast<double>(completed_layers) / elapsed
+            : 0.0;
+        const std::uint64_t remaining = completed_layers < total_layers_
+            ? total_layers_ - completed_layers
+            : 0;
+        const double eta = rate > 0.0
+            ? static_cast<double>(remaining) / rate
+            : 0.0;
+
+        std::cout << "\rrealization=" << realization + 1 << '/' << realizations
+                  << ", t=" << timestep
+                  << ", layers/s=" << std::fixed << std::setprecision(2) << rate
+                  << ", ETA=" << static_cast<std::uint64_t>(eta)
+                  << "s                    " << std::flush;
+    }
+
+    void finish() const
+    {
+        if (enabled_ && printed_)
+        {
+            std::cout << '\n';
+        }
+    }
+
+  private:
+    std::uint64_t total_layers_ = 0;
+    std::chrono::steady_clock::time_point start_;
+    std::chrono::steady_clock::time_point last_print_;
+    bool enabled_ = true;
+    bool printed_ = false;
+    std::chrono::milliseconds interval_{500};
+};
 
 void print_help(const char *program)
 {
@@ -238,7 +238,11 @@ void print_help(const char *program)
               << "continuation does not add a quantum measurement.\n"
               << "The system occupies q_0,...,q_{N-1}; the untouched ancilla is q_N.\n"
               << "The initial Bell pair is (|00>+|11>)/sqrt(2) on q_{N-d},q_N.\n"
-              << "S is the von Neumann entropy in nats, so S(t=0)=ln(2).\n";
+              << "S is the von Neumann entropy in nats, so S(t=0)=ln(2).\n\n"
+              << "Runtime controls:\n"
+              << "  MIPT_PROBED_PREFETCH=0       Disable CPU preparation overlap (default on).\n"
+              << "  MIPT_PROBED_PROGRESS=0       Disable progress output.\n"
+              << "  MIPT_PROBED_PROGRESS_MS=500  Minimum progress-update interval.\n";
 }
 
 int run_cli(int argc, char *argv[])
@@ -304,6 +308,17 @@ int run_cli(int argc, char *argv[])
     const int row_count = t_max - t_min + 1;
     std::vector<RunningStats> stats(static_cast<std::size_t>(row_count));
 
+    const bool prefetch_enabled =
+        env::boolean("MIPT_PROBED_PREFETCH", true) &&
+        realizations > 1 && t_max > 0;
+
+    const std::uint64_t total_layers =
+        static_cast<std::uint64_t>(realizations) *
+        static_cast<std::uint64_t>(t_max);
+    std::uint64_t completed_layers = 0;
+    const auto overall_start = std::chrono::steady_clock::now();
+    ProgressReporter progress(total_layers, overall_start);
+
     std::cout << "Probed MIPT simulation\n"
               << "system_N=" << n
               << ", total_qubits=" << n + 1
@@ -315,16 +330,23 @@ int run_cli(int argc, char *argv[])
               << ", t_range=[" << t_min << ',' << t_max << ']'
               << ", circ_type=" << static_cast<int>(type)
               << " (" << circuit_type_name(type) << ")"
+              << ", fermionic_trace="
+              << (uses_fermionic_trace(type) ? "on" : "off")
+              << ", cpu_prefetch=" << (prefetch_enabled ? "on" : "off")
+              << ", progress_ms=" << progress.interval_ms()
               << ", output=" << output << '\n';
 
-    probed::CircuitWorkspace1D workspace;
-    workspace.reserve(t_max);
+    std::array<probed::CircuitWorkspace1D, 2> workspaces;
+    for (auto &workspace : workspaces)
+    {
+        workspace.reserve(t_max);
+    }
+    std::array<std::future<void>, 2> preparation_jobs;
 
-    const std::uint64_t total_layers =
-        static_cast<std::uint64_t>(realizations) *
-        static_cast<std::uint64_t>(t_max);
-    std::uint64_t completed_layers = 0;
-    const auto overall_start = std::chrono::steady_clock::now();
+    if (t_max > 0)
+    {
+        workspaces[0].prepare(n, t_max, p, type);
+    }
 
     for (int realization = 0; realization < realizations; ++realization)
     {
@@ -337,7 +359,34 @@ int run_cli(int argc, char *argv[])
             continue;
         }
 
-        workspace.prepare(n, t_max, p, type);
+        const std::size_t current = static_cast<std::size_t>(realization % 2);
+        const std::size_t next = static_cast<std::size_t>((realization + 1) % 2);
+
+        if (realization > 0)
+        {
+            if (prefetch_enabled)
+            {
+                preparation_jobs[current].get();
+            }
+            else
+            {
+                workspaces[current].prepare(n, t_max, p, type);
+            }
+        }
+
+        // The inactive workspace is prepared on a CPU thread while CUDA-Q
+        // evolves the current realization on the main thread/GPU.
+        if (prefetch_enabled && realization + 1 < realizations)
+        {
+            preparation_jobs[next] = std::async(
+                std::launch::async,
+                [&workspace = workspaces[next], n, t_max, p, type]()
+                {
+                    workspace.prepare(n, t_max, p, type);
+                });
+        }
+
+        auto &workspace = workspaces[current];
         std::string context;
         if (backend::verbose_enabled())
         {
@@ -351,9 +400,10 @@ int run_cli(int argc, char *argv[])
             state = workspace.advance(state, 0, t_min, context);
             completed_layers += static_cast<std::uint64_t>(t_min);
             current_t = t_min;
-            stats[0].add(ancilla_entropy(state, n));
-            print_progress(realization, realizations, current_t,
-                           completed_layers, total_layers, overall_start);
+            stats[0].add(ancilla_entropy(state, n, type));
+            progress.update(
+                realization, realizations, current_t, completed_layers,
+                completed_layers == total_layers);
         }
 
         const int first_incremental_t = std::max(1, t_min + 1);
@@ -363,15 +413,13 @@ int run_cli(int argc, char *argv[])
             ++completed_layers;
             current_t = t;
             stats[static_cast<std::size_t>(t - t_min)].add(
-                ancilla_entropy(state, n));
-            print_progress(realization, realizations, current_t,
-                           completed_layers, total_layers, overall_start);
+                ancilla_entropy(state, n, type));
+            progress.update(
+                realization, realizations, current_t, completed_layers,
+                completed_layers == total_layers);
         }
     }
-    if (total_layers > 0)
-    {
-        std::cout << '\n';
-    }
+    progress.finish();
 
     std::ofstream csv(output, std::ios::out | std::ios::trunc);
     if (!csv)

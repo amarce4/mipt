@@ -128,7 +128,7 @@ CORE_TEST_OBJS := $(HOST_BUILD)/core_tests.o
 
 ifeq ($(CUDA_RHO),1)
   MIPT_OBJS += $(BUILD)/rho_reduce.o
-  MIPT_PROBED_OBJS += $(BUILD)/rho_reduce.o
+  MIPT_PROBED_OBJS += $(BUILD)/ancilla_rdm.o
   SIM_TMI_OBJS += $(BUILD)/rho_reduce.o $(BUILD)/tmi_cuda_svd.o $(BUILD)/tmi_cuda_rdm.o
   ENTROPY_OBJS += $(BUILD)/rho_reduce.o $(BUILD)/entropy_cuda.o
 endif
@@ -201,6 +201,8 @@ $(BUILD)/entropy.o: apps/entropy.cpp | $(BUILD)
 	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $(NVQXXFLAGS_COMMON) -c $< -o $@
 
 $(BUILD)/rho_reduce.o: src/cuda/rho_reduce.cu | $(BUILD)
+	$(CUDA_CU_COMPILER) $(CUDA_CU_FLAGS) -c $< -o $@
+$(BUILD)/ancilla_rdm.o: src/cuda/ancilla_rdm.cu | $(BUILD)
 	$(CUDA_CU_COMPILER) $(CUDA_CU_FLAGS) -c $< -o $@
 $(BUILD)/tmi_cuda_svd.o: src/cuda/tmi_cuda_svd.cu | $(BUILD)
 	$(CUDA_CU_COMPILER) $(CUDA_CU_FLAGS) -c $< -o $@
