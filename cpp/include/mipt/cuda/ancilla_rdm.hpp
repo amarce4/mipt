@@ -45,6 +45,44 @@ int mipt_cuda_rho1_complex_fermion_f32(
     int retained_qubit,
     double *host_rho_ri);
 
+/*
+ * Computes the complete complex 4x4 reduced density matrix of two retained
+ * qubits/modes. The local basis order is |q0 q1> with q0 as the least
+ * significant local bit: |00>, |10>, |01>, |11>.
+ *
+ * Output layout is a full row-major matrix with interleaved real/imaginary
+ * values:
+ *   host_rho_ri[2 * (4 * row + col) + 0] = Re(rho[row,col])
+ *   host_rho_ri[2 * (4 * row + col) + 1] = Im(rho[row,col])
+ */
+int mipt_cuda_rho2_complex_f64(
+    const void *device_state_vector,
+    int n_qubits,
+    int retained_qubit0,
+    int retained_qubit1,
+    double *host_rho_ri);
+
+int mipt_cuda_rho2_complex_f32(
+    const void *device_state_vector,
+    int n_qubits,
+    int retained_qubit0,
+    int retained_qubit1,
+    double *host_rho_ri);
+
+int mipt_cuda_rho2_complex_fermion_f64(
+    const void *device_state_vector,
+    int n_qubits,
+    int retained_qubit0,
+    int retained_qubit1,
+    double *host_rho_ri);
+
+int mipt_cuda_rho2_complex_fermion_f32(
+    const void *device_state_vector,
+    int n_qubits,
+    int retained_qubit0,
+    int retained_qubit1,
+    double *host_rho_ri);
+
 #ifdef __cplusplus
 }
 #endif
