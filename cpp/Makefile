@@ -110,43 +110,48 @@ MIPT_BIN := $(BUILD)/mipt.exe
 MIPT_PROBED_BIN := $(BUILD)/mipt_probed.exe
 MIPT_2PROBED_BIN := $(BUILD)/mipt_2probed.exe
 SIM_TMI_BIN := $(BUILD)/sim_tmi.exe
+DIST_SCALING_BIN := $(BUILD)/dist_scaling.exe
 ENTROPY_BIN := $(BUILD)/entropy.exe
 GMN_BIN := $(HOST_BUILD)/gmn.exe
 FGMN_BIN := $(HOST_BUILD)/fgmn.exe
 RING_BIN := $(HOST_BUILD)/ring_inflation.exe
 EXP_VALS_BIN := $(HOST_BUILD)/exp_vals.exe
 CORE_TEST_BIN := $(HOST_BUILD)/core_tests
+DIST_TEST_BIN := $(HOST_BUILD)/dist_metrics_tests
 
 MIPT_OBJS := $(BUILD)/mipt.o
 MIPT_PROBED_OBJS := $(BUILD)/mipt_probed.o
 MIPT_2PROBED_OBJS := $(BUILD)/mipt_2probed.o
 SIM_TMI_OBJS := $(BUILD)/sim_tmi.o
+DIST_SCALING_OBJS := $(BUILD)/dist_scaling.o
 ENTROPY_OBJS := $(BUILD)/entropy.o
 GMN_OBJS := $(HOST_BUILD)/gmn.o $(HOST_BUILD)/gmn_mosek.o $(HOST_BUILD)/fgmn.o
 FGMN_OBJS := $(HOST_BUILD)/fgmn_main.o $(HOST_BUILD)/fgmn.o
 RING_OBJS := $(HOST_BUILD)/ring_inflation_main.o $(HOST_BUILD)/ring_inflation.o $(HOST_BUILD)/gmn_mosek.o
 EXP_VALS_OBJS := $(HOST_BUILD)/exp_vals_main.o $(HOST_BUILD)/exp_vals_analysis.o
 CORE_TEST_OBJS := $(HOST_BUILD)/core_tests.o
+DIST_TEST_OBJS := $(HOST_BUILD)/dist_metrics_tests.o
 
 ifeq ($(CUDA_RHO),1)
   MIPT_OBJS += $(BUILD)/rho_reduce.o
   MIPT_PROBED_OBJS += $(BUILD)/ancilla_rdm.o
   MIPT_2PROBED_OBJS += $(BUILD)/ancilla_rdm.o
   SIM_TMI_OBJS += $(BUILD)/rho_reduce.o $(BUILD)/tmi_cuda_svd.o $(BUILD)/tmi_cuda_rdm.o
+  DIST_SCALING_OBJS += $(BUILD)/rho2_reduce.o
   ENTROPY_OBJS += $(BUILD)/rho_reduce.o $(BUILD)/entropy_cuda.o
 endif
 
 ALL_OBJS := $(MIPT_OBJS) $(MIPT_PROBED_OBJS) $(MIPT_2PROBED_OBJS) \
-  $(SIM_TMI_OBJS) $(ENTROPY_OBJS) $(GMN_OBJS) $(FGMN_OBJS) $(RING_OBJS) \
-  $(EXP_VALS_OBJS) $(CORE_TEST_OBJS)
+  $(SIM_TMI_OBJS) $(DIST_SCALING_OBJS) $(ENTROPY_OBJS) $(GMN_OBJS) $(FGMN_OBJS) \
+  $(RING_OBJS) $(EXP_VALS_OBJS) $(CORE_TEST_OBJS) $(DIST_TEST_OBJS)
 DEPS := $(ALL_OBJS:.o=.d)
 
-.PHONY: all simulation analysis clean cpu gpu print-config format test-core \
-  mipt.exe mipt_probed.exe mipt_2probed.exe sim_tmi.exe entropy.exe gmn.exe \
-  fgmn.exe ring_inflation.exe exp_vals.exe
+.PHONY: all simulation analysis clean cpu gpu print-config format test-core test-dist \
+  mipt.exe mipt_probed.exe mipt_2probed.exe sim_tmi.exe dist_scaling.exe \
+  entropy.exe gmn.exe fgmn.exe ring_inflation.exe exp_vals.exe
 
 all: simulation analysis
-simulation: mipt.exe mipt_probed.exe mipt_2probed.exe sim_tmi.exe entropy.exe
+simulation: mipt.exe mipt_probed.exe mipt_2probed.exe sim_tmi.exe dist_scaling.exe entropy.exe
 analysis: gmn.exe fgmn.exe ring_inflation.exe exp_vals.exe
 cpu:
 	$(MAKE) all GPU=0 CUDA_RHO=0
@@ -160,6 +165,8 @@ mipt_probed.exe: $(MIPT_PROBED_BIN)
 mipt_2probed.exe: $(MIPT_2PROBED_BIN)
 	cp $< $@
 sim_tmi.exe: $(SIM_TMI_BIN)
+	cp $< $@
+dist_scaling.exe: $(DIST_SCALING_BIN)
 	cp $< $@
 entropy.exe: $(ENTROPY_BIN)
 	cp $< $@
@@ -180,6 +187,8 @@ $(MIPT_2PROBED_BIN): $(MIPT_2PROBED_OBJS)
 	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $^ $(MIPT_CUDA_LIBS) $(DL_LIBS) -o $@
 $(SIM_TMI_BIN): $(SIM_TMI_OBJS)
 	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $^ $(MIPT_CUDA_LIBS) $(SIM_TMI_CUDA_LIBS) $(DL_LIBS) -o $@
+$(DIST_SCALING_BIN): $(DIST_SCALING_OBJS)
+	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $^ $(MIPT_CUDA_LIBS) $(DL_LIBS) -o $@
 $(ENTROPY_BIN): $(ENTROPY_OBJS)
 	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $^ $(MIPT_CUDA_LIBS) $(ENTROPY_CUDA_LIBS) $(DL_LIBS) -o $@
 $(GMN_BIN): $(GMN_OBJS)
@@ -193,9 +202,13 @@ $(EXP_VALS_BIN): $(EXP_VALS_OBJS)
 
 $(CORE_TEST_BIN): $(CORE_TEST_OBJS)
 	$(HOSTCXX) $^ -o $@
+$(DIST_TEST_BIN): $(DIST_TEST_OBJS)
+	$(HOSTCXX) $^ -o $@
 
 test-core: $(CORE_TEST_BIN)
 	$(CORE_TEST_BIN)
+test-dist: $(DIST_TEST_BIN)
+	$(DIST_TEST_BIN)
 
 $(BUILD) $(HOST_BUILD):
 	mkdir -p $@
@@ -208,10 +221,14 @@ $(BUILD)/mipt_2probed.o: apps/mipt_2probed.cpp | $(BUILD)
 	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $(NVQXXFLAGS_COMMON) -c $< -o $@
 $(BUILD)/sim_tmi.o: apps/sim_tmi.cpp | $(BUILD)
 	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $(NVQXXFLAGS_COMMON) -c $< -o $@
+$(BUILD)/dist_scaling.o: apps/dist_scaling.cpp | $(BUILD)
+	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $(NVQXXFLAGS_COMMON) -c $< -o $@
 $(BUILD)/entropy.o: apps/entropy.cpp | $(BUILD)
 	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $(NVQXXFLAGS_COMMON) -c $< -o $@
 
 $(BUILD)/rho_reduce.o: src/cuda/rho_reduce.cu | $(BUILD)
+	$(CUDA_CU_COMPILER) $(CUDA_CU_FLAGS) -c $< -o $@
+$(BUILD)/rho2_reduce.o: src/cuda/rho2_reduce.cu | $(BUILD)
 	$(CUDA_CU_COMPILER) $(CUDA_CU_FLAGS) -c $< -o $@
 $(BUILD)/ancilla_rdm.o: src/cuda/ancilla_rdm.cu | $(BUILD)
 	$(CUDA_CU_COMPILER) $(CUDA_CU_FLAGS) -c $< -o $@
@@ -239,6 +256,8 @@ $(HOST_BUILD)/exp_vals_analysis.o: src/analysis/exp_vals.cpp | $(HOST_BUILD)
 $(HOST_BUILD)/gmn_mosek.o: src/analysis/gmn_mosek.c | $(HOST_BUILD)
 	$(HOSTCC) $(CFLAGS_COMMON) $(MOSEK_CPPFLAGS) -c $< -o $@
 $(HOST_BUILD)/core_tests.o: tests/core_tests.cpp | $(HOST_BUILD)
+	$(HOSTCXX) $(CPPFLAGS_COMMON) -std=c++20 -O2 -MMD -MP -c $< -o $@
+$(HOST_BUILD)/dist_metrics_tests.o: tests/dist_metrics_tests.cpp | $(HOST_BUILD)
 	$(HOSTCXX) $(CPPFLAGS_COMMON) -std=c++20 -O2 -MMD -MP -c $< -o $@
 
 print-config:

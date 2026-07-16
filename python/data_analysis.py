@@ -4,6 +4,7 @@ Public functions
 ----------------
 gmn(...)               Plot GMN/fGMN and optional minimum bipartite negativity.
 entropy(...)           Plot Rényi-2 entropy scaling curves and weighted fits.
+dist_scaling(...)      Plot two-site MI/negativity distance scaling and power-law fits.
 expvals(...)           Plot aggregate fermionic observables and Wick residuals.
 tmi_collapse(...)      Fit and plot the TMI finite-size scaling collapse.
 probe1_collapse(...)   Fit and plot the one-ancilla dynamical collapse.
@@ -30,6 +31,7 @@ from scipy.optimize import differential_evolution, minimize, minimize_scalar
 __all__ = [
     "gmn",
     "entropy",
+    "dist_scaling",
     "expvals",
     "tmi_collapse",
     "probe1_collapse",
@@ -552,6 +554,446 @@ def entropy(
         "fits": pd.DataFrame(fit_rows),
         "metadata": metadata,
         "curves": curves,
+    }
+
+
+
+# ---------------------------------------------------------------------------
+# Two-site distance scaling
+# ---------------------------------------------------------------------------
+
+
+def _chunked_distance_summary(
+    path: str | Path,
+    *,
+    chunksize: int,
+    distance_round: int,
+) -> dict[str, pd.DataFrame]:
+    """Calculate count, mean, and standard error by chord distance."""
+    partials: dict[str, list[pd.DataFrame]] = {"mi": [], "mn": []}
+
+    try:
+        reader = pd.read_csv(
+            path,
+            usecols=["d", "mi", "mn"],
+            chunksize=chunksize,
+        )
+    except ValueError as exc:
+        raise ValueError(
+            f"{path!r} must contain the columns d, mi, and mn."
+        ) from exc
+
+    for chunk in reader:
+        for column in ("d", "mi", "mn"):
+            chunk[column] = pd.to_numeric(chunk[column], errors="coerce")
+        chunk = chunk.replace([np.inf, -np.inf], np.nan)
+        chunk = chunk.loc[np.isfinite(chunk["d"]) & (chunk["d"] > 0.0)]
+        if chunk.empty:
+            continue
+        chunk["_d"] = chunk["d"].round(distance_round)
+
+        for metric in ("mi", "mn"):
+            clean = chunk.dropna(subset=[metric])
+            if clean.empty:
+                continue
+            grouped = clean.groupby("_d", sort=False)[metric].agg(
+                count="count",
+                total="sum",
+                sumsq=lambda values: np.square(
+                    values.to_numpy(dtype=float)
+                ).sum(),
+            )
+            partials[metric].append(grouped)
+
+    output: dict[str, pd.DataFrame] = {}
+    for metric, pieces in partials.items():
+        if not pieces:
+            output[metric] = pd.DataFrame(
+                columns=["d", "mean", "stderr", "count"]
+            )
+            continue
+
+        combined = pd.concat(pieces).groupby(level=0).sum().sort_index()
+        count = combined["count"].to_numpy(dtype=float)
+        total = combined["total"].to_numpy(dtype=float)
+        sumsq = combined["sumsq"].to_numpy(dtype=float)
+        mean = total / count
+
+        variance = np.full_like(mean, np.nan)
+        valid = count > 1
+        variance[valid] = (
+            sumsq[valid] - total[valid] ** 2 / count[valid]
+        ) / (count[valid] - 1)
+        variance[valid] = np.maximum(variance[valid], 0.0)
+
+        output[metric] = pd.DataFrame(
+            {
+                "d": combined.index.to_numpy(dtype=float),
+                "mean": mean,
+                "stderr": np.sqrt(variance) / np.sqrt(count),
+                "count": count.astype(np.int64),
+            }
+        )
+
+    return output
+
+
+def _fit_range_for_size(
+    fit_range: (
+        tuple[float | None, float | None]
+        | Mapping[int, tuple[float | None, float | None]]
+        | None
+    ),
+    size: int,
+) -> tuple[float | None, float | None] | None:
+    if fit_range is None:
+        return None
+    if isinstance(fit_range, Mapping):
+        return fit_range.get(size)
+    return fit_range
+
+
+def _distance_power_law_fit(
+    curve: pd.DataFrame,
+    *,
+    fit_range: tuple[float | None, float | None] | None,
+    fit_last: int | None,
+    min_relative_error: float,
+) -> tuple[dict[str, float], pd.DataFrame]:
+    """Fit mean = prefactor * d**(-alpha) in logarithmic coordinates."""
+    selected = curve.loc[
+        np.isfinite(curve["d"])
+        & np.isfinite(curve["mean"])
+        & (curve["d"] > 0.0)
+        & (curve["mean"] > 0.0)
+    ].copy()
+
+    if fit_range is not None:
+        lower, upper = fit_range
+        if lower is not None:
+            selected = selected.loc[selected["d"] >= lower]
+        if upper is not None:
+            selected = selected.loc[selected["d"] <= upper]
+    elif fit_last is not None:
+        if fit_last < 3:
+            raise ValueError("fit_last must be at least 3 or None.")
+        selected = selected.tail(fit_last)
+
+    if len(selected) < 3:
+        raise ValueError(
+            f"Only {len(selected)} positive points remain in the fit window; "
+            "at least three are required."
+        )
+
+    relative_error = (
+        selected["stderr"].to_numpy(dtype=float)
+        / selected["mean"].to_numpy(dtype=float)
+    )
+    relative_error = np.where(
+        np.isfinite(relative_error) & (relative_error > 0.0),
+        relative_error,
+        min_relative_error,
+    )
+    relative_error = np.maximum(relative_error, min_relative_error)
+
+    linear = _weighted_linear_fit(
+        np.log(selected["d"].to_numpy(dtype=float)),
+        np.log(selected["mean"].to_numpy(dtype=float)),
+        relative_error,
+    )
+    fit = {
+        "alpha": -linear["slope"],
+        "alpha_stderr": linear["slope_stderr"],
+        "prefactor": float(np.exp(linear["intercept"])),
+        "log_prefactor": linear["intercept"],
+        "log_prefactor_stderr": linear["intercept_stderr"],
+        "reduced_chi2": linear["reduced_chi2"],
+        "d_min": float(selected["d"].min()),
+        "d_max": float(selected["d"].max()),
+        "points": int(len(selected)),
+    }
+    return fit, selected
+
+
+def _positive_log_errorbar(
+    ax,
+    x: np.ndarray,
+    y: np.ndarray,
+    dy: np.ndarray,
+    **kwargs,
+):
+    """Draw log-compatible error bars without extending below zero."""
+    lower = np.minimum(np.maximum(dy, 0.0), 0.999999 * y)
+    upper = np.maximum(dy, 0.0)
+    return ax.errorbar(x, y, yerr=np.vstack((lower, upper)), **kwargs)
+
+
+def dist_scaling(
+    files: Sequence[str | Path] | str | Path | None = None,
+    *,
+    file_glob: str | Path | None = None,
+    sizes: Sequence[int] | None = None,
+    l_by_file: Mapping[str, int] | None = None,
+    fit_size_mi: int | None = None,
+    fit_size_mn: int | None = None,
+    fit_range_mi: (
+        tuple[float | None, float | None]
+        | Mapping[int, tuple[float | None, float | None]]
+        | None
+    ) = None,
+    fit_range_mn: (
+        tuple[float | None, float | None]
+        | Mapping[int, tuple[float | None, float | None]]
+        | None
+    ) = None,
+    fit_last_mi: int | None = 4,
+    fit_last_mn: int | None = 4,
+    min_relative_error: float = 0.03,
+    chunksize: int = 1_000_000,
+    distance_round: int = 12,
+    show_errorbars: bool = True,
+    capsize: float = 2.0,
+    cmap: str = "viridis",
+    figsize: tuple[float, float] = (12.5, 5.2),
+    dpi: int = 130,
+    title: str | None = None,
+    show_summary: bool = True,
+    show: bool = True,
+) -> dict[str, Any]:
+    r"""Plot Fig.-4-style two-site distance scaling for MI and negativity.
+
+    Each input CSV must contain one raw row per two-site RDM with columns
+    ``d,mi,mn``. Rows are aggregated at equal chord distance, including zero
+    negativity events. Both panels use logarithmic axes. Power laws
+
+    .. math::
+
+        I_2(d)=A_{MI}d^{-\alpha_2^{MI}},\qquad
+        \mathcal{N}_2(d)=A_{MN}d^{-\alpha_2^{MN}}
+
+    are fitted by weighted least squares in log coordinates. As in Fig. 4 of
+    arXiv:2602.04969, the relative uncertainty used by the fit is floored at
+    ``min_relative_error`` (default 0.03).
+
+    ``fit_range_mi`` and ``fit_range_mn`` may be one ``(d_min, d_max)`` tuple
+    applied to every size, or dictionaries keyed by system size. When no range
+    is supplied, the largest ``fit_last_*`` positive-distance points are used.
+    The dashed line is drawn only for ``fit_size_*`` (largest size by default),
+    while fit results for every supplied size are returned in ``fits``.
+    """
+    if min_relative_error <= 0.0:
+        raise ValueError("min_relative_error must be positive.")
+    if chunksize <= 0:
+        raise ValueError("chunksize must be positive.")
+    if distance_round < 0:
+        raise ValueError("distance_round must be non-negative.")
+
+    paths = _resolve_files(files, file_glob)
+    if sizes is None:
+        parsed_sizes = [_parse_size(path, l_by_file) for path in paths]
+    else:
+        parsed_sizes = [int(size) for size in sizes]
+        if len(parsed_sizes) != len(paths):
+            raise ValueError("sizes must match the number of input files.")
+
+    if len(set(parsed_sizes)) != len(parsed_sizes):
+        raise ValueError(f"Duplicate system sizes found: {parsed_sizes}")
+
+    order = np.argsort(parsed_sizes)
+    paths = [paths[index] for index in order]
+    parsed_sizes = [parsed_sizes[index] for index in order]
+
+    data: dict[int, dict[str, pd.DataFrame]] = {}
+    for size, path in zip(parsed_sizes, paths):
+        print(f"Importing L={size}: {path}")
+        data[size] = _chunked_distance_summary(
+            path,
+            chunksize=chunksize,
+            distance_round=distance_round,
+        )
+        if data[size]["mi"].empty and data[size]["mn"].empty:
+            raise ValueError(f"No valid distance-scaling rows were found in {path}.")
+
+    fit_rows: list[dict[str, Any]] = []
+    selected_points: dict[tuple[int, str], pd.DataFrame] = {}
+    fit_settings = {
+        "mi": (fit_range_mi, fit_last_mi),
+        "mn": (fit_range_mn, fit_last_mn),
+    }
+    for size in parsed_sizes:
+        for metric, (range_spec, last_points) in fit_settings.items():
+            try:
+                fit, selected = _distance_power_law_fit(
+                    data[size][metric],
+                    fit_range=_fit_range_for_size(range_spec, size),
+                    fit_last=last_points,
+                    min_relative_error=min_relative_error,
+                )
+                fit_rows.append({"L": size, "metric": metric, **fit})
+                selected_points[(size, metric)] = selected
+            except ValueError as exc:
+                fit_rows.append(
+                    {
+                        "L": size,
+                        "metric": metric,
+                        "alpha": np.nan,
+                        "alpha_stderr": np.nan,
+                        "prefactor": np.nan,
+                        "log_prefactor": np.nan,
+                        "log_prefactor_stderr": np.nan,
+                        "reduced_chi2": np.nan,
+                        "d_min": np.nan,
+                        "d_max": np.nan,
+                        "points": 0,
+                        "error": str(exc),
+                    }
+                )
+                warnings.warn(f"L={size}, {metric.upper()} fit unavailable: {exc}")
+
+    fits = pd.DataFrame(fit_rows)
+    fit_size_mi = max(parsed_sizes) if fit_size_mi is None else int(fit_size_mi)
+    fit_size_mn = max(parsed_sizes) if fit_size_mn is None else int(fit_size_mn)
+    for metric, fit_size in (("mi", fit_size_mi), ("mn", fit_size_mn)):
+        if fit_size not in data:
+            raise ValueError(
+                f"fit_size_{metric}={fit_size} is not among {parsed_sizes}."
+            )
+
+    colors = _color_map_by_size(parsed_sizes, cmap)
+    fig, (ax_mi, ax_mn) = plt.subplots(
+        1, 2, figsize=figsize, dpi=dpi, constrained_layout=True
+    )
+    axes = {"mi": ax_mi, "mn": ax_mn}
+
+    for size in parsed_sizes:
+        color = colors[size]
+        for metric in ("mi", "mn"):
+            ax = axes[metric]
+            curve = data[size][metric]
+            positive = curve.loc[
+                np.isfinite(curve["d"])
+                & np.isfinite(curve["mean"])
+                & (curve["d"] > 0.0)
+                & (curve["mean"] > 0.0)
+            ]
+            omitted = len(curve) - len(positive)
+            if omitted:
+                warnings.warn(
+                    f"L={size}, {metric.upper()}: omitted {omitted} non-positive "
+                    "mean point(s) from the logarithmic plot."
+                )
+            if positive.empty:
+                continue
+
+            x = positive["d"].to_numpy(dtype=float)
+            y = positive["mean"].to_numpy(dtype=float)
+            dy = positive["stderr"].to_numpy(dtype=float)
+            dy = np.where(np.isfinite(dy), dy, 0.0)
+            if show_errorbars:
+                _positive_log_errorbar(
+                    ax,
+                    x,
+                    y,
+                    dy,
+                    fmt="o",
+                    markersize=4.0,
+                    color=color,
+                    ecolor=color,
+                    markeredgecolor=color,
+                    capsize=capsize,
+                    elinewidth=0.9,
+                    linestyle="none",
+                    label=rf"$L={size}$",
+                    alpha=0.95,
+                )
+            else:
+                ax.plot(
+                    x,
+                    y,
+                    linestyle="none",
+                    marker="o",
+                    markersize=4.0,
+                    color=color,
+                    markeredgecolor=color,
+                    label=rf"$L={size}$",
+                    alpha=0.95,
+                )
+
+    for metric, fit_size in (("mi", fit_size_mi), ("mn", fit_size_mn)):
+        row = fits.loc[
+            (fits["L"] == fit_size) & (fits["metric"] == metric)
+        ].iloc[0]
+        if not np.isfinite(row["alpha"]):
+            continue
+        selected = selected_points[(fit_size, metric)]
+        x_line = np.geomspace(
+            selected["d"].min(), selected["d"].max(), 200
+        )
+        y_line = row["prefactor"] * x_line ** (-row["alpha"])
+        exponent = "MI" if metric == "mi" else "MN"
+        axes[metric].plot(
+            x_line,
+            y_line,
+            color=colors[fit_size],
+            linestyle="--",
+            linewidth=1.5,
+            label=(
+                rf"$L={fit_size}$ fit: "
+                rf"$\alpha_2^{{{exponent}}}="
+                rf"{row['alpha']:.3g}\pm{row['alpha_stderr']:.2g}$"
+            ),
+            zorder=5,
+        )
+
+    ax_mi.set_xlabel(r"Effective chord distance $d$")
+    ax_mi.set_ylabel(r"Two-party mutual information $I_2$")
+    ax_mi.set_title("Two-party mutual information")
+    ax_mn.set_xlabel(r"Effective chord distance $d$")
+    ax_mn.set_ylabel(r"Bipartite negativity $\mathcal{N}_2$")
+    ax_mn.set_title("Bipartite negativity")
+
+    for ax in (ax_mi, ax_mn):
+        ax.set_xscale("log")
+        ax.set_yscale("log")
+        ax.grid(True, which="both", alpha=0.20)
+        ax.legend(fontsize=8)
+
+    if title is not None:
+        fig.suptitle(title, fontsize=14)
+    _show(fig, show)
+
+    summary = pd.DataFrame(
+        [
+            {
+                "L": size,
+                "file": str(path),
+                "distance_points_mi": len(data[size]["mi"]),
+                "distance_points_mn": len(data[size]["mn"]),
+                "rows_mi": int(data[size]["mi"]["count"].sum()),
+                "rows_mn": int(data[size]["mn"]["count"].sum()),
+            }
+            for size, path in zip(parsed_sizes, paths)
+        ]
+    )
+    if show_summary:
+        try:
+            from IPython.display import display
+
+            display(summary)
+            display(fits)
+        except ImportError:
+            print(summary.to_string(index=False))
+            print(fits.to_string(index=False))
+
+    return {
+        "figure": fig,
+        "axes": (ax_mi, ax_mn),
+        "data": data,
+        "summary": summary,
+        "fits": fits,
+        "fit_size_mi": fit_size_mi,
+        "fit_size_mn": fit_size_mn,
+        "selected_fit_points": selected_points,
     }
 
 
