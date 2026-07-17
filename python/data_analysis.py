@@ -954,6 +954,14 @@ def dist_scaling(
 
     for ax in (ax_mi, ax_mn):
         ax.set_xscale("log")
+        # Plain-number formatting for logarithmic distance axis.
+        from matplotlib.ticker import FuncFormatter
+        _plain_distance = FuncFormatter(
+            lambda value, _: f"{value:g}" if value > 0 else ""
+        )
+        ax.xaxis.set_major_formatter(_plain_distance)
+        ax.xaxis.set_minor_formatter(_plain_distance)
+        ax.xaxis.get_offset_text().set_visible(False)
         ax.set_yscale("log")
         ax.grid(True, which="both", alpha=0.20)
         ax.legend(fontsize=8)
@@ -1891,41 +1899,145 @@ def probe1_collapse(
 # ---------------------------------------------------------------------------
 
 
+def _probe2_metric_spec(metric: str) -> dict[str, Any]:
+    """Resolve a two-probe observable name and its CSV/plot metadata."""
+    key = str(metric).strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "i": "mi",
+        "mutual_information": "mi",
+        "mutualinfo": "mi",
+        "n": "negativity",
+        "neg": "negativity",
+        "mn": "negativity",
+        "log_neg": "log_negativity",
+        "logneg": "log_negativity",
+        "logarithmic_negativity": "log_negativity",
+        "ln_negativity": "log_negativity",
+    }
+    key = aliases.get(key, key)
+
+    specs = {
+        "mi": {
+            "mean_columns": [
+                "I_mean",
+                "i_mean",
+                "mi_mean",
+                "mutual_information_mean",
+            ],
+            "stderr_columns": [
+                "I_stderr",
+                "i_stderr",
+                "mi_stderr",
+                "mutual_information_stderr",
+                "stderr",
+            ],
+            "summary_name": "I",
+            "raw_ylabel": r"Mutual information $I(A:B)$ [nats]",
+            "raw_title": "Two-probe mutual information",
+            "collapse_ylabel": r"$L^{\eta}I(A:B)$",
+            "ansatz": r"$I(A:B)=L^{-\eta}g((t-2L)/L)$",
+            "suptitle": (
+                "Bulk two-probe mutual information at fixed measurement rate"
+            ),
+            "bootstrap_upper": 2.0 * np.log(2.0),
+        },
+        "negativity": {
+            "mean_columns": [
+                "negativity_mean",
+                "neg_mean",
+                "N_mean",
+                "n_mean",
+                "mn_mean",
+            ],
+            "stderr_columns": [
+                "negativity_stderr",
+                "neg_stderr",
+                "N_stderr",
+                "n_stderr",
+                "mn_stderr",
+            ],
+            "summary_name": "negativity",
+            "raw_ylabel": r"Negativity $\mathcal{N}(A:B)$",
+            "raw_title": "Two-probe negativity",
+            "collapse_ylabel": r"$L^{\eta}\mathcal{N}(A:B)$",
+            "ansatz": r"$\mathcal{N}(A:B)=L^{-\eta}g((t-2L)/L)$",
+            "suptitle": "Bulk two-probe negativity at fixed measurement rate",
+            "bootstrap_upper": 0.5,
+        },
+        "log_negativity": {
+            "mean_columns": [
+                "log_negativity_mean",
+                "log_neg_mean",
+                "logarithmic_negativity_mean",
+                "E_N_mean",
+                "en_mean",
+            ],
+            "stderr_columns": [
+                "log_negativity_stderr",
+                "log_neg_stderr",
+                "logarithmic_negativity_stderr",
+                "E_N_stderr",
+                "en_stderr",
+            ],
+            "summary_name": "log_negativity",
+            "raw_ylabel": (
+                r"Logarithmic negativity $E_{\mathcal{N}}(A:B)$ [nats]"
+            ),
+            "raw_title": "Two-probe logarithmic negativity",
+            "collapse_ylabel": r"$L^{\eta}E_{\mathcal{N}}(A:B)$",
+            "ansatz": (
+                r"$E_{\mathcal{N}}(A:B)="
+                r"L^{-\eta}g((t-2L)/L)$"
+            ),
+            "suptitle": (
+                "Bulk two-probe logarithmic negativity at fixed measurement rate"
+            ),
+            "bootstrap_upper": np.log(2.0),
+        },
+    }
+    if key not in specs:
+        raise ValueError(
+            "metric must be 'mi', 'negativity', or 'log_negativity'."
+        )
+    return {"key": key, **specs[key]}
+
+
 def _load_probe2_curve(
     path: Path,
     *,
     l_by_file: Mapping[str, int] | None,
     x_load: tuple[float | None, float | None],
+    metric_spec: Mapping[str, Any],
 ) -> dict[str, Any]:
     size = _parse_size(path, l_by_file)
     df = pd.read_csv(path)
     t_col = _find_column(df, ["t", "time", "timestep"])
-    mean_col = _find_column(
-        df, ["I_mean", "i_mean", "mi_mean", "mutual_information_mean"]
-    )
-    stderr_col = _find_column(df, ["I_stderr", "i_stderr", "mi_stderr", "stderr"])
+    mean_col = _find_column(df, metric_spec["mean_columns"])
+    stderr_col = _find_column(df, metric_spec["stderr_columns"])
     scaled_col = _find_column(df, ["scaled_time", "scaled_t", "x"], required=False)
     clean = pd.DataFrame(
         {
             "t": pd.to_numeric(df[t_col], errors="coerce"),
-            "I": pd.to_numeric(df[mean_col], errors="coerce"),
-            "dI": pd.to_numeric(df[stderr_col], errors="coerce"),
+            "value": pd.to_numeric(df[mean_col], errors="coerce"),
+            "dvalue": pd.to_numeric(df[stderr_col], errors="coerce"),
         }
     )
     if scaled_col is not None:
         clean["x_csv"] = pd.to_numeric(df[scaled_col], errors="coerce")
-    clean = clean.dropna(subset=["t", "I", "dI"])
+    clean = clean.dropna(subset=["t", "value", "dvalue"])
     clean = clean.sort_values("t").drop_duplicates("t", keep="last")
     clean["x"] = (clean["t"] - 2.0 * size) / float(size)
 
     if "x_csv" in clean:
         valid = np.isfinite(clean["x_csv"])
         if np.any(valid):
-            discrepancy = np.max(np.abs(clean.loc[valid, "x_csv"] - clean.loc[valid, "x"]))
+            discrepancy = np.max(
+                np.abs(clean.loc[valid, "x_csv"] - clean.loc[valid, "x"])
+            )
             if discrepancy > 1e-9:
                 warnings.warn(
-                    f"{path}: scaled_time differs from (t-2L)/L by {discrepancy:.3g}; "
-                    "using the recomputed value."
+                    f"{path}: scaled_time differs from (t-2L)/L by "
+                    f"{discrepancy:.3g}; using the recomputed value."
                 )
 
     x_min, x_max = x_load
@@ -1935,9 +2047,11 @@ def _load_probe2_curve(
         clean = clean.loc[clean["x"] <= x_max]
     if clean.empty:
         raise ValueError(f"No valid rows remain in {path} after load cutoffs.")
-    if np.any(clean["dI"] < 0):
-        warnings.warn(f"{path}: negative standard errors found; using absolute values.")
-        clean["dI"] = np.abs(clean["dI"])
+    if np.any(clean["dvalue"] < 0):
+        warnings.warn(
+            f"{path}: negative standard errors found; using absolute values."
+        )
+        clean["dvalue"] = np.abs(clean["dvalue"])
     if np.any(clean["x"] < -1e-12):
         warnings.warn(f"{path}: contains points before t0=2L.")
 
@@ -1945,10 +2059,11 @@ def _load_probe2_curve(
         "path": path,
         "L": size,
         "p": _parse_p(path),
+        "metric": metric_spec["key"],
         "t": clean["t"].to_numpy(dtype=float),
         "x": clean["x"].to_numpy(dtype=float),
-        "I": clean["I"].to_numpy(dtype=float),
-        "dI": clean["dI"].to_numpy(dtype=float),
+        "value": clean["value"].to_numpy(dtype=float),
+        "dvalue": clean["dvalue"].to_numpy(dtype=float),
     }
 
 
@@ -1957,6 +2072,7 @@ def probe2_collapse(
     *,
     file_glob: str | Path | None = None,
     l_by_file: Mapping[str, int] | None = None,
+    metric: str = "mi",
     x_load: tuple[float | None, float | None] = (None, None),
     fit_x: tuple[float, float | None] = (0.25, 8.0),
     fit_i_min: float = 1e-8,
@@ -1977,10 +2093,23 @@ def probe2_collapse(
     show_summary: bool = True,
     show: bool = True,
 ) -> dict[str, Any]:
-    """Fit I(A:B)=L^(-eta)g((t-2L)/L) for two ancilla probes."""
+    r"""Fit ``O(L,t)=L^(-eta)g((t-2L)/L)`` for two ancilla probes.
+
+    ``metric`` selects ``"mi"``, ``"negativity"``, or
+    ``"log_negativity"``. The same one-parameter bulk-exponent ansatz and
+    collapse objective are used for all three observables. ``fit_i_min`` is
+    retained for notebook compatibility and acts as the minimum selected
+    observable value, regardless of metric.
+    """
+    metric_spec = _probe2_metric_spec(metric)
     paths = _resolve_files(files, file_glob)
     curves = [
-        _load_probe2_curve(path, l_by_file=l_by_file, x_load=x_load)
+        _load_probe2_curve(
+            path,
+            l_by_file=l_by_file,
+            x_load=x_load,
+            metric_spec=metric_spec,
+        )
         for path in paths
     ]
     curves.sort(key=lambda curve: curve["L"])
@@ -1994,15 +2123,19 @@ def probe2_collapse(
     if finite_ps and not np.allclose(finite_ps, finite_ps[0], rtol=0, atol=1e-12):
         warnings.warn(f"The files contain multiple p values: {sorted(set(finite_ps))}")
 
+    summary_name = metric_spec["summary_name"]
     summary = pd.DataFrame(
         {
             "L": sizes,
+            "metric": metric_spec["key"],
             "p_from_filename": [curve["p"] for curve in curves],
             "points": [len(curve["x"]) for curve in curves],
             "x_min": [np.min(curve["x"]) for curve in curves],
             "x_max": [np.max(curve["x"]) for curve in curves],
-            "I_max": [np.max(curve["I"]) for curve in curves],
-            "x_at_I_max": [curve["x"][np.argmax(curve["I"])] for curve in curves],
+            f"{summary_name}_max": [np.max(curve["value"]) for curve in curves],
+            f"x_at_{summary_name}_max": [
+                curve["x"][np.argmax(curve["value"])] for curve in curves
+            ],
             "file": [str(curve["path"]) for curve in curves],
         }
     )
@@ -2019,10 +2152,10 @@ def probe2_collapse(
     def fit_mask(curve):
         mask = (
             np.isfinite(curve["x"])
-            & np.isfinite(curve["I"])
-            & np.isfinite(curve["dI"])
+            & np.isfinite(curve["value"])
+            & np.isfinite(curve["dvalue"])
             & (curve["x"] >= fit_x_min)
-            & (curve["I"] > fit_i_min)
+            & (curve["value"] > fit_i_min)
         )
         if fit_x_max is not None:
             mask &= curve["x"] <= fit_x_max
@@ -2035,8 +2168,8 @@ def probe2_collapse(
             order = np.argsort(curve["x"][mask])
             return (
                 curve["x"][mask][order],
-                (curve["I"][mask] * scale)[order],
-                (curve["dI"][mask] * scale)[order],
+                (curve["value"][mask] * scale)[order],
+                (curve["dvalue"][mask] * scale)[order],
             )
 
         xa, ya, dya = transformed(curve_a)
@@ -2055,7 +2188,9 @@ def probe2_collapse(
             absolute_error_floor,
         )
         floor = max(absolute_error_floor, relative_error_floor * typical)
-        return float(np.mean((ya_g - yb_g) ** 2 / (dya_g**2 + dyb_g**2 + floor**2)))
+        return float(
+            np.mean((ya_g - yb_g) ** 2 / (dya_g**2 + dyb_g**2 + floor**2))
+        )
 
     def score(eta, curve_set=curves):
         values = [
@@ -2088,10 +2223,13 @@ def probe2_collapse(
             synthetic_curves = []
             for curve in curves:
                 synthetic = dict(curve)
-                synthetic["I"] = np.clip(
-                    rng.normal(curve["I"], np.maximum(curve["dI"], 0.0)),
+                synthetic["value"] = np.clip(
+                    rng.normal(
+                        curve["value"],
+                        np.maximum(curve["dvalue"], 0.0),
+                    ),
                     0.0,
-                    2.0 * np.log(2.0),
+                    metric_spec["bootstrap_upper"],
                 )
                 synthetic_curves.append(synthetic)
             result = minimize_scalar(
@@ -2114,6 +2252,7 @@ def probe2_collapse(
         if bootstrap_samples >= 2:
             warnings.warn("Too few successful bootstrap fits to estimate eta uncertainty.")
 
+    print(f"metric = {metric_spec['key']}")
     print(f"eta = {eta:.6f} ± {eta_stderr:.6f}")
     if np.isfinite(eta_p16):
         print(f"bootstrap 68% interval = [{eta_p16:.6f}, {eta_p84:.6f}]")
@@ -2135,14 +2274,14 @@ def probe2_collapse(
         if show_errorbars:
             ax_raw.errorbar(
                 curve["x"],
-                curve["I"],
-                yerr=curve["dI"],
+                curve["value"],
+                yerr=curve["dvalue"],
                 elinewidth=0.9,
                 capsize=capsize,
                 **kwargs,
             )
         else:
-            ax_raw.plot(curve["x"], curve["I"], **kwargs)
+            ax_raw.plot(curve["x"], curve["value"], **kwargs)
 
         mask = fit_mask(curve)
         scale = float(size) ** eta
@@ -2150,7 +2289,7 @@ def probe2_collapse(
         if np.any(excluded):
             ax_collapse.plot(
                 curve["x"][excluded],
-                curve["I"][excluded] * scale,
+                curve["value"][excluded] * scale,
                 linestyle="none",
                 marker="o",
                 markersize=3,
@@ -2160,8 +2299,8 @@ def probe2_collapse(
         if show_errorbars:
             ax_collapse.errorbar(
                 curve["x"][mask],
-                curve["I"][mask] * scale,
-                yerr=curve["dI"][mask] * scale,
+                curve["value"][mask] * scale,
+                yerr=curve["dvalue"][mask] * scale,
                 elinewidth=0.9,
                 capsize=capsize,
                 **kwargs,
@@ -2169,22 +2308,26 @@ def probe2_collapse(
         else:
             ax_collapse.plot(
                 curve["x"][mask],
-                curve["I"][mask] * scale,
+                curve["value"][mask] * scale,
                 **kwargs,
             )
 
     ax_raw.axvline(0.0, linewidth=1, linestyle="--", alpha=0.6)
-    fit_upper = fit_x_max if fit_x_max is not None else max(curve["x"].max() for curve in curves)
+    fit_upper = (
+        fit_x_max
+        if fit_x_max is not None
+        else max(curve["x"].max() for curve in curves)
+    )
     ax_raw.axvspan(fit_x_min, fit_upper, alpha=0.08, label="fit window")
     ax_raw.set_xlabel(r"Scaled time $x=(t-2L)/L$")
-    ax_raw.set_ylabel(r"Mutual information $I(A:B)$ [nats]")
-    ax_raw.set_title("Two-probe mutual information")
+    ax_raw.set_ylabel(metric_spec["raw_ylabel"])
+    ax_raw.set_title(metric_spec["raw_title"])
     ax_raw.set_yscale(raw_yscale)
     ax_raw.grid(alpha=0.25)
     ax_raw.legend()
 
     ax_collapse.set_xlabel(r"Scaled time $x=(t-2L)/L$")
-    ax_collapse.set_ylabel(r"$L^{\eta}I(A:B)$")
+    ax_collapse.set_ylabel(metric_spec["collapse_ylabel"])
     ax_collapse.set_title("Bulk-exponent scaling collapse")
     ax_collapse.set_yscale(collapse_yscale)
     ax_collapse.grid(alpha=0.25)
@@ -2197,7 +2340,7 @@ def probe2_collapse(
     ax_collapse.text(
         0.97,
         0.02,
-        r"$I(A:B)=L^{-\eta}g((t-2L)/L)$"
+        metric_spec["ansatz"]
         + "\n"
         + eta_text
         + "\n"
@@ -2207,12 +2350,13 @@ def probe2_collapse(
         va="bottom",
         bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.88},
     )
-    fig.suptitle("Bulk two-probe mutual information at fixed measurement rate", fontsize=14)
+    fig.suptitle(metric_spec["suptitle"], fontsize=14)
     _show(fig, show)
 
     return {
         "figure": fig,
         "axes": (ax_raw, ax_collapse),
+        "metric": metric_spec["key"],
         "eta": eta,
         "eta_stderr": eta_stderr,
         "eta_p16": eta_p16,

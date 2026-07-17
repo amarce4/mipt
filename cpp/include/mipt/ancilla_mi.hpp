@@ -12,6 +12,13 @@
 
 namespace mipt::ancilla
 {
+struct TwoProbeObservables
+{
+    double mutual_information = 0.0;
+    double negativity = 0.0;
+    double log_negativity = 0.0;
+};
+
 inline double entropy_from_rdm(const Rdm &rho)
 {
     double rho00 = rho.rho00;
@@ -106,7 +113,7 @@ inline void jacobi_eigenvalues_symmetric_8x8(
         "The 4x4 ancilla density-matrix eigensolver did not converge.");
 }
 
-inline double entropy_from_rdm2(const Rdm2 &rho)
+inline Rdm2 normalized_hermitian_rdm2(const Rdm2 &rho)
 {
     double trace = 0.0;
     for (std::size_t i = 0; i < Rdm2::dimension; ++i)
@@ -119,30 +126,54 @@ inline double entropy_from_rdm2(const Rdm2 &rho)
             "Two-ancilla reduced density matrix has invalid trace.");
     }
 
-    std::array<std::array<double, 8>, 8> real_embedding{};
+    Rdm2 normalized;
+    for (std::size_t row = 0; row < Rdm2::dimension; ++row)
+    {
+        for (std::size_t col = row; col < Rdm2::dimension; ++col)
+        {
+            std::complex<double> value =
+                0.5 * (rho(row, col) + std::conj(rho(col, row))) / trace;
+            if (row == col)
+            {
+                value = {std::real(value), 0.0};
+            }
+            normalized(row, col) = value;
+            normalized(col, row) = std::conj(value);
+        }
+    }
+    return normalized;
+}
+
+inline std::array<std::array<double, 8>, 8> real_embedding(const Rdm2 &matrix)
+{
+    std::array<std::array<double, 8>, 8> embedding{};
     for (std::size_t row = 0; row < Rdm2::dimension; ++row)
     {
         for (std::size_t col = 0; col < Rdm2::dimension; ++col)
         {
-            const std::complex<double> value =
-                0.5 * (rho(row, col) + std::conj(rho(col, row))) / trace;
+            const std::complex<double> value = matrix(row, col);
             const double real = std::real(value);
             const double imag = std::imag(value);
-            real_embedding[row][col] = real;
-            real_embedding[row][col + 4] = -imag;
-            real_embedding[row + 4][col] = imag;
-            real_embedding[row + 4][col + 4] = real;
+            embedding[row][col] = real;
+            embedding[row][col + 4] = -imag;
+            embedding[row + 4][col] = imag;
+            embedding[row + 4][col + 4] = real;
         }
     }
+    return embedding;
+}
 
-    jacobi_eigenvalues_symmetric_8x8(real_embedding);
+inline double entropy_from_normalized_rdm2(const Rdm2 &rho)
+{
+    auto embedding = real_embedding(rho);
+    jacobi_eigenvalues_symmetric_8x8(embedding);
 
     double entropy_twice = 0.0;
     double eigenvalue_sum = 0.0;
     constexpr double negative_tolerance = 2e-6;
     for (std::size_t i = 0; i < 8; ++i)
     {
-        double lambda = real_embedding[i][i];
+        double lambda = embedding[i][i];
         if (!std::isfinite(lambda))
         {
             throw std::runtime_error(
@@ -170,7 +201,109 @@ inline double entropy_from_rdm2(const Rdm2 &rho)
     return 0.5 * entropy_twice;
 }
 
-inline double mutual_information(
+inline double entropy_from_rdm2(const Rdm2 &rho)
+{
+    return entropy_from_normalized_rdm2(normalized_hermitian_rdm2(rho));
+}
+
+inline double trace_norm_rdm2(const Rdm2 &matrix)
+{
+    Rdm2 gram;
+    for (std::size_t row = 0; row < Rdm2::dimension; ++row)
+    {
+        for (std::size_t col = 0; col < Rdm2::dimension; ++col)
+        {
+            std::complex<double> sum = 0.0;
+            for (std::size_t k = 0; k < Rdm2::dimension; ++k)
+            {
+                sum += std::conj(matrix(k, row)) * matrix(k, col);
+            }
+            gram(row, col) = sum;
+        }
+    }
+
+    for (std::size_t row = 0; row < Rdm2::dimension; ++row)
+    {
+        for (std::size_t col = row; col < Rdm2::dimension; ++col)
+        {
+            std::complex<double> value =
+                0.5 * (gram(row, col) + std::conj(gram(col, row)));
+            if (row == col)
+            {
+                value = {std::real(value), 0.0};
+            }
+            gram(row, col) = value;
+            gram(col, row) = std::conj(value);
+        }
+    }
+
+    auto embedding = real_embedding(gram);
+    jacobi_eigenvalues_symmetric_8x8(embedding);
+
+    double norm_twice = 0.0;
+    constexpr double negative_tolerance = 2e-10;
+    for (std::size_t i = 0; i < 8; ++i)
+    {
+        double lambda = embedding[i][i];
+        if (!std::isfinite(lambda))
+        {
+            throw std::runtime_error(
+                "Two-ancilla partial transpose produced a non-finite singular value.");
+        }
+        if (lambda < -negative_tolerance)
+        {
+            throw std::runtime_error(
+                "Two-ancilla partial-transpose Gram matrix is not positive semidefinite.");
+        }
+        lambda = std::max(0.0, lambda);
+        norm_twice += std::sqrt(lambda);
+    }
+    return 0.5 * norm_twice;
+}
+
+inline double negativity_from_normalized_rdm2(
+    const Rdm2 &rho,
+    bool fermion_trace)
+{
+    Rdm2 partial_transpose;
+    constexpr int mask = 1; // transpose ancilla A, local bit 0
+    for (int row = 0; row < 4; ++row)
+    {
+        for (int col = 0; col < 4; ++col)
+        {
+            const int source_row = (row & ~mask) | (col & mask);
+            const int source_col = (col & ~mask) | (row & mask);
+            std::complex<double> value = rho(source_row, source_col);
+
+            // Match the fGMN/two-site convention for fermionic partial transpose.
+            if (fermion_trace && (((row & mask) != 0) != ((col & mask) != 0)))
+            {
+                value *= std::complex<double>(0.0, 1.0);
+            }
+            partial_transpose(row, col) = value;
+        }
+    }
+
+    double value = 0.5 * (trace_norm_rdm2(partial_transpose) - 1.0);
+    if (value < 0.0 && value > -2e-8)
+    {
+        value = 0.0;
+    }
+    if (!std::isfinite(value) || value < -2e-8)
+    {
+        throw std::runtime_error(
+            "Ancilla negativity is invalid: " + std::to_string(value));
+    }
+    return std::max(0.0, value);
+}
+
+inline double negativity_from_rdm2(const Rdm2 &rho, bool fermion_trace)
+{
+    return negativity_from_normalized_rdm2(
+        normalized_hermitian_rdm2(rho), fermion_trace);
+}
+
+inline TwoProbeObservables two_probe_observables(
     cudaq::state &state,
     int n_qubits,
     int ancilla_a,
@@ -183,18 +316,42 @@ inline double mutual_information(
         state, n_qubits, ancilla_b, fermion_trace);
     const Rdm2 rho_ab = reduced_density_matrix_two(
         state, n_qubits, ancilla_a, ancilla_b, fermion_trace);
+    const Rdm2 normalized_rho_ab = normalized_hermitian_rdm2(rho_ab);
 
-    double value = entropy_from_rdm(rho_a) + entropy_from_rdm(rho_b) -
-                   entropy_from_rdm2(rho_ab);
-    if (value < 0.0 && value > -2e-6)
+    double mi = entropy_from_rdm(rho_a) + entropy_from_rdm(rho_b) -
+                entropy_from_normalized_rdm2(normalized_rho_ab);
+    if (mi < 0.0 && mi > -2e-6)
     {
-        value = 0.0;
+        mi = 0.0;
     }
-    if (!std::isfinite(value) || value < -2e-6)
+    if (!std::isfinite(mi) || mi < -2e-6)
     {
         throw std::runtime_error(
-            "Ancilla mutual information is invalid: " + std::to_string(value));
+            "Ancilla mutual information is invalid: " + std::to_string(mi));
     }
-    return value;
+
+    const double negativity = negativity_from_normalized_rdm2(
+        normalized_rho_ab, fermion_trace);
+    const double log_negativity = std::log1p(2.0 * negativity);
+    if (!std::isfinite(log_negativity) || log_negativity < 0.0)
+    {
+        throw std::runtime_error(
+            "Ancilla logarithmic negativity is invalid: " +
+            std::to_string(log_negativity));
+    }
+
+    return {std::max(0.0, mi), negativity, log_negativity};
+}
+
+inline double mutual_information(
+    cudaq::state &state,
+    int n_qubits,
+    int ancilla_a,
+    int ancilla_b,
+    bool fermion_trace)
+{
+    return two_probe_observables(
+        state, n_qubits, ancilla_a, ancilla_b, fermion_trace)
+        .mutual_information;
 }
 } // namespace mipt::ancilla

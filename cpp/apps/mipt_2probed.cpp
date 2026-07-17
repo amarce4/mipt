@@ -42,9 +42,7 @@ struct AttachTwoProbeKernel
     {
         cudaq::qvector q(state);
 
-        // The bulk two-point protocol replaces the two selected system sites
-        // with fresh local Bell pairs at t0. Reset performs the required
-        // projective collapse and returns each system qubit to |0>.
+        // Replace the selected system sites with fresh local Bell pairs at t0.
         cudaq::reset(q[probe_site_a]);
         cudaq::reset(q[probe_site_b]);
         h(q[probe_site_a]);
@@ -79,6 +77,30 @@ struct RunningStats
     std::uint64_t count = 0;
     double mean = 0.0;
     double m2 = 0.0;
+};
+
+struct ProbeStats
+{
+    void add(const ancilla::TwoProbeObservables &values)
+    {
+        mutual_information.add(values.mutual_information);
+        negativity.add(values.negativity);
+        log_negativity.add(values.log_negativity);
+    }
+
+    std::uint64_t count() const
+    {
+        if (mutual_information.count != negativity.count ||
+            mutual_information.count != log_negativity.count)
+        {
+            throw std::runtime_error("Internal error: probe statistic counts disagree.");
+        }
+        return mutual_information.count;
+    }
+
+    RunningStats mutual_information;
+    RunningStats negativity;
+    RunningStats log_negativity;
 };
 
 std::string compact_decimal(double value)
@@ -279,12 +301,15 @@ void print_help(const char *program)
               << "  2. Evolve only the system through t0=2N using periodic circuit layers.\n"
               << "  3. At t0, reset system sites q_(N-1)/2 and q_(N-1), then prepare\n"
               << "     exact Bell pairs (q_(N-1)/2,q_N) and (q_(N-1),q_(N+1)).\n"
-              << "  4. Continue the same trajectory and compute I(A:B) after every sampled\n"
-              << "     post-measurement timestep. Require t_min >= t0.\n\n"
-              << "The CSV columns are t, t_minus_t0, scaled_time=(t-t0)/N, I_mean, and\n"
-              << "I_stderr. Von Neumann entropies use natural logarithms, so I is in nats.\n"
-              << "For fermionic circuit types, S(A), S(B), and S(AB) each use the\n"
-              << "fermionic partial-trace convention.\n\n"
+              << "  4. Continue the same trajectory and compute I(A:B), negativity, and\n"
+              << "     logarithmic negativity after every sampled post-measurement timestep.\n"
+              << "     Require t_min >= t0.\n\n"
+              << "The CSV columns are t, t_minus_t0, scaled_time=(t-t0)/N, I_mean,\n"
+              << "I_stderr, negativity_mean, negativity_stderr, log_negativity_mean,\n"
+              << "and log_negativity_stderr. Entropies and logarithmic negativity use\n"
+              << "natural logarithms, so I and log-negativity are in nats.\n"
+              << "For fermionic circuit types, the existing fermionic partial-trace and\n"
+              << "fermionic partial-transpose conventions are used.\n\n"
               << "Runtime controls:\n"
               << "  MIPT_2PROBED_PREFETCH=0       Disable CPU preparation overlap.\n"
               << "  MIPT_2PROBED_PROGRESS=0       Disable progress output.\n"
@@ -359,7 +384,7 @@ int run_cli(int argc, char *argv[])
     const int ancilla_b = n + 1;
     const int total_qubits = n + 2;
     const int row_count = t_max - t_min + 1;
-    std::vector<RunningStats> stats(static_cast<std::size_t>(row_count));
+    std::vector<ProbeStats> stats(static_cast<std::size_t>(row_count));
 
     const bool prefetch_enabled = env::boolean(
         "MIPT_2PROBED_PREFETCH",
@@ -446,12 +471,17 @@ int run_cli(int argc, char *argv[])
             completed_layers += static_cast<std::uint64_t>(t_min - t0);
         }
 
-        stats[0].add(ancilla::mutual_information(
-            state,
-            total_qubits,
-            ancilla_a,
-            ancilla_b,
-            uses_fermionic_trace(type)));
+        auto record_observables = [&](std::size_t row)
+        {
+            stats[row].add(ancilla::two_probe_observables(
+                state,
+                total_qubits,
+                ancilla_a,
+                ancilla_b,
+                uses_fermionic_trace(type)));
+        };
+
+        record_observables(0);
         progress.update(
             realization,
             realizations,
@@ -463,13 +493,7 @@ int run_cli(int argc, char *argv[])
         {
             state = workspace.advance(state, t - 1, 1, context);
             ++completed_layers;
-            stats[static_cast<std::size_t>(t - t_min)].add(
-                ancilla::mutual_information(
-                    state,
-                    total_qubits,
-                    ancilla_a,
-                    ancilla_b,
-                    uses_fermionic_trace(type)));
+            record_observables(static_cast<std::size_t>(t - t_min));
             progress.update(
                 realization,
                 realizations,
@@ -485,13 +509,15 @@ int run_cli(int argc, char *argv[])
     {
         throw std::runtime_error("Could not open output CSV: " + output);
     }
-    csv << "t,t_minus_t0,scaled_time,I_mean,I_stderr\n";
+    csv << "t,t_minus_t0,scaled_time,I_mean,I_stderr,"
+           "negativity_mean,negativity_stderr,"
+           "log_negativity_mean,log_negativity_stderr\n";
     csv << std::setprecision(17);
     for (int t = t_min; t <= t_max; ++t)
     {
-        const RunningStats &sample =
+        const ProbeStats &sample =
             stats[static_cast<std::size_t>(t - t_min)];
-        if (sample.count != static_cast<std::uint64_t>(realizations))
+        if (sample.count() != static_cast<std::uint64_t>(realizations))
         {
             throw std::runtime_error(
                 "Internal error: incomplete statistics at t=" +
@@ -500,8 +526,12 @@ int run_cli(int argc, char *argv[])
         csv << t << ','
             << t - t0 << ','
             << static_cast<double>(t - t0) / static_cast<double>(n) << ','
-            << sample.mean << ','
-            << sample.stderr() << '\n';
+            << sample.mutual_information.mean << ','
+            << sample.mutual_information.stderr() << ','
+            << sample.negativity.mean << ','
+            << sample.negativity.stderr() << ','
+            << sample.log_negativity.mean << ','
+            << sample.log_negativity.stderr() << '\n';
     }
     csv.flush();
     if (!csv)
