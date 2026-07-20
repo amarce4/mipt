@@ -242,6 +242,13 @@ inline bool uses_fermionic_trace(CircuitType type)
     return circuit_info(type).fermionic_trace;
 }
 
+inline bool preserves_computational_parity(CircuitType type)
+{
+    return type == CircuitType::FermionRPPU ||
+           type == CircuitType::RFGS ||
+           type == CircuitType::QubitRPPU;
+}
+
 inline bool requires_even_sites(CircuitType type)
 {
     return circuit_info(type).requires_even_sites;

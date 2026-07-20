@@ -9,12 +9,15 @@
 #include <chrono>
 #include <cmath>
 #include <complex>
+#include <cstdio>
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
 #include <fstream>
 #include <future>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -155,6 +158,140 @@ std::string compact_count(std::uint64_t count)
     return std::to_string(count);
 }
 
+std::string precise_decimal(double value)
+{
+    std::ostringstream out;
+    out << std::setprecision(17) << value;
+    return out.str();
+}
+
+std::string shell_quote(std::string_view value)
+{
+    std::string quoted("'");
+    for (char character : value)
+    {
+        if (character == '\'')
+        {
+            quoted += "'\\''";
+        }
+        else
+        {
+            quoted += character;
+        }
+    }
+    quoted += '\'';
+    return quoted;
+}
+
+bool same_probability(double lhs, double rhs)
+{
+    return std::abs(lhs - rhs) <=
+        1.0e-12 * std::max({1.0, std::abs(lhs), std::abs(rhs)});
+}
+
+std::vector<double> completed_probabilities(const std::string &path)
+{
+    std::ifstream csv(path);
+    if (!csv)
+    {
+        return {};
+    }
+
+    std::string line;
+    if (!std::getline(csv, line))
+    {
+        return {};
+    }
+    if (line.rfind("p,", 0) != 0)
+    {
+        throw std::runtime_error(
+            "Cannot resume from malformed checkpoint CSV: " + path);
+    }
+
+    std::vector<double> completed;
+    while (std::getline(csv, line))
+    {
+        if (line.empty())
+        {
+            continue;
+        }
+        const auto comma = line.find(',');
+        if (comma == std::string::npos)
+        {
+            throw std::runtime_error(
+                "Cannot resume from malformed checkpoint row in: " + path);
+        }
+        const double p = std::stod(line.substr(0, comma));
+        if (std::none_of(
+                completed.begin(), completed.end(),
+                [p](double prior) { return same_probability(p, prior); }))
+        {
+            completed.push_back(p);
+        }
+    }
+    return completed;
+}
+
+void append_checkpoint_csv(const std::string &point_path,
+                           const std::string &output_path)
+{
+    std::ifstream point(point_path);
+    if (!point)
+    {
+        throw std::runtime_error(
+            "Isolated point did not produce its CSV: " + point_path);
+    }
+
+    std::string point_header;
+    if (!std::getline(point, point_header) || point_header.empty())
+    {
+        throw std::runtime_error(
+            "Isolated point produced an empty CSV: " + point_path);
+    }
+
+    std::ifstream existing(output_path);
+    std::string existing_header;
+    const bool append = existing && static_cast<bool>(
+        std::getline(existing, existing_header));
+    if (append && existing_header != point_header)
+    {
+        throw std::runtime_error(
+            "Checkpoint header does not match the new output: " + output_path);
+    }
+
+    const std::string update_path = output_path + ".update.tmp";
+    std::ofstream output(update_path, std::ios::out | std::ios::trunc);
+    if (!output)
+    {
+        throw std::runtime_error("Could not update checkpoint CSV: " + output_path);
+    }
+    if (append)
+    {
+        std::ifstream prior(output_path);
+        output << prior.rdbuf();
+        if (!prior.eof() && prior.fail())
+        {
+            throw std::runtime_error("Could not read checkpoint CSV: " + output_path);
+        }
+    }
+    else
+    {
+        output << point_header << '\n';
+    }
+    output << point.rdbuf();
+    output.flush();
+    if (!output)
+    {
+        throw std::runtime_error("Failed while updating checkpoint CSV: " + output_path);
+    }
+    output.close();
+    if (std::rename(update_path.c_str(), output_path.c_str()) != 0)
+    {
+        throw std::runtime_error(
+            "Could not atomically replace checkpoint CSV: " + output_path);
+    }
+}
+
 std::vector<double> linspace(double minimum, double maximum, int count)
 {
     if (count <= 0)
@@ -271,11 +408,49 @@ Sample measure_sample(cudaq::state &state,
     return {values.entropy, values.i2, values.i3, values.i4, 0.0, 0.0};
 }
 
+Sample measure_parity_encoded_probe(cudaq::state &state, int n)
+{
+    const auto weights = ancilla::parity_sector_weights(state, n);
+    const double entropy = ancilla::entropy_from_rdm(
+        {weights.even, weights.odd, {0.0, 0.0}});
+    return {entropy, 0.0, 0.0, 0.0, 0.0, 0.0};
+}
+
+std::string format_duration(double seconds)
+{
+    if (!std::isfinite(seconds) || seconds < 0.0)
+    {
+        return "--h --m --s";
+    }
+    const std::uint64_t total_seconds = static_cast<std::uint64_t>(
+        std::ceil(seconds));
+    const std::uint64_t hours = total_seconds / 3600u;
+    const std::uint64_t minutes = (total_seconds % 3600u) / 60u;
+    const std::uint64_t remainder = total_seconds % 60u;
+    std::ostringstream out;
+    out << std::setfill('0') << std::setw(2) << hours << "h "
+        << std::setw(2) << minutes << "m "
+        << std::setw(2) << remainder << 's';
+    return out.str();
+}
+
 class ProgressReporter
 {
   public:
-    explicit ProgressReporter(std::uint64_t total)
-        : total_(total),
+    explicit ProgressReporter(std::uint64_t local_total)
+        : global_offset_(static_cast<std::uint64_t>(env::integer(
+              "MIPT_PROBED_GLOBAL_OFFSET", 0, 0,
+              std::numeric_limits<long>::max()))),
+          global_total_(static_cast<std::uint64_t>(env::integer(
+              "MIPT_PROBED_GLOBAL_TOTAL",
+              static_cast<long>(local_total), 1,
+              std::numeric_limits<long>::max()))),
+          global_base_done_(static_cast<std::uint64_t>(env::integer(
+              "MIPT_PROBED_GLOBAL_BASE_DONE", 0, 0,
+              std::numeric_limits<long>::max()))),
+          global_start_ms_(static_cast<std::uint64_t>(env::integer(
+              "MIPT_PROBED_GLOBAL_START_MS", 0, 0,
+              std::numeric_limits<long>::max()))),
           start_(std::chrono::steady_clock::now()),
           enabled_(env::boolean("MIPT_PROBED_PROGRESS", true)),
           interval_(env::integer(
@@ -284,7 +459,12 @@ class ProgressReporter
         last_ = start_ - interval_;
     }
 
-    void update(std::uint64_t completed, double p, int t, bool force = false)
+    void update(std::uint64_t local_completed,
+                double p,
+                int t,
+                std::size_t point_index,
+                std::size_t point_count,
+                bool force = false)
     {
         if (!enabled_)
         {
@@ -299,19 +479,47 @@ class ProgressReporter
         printed_ = true;
         const double elapsed =
             std::chrono::duration<double>(now - start_).count();
-        const double rate = elapsed > 0.0
-            ? static_cast<double>(completed) / elapsed
+        double rate = elapsed > 0.0
+            ? static_cast<double>(local_completed) / elapsed
             : 0.0;
+        const std::uint64_t global_completed = std::min(
+            global_total_, global_offset_ + local_completed);
+        const std::uint64_t remaining = global_total_ - global_completed;
+        if (global_start_ms_ > 0)
+        {
+            const auto now_ms = static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count());
+            const double global_elapsed = now_ms > global_start_ms_
+                ? static_cast<double>(now_ms - global_start_ms_) / 1000.0
+                : 0.0;
+            const std::uint64_t completed_this_run =
+                global_completed > global_base_done_
+                ? global_completed - global_base_done_
+                : 0;
+            if (global_elapsed > 0.0 && completed_this_run > 0)
+            {
+                rate = static_cast<double>(completed_this_run) / global_elapsed;
+            }
+        }
         const double eta = rate > 0.0
-            ? static_cast<double>(total_ - std::min(total_, completed)) / rate
-            : 0.0;
-        std::cout << "\rtrajectory=" << completed << '/' << total_
-                  << ", p=" << std::setprecision(5) << p
-                  << ", t=" << t
-                  << ", trajectories/s=" << std::fixed << std::setprecision(3)
-                  << rate
-                  << ", ETA=" << static_cast<std::uint64_t>(eta)
-                  << "s                    " << std::flush;
+            ? static_cast<double>(remaining) / rate
+            : std::numeric_limits<double>::quiet_NaN();
+        const std::size_t shown_index = static_cast<std::size_t>(env::integer(
+            "MIPT_PROBED_GLOBAL_P_INDEX", static_cast<long>(point_index),
+            1, std::numeric_limits<long>::max()));
+        const std::size_t shown_count = static_cast<std::size_t>(env::integer(
+            "MIPT_PROBED_GLOBAL_P_COUNT", static_cast<long>(point_count),
+            1, std::numeric_limits<long>::max()));
+        std::cout << "\rrealizations: done=" << global_completed
+                  << ", left=" << remaining
+                  << ", total=" << global_total_
+                  << " | p=" << std::fixed << std::setprecision(5) << p
+                  << " [" << shown_index << '/' << shown_count << ']'
+                  << " | t=" << t
+                  << " | rate=" << std::setprecision(3) << rate << " traj/s"
+                  << " | ETA=" << format_duration(eta)
+                  << "                    " << std::flush;
     }
 
     void finish() const
@@ -323,7 +531,10 @@ class ProgressReporter
     }
 
   private:
-    std::uint64_t total_ = 0;
+    std::uint64_t global_offset_ = 0;
+    std::uint64_t global_total_ = 0;
+    std::uint64_t global_base_done_ = 0;
+    std::uint64_t global_start_ms_ = 0;
     std::chrono::steady_clock::time_point start_;
     std::chrono::steady_clock::time_point last_;
     bool enabled_ = true;
@@ -393,6 +604,10 @@ void print_help(const char *program)
         << "Runtime controls:\n"
         << "  MIPT_PROBED_DISTANCE=1       Legacy one-probe depth d.\n"
         << "  MIPT_PROBED_PREFETCH=0       Disable CPU layer prefetch.\n"
+        << "  MIPT_PROBED_PARITY_ENCODING=0 Disable exact one-probe parity encoding.\n"
+        << "  MIPT_PROBED_ISOLATE_P=0      Disable per-p subprocess isolation.\n"
+        << "  MIPT_PROBED_RESUME=0         Replace, rather than resume, a p scan.\n"
+        << "  MIPT_PROBED_RETRIES=1        Retries after a failed isolated p point.\n"
         << "  MIPT_PROBED_PROGRESS=0       Disable progress output.\n"
         << "  MIPT_PROBED_PROGRESS_MS=500  Progress-update interval.\n";
 }
@@ -501,9 +716,147 @@ void write_csv(const std::string &path,
     }
 }
 
+int run_isolated_p_scan(const char *program,
+                        int probes,
+                        int n,
+                        int realizations,
+                        CircuitType type,
+                        int mode,
+                        const std::vector<double> &p_values,
+                        const std::vector<int> &times,
+                        const std::string &output)
+{
+    const bool resume = env::boolean("MIPT_PROBED_RESUME", true);
+    if (!resume)
+    {
+        std::remove(output.c_str());
+    }
+    auto completed = completed_probabilities(output);
+    const int retries = static_cast<int>(env::integer(
+        "MIPT_PROBED_RETRIES", 1, 0, 10));
+
+    const std::uint64_t global_total =
+        static_cast<std::uint64_t>(p_values.size()) *
+        static_cast<std::uint64_t>(realizations);
+    const std::uint64_t global_base_done =
+        static_cast<std::uint64_t>(completed.size()) *
+        static_cast<std::uint64_t>(realizations);
+    const auto global_start_ms = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+    if (!completed.empty())
+    {
+        const std::uint64_t done =
+            static_cast<std::uint64_t>(completed.size()) *
+            static_cast<std::uint64_t>(realizations);
+        std::cout << "Resuming: " << completed.size() << '/' << p_values.size()
+                  << " p points complete; realizations done=" << done
+                  << ", left=" << global_total - std::min(global_total, done)
+                  << ".\n";
+    }
+    for (std::size_t index = 0; index < p_values.size(); ++index)
+    {
+        const double p = p_values[index];
+        const bool already_done = std::any_of(
+            completed.begin(), completed.end(),
+            [p](double prior) { return same_probability(p, prior); });
+        if (already_done)
+        {
+            backend::verbose_log(
+                "p point " + std::to_string(index + 1) + '/' +
+                std::to_string(p_values.size()) + " already checkpointed");
+            continue;
+        }
+
+        const std::string point_output = output + ".point_" +
+            std::to_string(index) + ".tmp";
+        std::ostringstream base;
+        const std::uint64_t global_offset =
+            static_cast<std::uint64_t>(completed.size()) *
+            static_cast<std::uint64_t>(realizations);
+        base << "MIPT_PROBED_INTERNAL_CHILD=1 "
+             << "MIPT_PROBED_ISOLATE_P=0 "
+             << "MIPT_PROBED_GLOBAL_OFFSET=" << global_offset << ' '
+             << "MIPT_PROBED_GLOBAL_TOTAL=" << global_total << ' '
+             << "MIPT_PROBED_GLOBAL_BASE_DONE=" << global_base_done << ' '
+             << "MIPT_PROBED_GLOBAL_START_MS=" << global_start_ms << ' '
+             << "MIPT_PROBED_GLOBAL_P_INDEX=" << index + 1 << ' '
+             << "MIPT_PROBED_GLOBAL_P_COUNT=" << p_values.size() << ' '
+             << "MIPT_PROBED_INTERNAL_OUTPUT=" << shell_quote(point_output)
+             << ' ' << shell_quote(program)
+             << ' ' << probes
+             << ' ' << n
+             << ' ' << realizations
+             << ' ' << static_cast<int>(type)
+             << ' ' << mode;
+        if (mode == 1)
+        {
+            base << ' ' << precise_decimal(p)
+                 << ' ' << precise_decimal(p)
+                 << " 1";
+        }
+        else
+        {
+            base << ' ' << times.front()
+                 << ' ' << times.back()
+                 << ' ' << times.size()
+                 << ' ' << precise_decimal(p)
+                 << ' ' << precise_decimal(p)
+                 << " 1";
+        }
+
+        backend::verbose_log(
+            "starting p point " + std::to_string(index + 1) + '/' +
+            std::to_string(p_values.size()) + " p=" + precise_decimal(p));
+        int status = -1;
+        for (int attempt = 0; attempt <= retries; ++attempt)
+        {
+            std::remove(point_output.c_str());
+            std::string command;
+            if (attempt > 0)
+            {
+                command = "MIPT_PROBED_PREFETCH=0 ";
+                std::cerr << "Retrying p=" << precise_decimal(p)
+                          << " in a fresh process with CPU prefetch disabled"
+                          << " (attempt " << attempt + 1 << '/' << retries + 1
+                          << ").\n";
+            }
+            command += base.str();
+            status = std::system(command.c_str());
+            if (status == 0)
+            {
+                break;
+            }
+        }
+        if (status != 0)
+        {
+            throw std::runtime_error(
+                "Isolated simulation failed for p=" + precise_decimal(p) +
+                " after " + std::to_string(retries + 1) +
+                " attempt(s). Earlier p points remain checkpointed; rerun the "
+                "same command to resume.");
+        }
+
+        append_checkpoint_csv(point_output, output);
+        std::remove(point_output.c_str());
+        completed.push_back(p);
+        backend::verbose_log(
+            "checkpointed p=" + precise_decimal(p) + " to " + output);
+    }
+
+    std::cout << "Saved " << p_values.size() * times.size()
+              << " rows to " << output << ".\n";
+    return 0;
+}
+
 int run_cli(int argc, char *argv[])
 {
-    backend::print_backend_banner_once("mipt_probed.exe");
+    const bool internal_child = env::boolean(
+        "MIPT_PROBED_INTERNAL_CHILD", false);
+    if (!internal_child)
+    {
+        backend::print_backend_banner_once("mipt_probed.exe");
+    }
     if (argc > 1 &&
         (std::strcmp(argv[1], "--help") == 0 ||
          std::strcmp(argv[1], "-h") == 0))
@@ -616,10 +969,15 @@ int run_cli(int argc, char *argv[])
         t0 = 0;
     }
 
+    const bool parity_encoding =
+        mode == 1 && probes == 1 && preserves_computational_parity(type) &&
+        env::boolean("MIPT_PROBED_PARITY_ENCODING", true);
     const auto sites = probe_sites(probes, n, mode);
     const int t_max = times.back();
-    const std::string output = default_output_name(
+    const std::string generated_output = default_output_name(
         probes, n, realizations, type, mode, p_values, times);
+    const std::string output = env::text(
+        "MIPT_PROBED_INTERNAL_OUTPUT", generated_output.c_str());
     const bool prefetch = env::boolean("MIPT_PROBED_PREFETCH", true) &&
         realizations > 1 && t_max > 0;
     const std::uint64_t total_trajectories =
@@ -629,25 +987,42 @@ int run_cli(int argc, char *argv[])
     std::uint64_t completed = 0;
     const auto start = std::chrono::steady_clock::now();
 
-    std::cout << "Unified probed MIPT simulation\n"
-              << "probes=" << probes
-              << ", system_N=" << n
-              << ", total_qubits=" << n + probes
-              << ", mode=" << mode
-              << ", realizations=" << realizations
-              << ", p_points=" << p_values.size()
-              << ", t_points=" << times.size()
-              << ", circ_type=" << static_cast<int>(type)
-              << " (" << circuit_type_name(type) << ')'
-              << ", fermionic_trace="
-              << (uses_fermionic_trace(type) ? "on" : "off")
-              << ", cpu_prefetch=" << (prefetch ? "on" : "off")
-              << ", output=" << output << '\n';
+    if (!internal_child)
+    {
+        std::cout << "Unified probed MIPT simulation\n"
+                  << "probes=" << probes
+                  << ", system_N=" << n
+                  << ", physical_total_qubits=" << n + probes
+                  << ", simulated_qubits=" << n + probes -
+                        (parity_encoding ? 1 : 0)
+                  << ", mode=" << mode
+                  << ", realizations_per_p=" << realizations
+                  << ", total_realizations=" << total_trajectories
+                  << ", p_points=" << p_values.size()
+                  << ", t_points=" << times.size()
+                  << ", circ_type=" << static_cast<int>(type)
+                  << " (" << circuit_type_name(type) << ')'
+                  << ", fermionic_trace="
+                  << (uses_fermionic_trace(type) ? "on" : "off")
+                  << ", probe_encoding="
+                  << (parity_encoding ? "parity_symmetry" : "explicit_reference")
+                  << ", cpu_prefetch=" << (prefetch ? "on" : "off")
+                  << ", output=" << output << '\n'
+                  << std::flush;
+    }
+
+    if (mode != 0 && p_values.size() > 1 &&
+        env::boolean("MIPT_PROBED_ISOLATE_P", true))
+    {
+        return run_isolated_p_scan(
+            argv[0], probes, n, realizations, type, mode, p_values, times, output);
+    }
 
     std::vector<OutputRow> rows;
     rows.reserve(p_values.size() * times.size());
-    for (double p : p_values)
+    for (std::size_t p_index = 0; p_index < p_values.size(); ++p_index)
     {
+        const double p = p_values[p_index];
         std::vector<Aggregate> aggregates(times.size());
         std::array<probed::CircuitWorkspace1D, 2> workspaces;
         for (auto &workspace : workspaces)
@@ -697,9 +1072,11 @@ int run_cli(int argc, char *argv[])
             }
 
             const bool attach_at_start = mode == 2 || probes == 1;
-            auto state = initialize_state(n, sites, attach_at_start);
             auto &workspace = workspaces[current];
-            int current_t = 0;
+            auto state = parity_encoding
+                ? workspace.simulate_parity_encoded_probe(n, sites.front())
+                : initialize_state(n, sites, attach_at_start);
+            int current_t = parity_encoding ? t_max : 0;
             std::size_t first_sample = 0;
 
             if ((mode == 0 || mode == 1) && probes > 1)
@@ -720,7 +1097,12 @@ int run_cli(int argc, char *argv[])
                         state, current_t, target_t - current_t);
                     current_t = target_t;
                 }
-                if (mode == 2 || mode == 1 || probes != 1 || target_t > 0)
+                if (parity_encoding)
+                {
+                    aggregates[sample_index].add(
+                        measure_parity_encoded_probe(state, n));
+                }
+                else if (mode == 2 || mode == 1 || probes != 1 || target_t > 0)
                 {
                     aggregates[sample_index].add(
                         measure_sample(state, probes, n, type));
@@ -733,7 +1115,12 @@ int run_cli(int argc, char *argv[])
             }
             ++completed;
             progress.update(
-                completed, p, times.back(), completed == total_trajectories);
+                completed,
+                p,
+                times.back(),
+                p_index + 1,
+                p_values.size(),
+                completed == total_trajectories);
         }
 
         for (std::size_t i = 0; i < times.size(); ++i)
@@ -746,8 +1133,11 @@ int run_cli(int argc, char *argv[])
 
     const double elapsed = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - start).count();
-    std::cout << "Saved " << rows.size() << " rows to " << output
-              << ". Elapsed time: " << elapsed << "s\n";
+    if (!internal_child)
+    {
+        std::cout << "Saved " << rows.size() << " rows to " << output
+                  << ". Elapsed time: " << format_duration(elapsed) << '\n';
+    }
     return 0;
 }
 } // namespace

@@ -61,6 +61,21 @@ incompatible object files cannot be silently reused.
 
 ## External validation still required
 
+The unified probe runner also needs a long-duration NVIDIA test. Modes 1 and 2
+now execute each `p` point in a fresh process, atomically checkpoint successful
+points, resume an interrupted scan by default, and retry a failed point once.
+This contains late CUDA-Q/cuStateVec synchronization failures but does not hide
+a persistently unhealthy driver or GPU.
+
+The optimized parity encoding for one-probe mode 1 was checked against an
+explicit `N+1`-qubit reference construction for 30 random parity-preserving
+trajectories with interleaved projective measurements. At every measurement,
+outcome probabilities and normalized post-measurement states agreed to below
+`3e-12`; the explicit reference RDM equaled the encoded even/odd parity weights
+to the same tolerance. A configured NVIDIA machine must still benchmark the
+actual speedup and compare production statistics with
+`MIPT_PROBED_PARITY_ENCODING=0` at small `N`.
+
 On a configured simulation machine, run at minimum:
 
 ```bash

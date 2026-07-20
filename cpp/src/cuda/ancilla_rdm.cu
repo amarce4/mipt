@@ -8,6 +8,7 @@ namespace
 {
 constexpr int THREADS = 256;
 constexpr int RHO1_OUTPUT_VALUES = 4;
+constexpr int PARITY_OUTPUT_VALUES = 2;
 constexpr int RHO2_PACKED_VALUES = 16;
 constexpr int RHO2_OUTPUT_VALUES = 32;
 constexpr int RHO4_THREADS = 128;
@@ -290,6 +291,61 @@ __global__ void rho1_complex_kernel(
         atomic_add_f64(&rho[1], scratch11[0]);
         atomic_add_f64(&rho[2], scratch01_re[0]);
         atomic_add_f64(&rho[3], scratch01_im[0]);
+    }
+}
+
+template <typename Real>
+__global__ void parity_weights_kernel(
+    const Cx<Real> *__restrict__ psi,
+    std::uint64_t dimension,
+    double *__restrict__ weights)
+{
+    double local_even = 0.0;
+    double local_odd = 0.0;
+    const std::uint64_t first =
+        static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const std::uint64_t stride =
+        static_cast<std::uint64_t>(blockDim.x) * gridDim.x;
+    for (std::uint64_t index = first; index < dimension; index += stride)
+    {
+        const Cx<Real> amplitude = psi[index];
+        const double real = static_cast<double>(amplitude.re);
+        const double imag = static_cast<double>(amplitude.im);
+        const double probability = real * real + imag * imag;
+        if (odd_popcount64(index))
+        {
+            local_odd += probability;
+        }
+        else
+        {
+            local_even += probability;
+        }
+    }
+
+    __shared__ double scratch_even[THREADS];
+    __shared__ double scratch_odd[THREADS];
+    scratch_even[threadIdx.x] = local_even;
+    scratch_odd[threadIdx.x] = local_odd;
+    __syncthreads();
+
+    for (int reduction_stride = THREADS / 2;
+         reduction_stride > 0;
+         reduction_stride >>= 1)
+    {
+        if (threadIdx.x < reduction_stride)
+        {
+            scratch_even[threadIdx.x] +=
+                scratch_even[threadIdx.x + reduction_stride];
+            scratch_odd[threadIdx.x] +=
+                scratch_odd[threadIdx.x + reduction_stride];
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0)
+    {
+        atomic_add_f64(&weights[0], scratch_even[0]);
+        atomic_add_f64(&weights[1], scratch_odd[0]);
     }
 }
 
@@ -576,6 +632,58 @@ int launch_rho1_complex(
 }
 
 template <typename Real>
+int launch_parity_weights(
+    const void *device_state_vector,
+    int n_qubits,
+    double *host_weights)
+{
+    if (device_state_vector == nullptr || host_weights == nullptr ||
+        n_qubits < 1 || n_qubits >= 63)
+    {
+        return static_cast<int>(cudaErrorInvalidValue);
+    }
+
+    static thread_local double *device_weights = nullptr;
+    if (device_weights == nullptr)
+    {
+        const cudaError_t allocation = cudaMalloc(
+            &device_weights, PARITY_OUTPUT_VALUES * sizeof(double));
+        if (allocation != cudaSuccess)
+        {
+            return static_cast<int>(allocation);
+        }
+    }
+
+    cudaError_t status = cudaMemset(
+        device_weights, 0, PARITY_OUTPUT_VALUES * sizeof(double));
+    if (status != cudaSuccess)
+    {
+        return static_cast<int>(status);
+    }
+
+    const std::uint64_t dimension = std::uint64_t{1} << n_qubits;
+    const std::uint64_t blocks_needed =
+        (dimension + THREADS - 1) / THREADS;
+    const int blocks = static_cast<int>(
+        blocks_needed < 1024u ? blocks_needed : 1024u);
+    parity_weights_kernel<Real><<<blocks, THREADS>>>(
+        reinterpret_cast<const Cx<Real> *>(device_state_vector),
+        dimension,
+        device_weights);
+    status = cudaGetLastError();
+    if (status != cudaSuccess)
+    {
+        return static_cast<int>(status);
+    }
+    status = cudaMemcpy(
+        host_weights,
+        device_weights,
+        PARITY_OUTPUT_VALUES * sizeof(double),
+        cudaMemcpyDeviceToHost);
+    return static_cast<int>(status);
+}
+
+template <typename Real>
 int launch_rho2_complex(
     const void *device_state_vector,
     int n_qubits,
@@ -786,6 +894,24 @@ extern "C" int mipt_cuda_rho1_complex_fermion_f32(
         retained_qubit,
         host_rho_ri,
         1);
+}
+
+extern "C" int mipt_cuda_parity_weights_f64(
+    const void *device_state_vector,
+    int n_qubits,
+    double *host_weights)
+{
+    return launch_parity_weights<double>(
+        device_state_vector, n_qubits, host_weights);
+}
+
+extern "C" int mipt_cuda_parity_weights_f32(
+    const void *device_state_vector,
+    int n_qubits,
+    double *host_weights)
+{
+    return launch_parity_weights<float>(
+        device_state_vector, n_qubits, host_weights);
 }
 
 extern "C" int mipt_cuda_rho2_complex_f64(

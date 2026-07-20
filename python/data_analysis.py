@@ -505,7 +505,7 @@ def entropy(
                     color=color,
                     label=(
                         rf"$p={p:g}$: $\alpha=${fit['slope']:.{precision}f}"
-                        rf"$\pm ${slope_error:.{precision}f}, "
+                        rf"$\pm${slope_error:.{precision}f}, "
                         rf"$\chi_\nu^2=${fit['reduced_chi2']:.1g}"
                     ),
                 )
@@ -946,7 +946,7 @@ def dist_scaling(
             label=(
                 rf"$L={fit_size}$ fit: "
                 rf"$\alpha_2^{{{exponent}}}="
-                rf"{row['alpha']:.3g}\pm {row['alpha_stderr']:.2g}$"
+                rf"{row['alpha']:.3g}\pm{row['alpha_stderr']:.2g}$"
             ),
             zorder=5,
         )
@@ -1505,11 +1505,11 @@ def tmi_collapse(
     ax_collapse.legend()
 
     text = (
-        rf"$p_c={pc:.4g}\pm {dpc:.1g}$" "\n"
-        rf"$\nu={nu:.3g}\pm {dnu:.1g}$" "\n"
+        rf"$p_c={pc:.4g}\pm{dpc:.1g}$" "\n"
+        rf"$\nu={nu:.3g}\pm{dnu:.1g}$" "\n"
         rf"$S={quality:.3g}$" "\n"
         + (
-            rf"$\zeta={zeta:.3g}\pm {dzeta:.1g}$"
+            rf"$\zeta={zeta:.3g}\pm{dzeta:.1g}$"
             if fit_zeta
             else rf"$\zeta={zeta:g}$ fixed"
         )
@@ -1863,7 +1863,7 @@ def probe1_collapse(
     ax_collapse.grid(alpha=0.25)
     ax_collapse.legend()
     x_a_text = (
-        rf"$x_A={best_x_a:.4f}\pm {x_a_stderr:.4f}$"
+        rf"$x_A={best_x_a:.4f}\pm{x_a_stderr:.4f}$"
         if fixed_x_a is None
         else rf"$x_A={best_x_a:.4f}$ fixed"
     )
@@ -1872,7 +1872,7 @@ def probe1_collapse(
         0.97,
         r"$\overline{S_A}=L^{-x_A}F(t/L^z)$"
         + "\n"
-        + rf"$z={best_z:.4f}\pm {z_stderr:.4f}$"
+        + rf"$z={best_z:.4f}\pm{z_stderr:.4f}$"
         + "\n"
         + x_a_text
         + "\n"
@@ -2339,7 +2339,7 @@ def probe2_collapse(
     ax_collapse.grid(alpha=0.25)
     ax_collapse.legend()
     eta_text = (
-        rf"$\eta={eta:.4f}\pm {eta_stderr:.4f}$"
+        rf"$\eta={eta:.4f}\pm{eta_stderr:.4f}$"
         if np.isfinite(eta_stderr)
         else rf"$\eta={eta:.4f}$"
     )
@@ -2771,13 +2771,13 @@ def probe_pc_collapse(
         x_text = (
             r"$x=0$ fixed"
             if metric == "sq" and abs(fit["x"]) < 1e-14
-            else rf"${spec['x_symbol']}={fit['x']:.4g}\pm {fit['x_stderr']:.2g}$"
+            else rf"${spec['x_symbol']}={fit['x']:.4g}\pm{fit['x_stderr']:.2g}$"
         )
         ax_scaled.text(
             0.97,
             0.03,
-            rf"$p_c={fit['pc']:.5g}\pm {fit['pc_stderr']:.2g}$" + "\n"
-            + rf"$\nu={fit['nu']:.4g}\pm {fit['nu_stderr']:.2g}$" + "\n"
+            rf"$p_c={fit['pc']:.5g}\pm{fit['pc_stderr']:.2g}$" + "\n"
+            + rf"$\nu={fit['nu']:.4g}\pm{fit['nu_stderr']:.2g}$" + "\n"
             + x_text + "\n" + rf"score $={fit['score']:.3g}$",
             transform=ax_scaled.transAxes,
             ha="right",
@@ -3329,7 +3329,7 @@ def probe4_collapse(
     ax_collapse.grid(alpha=0.25)
     ax_collapse.legend()
     eta_text = (
-        rf"${metric_spec['eta_symbol']}={eta:.4f}\pm {eta_stderr:.4f}$"
+        rf"${metric_spec['eta_symbol']}={eta:.4f}\pm{eta_stderr:.4f}$"
         if np.isfinite(eta_stderr)
         else rf"${metric_spec['eta_symbol']}={eta:.4f}$"
     )

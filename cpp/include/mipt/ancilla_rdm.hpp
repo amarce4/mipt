@@ -27,6 +27,12 @@ struct Rdm
     std::complex<double> rho01 = 0.0;
 };
 
+struct ParityWeights
+{
+    double even = 0.0;
+    double odd = 0.0;
+};
+
 struct Rdm2
 {
     static constexpr std::size_t dimension = 4;
@@ -387,6 +393,64 @@ inline std::vector<int> basis_bits_from_index(
     return bits;
 }
 
+template <typename Complex>
+inline ParityWeights parity_weights_from_host_statevector(
+    const Complex *state,
+    int n_qubits)
+{
+    if (state == nullptr)
+    {
+        throw std::invalid_argument("Parity reduction received a null statevector.");
+    }
+    const std::uint64_t dimension = checked_dimension(n_qubits);
+    ParityWeights weights;
+    for (std::uint64_t index = 0; index < dimension; ++index)
+    {
+        const double probability = std::norm(
+            static_cast<std::complex<double>>(state[index]));
+        (odd_popcount(index) ? weights.odd : weights.even) += probability;
+    }
+    return weights;
+}
+
+inline ParityWeights parity_weights_from_amplitude_queries(
+    cudaq::state &state,
+    int n_qubits)
+{
+    const std::uint64_t dimension = checked_dimension(n_qubits);
+    const std::size_t batch_size = static_cast<std::size_t>(
+        backend::mps_amplitude_batch_size());
+    std::vector<std::vector<int>> basis_states;
+    basis_states.reserve(batch_size);
+    ParityWeights weights;
+    for (std::uint64_t first = 0; first < dimension; first += batch_size)
+    {
+        const std::uint64_t count = std::min<std::uint64_t>(
+            batch_size, dimension - first);
+        basis_states.clear();
+        for (std::uint64_t offset = 0; offset < count; ++offset)
+        {
+            basis_states.push_back(
+                basis_bits_from_index(n_qubits, first + offset));
+        }
+        const auto amplitudes = state.amplitudes(basis_states);
+        if (amplitudes.size() != basis_states.size())
+        {
+            throw std::runtime_error(
+                "CUDA-Q state.amplitudes returned an unexpected count for parity reduction.");
+        }
+        for (std::uint64_t offset = 0; offset < count; ++offset)
+        {
+            const double probability = std::norm(
+                static_cast<std::complex<double>>(
+                    amplitudes[static_cast<std::size_t>(offset)]));
+            (odd_popcount(first + offset) ? weights.odd : weights.even) +=
+                probability;
+        }
+    }
+    return weights;
+}
+
 inline Rdm from_amplitude_queries(
     cudaq::state &state,
     int n_qubits,
@@ -742,6 +806,78 @@ inline Rdm reduced_density_matrix(
         n_qubits,
         retained_qubit,
         fermion_trace);
+}
+
+inline ParityWeights parity_sector_weights(
+    cudaq::state &state,
+    int n_qubits)
+{
+    const std::uint64_t dimension_u64 = checked_dimension(n_qubits);
+    if (dimension_u64 >
+        static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()))
+    {
+        throw std::invalid_argument(
+            "Parity statevector dimension does not fit in size_t.");
+    }
+    const std::size_t dimension = static_cast<std::size_t>(dimension_u64);
+    const auto precision = state.get_precision();
+    const auto tensor = state.get_tensor();
+    const bool dense_rank1 =
+        tensor.get_rank() == 1 &&
+        tensor.get_num_elements() >= dimension &&
+        tensor.data != nullptr;
+
+    if (!dense_rank1)
+    {
+        backend::warn_mps_amplitude_path_once(
+            "parity-sector reduction", n_qubits, false, 0);
+        return parity_weights_from_amplitude_queries(state, n_qubits);
+    }
+
+#ifdef MIPT_ENABLE_CUDA_RHO
+    if (state.is_on_gpu())
+    {
+        double values[2]{};
+        const int status =
+            precision == cudaq::SimulationState::precision::fp64
+            ? mipt_cuda_parity_weights_f64(
+                  tensor.data, n_qubits, values)
+            : mipt_cuda_parity_weights_f32(
+                  tensor.data, n_qubits, values);
+        if (status != 0)
+        {
+            throw std::runtime_error(
+                "CUDA parity-sector reduction failed; status=" +
+                std::to_string(status));
+        }
+        return {values[0], values[1]};
+    }
+#endif
+
+    if (state.is_on_gpu())
+    {
+        if (precision == cudaq::SimulationState::precision::fp64)
+        {
+            std::vector<std::complex<double>> host_state(dimension);
+            state.to_host(host_state.data(), host_state.size());
+            return parity_weights_from_host_statevector(
+                host_state.data(), n_qubits);
+        }
+        std::vector<std::complex<float>> host_state(dimension);
+        state.to_host(host_state.data(), host_state.size());
+        return parity_weights_from_host_statevector(
+            host_state.data(), n_qubits);
+    }
+
+    if (precision == cudaq::SimulationState::precision::fp64)
+    {
+        return parity_weights_from_host_statevector(
+            reinterpret_cast<const std::complex<double> *>(tensor.data),
+            n_qubits);
+    }
+    return parity_weights_from_host_statevector(
+        reinterpret_cast<const std::complex<float> *>(tensor.data),
+        n_qubits);
 }
 
 inline Rdm2 reduced_density_matrix_two(

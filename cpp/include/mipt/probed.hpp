@@ -71,6 +71,35 @@ struct RfgsAdvanceKernel
     }
 };
 
+struct RppuParityProbeKernel
+{
+    void operator()(int n,
+                    int probe_site,
+                    const std::vector<RppuLayer> &layers) __qpu__
+    {
+        cudaq::qvector q(n);
+        // Exact symmetry encoding of a reference Bell pair: when every system
+        // operation preserves computational parity, the omitted reference bit
+        // is equal to the system parity.  H on probe_site is the isometric
+        // image of (|00>+|11>)/sqrt(2).
+        h(q[probe_site]);
+        apply_rppu_layers(q, n, layers);
+    }
+};
+
+struct RfgsParityProbeKernel
+{
+    void operator()(int n,
+                    int probe_site,
+                    const std::vector<RfgsLayer> &layers,
+                    bool closed) __qpu__
+    {
+        cudaq::qvector q(n);
+        h(q[probe_site]);
+        apply_rfgs_layers(q, n, layers, closed);
+    }
+};
+
 // Builds one complete random layer history per realization and advances the
 // same post-measurement trajectory through selected contiguous layer segments.
 // One timestep is exactly one unitary brickwork layer plus its measurement
@@ -222,6 +251,59 @@ class CircuitWorkspace1D
         return state;
     }
 
+    cudaq::state simulate_parity_encoded_probe(
+        int n,
+        int probe_site,
+        std::string_view context = {}) const
+    {
+        if (n != prepared_n_ || probe_site < 0 || probe_site >= n)
+        {
+            throw std::invalid_argument(
+                "Parity-encoded probe does not match the prepared circuit.");
+        }
+        if (!preserves_computational_parity(prepared_type_))
+        {
+            throw std::invalid_argument(
+                "Parity-encoded probes require a parity-preserving circuit.");
+        }
+        log_start(
+            context,
+            circuit_type_name(prepared_type_),
+            prepared_n_,
+            prepared_timesteps_,
+            0);
+        const auto start = std::chrono::steady_clock::now();
+        switch (prepared_type_)
+        {
+        case CircuitType::FermionRPPU:
+        case CircuitType::QubitRPPU:
+            return finish_logged(
+                cudaq::get_state(
+                    RppuParityProbeKernel{},
+                    n,
+                    probe_site,
+                    rppu_layers_),
+                context,
+                circuit_type_name(prepared_type_),
+                start);
+        case CircuitType::RFGS:
+            return finish_logged(
+                cudaq::get_state(
+                    RfgsParityProbeKernel{},
+                    n,
+                    probe_site,
+                    rfgs_layers_,
+                    true),
+                context,
+                circuit_type_name(prepared_type_),
+                start);
+        default:
+            break;
+        }
+        throw std::invalid_argument(
+            "Unsupported parity-encoded probe circuit.");
+    }
+
     cudaq::state advance(cudaq::state &state,
                          int first_timestep,
                          int timestep_count,
@@ -289,6 +371,13 @@ class CircuitWorkspace1D
                                     int count,
                                     Runner &&runner)
     {
+        if (first == 0 && count == static_cast<int>(source.size()))
+        {
+            // The common fixed-time path consumes the complete prepared
+            // history. Pass it directly rather than deep-copying every nested
+            // gate and measurement vector into the segment scratch space.
+            return runner(source);
+        }
         if (count == 1)
         {
             // get_state is synchronous. Swap the selected layer into a reusable
@@ -338,14 +427,15 @@ class CircuitWorkspace1D
     static void log_start(std::string_view context,
                           std::string_view name,
                           int n,
-                          int timesteps)
+                          int timesteps,
+                          int extra_qubits = 1)
     {
         if (backend::verbose_enabled())
         {
             backend::verbose_log(
                 prefix(context) + "get_state start: probed " + std::string(name) +
                 " system_n=" + std::to_string(n) +
-                " total_qubits=" + std::to_string(n + 1) +
+                " total_qubits=" + std::to_string(n + extra_qubits) +
                 " timesteps=" + std::to_string(timesteps));
         }
     }

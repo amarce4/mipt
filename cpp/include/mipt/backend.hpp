@@ -13,6 +13,10 @@
 #define MIPT_CUDAQ_BACKEND_NAME "unknown"
 #endif
 
+#ifndef MIPT_CUDAQ_PRECISION
+#define MIPT_CUDAQ_PRECISION 0
+#endif
+
 namespace mipt::backend
 {
     inline long debug_prefix_layers()
@@ -131,6 +135,10 @@ namespace mipt::backend
 
         std::cerr << program_name << " backend: CUDA-Q target="
                   << compiled_cudaq_backend();
+        if (MIPT_CUDAQ_PRECISION == 32 || MIPT_CUDAQ_PRECISION == 64)
+        {
+            std::cerr << ", statevector_precision=fp" << MIPT_CUDAQ_PRECISION;
+        }
 
         const char *requested = std::getenv("MIPT_TENSOR_BACKEND");
         if (requested != nullptr && *requested != '\0')

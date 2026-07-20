@@ -71,6 +71,46 @@ The output filename is always generated from the arguments. Use the supplied
 outputs. Run `./mipt_probed.exe --help` for the probe geometry and environment
 controls.
 
+Modes 1 and 2 isolate each `p` point in a fresh subprocess by default. This
+keeps a long scan from accumulating CUDA-Q/cuStateVec runtime state and writes
+an atomic checkpoint after every completed point. Re-running the identical
+command resumes an existing output; set `MIPT_PROBED_RESUME=0` to replace it or
+`MIPT_PROBED_ISOLATE_P=0` to restore the single-process behavior. A failed point
+is retried once in a fresh process with CPU prefetch disabled; control this with
+`MIPT_PROBED_RETRIES`.
+
+### One-probe mode-1 performance
+
+For parity-preserving circuits (`circ_type` 2, 3, or 4), one-probe mode 1 uses
+an exact symmetry encoding by default. The physical state has `N+1` qubits but
+is confined to the even total-parity sector: the reference bit is equal to the
+system parity. The runner therefore evolves only `N` dense qubits, initializes
+the encoded Bell pair with `H` on the probe site, and obtains `S_Q` from the
+even/odd system-parity weights. System gates, measurement locations and
+outcomes, the `p=0` encoding interval, and the `t=4N` readout are unchanged.
+Set `MIPT_PROBED_PARITY_ENCODING=0` for an explicit-reference A/B run.
+
+Build the NVIDIA target in FP32 (the banner should say
+`statevector_precision=fp32`):
+
+```bash
+make mipt_probed.exe GPU=1 CUDA_RHO=1 FP64=0
+```
+
+CUDA-Q gate-fusion performance depends on the GPU and circuit. The included
+benchmark sweeps fusion widths 4, 5, and 6 and host fusion thread counts 4, 8,
+and 16 using the real mode-1 workload:
+
+```bash
+./benchmark_probed_gpu.sh ./mipt_probed.exe 24 8 0.35 2
+```
+
+It writes `probed_gpu_benchmark.csv`; use the fastest row by exporting
+`CUDAQ_FUSION_MAX_QUBITS` and `CUDAQ_FUSION_NUM_HOST_THREADS` in production.
+The sweep can be changed with `MIPT_FUSION_LEVELS` and
+`MIPT_FUSION_HOST_THREADS`. CUDA-Q's defaults remain untouched unless the user
+sets them, since their optimum is hardware-dependent.
+
 The old Makefile referenced `tmi.cpp`, but that source was absent from the supplied
 archive. The stale `tmi.exe` target was therefore removed; `sim_tmi.exe` remains the
 maintained online TMI path.

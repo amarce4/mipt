@@ -21,6 +21,11 @@ void test_circuit_metadata()
     assert(uses_fermionic_trace(CircuitType::RFGS));
     assert(!uses_fermionic_trace(CircuitType::QubitRPPU));
     assert(requires_even_sites(CircuitType::Haar));
+    assert(preserves_computational_parity(CircuitType::FermionRPPU));
+    assert(preserves_computational_parity(CircuitType::RFGS));
+    assert(preserves_computational_parity(CircuitType::QubitRPPU));
+    assert(!preserves_computational_parity(CircuitType::MMS));
+    assert(!preserves_computational_parity(CircuitType::Haar));
 
     bool rejected = false;
     try

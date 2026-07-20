@@ -46,6 +46,25 @@ int mipt_cuda_rho1_complex_fermion_f32(
     double *host_rho_ri);
 
 /*
+ * Computes the total probability in the even and odd computational-parity
+ * sectors of a dense statevector.  This supports the exact one-reference
+ * symmetry encoding used by parity-preserving probe circuits.
+ *
+ * Output layout:
+ *   host_weights[0] = even-parity probability
+ *   host_weights[1] = odd-parity probability
+ */
+int mipt_cuda_parity_weights_f64(
+    const void *device_state_vector,
+    int n_qubits,
+    double *host_weights);
+
+int mipt_cuda_parity_weights_f32(
+    const void *device_state_vector,
+    int n_qubits,
+    double *host_weights);
+
+/*
  * Computes the complete complex 4x4 reduced density matrix of two retained
  * qubits/modes. The local basis order is |q0 q1> with q0 as the least
  * significant local bit: |00>, |10>, |01>, |11>.
