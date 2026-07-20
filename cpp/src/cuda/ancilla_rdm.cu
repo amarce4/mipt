@@ -10,6 +10,11 @@ constexpr int THREADS = 256;
 constexpr int RHO1_OUTPUT_VALUES = 4;
 constexpr int RHO2_PACKED_VALUES = 16;
 constexpr int RHO2_OUTPUT_VALUES = 32;
+constexpr int RHO4_THREADS = 128;
+constexpr int RHO4_DIMENSION = 16;
+constexpr int RHO4_TILE = 4;
+constexpr int RHO4_COMPONENTS_PER_TILE = 2 * RHO4_TILE * RHO4_TILE;
+constexpr int RHO4_OUTPUT_VALUES = 2 * RHO4_DIMENSION * RHO4_DIMENSION;
 
 template <typename Real>
 struct Cx
@@ -79,6 +84,34 @@ __device__ __forceinline__ std::uint64_t embed_environment_bits_two(
         embed_environment_bits(environment, lower), upper);
 }
 
+__device__ __forceinline__ std::uint64_t embed_environment_bits_four(
+    std::uint64_t environment,
+    int q0,
+    int q1,
+    int q2,
+    int q3)
+{
+    int retained[4] = {q0, q1, q2, q3};
+    for (int i = 0; i < 4; ++i)
+    {
+        for (int j = i + 1; j < 4; ++j)
+        {
+            if (retained[j] < retained[i])
+            {
+                const int tmp = retained[i];
+                retained[i] = retained[j];
+                retained[j] = tmp;
+            }
+        }
+    }
+    std::uint64_t value = environment;
+    for (int i = 0; i < 4; ++i)
+    {
+        value = embed_environment_bits(value, retained[i]);
+    }
+    return value;
+}
+
 __device__ __forceinline__ int two_mode_reordered_position(
     int mode,
     int retained_qubit0,
@@ -112,6 +145,55 @@ __device__ __forceinline__ double two_mode_fermion_reorder_sign(
         }
         const int position = two_mode_reordered_position(
             mode, retained_qubit0, retained_qubit1);
+        const std::uint64_t lower_or_equal =
+            (std::uint64_t{1} << (position + 1)) - std::uint64_t{1};
+        parity ^= odd_popcount64(seen_new_positions & ~lower_or_equal) ? 1 : 0;
+        seen_new_positions |= std::uint64_t{1} << position;
+    }
+    return parity ? -1.0 : 1.0;
+}
+
+__device__ __forceinline__ int four_mode_reordered_position(
+    int mode,
+    int q0,
+    int q1,
+    int q2,
+    int q3)
+{
+    const int retained[4] = {q0, q1, q2, q3};
+    for (int local = 0; local < 4; ++local)
+    {
+        if (mode == retained[local])
+        {
+            return local;
+        }
+    }
+    int before = 0;
+    for (int local = 0; local < 4; ++local)
+    {
+        before += retained[local] < mode ? 1 : 0;
+    }
+    return 4 + mode - before;
+}
+
+__device__ __forceinline__ double four_mode_fermion_reorder_sign(
+    std::uint64_t occupation_mask,
+    int n_qubits,
+    int q0,
+    int q1,
+    int q2,
+    int q3)
+{
+    std::uint64_t seen_new_positions = 0;
+    int parity = 0;
+    for (int mode = 0; mode < n_qubits; ++mode)
+    {
+        if (((occupation_mask >> mode) & std::uint64_t{1}) == 0)
+        {
+            continue;
+        }
+        const int position = four_mode_reordered_position(
+            mode, q0, q1, q2, q3);
         const std::uint64_t lower_or_equal =
             (std::uint64_t{1} << (position + 1)) - std::uint64_t{1};
         parity ^= odd_popcount64(seen_new_positions & ~lower_or_equal) ? 1 : 0;
@@ -317,6 +399,122 @@ __global__ void rho2_complex_kernel(
 }
 
 template <typename Real>
+__global__ void rho4_complex_kernel(
+    const Cx<Real> *__restrict__ psi,
+    int n_qubits,
+    int q0,
+    int q1,
+    int q2,
+    int q3,
+    double *__restrict__ rho,
+    int fermion_trace)
+{
+    const int tile = blockIdx.x;
+    const int row0 = (tile / 4) * RHO4_TILE;
+    const int col0 = (tile % 4) * RHO4_TILE;
+    const std::uint64_t masks[4] = {
+        std::uint64_t{1} << q0,
+        std::uint64_t{1} << q1,
+        std::uint64_t{1} << q2,
+        std::uint64_t{1} << q3};
+    const std::uint64_t environment_dim =
+        std::uint64_t{1} << (n_qubits - 4);
+    double local[RHO4_COMPONENTS_PER_TILE]{};
+
+    for (std::uint64_t environment = threadIdx.x;
+         environment < environment_dim;
+         environment += blockDim.x)
+    {
+        const std::uint64_t base = embed_environment_bits_four(
+            environment, q0, q1, q2, q3);
+        double row_re[RHO4_TILE]{};
+        double row_im[RHO4_TILE]{};
+        double col_re[RHO4_TILE]{};
+        double col_im[RHO4_TILE]{};
+
+        for (int item = 0; item < RHO4_TILE; ++item)
+        {
+            const int row_local = row0 + item;
+            const int col_local = col0 + item;
+            std::uint64_t row_index = base;
+            std::uint64_t col_index = base;
+            for (int bit = 0; bit < 4; ++bit)
+            {
+                row_index |= (row_local & (1 << bit))
+                    ? masks[bit]
+                    : std::uint64_t{0};
+                col_index |= (col_local & (1 << bit))
+                    ? masks[bit]
+                    : std::uint64_t{0};
+            }
+            const Cx<Real> row_amplitude = psi[row_index];
+            const Cx<Real> col_amplitude = psi[col_index];
+            const double row_sign = fermion_trace
+                ? four_mode_fermion_reorder_sign(
+                      row_index, n_qubits, q0, q1, q2, q3)
+                : 1.0;
+            const double col_sign = fermion_trace
+                ? four_mode_fermion_reorder_sign(
+                      col_index, n_qubits, q0, q1, q2, q3)
+                : 1.0;
+            row_re[item] = row_sign * static_cast<double>(row_amplitude.re);
+            row_im[item] = row_sign * static_cast<double>(row_amplitude.im);
+            col_re[item] = col_sign * static_cast<double>(col_amplitude.re);
+            col_im[item] = col_sign * static_cast<double>(col_amplitude.im);
+        }
+
+        for (int row = 0; row < RHO4_TILE; ++row)
+        {
+            for (int col = 0; col < RHO4_TILE; ++col)
+            {
+                const int component = 2 * (RHO4_TILE * row + col);
+                local[component] +=
+                    row_re[row] * col_re[col] + row_im[row] * col_im[col];
+                local[component + 1] +=
+                    row_im[row] * col_re[col] - row_re[row] * col_im[col];
+            }
+        }
+    }
+
+    __shared__ double scratch[RHO4_COMPONENTS_PER_TILE][RHO4_THREADS];
+    for (int component = 0; component < RHO4_COMPONENTS_PER_TILE; ++component)
+    {
+        scratch[component][threadIdx.x] = local[component];
+    }
+    __syncthreads();
+
+    for (int stride = RHO4_THREADS / 2; stride > 0; stride >>= 1)
+    {
+        if (threadIdx.x < stride)
+        {
+            for (int component = 0;
+                 component < RHO4_COMPONENTS_PER_TILE;
+                 ++component)
+            {
+                scratch[component][threadIdx.x] +=
+                    scratch[component][threadIdx.x + stride];
+            }
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0)
+    {
+        for (int row = 0; row < RHO4_TILE; ++row)
+        {
+            for (int col = 0; col < RHO4_TILE; ++col)
+            {
+                const int component = 2 * (RHO4_TILE * row + col);
+                const int output = 2 * (
+                    RHO4_DIMENSION * (row0 + row) + col0 + col);
+                rho[output] = scratch[component][0];
+                rho[output + 1] = scratch[component + 1][0];
+            }
+        }
+    }
+}
+
+template <typename Real>
 int launch_rho1_complex(
     const void *device_state_vector,
     int n_qubits,
@@ -467,6 +665,71 @@ int launch_rho2_complex(
     }
     return 0;
 }
+
+template <typename Real>
+int launch_rho4_complex(
+    const void *device_state_vector,
+    int n_qubits,
+    int q0,
+    int q1,
+    int q2,
+    int q3,
+    double *host_rho,
+    int fermion_trace)
+{
+    const int retained[4] = {q0, q1, q2, q3};
+    if (device_state_vector == nullptr || host_rho == nullptr ||
+        n_qubits < 4 || n_qubits >= 63)
+    {
+        return static_cast<int>(cudaErrorInvalidValue);
+    }
+    for (int i = 0; i < 4; ++i)
+    {
+        if (retained[i] < 0 || retained[i] >= n_qubits)
+        {
+            return static_cast<int>(cudaErrorInvalidValue);
+        }
+        for (int j = i + 1; j < 4; ++j)
+        {
+            if (retained[i] == retained[j])
+            {
+                return static_cast<int>(cudaErrorInvalidValue);
+            }
+        }
+    }
+
+    static thread_local double *device_rho = nullptr;
+    if (device_rho == nullptr)
+    {
+        const cudaError_t allocation = cudaMalloc(
+            &device_rho, RHO4_OUTPUT_VALUES * sizeof(double));
+        if (allocation != cudaSuccess)
+        {
+            return static_cast<int>(allocation);
+        }
+    }
+
+    rho4_complex_kernel<Real><<<16, RHO4_THREADS>>>(
+        reinterpret_cast<const Cx<Real> *>(device_state_vector),
+        n_qubits,
+        q0,
+        q1,
+        q2,
+        q3,
+        device_rho,
+        fermion_trace ? 1 : 0);
+    cudaError_t status = cudaGetLastError();
+    if (status != cudaSuccess)
+    {
+        return static_cast<int>(status);
+    }
+    status = cudaMemcpy(
+        host_rho,
+        device_rho,
+        RHO4_OUTPUT_VALUES * sizeof(double),
+        cudaMemcpyDeviceToHost);
+    return static_cast<int>(status);
+}
 } // namespace
 
 extern "C" int mipt_cuda_rho1_complex_f64(
@@ -587,4 +850,56 @@ extern "C" int mipt_cuda_rho2_complex_fermion_f32(
         retained_qubit1,
         host_rho_ri,
         1);
+}
+
+extern "C" int mipt_cuda_rho4_complex_f64(
+    const void *device_state_vector,
+    int n_qubits,
+    int q0,
+    int q1,
+    int q2,
+    int q3,
+    double *host_rho_ri)
+{
+    return launch_rho4_complex<double>(
+        device_state_vector, n_qubits, q0, q1, q2, q3, host_rho_ri, 0);
+}
+
+extern "C" int mipt_cuda_rho4_complex_f32(
+    const void *device_state_vector,
+    int n_qubits,
+    int q0,
+    int q1,
+    int q2,
+    int q3,
+    double *host_rho_ri)
+{
+    return launch_rho4_complex<float>(
+        device_state_vector, n_qubits, q0, q1, q2, q3, host_rho_ri, 0);
+}
+
+extern "C" int mipt_cuda_rho4_complex_fermion_f64(
+    const void *device_state_vector,
+    int n_qubits,
+    int q0,
+    int q1,
+    int q2,
+    int q3,
+    double *host_rho_ri)
+{
+    return launch_rho4_complex<double>(
+        device_state_vector, n_qubits, q0, q1, q2, q3, host_rho_ri, 1);
+}
+
+extern "C" int mipt_cuda_rho4_complex_fermion_f32(
+    const void *device_state_vector,
+    int n_qubits,
+    int q0,
+    int q1,
+    int q2,
+    int q3,
+    double *host_rho_ri)
+{
+    return launch_rho4_complex<float>(
+        device_state_vector, n_qubits, q0, q1, q2, q3, host_rho_ri, 1);
 }

@@ -103,9 +103,58 @@ class CircuitWorkspace1D
         }
         validate_circuit_site_count(type, n, "N");
 
+        prepare_with_probability(
+            n,
+            timesteps,
+            [p](int) { return p; },
+            type);
+    }
+
+    // Gullans--Huse encoding schedule: scramble without measurements through
+    // t0, then evolve with measurement probability p through timesteps.
+    void prepare_quench(int n,
+                        int timesteps,
+                        int t0,
+                        double p,
+                        CircuitType type)
+    {
+        if (t0 < 0 || t0 > timesteps)
+        {
+            throw std::invalid_argument("t0 must lie in [0,timesteps].");
+        }
+        prepare_with_probability(
+            n,
+            timesteps,
+            [t0, p](int step) { return step < t0 ? 0.0 : p; },
+            type);
+    }
+
+    template <typename ProbabilityAt>
+    void prepare_with_probability(int n,
+                                  int timesteps,
+                                  ProbabilityAt probability_at,
+                                  CircuitType type)
+    {
+        if (timesteps < 0)
+        {
+            throw std::invalid_argument("timesteps must be non-negative.");
+        }
+        validate_circuit_site_count(type, n, "N");
+
         prepared_n_ = n;
         prepared_timesteps_ = timesteps;
         prepared_type_ = type;
+
+        auto probability = [&](int step)
+        {
+            const double value = probability_at(step);
+            if (value < 0.0 || value > 1.0)
+            {
+                throw std::invalid_argument(
+                    "Layer measurement probability must lie in [0,1].");
+            }
+            return value;
+        };
 
         switch (type)
         {
@@ -114,7 +163,7 @@ class CircuitWorkspace1D
             for (int step = 0; step < timesteps; ++step)
             {
                 fill_mms_layer(mms_layers_[static_cast<std::size_t>(step)],
-                               n, step % 2, p, rng_);
+                               n, step % 2, probability(step), rng_);
             }
             return;
 
@@ -123,7 +172,7 @@ class CircuitWorkspace1D
             for (int step = 0; step < timesteps; ++step)
             {
                 fill_haar_layer(haar_layers_[static_cast<std::size_t>(step)],
-                                n, step % 2, p, true, rng_);
+                                n, step % 2, probability(step), true, rng_);
             }
             return;
 
@@ -140,7 +189,8 @@ class CircuitWorkspace1D
             for (int step = 0; step < timesteps; ++step)
             {
                 fill_rppu_layer(rppu_layers_[static_cast<std::size_t>(step)],
-                                n, (step % 2) != 0, p, true, rng_, boundary_mode);
+                                n, (step % 2) != 0, probability(step), true, rng_,
+                                boundary_mode);
             }
             return;
         }
@@ -150,7 +200,7 @@ class CircuitWorkspace1D
             for (int step = 0; step < timesteps; ++step)
             {
                 fill_rfgs_layer(rfgs_layers_[static_cast<std::size_t>(step)],
-                                n, step % 2, p, rng_, true);
+                                n, step % 2, probability(step), rng_, true);
             }
             return;
         }

@@ -9,6 +9,9 @@ expvals(...)           Plot aggregate fermionic observables and Wick residuals.
 tmi_collapse(...)      Fit and plot the TMI finite-size scaling collapse.
 probe1_collapse(...)   Fit and plot the one-ancilla dynamical collapse.
 probe2_collapse(...)   Fit and plot the two-ancilla bulk-exponent collapse.
+probe4_collapse(...)   Fit and plot four-ancilla I2/I3/I4 collapses.
+probe_pc_collapse(...) Fit fixed-t p scans for one/two/four probes.
+probe_entropy_map(...) Plot the p-t S_Q heatmap and selected-p time curves.
 
 All plotting functions return a dictionary containing the figure, axes, loaded
 or summarized data, and fitted parameters. They show the plot by default; pass
@@ -36,6 +39,9 @@ __all__ = [
     "tmi_collapse",
     "probe1_collapse",
     "probe2_collapse",
+    "probe4_collapse",
+    "probe_pc_collapse",
+    "probe_entropy_map",
 ]
 
 
@@ -499,7 +505,7 @@ def entropy(
                     color=color,
                     label=(
                         rf"$p={p:g}$: $\alpha=${fit['slope']:.{precision}f}"
-                        rf"$\pm${slope_error:.{precision}f}, "
+                        rf"$\pm ${slope_error:.{precision}f}, "
                         rf"$\chi_\nu^2=${fit['reduced_chi2']:.1g}"
                     ),
                 )
@@ -940,7 +946,7 @@ def dist_scaling(
             label=(
                 rf"$L={fit_size}$ fit: "
                 rf"$\alpha_2^{{{exponent}}}="
-                rf"{row['alpha']:.3g}\pm{row['alpha_stderr']:.2g}$"
+                rf"{row['alpha']:.3g}\pm {row['alpha_stderr']:.2g}$"
             ),
             zorder=5,
         )
@@ -1499,11 +1505,11 @@ def tmi_collapse(
     ax_collapse.legend()
 
     text = (
-        rf"$p_c={pc:.4g}\pm{dpc:.1g}$" "\n"
-        rf"$\nu={nu:.3g}\pm{dnu:.1g}$" "\n"
+        rf"$p_c={pc:.4g}\pm {dpc:.1g}$" "\n"
+        rf"$\nu={nu:.3g}\pm {dnu:.1g}$" "\n"
         rf"$S={quality:.3g}$" "\n"
         + (
-            rf"$\zeta={zeta:.3g}\pm{dzeta:.1g}$"
+            rf"$\zeta={zeta:.3g}\pm {dzeta:.1g}$"
             if fit_zeta
             else rf"$\zeta={zeta:g}$ fixed"
         )
@@ -1857,7 +1863,7 @@ def probe1_collapse(
     ax_collapse.grid(alpha=0.25)
     ax_collapse.legend()
     x_a_text = (
-        rf"$x_A={best_x_a:.4f}\pm{x_a_stderr:.4f}$"
+        rf"$x_A={best_x_a:.4f}\pm {x_a_stderr:.4f}$"
         if fixed_x_a is None
         else rf"$x_A={best_x_a:.4f}$ fixed"
     )
@@ -1866,7 +1872,7 @@ def probe1_collapse(
         0.97,
         r"$\overline{S_A}=L^{-x_A}F(t/L^z)$"
         + "\n"
-        + rf"$z={best_z:.4f}\pm{z_stderr:.4f}$"
+        + rf"$z={best_z:.4f}\pm {z_stderr:.4f}$"
         + "\n"
         + x_a_text
         + "\n"
@@ -2333,9 +2339,999 @@ def probe2_collapse(
     ax_collapse.grid(alpha=0.25)
     ax_collapse.legend()
     eta_text = (
-        rf"$\eta={eta:.4f}\pm{eta_stderr:.4f}$"
+        rf"$\eta={eta:.4f}\pm {eta_stderr:.4f}$"
         if np.isfinite(eta_stderr)
         else rf"$\eta={eta:.4f}$"
+    )
+    ax_collapse.text(
+        0.97,
+        0.02,
+        metric_spec["ansatz"]
+        + "\n"
+        + eta_text
+        + "\n"
+        + rf"score $={best_score:.3g}$",
+        transform=ax_collapse.transAxes,
+        ha="right",
+        va="bottom",
+        bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.88},
+    )
+    fig.suptitle(metric_spec["suptitle"], fontsize=14)
+    _show(fig, show)
+
+    return {
+        "figure": fig,
+        "axes": (ax_raw, ax_collapse),
+        "metric": metric_spec["key"],
+        "eta": eta,
+        "eta_stderr": eta_stderr,
+        "eta_p16": eta_p16,
+        "eta_p84": eta_p84,
+        "score": best_score,
+        "bootstrap_successes": len(estimates),
+        "summary": summary,
+        "curves": curves,
+        "fit_result": fit_result,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Unified probe p scans and p-t entropy maps
+# ---------------------------------------------------------------------------
+
+
+_PROBE_PC_SPECS = {
+    "sq": {
+        "mean": ["S_Q_mean", "SQ_mean", "S_mean", "entropy_mean"],
+        "stderr": ["S_Q_stderr", "SQ_stderr", "S_stderr", "entropy_stderr"],
+        "ylabel": r"Reference entropy $\overline{S_Q}$ [nats]",
+        "scaled_ylabel": r"$\overline{S_Q}$",
+        "title": "One-probe Gullans--Huse order parameter",
+        "x_symbol": "0",
+    },
+    "i2": {
+        "mean": ["I2_mean", "I_mean", "i2_mean", "mi_mean"],
+        "stderr": ["I2_stderr", "I_stderr", "i2_stderr", "mi_stderr"],
+        "ylabel": r"$\overline{I_2}$ [nats]",
+        "scaled_ylabel": r"$L^{x_2}\overline{I_2}$",
+        "title": "Two-point probe information",
+        "x_symbol": r"x_2",
+    },
+    "i3": {
+        "mean": ["I3_mean", "i3_mean", "tmi_mean"],
+        "stderr": ["I3_stderr", "i3_stderr", "tmi_stderr"],
+        "ylabel": r"$\overline{I_3}$ [nats]",
+        "scaled_ylabel": r"$L^{x_3}\overline{I_3}$",
+        "title": "Three-point probe information",
+        "x_symbol": r"x_3",
+    },
+    "i4": {
+        "mean": ["I4_mean", "i4_mean"],
+        "stderr": ["I4_stderr", "i4_stderr"],
+        "ylabel": r"$I_4$ [nats]",
+        "scaled_ylabel": r"$L^{x_4}I_4$",
+        "title": "Four-point probe information",
+        "x_symbol": r"x_4",
+    },
+}
+
+
+def _infer_probe_count(path: Path, df: pd.DataFrame) -> int:
+    match = re.search(r"(?:^|[_-])probed[_-]([124])(?:[_-]|$)", path.name)
+    if match:
+        return int(match.group(1))
+    lowered = {str(column).lower() for column in df.columns}
+    if "i4_mean" in lowered:
+        return 4
+    if "i2_mean" in lowered or "i_mean" in lowered:
+        return 2
+    return 1
+
+
+def _load_probe_pc_curve(
+    path: Path,
+    metric: str,
+    l_by_file: Mapping[str, int] | None,
+    p_range: tuple[float | None, float | None],
+) -> dict[str, Any]:
+    spec = _PROBE_PC_SPECS[metric]
+    df = pd.read_csv(path)
+    p_col = _find_column(df, ["p", "measurement_rate"])
+    mean_col = _find_column(df, spec["mean"])
+    stderr_col = _find_column(df, spec["stderr"])
+    clean = pd.DataFrame(
+        {
+            "p": pd.to_numeric(df[p_col], errors="coerce"),
+            "value": pd.to_numeric(df[mean_col], errors="coerce"),
+            "dvalue": pd.to_numeric(df[stderr_col], errors="coerce"),
+        }
+    ).replace([np.inf, -np.inf], np.nan).dropna()
+    clean = clean.sort_values("p").drop_duplicates("p", keep="last")
+    p_min, p_max = p_range
+    if p_min is not None:
+        clean = clean.loc[clean["p"] >= p_min]
+    if p_max is not None:
+        clean = clean.loc[clean["p"] <= p_max]
+    if clean.empty:
+        raise ValueError(f"No usable {metric} rows remain in {path}.")
+    if np.any(clean["dvalue"] < 0):
+        warnings.warn(f"{path}: negative standard errors found; taking abs().")
+        clean["dvalue"] = np.abs(clean["dvalue"])
+    return {
+        "path": path,
+        "L": _parse_size(path, l_by_file),
+        "p": clean["p"].to_numpy(dtype=float),
+        "value": clean["value"].to_numpy(dtype=float),
+        "dvalue": clean["dvalue"].to_numpy(dtype=float),
+    }
+
+
+def _fit_probe_pc_metric(
+    curves: Sequence[dict[str, Any]],
+    metric: str,
+    *,
+    pc_bounds: tuple[float, float],
+    nu_bounds: tuple[float, float],
+    x_bounds: tuple[float, float],
+    fixed_pc: float | None,
+    fixed_nu: float | None,
+    fixed_x: float | None,
+    interpolation_points: int,
+    relative_error_floor: float,
+    absolute_error_floor: float,
+    seed: int,
+) -> dict[str, Any]:
+    for name, value, bound in (
+        ("fixed_pc", fixed_pc, pc_bounds),
+        ("fixed_nu", fixed_nu, nu_bounds),
+        ("fixed_x", fixed_x, x_bounds),
+    ):
+        if value is not None and not bound[0] <= value <= bound[1]:
+            raise ValueError(f"{name}={value} lies outside bounds {bound}.")
+    names, bounds, fixed = [], [], {}
+    for name, value, bound in (
+        ("pc", fixed_pc, pc_bounds),
+        ("nu", fixed_nu, nu_bounds),
+        ("x", fixed_x, x_bounds),
+    ):
+        if value is None:
+            names.append(name)
+            bounds.append(bound)
+        else:
+            fixed[name] = float(value)
+
+    def unpack(theta):
+        values = dict(fixed)
+        values.update({name: float(value) for name, value in zip(names, theta)})
+        return values["pc"], values["nu"], values["x"]
+
+    def transformed(curve, pc, nu, exponent):
+        scale = float(curve["L"]) ** exponent
+        x = (curve["p"] - pc) * float(curve["L"]) ** (1.0 / nu)
+        order = np.argsort(x)
+        return x[order], (curve["value"] * scale)[order], (
+            curve["dvalue"] * scale
+        )[order]
+
+    def objective(theta, curve_set=curves):
+        pc, nu, exponent = unpack(theta)
+        if (
+            not np.isfinite(pc + nu + exponent)
+            or not pc_bounds[0] <= pc <= pc_bounds[1]
+            or not nu_bounds[0] <= nu <= nu_bounds[1]
+            or not x_bounds[0] <= exponent <= x_bounds[1]
+        ):
+            return np.inf
+        scores = []
+        for i in range(len(curve_set)):
+            for j in range(i + 1, len(curve_set)):
+                xa, ya, dya = transformed(curve_set[i], pc, nu, exponent)
+                xb, yb, dyb = transformed(curve_set[j], pc, nu, exponent)
+                lo, hi = max(xa.min(), xb.min()), min(xa.max(), xb.max())
+                if hi <= lo:
+                    continue
+                grid = np.linspace(lo, hi, interpolation_points)
+                ya_grid, yb_grid = np.interp(grid, xa, ya), np.interp(grid, xb, yb)
+                dya_grid = np.interp(grid, xa, dya)
+                dyb_grid = np.interp(grid, xb, dyb)
+                typical = max(
+                    np.nanmedian(np.abs(ya_grid)),
+                    np.nanmedian(np.abs(yb_grid)),
+                    absolute_error_floor,
+                )
+                floor = max(absolute_error_floor, relative_error_floor * typical)
+                scores.append(
+                    np.mean(
+                        (ya_grid - yb_grid) ** 2
+                        / (dya_grid**2 + dyb_grid**2 + floor**2)
+                    )
+                )
+        return float(np.mean(scores)) if scores else np.inf
+
+    if bounds:
+        global_fit = differential_evolution(
+            objective,
+            bounds=bounds,
+            seed=seed,
+            polish=False,
+            updating="immediate",
+            workers=1,
+        )
+        local_fit = minimize(
+            objective,
+            global_fit.x,
+            method="Nelder-Mead",
+            options={"maxiter": 20_000, "xatol": 1e-8, "fatol": 1e-8},
+        )
+        theta = local_fit.x if np.isfinite(local_fit.fun) else global_fit.x
+        score = float(objective(theta))
+        errors_free, covariance, hessian = _curvature_errors(
+            objective, theta, f_min=score
+        )
+    else:
+        global_fit = local_fit = None
+        theta = np.empty(0)
+        score = float(objective(theta))
+        errors_free = np.empty(0)
+        covariance = hessian = np.empty((0, 0))
+
+    pc, nu, exponent = unpack(theta)
+    errors = {"pc": 0.0, "nu": 0.0, "x": 0.0}
+    for name, error in zip(names, errors_free):
+        errors[name] = float(error)
+    return {
+        "metric": metric,
+        "pc": pc,
+        "nu": nu,
+        "x": exponent,
+        "pc_stderr": errors["pc"],
+        "nu_stderr": errors["nu"],
+        "x_stderr": errors["x"],
+        "score": score,
+        "transform": transformed,
+        "global_fit": global_fit,
+        "local_fit": local_fit,
+        "covariance": covariance,
+        "hessian": hessian,
+    }
+
+
+def probe_pc_collapse(
+    files: Sequence[str | Path] | str | Path | None = None,
+    *,
+    file_glob: str | Path | None = None,
+    l_by_file: Mapping[str, int] | None = None,
+    metrics: Sequence[str] | str | None = None,
+    p_range: tuple[float | None, float | None] = (None, None),
+    pc_bounds: tuple[float, float] | None = None,
+    nu_bounds: tuple[float, float] = (0.3, 5.0),
+    x_bounds: tuple[float, float] = (0.0, 8.0),
+    fixed_pc: float | None = None,
+    fixed_nu: float | None = None,
+    fixed_x: float | Mapping[str, float] | None = None,
+    sq_units: str = "bits",
+    interpolation_points: int = 250,
+    relative_error_floor: float = 0.02,
+    absolute_error_floor: float = 1e-10,
+    seed: int = 24680,
+    cmap: str = "viridis",
+    show_errorbars: bool = True,
+    capsize: float = 2,
+    figsize: tuple[float, float] | None = None,
+    dpi: int = 130,
+    show: bool = True,
+) -> dict[str, Any]:
+    r"""Plot fixed-``t=4L`` probe scans and fit
+    ``I_k=L^{-x_k}f_k((p-p_c)L^{1/nu})``.
+
+    A one-probe input uses ``S_Q`` with ``x=0`` and reproduces the Fig. 1(b)
+    crossing/collapse protocol of Gullans and Huse. Two-probe inputs plot
+    ``I2``; four-probe inputs produce stacked ``I2``, ``I3``, and ``I4`` raw
+    and collapse pairs. Supply ``fixed_pc`` and/or ``fixed_nu`` to stabilize
+    the noisier three-parameter multiprobe fits.
+    """
+    sq_units = str(sq_units).strip().lower()
+    if sq_units not in {"bits", "nats"}:
+        raise ValueError("sq_units must be 'bits' or 'nats'.")
+    paths = _resolve_files(files, file_glob)
+    first_df = pd.read_csv(paths[0], nrows=2)
+    probes = _infer_probe_count(paths[0], first_df)
+    inferred_metrics = {1: ["sq"], 2: ["i2"], 4: ["i2", "i3", "i4"]}[probes]
+    if metrics is None:
+        selected_metrics = inferred_metrics
+    elif isinstance(metrics, str):
+        selected_metrics = [metrics.lower()]
+    else:
+        selected_metrics = [str(metric).lower() for metric in metrics]
+    invalid = [metric for metric in selected_metrics if metric not in inferred_metrics]
+    if invalid:
+        raise ValueError(
+            f"Metrics {invalid} are unavailable for probes={probes}; "
+            f"choose from {inferred_metrics}."
+        )
+
+    curves_by_metric = {}
+    all_p = []
+    for metric in selected_metrics:
+        curves = [
+            _load_probe_pc_curve(path, metric, l_by_file, p_range)
+            for path in paths
+        ]
+        curves.sort(key=lambda curve: curve["L"])
+        if metric == "sq" and sq_units == "bits":
+            for curve in curves:
+                curve["value"] = curve["value"] / np.log(2.0)
+                curve["dvalue"] = curve["dvalue"] / np.log(2.0)
+        sizes = [curve["L"] for curve in curves]
+        if len(set(sizes)) != len(sizes):
+            raise ValueError(f"Duplicate system sizes found: {sizes}")
+        if len(curves) < 3:
+            warnings.warn("Critical collapse has fewer than three system sizes.")
+        curves_by_metric[metric] = curves
+        all_p.extend(np.concatenate([curve["p"] for curve in curves]))
+
+    if pc_bounds is None:
+        pc_bounds = (float(np.min(all_p)), float(np.max(all_p)))
+    if not pc_bounds[0] < pc_bounds[1]:
+        raise ValueError("pc_bounds must be strictly increasing.")
+
+    fits = {}
+    for index, metric in enumerate(selected_metrics):
+        if isinstance(fixed_x, Mapping):
+            metric_fixed_x = fixed_x.get(metric)
+        elif fixed_x is not None:
+            metric_fixed_x = float(fixed_x)
+        else:
+            metric_fixed_x = 0.0 if metric == "sq" else None
+        fits[metric] = _fit_probe_pc_metric(
+            curves_by_metric[metric],
+            metric,
+            pc_bounds=pc_bounds,
+            nu_bounds=nu_bounds,
+            x_bounds=x_bounds,
+            fixed_pc=fixed_pc,
+            fixed_nu=fixed_nu,
+            fixed_x=metric_fixed_x,
+            interpolation_points=interpolation_points,
+            relative_error_floor=relative_error_floor,
+            absolute_error_floor=absolute_error_floor,
+            seed=seed + index,
+        )
+        fit = fits[metric]
+        print(
+            f"{metric}: p_c={fit['pc']:.6g} ± {fit['pc_stderr']:.3g}, "
+            f"nu={fit['nu']:.6g} ± {fit['nu_stderr']:.3g}, "
+            f"x={fit['x']:.6g} ± {fit['x_stderr']:.3g}, "
+            f"score={fit['score']:.6g}"
+        )
+
+    nrows = len(selected_metrics)
+    if figsize is None:
+        figsize = (13, 4.5 * nrows)
+    fig, axes = plt.subplots(
+        nrows,
+        2,
+        figsize=figsize,
+        dpi=dpi,
+        squeeze=False,
+        constrained_layout=True,
+    )
+    sizes = sorted({curve["L"] for curves in curves_by_metric.values() for curve in curves})
+    colors = _color_map_by_size(sizes, cmap)
+    for row, metric in enumerate(selected_metrics):
+        spec = _PROBE_PC_SPECS[metric]
+        fit = fits[metric]
+        ax_raw, ax_scaled = axes[row]
+        for curve in curves_by_metric[metric]:
+            size = curve["L"]
+            kwargs = {
+                "color": colors[size],
+                "marker": "o",
+                "markersize": 3.8,
+                "linewidth": 1.2,
+                "label": rf"$L={size}$",
+            }
+            if show_errorbars:
+                ax_raw.errorbar(
+                    curve["p"], curve["value"], yerr=curve["dvalue"],
+                    capsize=capsize, elinewidth=0.9, **kwargs
+                )
+            else:
+                ax_raw.plot(curve["p"], curve["value"], **kwargs)
+            x_scaled, y_scaled, dy_scaled = fit["transform"](
+                curve, fit["pc"], fit["nu"], fit["x"]
+            )
+            if show_errorbars:
+                ax_scaled.errorbar(
+                    x_scaled, y_scaled, yerr=dy_scaled,
+                    capsize=capsize, elinewidth=0.9, **kwargs
+                )
+            else:
+                ax_scaled.plot(x_scaled, y_scaled, **kwargs)
+
+        ax_raw.axvline(fit["pc"], color="black", linestyle="--", linewidth=1)
+        ax_raw.axhline(0.0, color="black", linewidth=0.7, alpha=0.3)
+        ax_raw.set_xlabel(r"Measurement rate $p$")
+        ax_raw.set_ylabel(
+            r"Reference entropy $\overline{S_Q}$ [bits]"
+            if metric == "sq" and sq_units == "bits"
+            else spec["ylabel"]
+        )
+        ax_raw.set_title(spec["title"] + " — raw")
+        ax_raw.grid(alpha=0.25)
+        ax_raw.legend()
+
+        ax_scaled.axvline(0.0, color="black", linestyle="--", linewidth=1)
+        ax_scaled.axhline(0.0, color="black", linewidth=0.7, alpha=0.3)
+        ax_scaled.set_xlabel(r"$(p-p_c)L^{1/\nu}$")
+        ax_scaled.set_ylabel(spec["scaled_ylabel"])
+        ax_scaled.set_title("Finite-size scaling collapse")
+        ax_scaled.grid(alpha=0.25)
+        ax_scaled.legend()
+        x_text = (
+            r"$x=0$ fixed"
+            if metric == "sq" and abs(fit["x"]) < 1e-14
+            else rf"${spec['x_symbol']}={fit['x']:.4g}\pm {fit['x_stderr']:.2g}$"
+        )
+        ax_scaled.text(
+            0.97,
+            0.03,
+            rf"$p_c={fit['pc']:.5g}\pm {fit['pc_stderr']:.2g}$" + "\n"
+            + rf"$\nu={fit['nu']:.4g}\pm {fit['nu_stderr']:.2g}$" + "\n"
+            + x_text + "\n" + rf"score $={fit['score']:.3g}$",
+            transform=ax_scaled.transAxes,
+            ha="right",
+            va="bottom",
+            bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.88},
+        )
+    fig.suptitle(f"Fixed-time critical probe scaling (probes={probes}, t=4L)")
+    _show(fig, show)
+    return {
+        "figure": fig,
+        "axes": axes,
+        "probes": probes,
+        "metrics": selected_metrics,
+        "sq_units": sq_units,
+        "fits": fits,
+        "curves": curves_by_metric,
+    }
+
+
+def probe_entropy_map(
+    file: str | Path,
+    *,
+    p_values: Sequence[float] | None = None,
+    line_count: int = 5,
+    cmap: str = "magma",
+    capsize: float = 2,
+    show_errorbars: bool = True,
+    vmin: float | None = None,
+    vmax: float | None = None,
+    figsize: tuple[float, float] = (13, 5),
+    dpi: int = 130,
+    show: bool = True,
+) -> dict[str, Any]:
+    """Plot mode-2 ``S_Q(p,t)`` as a p-x/t-y heatmap and selected-p curves.
+
+    ``p_values`` is the user control for the right-hand plot. Requested values
+    are matched to the nearest simulated p value and duplicates are removed.
+    """
+    path = Path(file)
+    df = pd.read_csv(path)
+    probes = _infer_probe_count(path, df)
+    p_col = _find_column(df, ["p", "measurement_rate"])
+    t_col = _find_column(df, ["t", "time", "timestep"])
+    mean_col = _find_column(df, _PROBE_PC_SPECS["sq"]["mean"])
+    stderr_col = _find_column(df, _PROBE_PC_SPECS["sq"]["stderr"])
+    clean = pd.DataFrame(
+        {
+            "p": pd.to_numeric(df[p_col], errors="coerce"),
+            "t": pd.to_numeric(df[t_col], errors="coerce"),
+            "S_Q": pd.to_numeric(df[mean_col], errors="coerce"),
+            "dS_Q": pd.to_numeric(df[stderr_col], errors="coerce"),
+        }
+    ).replace([np.inf, -np.inf], np.nan).dropna()
+    if clean.empty:
+        raise ValueError(f"No valid p-t entropy rows were loaded from {path}.")
+    clean = clean.sort_values(["p", "t"]).drop_duplicates(["p", "t"], keep="last")
+    simulated_p = np.sort(clean["p"].unique())
+    simulated_t = np.sort(clean["t"].unique())
+    expected = len(simulated_p) * len(simulated_t)
+    if len(clean) != expected:
+        raise ValueError(
+            "The mode-2 CSV is not a complete rectangular p-t grid: "
+            f"found {len(clean)} of {expected} rows."
+        )
+    pivot = clean.pivot(index="t", columns="p", values="S_Q").reindex(
+        index=simulated_t, columns=simulated_p
+    )
+
+    if p_values is None:
+        count = min(max(1, line_count), len(simulated_p))
+        indices = np.unique(
+            np.rint(np.linspace(0, len(simulated_p) - 1, count)).astype(int)
+        )
+        selected_p = simulated_p[indices]
+    else:
+        selected = []
+        for requested in p_values:
+            nearest = float(simulated_p[np.argmin(np.abs(simulated_p - requested))])
+            if nearest not in selected:
+                selected.append(nearest)
+            if not np.isclose(nearest, requested, rtol=0.0, atol=1e-12):
+                warnings.warn(
+                    f"Requested p={requested:g}; using nearest simulated p={nearest:g}."
+                )
+        selected_p = np.asarray(selected, dtype=float)
+
+    fig, (ax_map, ax_lines) = plt.subplots(
+        1, 2, figsize=figsize, dpi=dpi, constrained_layout=True
+    )
+    mesh = ax_map.pcolormesh(
+        simulated_p,
+        simulated_t,
+        pivot.to_numpy(dtype=float),
+        shading="auto",
+        cmap=cmap,
+        vmin=vmin,
+        vmax=vmax,
+    )
+    colorbar = fig.colorbar(mesh, ax=ax_map)
+    colorbar.set_label(r"$\overline{S_Q}$ [nats]")
+    ax_map.set_xlabel(r"Measurement rate $p$")
+    ax_map.set_ylabel(r"Time $t$")
+    ax_map.set_title(r"Joint-reference entropy $\overline{S_Q}(p,t)$")
+
+    colors = plt.get_cmap("viridis")(
+        np.linspace(0.1, 0.9, max(1, len(selected_p)))
+    )
+    for color, p in zip(colors, selected_p):
+        curve = clean.loc[np.isclose(clean["p"], p)].sort_values("t")
+        kwargs = {
+            "color": color,
+            "marker": "o",
+            "markersize": 3.8,
+            "linewidth": 1.2,
+            "label": rf"$p={p:g}$",
+        }
+        if show_errorbars:
+            ax_lines.errorbar(
+                curve["t"], curve["S_Q"], yerr=curve["dS_Q"],
+                capsize=capsize, elinewidth=0.9, **kwargs
+            )
+        else:
+            ax_lines.plot(curve["t"], curve["S_Q"], **kwargs)
+    ax_lines.set_xlabel(r"Time $t$")
+    ax_lines.set_ylabel(r"Reference entropy $\overline{S_Q}$ [nats]")
+    ax_lines.set_title("Entropy dynamics at selected measurement rates")
+    ax_lines.grid(alpha=0.25)
+    ax_lines.legend()
+    fig.suptitle(f"Probe-entropy p-t scan (probes={probes})")
+    _show(fig, show)
+    return {
+        "figure": fig,
+        "axes": (ax_map, ax_lines),
+        "colorbar": colorbar,
+        "probes": probes,
+        "selected_p": selected_p,
+        "p": simulated_p,
+        "t": simulated_t,
+        "entropy": pivot.to_numpy(dtype=float),
+        "data": clean,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Four-probe multipartite-information collapse
+# ---------------------------------------------------------------------------
+
+
+def _probe4_metric_spec(metric: str) -> dict[str, Any]:
+    """Resolve a four-probe information metric and its CSV/plot metadata."""
+    key = str(metric).strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "2": "i2",
+        "mi2": "i2",
+        "pair": "i2",
+        "pairwise": "i2",
+        "pairwise_mi": "i2",
+        "3": "i3",
+        "tmi": "i3",
+        "tripartite": "i3",
+        "tripartite_information": "i3",
+        "4": "i4",
+        "fourpartite": "i4",
+        "four_party": "i4",
+        "four_party_information": "i4",
+    }
+    key = aliases.get(key, key)
+
+    specs = {
+        "i2": {
+            "mean_columns": ["I2_mean", "i2_mean", "I_2_mean"],
+            "stderr_columns": ["I2_stderr", "i2_stderr", "I_2_stderr"],
+            "raw_ylabel": r"Mean pair information $\overline{I_2}$ [nats]",
+            "raw_title": "Four-probe mean pair information",
+            "collapse_ylabel": r"$L^{\eta_2}\overline{I_2}$",
+            "ansatz": r"$\overline{I_2}=L^{-\eta_2}g_2((t-2L)/L)$",
+            "suptitle": "Four-probe pair-information scaling",
+            "eta_symbol": r"\eta_2",
+            "nonnegative": True,
+        },
+        "i3": {
+            "mean_columns": ["I3_mean", "i3_mean", "I_3_mean", "tmi_mean"],
+            "stderr_columns": [
+                "I3_stderr",
+                "i3_stderr",
+                "I_3_stderr",
+                "tmi_stderr",
+            ],
+            "raw_ylabel": r"Mean tripartite information $\overline{I_3}$ [nats]",
+            "raw_title": "Four-probe mean tripartite information",
+            "collapse_ylabel": r"$L^{\eta_3}\overline{I_3}$",
+            "ansatz": r"$\overline{I_3}=L^{-\eta_3}g_3((t-2L)/L)$",
+            "suptitle": "Four-probe tripartite-information scaling",
+            "eta_symbol": r"\eta_3",
+            "nonnegative": False,
+        },
+        "i4": {
+            "mean_columns": ["I4_mean", "i4_mean", "I_4_mean"],
+            "stderr_columns": ["I4_stderr", "i4_stderr", "I_4_stderr"],
+            "raw_ylabel": r"Four-party information $I_4$ [nats]",
+            "raw_title": "Four-probe four-party information",
+            "collapse_ylabel": r"$L^{\eta_4}I_4$",
+            "ansatz": r"$I_4=L^{-\eta_4}g_4((t-2L)/L)$",
+            "suptitle": "Four-probe four-party-information scaling",
+            "eta_symbol": r"\eta_4",
+            "nonnegative": False,
+        },
+    }
+    if key not in specs:
+        raise ValueError("metric must be 'i2', 'i3', or 'i4'.")
+    return {"key": key, **specs[key]}
+
+
+def _load_probe4_curve(
+    path: Path,
+    *,
+    l_by_file: Mapping[str, int] | None,
+    x_load: tuple[float | None, float | None],
+    metric_spec: Mapping[str, Any],
+) -> dict[str, Any]:
+    size = _parse_size(path, l_by_file)
+    df = pd.read_csv(path)
+    t_col = _find_column(df, ["t", "time", "timestep"])
+    mean_col = _find_column(df, metric_spec["mean_columns"])
+    stderr_col = _find_column(df, metric_spec["stderr_columns"])
+    scaled_col = _find_column(df, ["scaled_time", "scaled_t", "x"], required=False)
+    clean = pd.DataFrame(
+        {
+            "t": pd.to_numeric(df[t_col], errors="coerce"),
+            "value": pd.to_numeric(df[mean_col], errors="coerce"),
+            "dvalue": pd.to_numeric(df[stderr_col], errors="coerce"),
+        }
+    )
+    if scaled_col is not None:
+        clean["x_csv"] = pd.to_numeric(df[scaled_col], errors="coerce")
+    clean = clean.dropna(subset=["t", "value", "dvalue"])
+    clean = clean.sort_values("t").drop_duplicates("t", keep="last")
+    clean["x"] = (clean["t"] - 2.0 * size) / float(size)
+
+    if "x_csv" in clean:
+        valid = np.isfinite(clean["x_csv"])
+        if np.any(valid):
+            discrepancy = np.max(
+                np.abs(clean.loc[valid, "x_csv"] - clean.loc[valid, "x"])
+            )
+            if discrepancy > 1e-9:
+                warnings.warn(
+                    f"{path}: scaled_time differs from (t-2L)/L by "
+                    f"{discrepancy:.3g}; using the recomputed value."
+                )
+
+    x_min, x_max = x_load
+    if x_min is not None:
+        clean = clean.loc[clean["x"] >= x_min]
+    if x_max is not None:
+        clean = clean.loc[clean["x"] <= x_max]
+    if clean.empty:
+        raise ValueError(f"No valid rows remain in {path} after load cutoffs.")
+    if np.any(clean["dvalue"] < 0):
+        warnings.warn(
+            f"{path}: negative standard errors found; using absolute values."
+        )
+        clean["dvalue"] = np.abs(clean["dvalue"])
+    if np.any(clean["x"] < -1e-12):
+        warnings.warn(f"{path}: contains points before t0=2L.")
+
+    return {
+        "path": path,
+        "L": size,
+        "p": _parse_p(path),
+        "metric": metric_spec["key"],
+        "t": clean["t"].to_numpy(dtype=float),
+        "x": clean["x"].to_numpy(dtype=float),
+        "value": clean["value"].to_numpy(dtype=float),
+        "dvalue": clean["dvalue"].to_numpy(dtype=float),
+    }
+
+
+def probe4_collapse(
+    files: Sequence[str | Path] | str | Path | None = None,
+    *,
+    file_glob: str | Path | None = None,
+    l_by_file: Mapping[str, int] | None = None,
+    metric: str = "i2",
+    x_load: tuple[float | None, float | None] = (None, None),
+    fit_x: tuple[float, float | None] = (0.25, 8.0),
+    fit_abs_min: float = 1e-8,
+    eta_bounds: tuple[float, float] = (0.0, 8.0),
+    interpolation_points: int = 250,
+    relative_error_floor: float = 0.01,
+    absolute_error_floor: float = 1e-8,
+    bootstrap_samples: int = 200,
+    bootstrap_seed: int = 24680,
+    bootstrap_xtol: float = 1e-5,
+    raw_yscale: str = "linear",
+    collapse_yscale: str = "linear",
+    show_errorbars: bool = True,
+    capsize: float = 2,
+    cmap: str = "viridis",
+    figsize: tuple[float, float] = (13, 5),
+    dpi: int = 130,
+    show_summary: bool = True,
+    show: bool = True,
+) -> dict[str, Any]:
+    r"""Fit a four-probe ``I_k=L^(-eta_k)g_k((t-2L)/L)`` collapse.
+
+    ``metric`` selects ``"i2"``, ``"i3"``, or ``"i4"``. The simulator's
+    ``I2`` is the mean over all six probe pairs, ``I3`` is the mean over all
+    four probe triplets, and ``I4`` is the four-party information. Because
+    ``I3`` and ``I4`` may be signed, the fit cutoff is applied to the absolute
+    value through ``fit_abs_min`` and bootstrap samples are not clipped.
+    """
+    if fit_abs_min < 0.0:
+        raise ValueError("fit_abs_min must be non-negative.")
+    metric_spec = _probe4_metric_spec(metric)
+    paths = _resolve_files(files, file_glob)
+    curves = [
+        _load_probe4_curve(
+            path,
+            l_by_file=l_by_file,
+            x_load=x_load,
+            metric_spec=metric_spec,
+        )
+        for path in paths
+    ]
+    curves.sort(key=lambda curve: curve["L"])
+    sizes = [curve["L"] for curve in curves]
+    if len(set(sizes)) != len(sizes):
+        raise ValueError(f"Duplicate system sizes found: {sizes}")
+    if len(curves) < 3:
+        warnings.warn("A collapse with fewer than three sizes is weakly constrained.")
+
+    finite_ps = [curve["p"] for curve in curves if np.isfinite(curve["p"])]
+    if finite_ps and not np.allclose(finite_ps, finite_ps[0], rtol=0, atol=1e-12):
+        warnings.warn(f"The files contain multiple p values: {sorted(set(finite_ps))}")
+
+    summary = pd.DataFrame(
+        {
+            "L": sizes,
+            "metric": metric_spec["key"],
+            "p_from_filename": [curve["p"] for curve in curves],
+            "points": [len(curve["x"]) for curve in curves],
+            "x_min": [np.min(curve["x"]) for curve in curves],
+            "x_max": [np.max(curve["x"]) for curve in curves],
+            "value_min": [np.min(curve["value"]) for curve in curves],
+            "value_max": [np.max(curve["value"]) for curve in curves],
+            "abs_max": [np.max(np.abs(curve["value"])) for curve in curves],
+            "x_at_abs_max": [
+                curve["x"][np.argmax(np.abs(curve["value"]))]
+                for curve in curves
+            ],
+            "file": [str(curve["path"]) for curve in curves],
+        }
+    )
+    if show_summary:
+        try:
+            from IPython.display import display
+
+            display(summary)
+        except ImportError:
+            print(summary.to_string(index=False))
+
+    fit_x_min, fit_x_max = fit_x
+
+    def fit_mask(curve):
+        mask = (
+            np.isfinite(curve["x"])
+            & np.isfinite(curve["value"])
+            & np.isfinite(curve["dvalue"])
+            & (curve["x"] >= fit_x_min)
+            & (np.abs(curve["value"]) > fit_abs_min)
+        )
+        if fit_x_max is not None:
+            mask &= curve["x"] <= fit_x_max
+        return mask
+
+    def pair_score(curve_a, curve_b, eta):
+        def transformed(curve):
+            mask = fit_mask(curve)
+            scale = float(curve["L"]) ** eta
+            order = np.argsort(curve["x"][mask])
+            return (
+                curve["x"][mask][order],
+                (curve["value"][mask] * scale)[order],
+                (curve["dvalue"][mask] * scale)[order],
+            )
+
+        xa, ya, dya = transformed(curve_a)
+        xb, yb, dyb = transformed(curve_b)
+        if len(xa) < 3 or len(xb) < 3:
+            return np.inf
+        lo, hi = max(xa.min(), xb.min()), min(xa.max(), xb.max())
+        if hi <= lo:
+            return np.inf
+        grid = np.linspace(lo, hi, interpolation_points)
+        ya_g, yb_g = np.interp(grid, xa, ya), np.interp(grid, xb, yb)
+        dya_g, dyb_g = np.interp(grid, xa, dya), np.interp(grid, xb, dyb)
+        typical = max(
+            np.nanmedian(np.abs(ya_g)),
+            np.nanmedian(np.abs(yb_g)),
+            absolute_error_floor,
+        )
+        floor = max(absolute_error_floor, relative_error_floor * typical)
+        return float(
+            np.mean((ya_g - yb_g) ** 2 / (dya_g**2 + dyb_g**2 + floor**2))
+        )
+
+    def score(eta, curve_set=curves):
+        values = [
+            pair_score(curve_set[i], curve_set[j], eta)
+            for i in range(len(curve_set))
+            for j in range(i + 1, len(curve_set))
+        ]
+        finite = [value for value in values if np.isfinite(value)]
+        return float(np.mean(finite)) if finite else np.inf
+
+    fit_result = minimize_scalar(
+        score,
+        bounds=eta_bounds,
+        method="bounded",
+        options={"xatol": 1e-7},
+    )
+    if not fit_result.success or not np.isfinite(fit_result.fun):
+        raise RuntimeError(f"Eta fit failed: {fit_result.message}")
+    eta = float(fit_result.x)
+    best_score = float(fit_result.fun)
+    if min(eta - eta_bounds[0], eta_bounds[1] - eta) < 0.01 * (
+        eta_bounds[1] - eta_bounds[0]
+    ):
+        warnings.warn("eta is close to an eta_bounds boundary; widen the bounds.")
+
+    rng = np.random.default_rng(bootstrap_seed)
+    estimates: list[float] = []
+    if bootstrap_samples >= 2:
+        for index in range(bootstrap_samples):
+            synthetic_curves = []
+            for curve in curves:
+                synthetic = dict(curve)
+                synthetic_values = rng.normal(
+                    curve["value"],
+                    np.maximum(curve["dvalue"], 0.0),
+                )
+                synthetic["value"] = (
+                    np.maximum(synthetic_values, 0.0)
+                    if metric_spec["nonnegative"]
+                    else synthetic_values
+                )
+                synthetic_curves.append(synthetic)
+            result = minimize_scalar(
+                lambda value: score(value, synthetic_curves),
+                bounds=eta_bounds,
+                method="bounded",
+                options={"xatol": bootstrap_xtol},
+            )
+            if result.success and np.isfinite(result.x) and np.isfinite(result.fun):
+                estimates.append(float(result.x))
+            if (index + 1) % 25 == 0 or index + 1 == bootstrap_samples:
+                print(f"Bootstrap fits: {index + 1}/{bootstrap_samples}")
+
+    if len(estimates) >= 2:
+        estimate_array = np.asarray(estimates)
+        eta_stderr = float(np.std(estimate_array, ddof=1))
+        eta_p16, eta_p84 = map(float, np.percentile(estimate_array, [16, 84]))
+    else:
+        eta_stderr = eta_p16 = eta_p84 = np.nan
+        if bootstrap_samples >= 2:
+            warnings.warn("Too few successful bootstrap fits to estimate eta uncertainty.")
+
+    print(f"metric = {metric_spec['key']}")
+    print(f"eta = {eta:.6f} ± {eta_stderr:.6f}")
+    if np.isfinite(eta_p16):
+        print(f"bootstrap 68% interval = [{eta_p16:.6f}, {eta_p84:.6f}]")
+    print(f"collapse score = {best_score:.6g}")
+
+    colors = _color_map_by_size(sizes, cmap)
+    fig, (ax_raw, ax_collapse) = plt.subplots(
+        1, 2, figsize=figsize, dpi=dpi, constrained_layout=True
+    )
+    for curve in curves:
+        size, color = curve["L"], colors[curve["L"]]
+        kwargs = dict(
+            color=color,
+            marker="o",
+            markersize=3.6,
+            linewidth=1.2,
+            label=rf"$L={size}$",
+        )
+        if show_errorbars:
+            ax_raw.errorbar(
+                curve["x"],
+                curve["value"],
+                yerr=curve["dvalue"],
+                elinewidth=0.9,
+                capsize=capsize,
+                **kwargs,
+            )
+        else:
+            ax_raw.plot(curve["x"], curve["value"], **kwargs)
+
+        mask = fit_mask(curve)
+        scale = float(size) ** eta
+        excluded = ~mask
+        if np.any(excluded):
+            ax_collapse.plot(
+                curve["x"][excluded],
+                curve["value"][excluded] * scale,
+                linestyle="none",
+                marker="o",
+                markersize=3,
+                color=color,
+                alpha=0.20,
+            )
+        if show_errorbars:
+            ax_collapse.errorbar(
+                curve["x"][mask],
+                curve["value"][mask] * scale,
+                yerr=curve["dvalue"][mask] * scale,
+                elinewidth=0.9,
+                capsize=capsize,
+                **kwargs,
+            )
+        else:
+            ax_collapse.plot(
+                curve["x"][mask],
+                curve["value"][mask] * scale,
+                **kwargs,
+            )
+
+    ax_raw.axhline(0.0, linewidth=1, alpha=0.35)
+    ax_raw.axvline(0.0, linewidth=1, linestyle="--", alpha=0.6)
+    fit_upper = (
+        fit_x_max
+        if fit_x_max is not None
+        else max(curve["x"].max() for curve in curves)
+    )
+    ax_raw.axvspan(fit_x_min, fit_upper, alpha=0.08, label="fit window")
+    ax_raw.set_xlabel(r"Scaled time $x=(t-2L)/L$")
+    ax_raw.set_ylabel(metric_spec["raw_ylabel"])
+    ax_raw.set_title(metric_spec["raw_title"])
+    ax_raw.set_yscale(raw_yscale)
+    ax_raw.grid(alpha=0.25)
+    ax_raw.legend()
+
+    ax_collapse.axhline(0.0, linewidth=1, alpha=0.35)
+    ax_collapse.set_xlabel(r"Scaled time $x=(t-2L)/L$")
+    ax_collapse.set_ylabel(metric_spec["collapse_ylabel"])
+    ax_collapse.set_title("Bulk-exponent scaling collapse")
+    ax_collapse.set_yscale(collapse_yscale)
+    ax_collapse.grid(alpha=0.25)
+    ax_collapse.legend()
+    eta_text = (
+        rf"${metric_spec['eta_symbol']}={eta:.4f}\pm {eta_stderr:.4f}$"
+        if np.isfinite(eta_stderr)
+        else rf"${metric_spec['eta_symbol']}={eta:.4f}$"
     )
     ax_collapse.text(
         0.97,

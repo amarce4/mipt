@@ -70,6 +70,7 @@ make test-core
 ./mipt.exe --help
 ./sim_tmi.exe --help
 ./entropy.exe --help
+./mipt_probed.exe --help
 ```
 
 On a solver machine, additionally run:

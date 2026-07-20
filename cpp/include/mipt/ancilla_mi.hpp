@@ -14,6 +14,7 @@ namespace mipt::ancilla
 {
 struct TwoProbeObservables
 {
+    double joint_entropy = 0.0;
     double mutual_information = 0.0;
     double negativity = 0.0;
     double log_negativity = 0.0;
@@ -318,8 +319,10 @@ inline TwoProbeObservables two_probe_observables(
         state, n_qubits, ancilla_a, ancilla_b, fermion_trace);
     const Rdm2 normalized_rho_ab = normalized_hermitian_rdm2(rho_ab);
 
+    const double joint_entropy =
+        entropy_from_normalized_rdm2(normalized_rho_ab);
     double mi = entropy_from_rdm(rho_a) + entropy_from_rdm(rho_b) -
-                entropy_from_normalized_rdm2(normalized_rho_ab);
+                joint_entropy;
     if (mi < 0.0 && mi > -2e-6)
     {
         mi = 0.0;
@@ -340,7 +343,7 @@ inline TwoProbeObservables two_probe_observables(
             std::to_string(log_negativity));
     }
 
-    return {std::max(0.0, mi), negativity, log_negativity};
+    return {joint_entropy, std::max(0.0, mi), negativity, log_negativity};
 }
 
 inline double mutual_information(

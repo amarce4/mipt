@@ -40,6 +40,7 @@ make analysis                     # GMN, fGMN, and ring inflation
 make                              # both groups
 make GPU=0 CUDA_RHO=0             # CPU CUDA-Q build
 make sim_tmi.exe GPU=1 FP64=0
+make mipt_probed.exe GPU=1 FP64=0
 make test-core                    # no CUDA-Q/MOSEK/SCS required
 make print-config
 ```
@@ -49,6 +50,26 @@ The CUDA helper compiler falls back from `nvcc` to `nvq++` when `nvcc` is not on
 
 Build outputs are isolated in names such as `build/nvidia_fp32_rho1`, preventing
 objects from incompatible configurations from being mixed.
+
+## Unified probe simulator
+
+All one-, two-, and four-reference protocols are provided by one executable:
+
+```bash
+./mipt_probed.exe PROBES N REALIZATIONS CIRC_TYPE MODE ARGS...
+```
+
+| Mode | Arguments | Protocol |
+|---:|---|---|
+| 0 | `p t_min t_max` | Legacy time trajectory. One reference is attached at `t=0`; two/four are attached after `t0=2N`. |
+| 1 | `p_min p_max p_res` | Fixed-`t=4N` critical scan. One probe uses the Gullans--Huse no-measurement encoding quench; two/four output `I2` or `I2,I3,I4`. |
+| 2 | `t_min t_max t_res p_min p_max p_res` | Rectangular `p,t` scan of the joint reference entropy `S_Q`. |
+
+The output filename is always generated from the arguments. Use the supplied
+`data_analysis.py` functions
+`probe_pc_collapse(...)` and `probe_entropy_map(...)` for the mode-1 and mode-2
+outputs. Run `./mipt_probed.exe --help` for the probe geometry and environment
+controls.
 
 The old Makefile referenced `tmi.cpp`, but that source was absent from the supplied
 archive. The stale `tmi.exe` target was therefore removed; `sim_tmi.exe` remains the

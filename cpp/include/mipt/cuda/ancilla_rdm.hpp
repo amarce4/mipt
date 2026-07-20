@@ -83,6 +83,47 @@ int mipt_cuda_rho2_complex_fermion_f32(
     int retained_qubit1,
     double *host_rho_ri);
 
+/*
+ * Computes the complete complex 16x16 reduced density matrix of four retained
+ * qubits/modes. Local bit i corresponds to retained_qubit_i. Output is a full
+ * row-major matrix with interleaved real/imaginary values (512 doubles).
+ */
+int mipt_cuda_rho4_complex_f64(
+    const void *device_state_vector,
+    int n_qubits,
+    int retained_qubit0,
+    int retained_qubit1,
+    int retained_qubit2,
+    int retained_qubit3,
+    double *host_rho_ri);
+
+int mipt_cuda_rho4_complex_f32(
+    const void *device_state_vector,
+    int n_qubits,
+    int retained_qubit0,
+    int retained_qubit1,
+    int retained_qubit2,
+    int retained_qubit3,
+    double *host_rho_ri);
+
+int mipt_cuda_rho4_complex_fermion_f64(
+    const void *device_state_vector,
+    int n_qubits,
+    int retained_qubit0,
+    int retained_qubit1,
+    int retained_qubit2,
+    int retained_qubit3,
+    double *host_rho_ri);
+
+int mipt_cuda_rho4_complex_fermion_f32(
+    const void *device_state_vector,
+    int n_qubits,
+    int retained_qubit0,
+    int retained_qubit1,
+    int retained_qubit2,
+    int retained_qubit3,
+    double *host_rho_ri);
+
 #ifdef __cplusplus
 }
 #endif
