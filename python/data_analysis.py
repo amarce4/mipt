@@ -9,6 +9,7 @@ expvals(...)           Plot aggregate fermionic observables and Wick residuals.
 tmi_collapse(...)      Fit and plot the TMI finite-size scaling collapse.
 probe1_collapse(...)   Fit and plot the one-ancilla dynamical collapse.
 probe2_collapse(...)   Fit and plot the two-ancilla bulk-exponent collapse.
+probe_anisotropy(...)  Plot mode-3 space/time correlators and estimate alpha.
 probe4_collapse(...)   Fit and plot four-ancilla I2/I3/I4 collapses.
 probe_pc_collapse(...) Fit fixed-t p scans for one/two/four probes.
 probe_entropy_map(...) Plot the p-t S_Q heatmap and selected-p time curves.
@@ -39,6 +40,7 @@ __all__ = [
     "tmi_collapse",
     "probe1_collapse",
     "probe2_collapse",
+    "probe_anisotropy",
     "probe4_collapse",
     "probe_pc_collapse",
     "probe_entropy_map",
@@ -505,7 +507,7 @@ def entropy(
                     color=color,
                     label=(
                         rf"$p={p:g}$: $\alpha=${fit['slope']:.{precision}f}"
-                        rf"$\pm${slope_error:.{precision}f}, "
+                        rf"$\pm ${slope_error:.{precision}f}, "
                         rf"$\chi_\nu^2=${fit['reduced_chi2']:.1g}"
                     ),
                 )
@@ -946,7 +948,7 @@ def dist_scaling(
             label=(
                 rf"$L={fit_size}$ fit: "
                 rf"$\alpha_2^{{{exponent}}}="
-                rf"{row['alpha']:.3g}\pm{row['alpha_stderr']:.2g}$"
+                rf"{row['alpha']:.3g}\pm {row['alpha_stderr']:.2g}$"
             ),
             zorder=5,
         )
@@ -1505,11 +1507,11 @@ def tmi_collapse(
     ax_collapse.legend()
 
     text = (
-        rf"$p_c={pc:.4g}\pm{dpc:.1g}$" "\n"
-        rf"$\nu={nu:.3g}\pm{dnu:.1g}$" "\n"
+        rf"$p_c={pc:.4g}\pm {dpc:.1g}$" "\n"
+        rf"$\nu={nu:.3g}\pm {dnu:.1g}$" "\n"
         rf"$S={quality:.3g}$" "\n"
         + (
-            rf"$\zeta={zeta:.3g}\pm{dzeta:.1g}$"
+            rf"$\zeta={zeta:.3g}\pm {dzeta:.1g}$"
             if fit_zeta
             else rf"$\zeta={zeta:g}$ fixed"
         )
@@ -1863,7 +1865,7 @@ def probe1_collapse(
     ax_collapse.grid(alpha=0.25)
     ax_collapse.legend()
     x_a_text = (
-        rf"$x_A={best_x_a:.4f}\pm{x_a_stderr:.4f}$"
+        rf"$x_A={best_x_a:.4f}\pm {x_a_stderr:.4f}$"
         if fixed_x_a is None
         else rf"$x_A={best_x_a:.4f}$ fixed"
     )
@@ -1872,7 +1874,7 @@ def probe1_collapse(
         0.97,
         r"$\overline{S_A}=L^{-x_A}F(t/L^z)$"
         + "\n"
-        + rf"$z={best_z:.4f}\pm{z_stderr:.4f}$"
+        + rf"$z={best_z:.4f}\pm {z_stderr:.4f}$"
         + "\n"
         + x_a_text
         + "\n"
@@ -2339,7 +2341,7 @@ def probe2_collapse(
     ax_collapse.grid(alpha=0.25)
     ax_collapse.legend()
     eta_text = (
-        rf"$\eta={eta:.4f}\pm{eta_stderr:.4f}$"
+        rf"$\eta={eta:.4f}\pm {eta_stderr:.4f}$"
         if np.isfinite(eta_stderr)
         else rf"$\eta={eta:.4f}$"
     )
@@ -2372,6 +2374,438 @@ def probe2_collapse(
         "summary": summary,
         "curves": curves,
         "fit_result": fit_result,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Two-probe spacetime anisotropy
+# ---------------------------------------------------------------------------
+
+
+def _constant_csv_value(
+    df: pd.DataFrame,
+    candidates: Sequence[str],
+    path: Path,
+    *,
+    integer: bool = False,
+) -> float | int:
+    column = _find_column(df, candidates)
+    values = pd.to_numeric(df[column], errors="coerce").dropna().unique()
+    if len(values) != 1:
+        raise ValueError(
+            f"{path}: expected one constant value in {column!r}, found {values}."
+        )
+    value = float(values[0])
+    if integer:
+        rounded = int(round(value))
+        if not np.isclose(value, rounded, rtol=0.0, atol=1e-9):
+            raise ValueError(f"{path}: {column!r} must contain an integer.")
+        return rounded
+    return value
+
+
+def _load_probe_anisotropy_curve(
+    path: Path,
+    l_by_file: Mapping[str, int] | None,
+) -> dict[str, Any]:
+    df = pd.read_csv(path)
+    if df.empty:
+        raise ValueError(f"{path}: anisotropy CSV is empty.")
+
+    n_col = _find_column(df, ["N", "L", "system_N"], required=False)
+    if n_col is None:
+        size = _parse_size(path, l_by_file)
+    else:
+        size = int(_constant_csv_value(df, [n_col], path, integer=True))
+        try:
+            parsed_size = _parse_size(path, l_by_file)
+        except ValueError:
+            parsed_size = size
+        if parsed_size != size:
+            raise ValueError(
+                f"{path}: filename gives L={parsed_size}, but CSV gives N={size}."
+            )
+
+    delta_x = int(
+        _constant_csv_value(df, ["delta_x", "dx"], path, integer=True)
+    )
+    delta_t = int(
+        _constant_csv_value(df, ["delta_t", "dt"], path, integer=True)
+    )
+    p = float(_constant_csv_value(df, ["p", "measurement_rate"], path))
+    tau_col = _find_column(df, ["tau", "readout_time", "elapsed_time"])
+    scaled_col = _find_column(
+        df,
+        ["tau_over_L", "tau_over_l", "scaled_time", "scaled_tau"],
+        required=False,
+    )
+    mean_col = _find_column(
+        df, ["I_mean", "i_mean", "I2_mean", "mi_mean"]
+    )
+    stderr_col = _find_column(
+        df, ["I_stderr", "i_stderr", "I2_stderr", "mi_stderr"]
+    )
+    clean = pd.DataFrame(
+        {
+            "tau": pd.to_numeric(df[tau_col], errors="coerce"),
+            "I": pd.to_numeric(df[mean_col], errors="coerce"),
+            "dI": pd.to_numeric(df[stderr_col], errors="coerce"),
+        }
+    )
+    if scaled_col is not None:
+        clean["x_csv"] = pd.to_numeric(df[scaled_col], errors="coerce")
+    clean = clean.replace([np.inf, -np.inf], np.nan).dropna(
+        subset=["tau", "I", "dI"]
+    )
+    clean = clean.sort_values("tau").drop_duplicates("tau", keep="last")
+    if clean.empty:
+        raise ValueError(f"{path}: no finite anisotropy rows were found.")
+    if np.any(clean["dI"] < 0):
+        warnings.warn(f"{path}: negative standard errors found; taking abs().")
+        clean["dI"] = np.abs(clean["dI"])
+    clean["x"] = clean["tau"] / float(size)
+    if "x_csv" in clean:
+        valid = np.isfinite(clean["x_csv"])
+        if np.any(valid):
+            discrepancy = np.max(
+                np.abs(clean.loc[valid, "x_csv"] - clean.loc[valid, "x"])
+            )
+            if discrepancy > 1e-9:
+                warnings.warn(
+                    f"{path}: tau_over_L differs from tau/L by {discrepancy:.3g}; "
+                    "using the recomputed value."
+                )
+
+    spatial = delta_t == 0 and delta_x * 2 == size
+    temporal = delta_x == 0 and delta_t > 0
+    if not (spatial or temporal):
+        raise ValueError(
+            f"{path}: expected spatial (delta_x=L/2, delta_t=0) or temporal "
+            "(delta_x=0, delta_t>0) mode-3 geometry."
+        )
+    return {
+        "path": path,
+        "L": size,
+        "p": p,
+        "delta_x": delta_x,
+        "delta_t": delta_t,
+        "branch": "spatial" if spatial else "temporal",
+        "tau": clean["tau"].to_numpy(dtype=float),
+        "x": clean["x"].to_numpy(dtype=float),
+        "I": clean["I"].to_numpy(dtype=float),
+        "dI": clean["dI"].to_numpy(dtype=float),
+    }
+
+
+def _anisotropy_late_estimate(
+    curve: Mapping[str, Any],
+    window: tuple[float, float],
+    method: str,
+) -> tuple[float, float, int]:
+    lo, hi = window
+    mask = (
+        np.isfinite(curve["x"])
+        & np.isfinite(curve["I"])
+        & np.isfinite(curve["dI"])
+        & (curve["x"] >= lo)
+        & (curve["x"] <= hi)
+    )
+    if not np.any(mask):
+        raise ValueError(
+            f"{curve['path']}: no points lie in estimate_window={window}."
+        )
+    x = curve["x"][mask]
+    values = curve["I"][mask]
+    errors = np.maximum(curve["dI"][mask], 0.0)
+    if method == "last":
+        index = int(np.argmax(x))
+        return float(values[index]), float(errors[index]), len(values)
+    if method != "mean":
+        raise ValueError("estimate_method must be 'mean' or 'last'.")
+
+    positive = errors > 0
+    if np.any(positive):
+        floor = max(float(np.median(errors[positive])) * 1e-6, 1e-15)
+        weights = 1.0 / np.maximum(errors, floor) ** 2
+        value = float(np.average(values, weights=weights))
+    else:
+        value = float(np.mean(values))
+    # Readout times within one trajectory are correlated. Keep the typical
+    # per-time standard error instead of reducing it by sqrt(number of times).
+    error = float(np.sqrt(np.mean(errors**2)))
+    return value, error, len(values)
+
+
+def probe_anisotropy(
+    files: Sequence[str | Path] | str | Path | None = None,
+    *,
+    file_glob: str | Path | None = None,
+    l_by_file: Mapping[str, int] | None = None,
+    estimate_window: tuple[float, float] = (7.0, 8.0),
+    estimate_method: str = "mean",
+    full_xlim: tuple[float, float] = (0.0, 8.0),
+    zoom_xlim: tuple[float, float] = (7.0, 8.0),
+    full_ylim: tuple[float, float] | None = None,
+    zoom_ylim: tuple[float, float] | None = None,
+    bootstrap_samples: int = 20_000,
+    bootstrap_seed: int = 24680,
+    show_errorbars: bool = True,
+    errorbar_points: int = 48,
+    colors: Sequence[Any] = ("tab:blue", "tab:green", "tab:red"),
+    figsize: tuple[float, float] = (13, 4.8),
+    dpi: int = 130,
+    show_summary: bool = True,
+    show: bool = True,
+) -> dict[str, Any]:
+    r"""Reproduce Fig. S8(b,c) and estimate the spacetime anisotropy.
+
+    Supply one mode-3 spatial file, ``(delta_x,delta_t)=(L/2,0)``, and at
+    least two temporal files, ``(0,delta_t)``, whose late-time mutual
+    information brackets the spatial value. The crossing ``delta_t_star`` is
+    found by linear interpolation, then
+
+    ``alpha = log(1+sqrt(2)) / (pi * (delta_t_star/L))``.
+
+    ``estimate_method="mean"`` averages the selected late-time window while
+    conservatively retaining a typical per-time standard error because points
+    from the same trajectories are correlated. Use ``"last"`` to reproduce a
+    final-readout-only estimate.
+    """
+    paths = _resolve_files(files, file_glob)
+    curves = [_load_probe_anisotropy_curve(path, l_by_file) for path in paths]
+    sizes = {curve["L"] for curve in curves}
+    if len(sizes) != 1:
+        raise ValueError(f"Anisotropy files must have one system size; found {sizes}.")
+    size = sizes.pop()
+    probabilities = np.asarray([curve["p"] for curve in curves], dtype=float)
+    if not np.allclose(probabilities, probabilities[0], rtol=0.0, atol=1e-12):
+        raise ValueError(
+            "All anisotropy branches must use the same critical measurement rate."
+        )
+    spatial_curves = [curve for curve in curves if curve["branch"] == "spatial"]
+    temporal_curves = sorted(
+        (curve for curve in curves if curve["branch"] == "temporal"),
+        key=lambda curve: curve["delta_t"],
+    )
+    if len(spatial_curves) != 1:
+        raise ValueError(
+            f"Expected exactly one spatial branch, found {len(spatial_curves)}."
+        )
+    if len(temporal_curves) < 2:
+        raise ValueError("At least two temporal branches are required.")
+    if len({curve["delta_t"] for curve in temporal_curves}) != len(temporal_curves):
+        raise ValueError("Temporal files contain duplicate delta_t values.")
+    if not estimate_window[0] < estimate_window[1]:
+        raise ValueError("estimate_window must be strictly increasing.")
+
+    ordered_curves = [spatial_curves[0], *temporal_curves]
+    estimates = []
+    for curve in ordered_curves:
+        value, error, point_count = _anisotropy_late_estimate(
+            curve, estimate_window, estimate_method
+        )
+        estimates.append(
+            {
+                "curve": curve,
+                "value": value,
+                "error": error,
+                "points": point_count,
+            }
+        )
+    spatial_estimate = estimates[0]
+    temporal_estimates = estimates[1:]
+    candidates = []
+    for left, right in zip(temporal_estimates[:-1], temporal_estimates[1:]):
+        left_difference = left["value"] - spatial_estimate["value"]
+        right_difference = right["value"] - spatial_estimate["value"]
+        if left_difference == 0.0 or right_difference == 0.0 or (
+            left_difference * right_difference < 0.0
+        ):
+            span = right["curve"]["delta_t"] - left["curve"]["delta_t"]
+            proximity = abs(left_difference) + abs(right_difference)
+            candidates.append((span, proximity, left, right))
+    if not candidates:
+        values = ", ".join(
+            f"delta_t/L={item['curve']['delta_t']/size:g}: I={item['value']:.6g}"
+            for item in temporal_estimates
+        )
+        raise ValueError(
+            "Temporal late-time values do not bracket the spatial value "
+            f"I_space={spatial_estimate['value']:.6g}. Temporal values: {values}."
+        )
+    _, _, lower, upper = min(candidates, key=lambda item: (item[0], item[1]))
+    x_lower = lower["curve"]["delta_t"] / float(size)
+    x_upper = upper["curve"]["delta_t"] / float(size)
+    denominator = upper["value"] - lower["value"]
+    if denominator == 0.0:
+        raise ValueError("The bracketing temporal estimates are equal.")
+    fraction = (spatial_estimate["value"] - lower["value"]) / denominator
+    delta_t_star_over_l = float(x_lower + fraction * (x_upper - x_lower))
+    if delta_t_star_over_l <= 0.0:
+        raise ValueError("The interpolated delta_t_star/L is not positive.")
+    alpha_constant = float(np.log1p(np.sqrt(2.0)) / np.pi)
+    alpha = alpha_constant / delta_t_star_over_l
+    alpha_bracket = tuple(
+        sorted((alpha_constant / x_upper, alpha_constant / x_lower))
+    )
+
+    rng = np.random.default_rng(bootstrap_seed)
+    bootstrap_alpha = []
+    bootstrap_delta_t = []
+    if bootstrap_samples >= 2:
+        for _ in range(bootstrap_samples):
+            sampled_space = rng.normal(
+                spatial_estimate["value"], spatial_estimate["error"]
+            )
+            sampled_lower = rng.normal(lower["value"], lower["error"])
+            sampled_upper = rng.normal(upper["value"], upper["error"])
+            sampled_denominator = sampled_upper - sampled_lower
+            if abs(sampled_denominator) < 1e-15:
+                continue
+            sampled_fraction = (sampled_space - sampled_lower) / sampled_denominator
+            sampled_x = x_lower + sampled_fraction * (x_upper - x_lower)
+            if x_lower <= sampled_x <= x_upper and sampled_x > 0.0:
+                bootstrap_delta_t.append(sampled_x)
+                bootstrap_alpha.append(alpha_constant / sampled_x)
+    if len(bootstrap_alpha) >= 2:
+        alpha_samples = np.asarray(bootstrap_alpha)
+        delta_t_samples = np.asarray(bootstrap_delta_t)
+        alpha_stderr = float(np.std(alpha_samples, ddof=1))
+        alpha_interval = tuple(map(float, np.percentile(alpha_samples, [16, 84])))
+        delta_t_stderr = float(np.std(delta_t_samples, ddof=1))
+    else:
+        alpha_stderr = delta_t_stderr = np.nan
+        alpha_interval = (np.nan, np.nan)
+        if bootstrap_samples >= 2:
+            warnings.warn(
+                "Too few bootstrap crossings remained inside the interpolation bracket."
+            )
+
+    summary = pd.DataFrame(
+        [
+            {
+                "branch": item["curve"]["branch"],
+                "delta_x": item["curve"]["delta_x"],
+                "delta_t": item["curve"]["delta_t"],
+                "delta_t_over_L": item["curve"]["delta_t"] / float(size),
+                "I_late": item["value"],
+                "I_late_stderr": item["error"],
+                "late_points": item["points"],
+                "file": str(item["curve"]["path"]),
+            }
+            for item in estimates
+        ]
+    )
+    print(
+        f"delta_t*/L = {delta_t_star_over_l:.7g} ± {delta_t_stderr:.2g}\n"
+        f"alpha = {alpha:.7g} ± {alpha_stderr:.2g} (stat.), "
+        f"bracket [{alpha_bracket[0]:.7g}, {alpha_bracket[1]:.7g}]"
+    )
+    if show_summary:
+        try:
+            from IPython.display import display
+
+            display(summary)
+        except ImportError:
+            print(summary.to_string(index=False))
+
+    # palette = list(colors)
+    # if not palette:
+    #     raise ValueError("colors must contain at least one color.")
+    # if len(palette) < len(ordered_curves):
+    palette = list(
+        plt.get_cmap("viridis")(
+            np.linspace(0.08, 0.92, len(ordered_curves))
+        )
+    )
+    fig, (ax_full, ax_zoom) = plt.subplots(
+        1, 2, figsize=figsize, dpi=dpi, constrained_layout=True
+    )
+    for color, curve in zip(palette, ordered_curves):
+        if curve["branch"] == "spatial":
+            label = r"$(\delta x,\delta t)=(L/2,0)$"
+        else:
+            label = rf"$(\delta x,\delta t)=(0,{curve['delta_t']/size:g}L)$"
+        every = max(1, int(np.ceil(len(curve["x"]) / max(1, errorbar_points))))
+        for axis in (ax_full, ax_zoom):
+            if show_errorbars:
+                axis.errorbar(
+                    curve["x"],
+                    curve["I"],
+                    yerr=curve["dI"],
+                    color=color,
+                    marker="o",
+                    markersize=2.8,
+                    linewidth=1.15,
+                    elinewidth=0.75,
+                    capsize=1.5,
+                    errorevery=every,
+                    label=label,
+                )
+            else:
+                axis.plot(
+                    curve["x"], curve["I"], color=color, linewidth=1.3, label=label
+                )
+    for axis, limits, title in (
+        (ax_full, full_xlim, "Full evolution"),
+        (ax_zoom, zoom_xlim, "Late-time zoom"),
+    ):
+        axis.set_xlim(*limits)
+        axis.set_xlabel(r"Readout time $\tau/L$")
+        axis.set_ylabel(r"Mutual information $I_{12}$ [nats]")
+        axis.set_title(title)
+        axis.grid(alpha=0.22)
+    if full_ylim is not None:
+        ax_full.set_ylim(*full_ylim)
+    if zoom_ylim is None:
+        visible_lower = []
+        visible_upper = []
+        for curve in ordered_curves:
+            mask = (curve["x"] >= zoom_xlim[0]) & (curve["x"] <= zoom_xlim[1])
+            if np.any(mask):
+                visible_lower.extend((curve["I"][mask] - curve["dI"][mask]).tolist())
+                visible_upper.extend((curve["I"][mask] + curve["dI"][mask]).tolist())
+        if visible_lower:
+            lower_y, upper_y = min(visible_lower), max(visible_upper)
+            margin = max(0.08 * (upper_y - lower_y), 1e-6)
+            ax_zoom.set_ylim(lower_y - margin, upper_y + margin)
+    else:
+        ax_zoom.set_ylim(*zoom_ylim)
+    ax_full.legend()
+    ax_zoom.axvspan(
+        estimate_window[0], estimate_window[1], color="black", alpha=0.045
+    )
+    ax_zoom.text(
+        0.97,
+        0.04,
+        rf"$\delta t_*/L={delta_t_star_over_l:.4g}$" + "\n"
+        + rf"$\alpha={alpha:.4g}\pm {alpha_stderr:.2g}$ (stat.)",
+        transform=ax_zoom.transAxes,
+        ha="right",
+        va="bottom",
+        bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.88},
+    )
+    fig.suptitle(
+        rf"Two-probe anisotropy correlators ($L={size}$, $p={probabilities[0]:g}$)"
+    )
+    _show(fig, show)
+    return {
+        "figure": fig,
+        "axes": (ax_full, ax_zoom),
+        "L": size,
+        "p": float(probabilities[0]),
+        "summary": summary,
+        "curves": ordered_curves,
+        "spatial_estimate": spatial_estimate,
+        "bracketing_temporal_estimates": (lower, upper),
+        "delta_t_star_over_L": delta_t_star_over_l,
+        "delta_t_star": delta_t_star_over_l * size,
+        "delta_t_star_stderr": delta_t_stderr * size,
+        "alpha": alpha,
+        "alpha_stderr": alpha_stderr,
+        "alpha_interval_68": alpha_interval,
+        "alpha_bracket": alpha_bracket,
+        "bootstrap_successes": len(bootstrap_alpha),
     }
 
 
@@ -2771,13 +3205,13 @@ def probe_pc_collapse(
         x_text = (
             r"$x=0$ fixed"
             if metric == "sq" and abs(fit["x"]) < 1e-14
-            else rf"${spec['x_symbol']}={fit['x']:.4g}\pm{fit['x_stderr']:.2g}$"
+            else rf"${spec['x_symbol']}={fit['x']:.4g}\pm {fit['x_stderr']:.2g}$"
         )
         ax_scaled.text(
             0.97,
             0.03,
-            rf"$p_c={fit['pc']:.5g}\pm{fit['pc_stderr']:.2g}$" + "\n"
-            + rf"$\nu={fit['nu']:.4g}\pm{fit['nu_stderr']:.2g}$" + "\n"
+            rf"$p_c={fit['pc']:.5g}\pm {fit['pc_stderr']:.2g}$" + "\n"
+            + rf"$\nu={fit['nu']:.4g}\pm {fit['nu_stderr']:.2g}$" + "\n"
             + x_text + "\n" + rf"score $={fit['score']:.3g}$",
             transform=ax_scaled.transAxes,
             ha="right",
@@ -3329,7 +3763,7 @@ def probe4_collapse(
     ax_collapse.grid(alpha=0.25)
     ax_collapse.legend()
     eta_text = (
-        rf"${metric_spec['eta_symbol']}={eta:.4f}\pm{eta_stderr:.4f}$"
+        rf"${metric_spec['eta_symbol']}={eta:.4f}\pm {eta_stderr:.4f}$"
         if np.isfinite(eta_stderr)
         else rf"${metric_spec['eta_symbol']}={eta:.4f}$"
     )

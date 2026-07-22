@@ -66,6 +66,20 @@ struct AttachReferencesKernel
     }
 };
 
+struct AttachReferenceKernel
+{
+    void operator()(cudaq::state *state,
+                    int n,
+                    int site,
+                    int reference) __qpu__
+    {
+        cudaq::qvector q(state);
+        reset(q[site]);
+        h(q[site]);
+        cx(q[site], q[n + reference]);
+    }
+};
+
 struct RunningStats
 {
     void add(double value)
@@ -340,7 +354,7 @@ std::vector<int> integer_linspace(int minimum, int maximum, int count)
     return values;
 }
 
-std::vector<int> probe_sites(int probes, int n, int mode)
+std::vector<int> probe_sites(int probes, int n, int mode, int delta_x = 0)
 {
     if (probes == 1)
     {
@@ -349,6 +363,11 @@ std::vector<int> probe_sites(int probes, int n, int mode)
     }
     if (probes == 2)
     {
+        if (mode == 3)
+        {
+            // x1=1 and x2=1+delta_x in one-indexed notation.
+            return {0, delta_x % n};
+        }
         return {(n - 1) / 2, n - 1};
     }
     if (n % 4 != 0)
@@ -373,6 +392,15 @@ cudaq::state attach_references(cudaq::state &state,
                                const std::vector<int> &sites)
 {
     return cudaq::get_state(AttachReferencesKernel{}, &state, n, sites);
+}
+
+cudaq::state attach_reference(cudaq::state &state,
+                              int n,
+                              int site,
+                              int reference)
+{
+    return cudaq::get_state(
+        AttachReferenceKernel{}, &state, n, site, reference);
 }
 
 Sample measure_sample(cudaq::state &state,
@@ -457,11 +485,17 @@ class ProgressReporter
               "MIPT_PROBED_PROGRESS_MS", 500, 0, 60000))
     {
         last_ = start_ - interval_;
+        point_start_ = start_;
+    }
+
+    void begin_point(std::uint64_t local_completed)
+    {
+        point_start_ = std::chrono::steady_clock::now();
+        point_base_completed_ = local_completed;
     }
 
     void update(std::uint64_t local_completed,
                 double p,
-                int t,
                 std::size_t point_index,
                 std::size_t point_count,
                 bool force = false)
@@ -479,8 +513,17 @@ class ProgressReporter
         printed_ = true;
         const double elapsed =
             std::chrono::duration<double>(now - start_).count();
-        double rate = elapsed > 0.0
+        double average_rate = elapsed > 0.0
             ? static_cast<double>(local_completed) / elapsed
+            : 0.0;
+        const double point_elapsed =
+            std::chrono::duration<double>(now - point_start_).count();
+        const std::uint64_t point_completed =
+            local_completed >= point_base_completed_
+            ? local_completed - point_base_completed_
+            : 0;
+        const double current_rate = point_elapsed > 0.0
+            ? static_cast<double>(point_completed) / point_elapsed
             : 0.0;
         const std::uint64_t global_completed = std::min(
             global_total_, global_offset_ + local_completed);
@@ -499,11 +542,12 @@ class ProgressReporter
                 : 0;
             if (global_elapsed > 0.0 && completed_this_run > 0)
             {
-                rate = static_cast<double>(completed_this_run) / global_elapsed;
+                average_rate =
+                    static_cast<double>(completed_this_run) / global_elapsed;
             }
         }
-        const double eta = rate > 0.0
-            ? static_cast<double>(remaining) / rate
+        const double eta = average_rate > 0.0
+            ? static_cast<double>(remaining) / average_rate
             : std::numeric_limits<double>::quiet_NaN();
         const std::size_t shown_index = static_cast<std::size_t>(env::integer(
             "MIPT_PROBED_GLOBAL_P_INDEX", static_cast<long>(point_index),
@@ -511,15 +555,15 @@ class ProgressReporter
         const std::size_t shown_count = static_cast<std::size_t>(env::integer(
             "MIPT_PROBED_GLOBAL_P_COUNT", static_cast<long>(point_count),
             1, std::numeric_limits<long>::max()));
-        std::cout << "\rrealizations: done=" << global_completed
-                  << ", left=" << remaining
-                  << ", total=" << global_total_
-                  << " | p=" << std::fixed << std::setprecision(5) << p
+        std::cout << "\rrealizations: " << global_completed << '/'
+                  << global_total_
+                  << " | p=" << std::fixed << std::setprecision(3) << p
                   << " [" << shown_index << '/' << shown_count << ']'
-                  << " | t=" << t
-                  << " | rate=" << std::setprecision(3) << rate << " traj/s"
+                  << " | avg=" << std::setprecision(3) << average_rate
+                  << " traj/s"
+                  << " | current=" << current_rate << " traj/s"
                   << " | ETA=" << format_duration(eta)
-                  << "                    " << std::flush;
+                  << "     " << std::flush;
     }
 
     void finish() const
@@ -537,6 +581,8 @@ class ProgressReporter
     std::uint64_t global_start_ms_ = 0;
     std::chrono::steady_clock::time_point start_;
     std::chrono::steady_clock::time_point last_;
+    std::chrono::steady_clock::time_point point_start_;
+    std::uint64_t point_base_completed_ = 0;
     bool enabled_ = true;
     bool printed_ = false;
     std::chrono::milliseconds interval_{500};
@@ -548,7 +594,9 @@ std::string default_output_name(int probes,
                                 CircuitType type,
                                 int mode,
                                 const std::vector<double> &p_values,
-                                const std::vector<int> &times)
+                                const std::vector<int> &times,
+                                int delta_x,
+                                int delta_t)
 {
     std::string name = "probed_" + std::to_string(probes) + "_" +
         std::string(circuit_type_tag(type)) + "_n_" + std::to_string(n) +
@@ -566,11 +614,21 @@ std::string default_output_name(int probes,
     }
     if (!times.empty())
     {
-        name += "_t_" + std::to_string(times.front()) + "_" +
-            std::to_string(times.back());
-        if (mode == 2)
+        if (mode == 3)
         {
-            name += "_res_" + std::to_string(times.size());
+            name += "_dx_" + std::to_string(delta_x) +
+                "_dt_" + std::to_string(delta_t) +
+                "_tau_" + std::to_string(times.front()) + "_" +
+                std::to_string(times.back());
+        }
+        else
+        {
+            name += "_t_" + std::to_string(times.front()) + "_" +
+                std::to_string(times.back());
+            if (mode == 2)
+            {
+                name += "_res_" + std::to_string(times.size());
+            }
         }
     }
     return name + ".csv";
@@ -597,7 +655,15 @@ void print_help(const char *program)
         << "     t0=2N, are attached locally, and are sampled at t=4N.\n"
         << "  2  Entropy grid: [t_min] [t_max] [t_res] [p_min] [p_max] [p_res]\n"
         << "     References are attached at t=0 and the joint entropy S_Q=S(rho_R) is\n"
-        << "     recorded on the inclusive integer-time and p linspaces.\n\n"
+        << "     recorded on the inclusive integer-time and p linspaces.\n"
+        << "  3  Anisotropy correlation: [p] [delta_x] [delta_t]\n"
+        << "     Requires probes=2. The first reference is attached to site 1 at\n"
+        << "     tau1=4N; the second is attached to site 1+delta_x (periodic,\n"
+        << "     one-indexed) at tau2=tau1+\n"
+        << "     delta_t. Use (delta_x,delta_t)=(N/2,0) for the spatial branch or\n"
+        << "     (0,delta_t>0) for the temporal branch. Mutual information is recorded\n"
+        << "     for elapsed readout time tau=0,...,8N after the second insertion, so\n"
+        << "     the absolute circuit depth is 12N+delta_t.\n\n"
         << "All entropies use natural logarithms. Four-probe I2/I3 are averages over\n"
         << "the six pairs/four triplets; I4 is inclusion--exclusion information.\n"
         << "Output paths are generated from all CLI arguments; output.csv is not accepted.\n\n"
@@ -617,7 +683,9 @@ void write_csv(const std::string &path,
                int mode,
                int n,
                int realizations,
-               const std::vector<OutputRow> &rows)
+               const std::vector<OutputRow> &rows,
+               int delta_x,
+               int delta_t)
 {
     std::ofstream csv(path, std::ios::out | std::ios::trunc);
     if (!csv)
@@ -626,7 +694,26 @@ void write_csv(const std::string &path,
     }
     csv << std::setprecision(17);
 
-    if (mode == 0 && probes == 1)
+    if (mode == 3)
+    {
+        const int tau1 = 4 * n;
+        const int tau2 = tau1 + delta_t;
+        csv << "N,p,delta_x,delta_t,tau1,tau2,tau,tau_over_L,t_absolute,"
+               "I_mean,I_stderr,negativity_mean,negativity_stderr,"
+               "log_negativity_mean,log_negativity_stderr\n";
+        for (const auto &row : rows)
+        {
+            csv << n << ',' << row.p << ',' << delta_x << ',' << delta_t << ','
+                << tau1 << ',' << tau2 << ',' << row.t << ','
+                << static_cast<double>(row.t) / n << ',' << tau2 + row.t << ','
+                << row.stats.i2.mean << ',' << row.stats.i2.stderr() << ','
+                << row.stats.negativity.mean << ','
+                << row.stats.negativity.stderr() << ','
+                << row.stats.log_negativity.mean << ','
+                << row.stats.log_negativity.stderr() << '\n';
+        }
+    }
+    else if (mode == 0 && probes == 1)
     {
         csv << "t,S_mean,S_stderr\n";
         for (const auto &row : rows)
@@ -887,9 +974,9 @@ int run_cli(int argc, char *argv[])
     {
         throw std::invalid_argument("N+probes must be below 63.");
     }
-    if (mode < 0 || mode > 2)
+    if (mode < 0 || mode > 3)
     {
-        throw std::invalid_argument("probe_mode must be 0, 1, or 2.");
+        throw std::invalid_argument("probe_mode must be 0, 1, 2, or 3.");
     }
     if (env::boolean("MIPT_NATIVE_MPS", false) ||
         env::boolean("MIPT_NATIVE_TEBD", false))
@@ -900,6 +987,8 @@ int run_cli(int argc, char *argv[])
 
     std::vector<double> p_values;
     std::vector<int> times;
+    int delta_x = -1;
+    int delta_t = -1;
     int t0 = probes == 1 ? 0 : 2 * n;
     if (mode == 0)
     {
@@ -946,7 +1035,7 @@ int run_cli(int argc, char *argv[])
         times = {4 * n};
         t0 = 2 * n;
     }
-    else
+    else if (mode == 2)
     {
         if (argc != 12)
         {
@@ -968,14 +1057,53 @@ int run_cli(int argc, char *argv[])
         p_values = linspace(p_min, p_max, p_res);
         t0 = 0;
     }
+    else
+    {
+        if (probes != 2)
+        {
+            throw std::invalid_argument("Mode 3 requires probes=2.");
+        }
+        if (argc != 9)
+        {
+            throw std::invalid_argument(
+                "Mode 3 requires [p] [delta_x] [delta_t].");
+        }
+        const double p = std::stod(argv[6]);
+        delta_x = std::stoi(argv[7]);
+        delta_t = std::stoi(argv[8]);
+        if (p < 0.0 || p > 1.0 || delta_x < 0 || delta_x > n / 2 ||
+            delta_t < 0)
+        {
+            throw std::invalid_argument(
+                "Mode 3 requires p in [0,1], 0 <= delta_x <= N/2, and delta_t >= 0.");
+        }
+        const bool spatial_branch = delta_t == 0;
+        if (spatial_branch && (n % 2 != 0 || delta_x != n / 2))
+        {
+            throw std::invalid_argument(
+                "The mode-3 spatial branch requires even N, delta_x=N/2, delta_t=0.");
+        }
+        if (!spatial_branch && delta_x != 0)
+        {
+            throw std::invalid_argument(
+                "The mode-3 temporal branch requires delta_x=0 and delta_t>0.");
+        }
+        p_values = {p};
+        times.reserve(static_cast<std::size_t>(8 * n + 1));
+        for (int tau = 0; tau <= 8 * n; ++tau)
+        {
+            times.push_back(tau);
+        }
+        t0 = 4 * n + delta_t;
+    }
 
     const bool parity_encoding =
         mode == 1 && probes == 1 && preserves_computational_parity(type) &&
         env::boolean("MIPT_PROBED_PARITY_ENCODING", true);
-    const auto sites = probe_sites(probes, n, mode);
-    const int t_max = times.back();
+    const auto sites = probe_sites(probes, n, mode, delta_x);
+    const int t_max = mode == 3 ? 12 * n + delta_t : times.back();
     const std::string generated_output = default_output_name(
-        probes, n, realizations, type, mode, p_values, times);
+        probes, n, realizations, type, mode, p_values, times, delta_x, delta_t);
     const std::string output = env::text(
         "MIPT_PROBED_INTERNAL_OUTPUT", generated_output.c_str());
     const bool prefetch = env::boolean("MIPT_PROBED_PREFETCH", true) &&
@@ -1000,6 +1128,17 @@ int run_cli(int argc, char *argv[])
                   << ", total_realizations=" << total_trajectories
                   << ", p_points=" << p_values.size()
                   << ", t_points=" << times.size()
+                  << (mode == 3
+                          ? ", t_absolute=0.." + std::to_string(t_max)
+                          : times.size() == 1
+                              ? ", t=" + std::to_string(times.front())
+                              : ", t=" + std::to_string(times.front()) + ".." +
+                                    std::to_string(times.back()))
+                  << (mode == 3
+                          ? ", delta_x=" + std::to_string(delta_x) +
+                                ", delta_t=" + std::to_string(delta_t) +
+                                ", readout_tau_max=8N"
+                          : "")
                   << ", circ_type=" << static_cast<int>(type)
                   << " (" << circuit_type_name(type) << ')'
                   << ", fermionic_trace="
@@ -1022,6 +1161,7 @@ int run_cli(int argc, char *argv[])
     rows.reserve(p_values.size() * times.size());
     for (std::size_t p_index = 0; p_index < p_values.size(); ++p_index)
     {
+        progress.begin_point(completed);
         const double p = p_values[p_index];
         std::vector<Aggregate> aggregates(times.size());
         std::array<probed::CircuitWorkspace1D, 2> workspaces;
@@ -1079,45 +1219,74 @@ int run_cli(int argc, char *argv[])
             int current_t = parity_encoding ? t_max : 0;
             std::size_t first_sample = 0;
 
-            if ((mode == 0 || mode == 1) && probes > 1)
+            if (mode == 3)
+            {
+                state = workspace.advance(state, 0, 4 * n);
+                current_t = 4 * n;
+                state = attach_reference(state, n, sites[0], 0);
+                if (delta_t > 0)
+                {
+                    state = workspace.advance(state, current_t, delta_t);
+                    current_t += delta_t;
+                }
+                state = attach_reference(state, n, sites[1], 1);
+
+                for (std::size_t sample_index = 0;
+                     sample_index < times.size();
+                     ++sample_index)
+                {
+                    const int target_t = t0 + times[sample_index];
+                    if (target_t > current_t)
+                    {
+                        state = workspace.advance(
+                            state, current_t, target_t - current_t);
+                        current_t = target_t;
+                    }
+                    aggregates[sample_index].add(
+                        measure_sample(state, probes, n, type));
+                }
+            }
+            else if ((mode == 0 || mode == 1) && probes > 1)
             {
                 state = workspace.advance(state, 0, 2 * n);
                 current_t = 2 * n;
                 state = attach_references(state, n, sites);
             }
 
-            for (std::size_t sample_index = first_sample;
-                 sample_index < times.size();
-                 ++sample_index)
+            if (mode != 3)
             {
-                const int target_t = times[sample_index];
-                if (target_t > current_t)
+                for (std::size_t sample_index = first_sample;
+                     sample_index < times.size();
+                     ++sample_index)
                 {
-                    state = workspace.advance(
-                        state, current_t, target_t - current_t);
-                    current_t = target_t;
-                }
-                if (parity_encoding)
-                {
-                    aggregates[sample_index].add(
-                        measure_parity_encoded_probe(state, n));
-                }
-                else if (mode == 2 || mode == 1 || probes != 1 || target_t > 0)
-                {
-                    aggregates[sample_index].add(
-                        measure_sample(state, probes, n, type));
-                }
-                else
-                {
-                    aggregates[sample_index].add(
-                        {std::log(2.0), 0.0, 0.0, 0.0, 0.0, 0.0});
+                    const int target_t = times[sample_index];
+                    if (target_t > current_t)
+                    {
+                        state = workspace.advance(
+                            state, current_t, target_t - current_t);
+                        current_t = target_t;
+                    }
+                    if (parity_encoding)
+                    {
+                        aggregates[sample_index].add(
+                            measure_parity_encoded_probe(state, n));
+                    }
+                    else if (mode == 2 || mode == 1 || probes != 1 || target_t > 0)
+                    {
+                        aggregates[sample_index].add(
+                            measure_sample(state, probes, n, type));
+                    }
+                    else
+                    {
+                        aggregates[sample_index].add(
+                            {std::log(2.0), 0.0, 0.0, 0.0, 0.0, 0.0});
+                    }
                 }
             }
             ++completed;
             progress.update(
                 completed,
                 p,
-                times.back(),
                 p_index + 1,
                 p_values.size(),
                 completed == total_trajectories);
@@ -1129,7 +1298,7 @@ int run_cli(int argc, char *argv[])
         }
     }
     progress.finish();
-    write_csv(output, probes, mode, n, realizations, rows);
+    write_csv(output, probes, mode, n, realizations, rows, delta_x, delta_t);
 
     const double elapsed = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - start).count();
