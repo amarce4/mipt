@@ -69,6 +69,15 @@ def _show(fig, show: bool) -> None:
         plt.show()
 
 
+def _mi_unit_spec(mi_units: str) -> tuple[str, float]:
+    """Return the canonical MI unit and the nats-to-unit scale factor."""
+    key = str(mi_units).strip().lower()
+    key = {"nat": "nats", "bit": "bits"}.get(key, key)
+    if key not in {"nats", "bits"}:
+        raise ValueError("mi_units must be 'nats' or 'bits'.")
+    return key, 1.0 if key == "nats" else 1.0 / np.log(2.0)
+
+
 def _as_paths(files: Sequence[str | Path] | str | Path | None) -> list[Path]:
     if files is None:
         return []
@@ -759,6 +768,7 @@ def dist_scaling(
     min_relative_error: float = 0.03,
     chunksize: int = 1_000_000,
     distance_round: int = 12,
+    mi_units: str = "nats",
     show_errorbars: bool = True,
     capsize: float = 2.0,
     cmap: str = "viridis",
@@ -788,6 +798,8 @@ def dist_scaling(
     is supplied, the largest ``fit_last_*`` positive-distance points are used.
     The dashed line is drawn only for ``fit_size_*`` (largest size by default),
     while fit results for every supplied size are returned in ``fits``.
+    ``mi_units`` converts the MI panel and fitted prefactor between ``"nats"``
+    and ``"bits"``; it does not change the fitted exponent.
     """
     if min_relative_error <= 0.0:
         raise ValueError("min_relative_error must be positive.")
@@ -795,6 +807,7 @@ def dist_scaling(
         raise ValueError("chunksize must be positive.")
     if distance_round < 0:
         raise ValueError("distance_round must be non-negative.")
+    mi_units, mi_scale = _mi_unit_spec(mi_units)
 
     paths = _resolve_files(files, file_glob)
     if sizes is None:
@@ -819,6 +832,7 @@ def dist_scaling(
             chunksize=chunksize,
             distance_round=distance_round,
         )
+        data[size]["mi"].loc[:, ["mean", "stderr"]] *= mi_scale
         if data[size]["mi"].empty and data[size]["mn"].empty:
             raise ValueError(f"No valid distance-scaling rows were found in {path}.")
 
@@ -954,7 +968,7 @@ def dist_scaling(
         )
 
     ax_mi.set_xlabel(r"Effective chord distance $d$")
-    ax_mi.set_ylabel(r"Two-party mutual information $I_2$")
+    ax_mi.set_ylabel(rf"Two-party mutual information $I_2$ [{mi_units}]")
     ax_mi.set_title("Two-party mutual information")
     ax_mn.set_xlabel(r"Effective chord distance $d$")
     ax_mn.set_ylabel(r"Bipartite negativity $\mathcal{N}_2$")
@@ -1009,6 +1023,7 @@ def dist_scaling(
         "fits": fits,
         "fit_size_mi": fit_size_mi,
         "fit_size_mn": fit_size_mn,
+        "mi_units": mi_units,
         "selected_fit_points": selected_points,
     }
 
@@ -1312,13 +1327,17 @@ def tmi_collapse(
     min_common_p: int = 4,
     interpolate: bool = True,
     chunksize: int = 1_000_000,
+    mi_units: str = "nats",
     error_floor: float = 1e-12,
     curvature_step: float = 1e-3,
     colors: Sequence[Any] | None = None,
     figsize: tuple[float, float] = (10, 8),
     show: bool = True,
 ) -> dict[str, Any]:
-    """Fit p_c and nu for the TMI crossing using pyfssa."""
+    """Fit p_c and nu for the TMI crossing using pyfssa.
+
+    ``mi_units`` selects ``"nats"`` or ``"bits"`` for TMI values and errors.
+    """
     try:
         import fssa
     except ImportError as exc:
@@ -1329,6 +1348,7 @@ def tmi_collapse(
     # Older pyfssa releases still reference np.int.
     if not hasattr(np, "int"):
         np.int = int  # type: ignore[attr-defined]
+    mi_units, mi_scale = _mi_unit_spec(mi_units)
 
     paths = _as_paths(files)
     sizes = list(sizes)
@@ -1350,8 +1370,8 @@ def tmi_collapse(
         if ps.size == 0:
             raise RuntimeError(f"No usable TMI data were loaded from {path}.")
         ps_arr.append(ps)
-        mean_arr.append(mean)
-        stderr_arr.append(stderr)
+        mean_arr.append(mean * mi_scale)
+        stderr_arr.append(stderr * mi_scale)
 
     rho, a, da, alignment = _align_tmi_grids(
         ps_arr,
@@ -1492,16 +1512,16 @@ def tmi_collapse(
 
     ax_raw.axvline(pc, color="black", linestyle="--", linewidth=1, alpha=0.7)
     ax_raw.set_xlabel(r"Measurement rate $p$")
-    ax_raw.set_ylabel(r"TMI $\overline{I}_3$")
+    ax_raw.set_ylabel(rf"TMI $\overline{{I}}_3$ [{mi_units}]")
     ax_raw.set_title("Raw TMI crossing")
     ax_raw.legend()
 
     ax_collapse.axvline(0.0, color="black", linestyle="--", linewidth=1, alpha=0.7)
     ax_collapse.set_xlabel(r"Scaled variable $(p-p_c)L^{1/\nu}$")
     ax_collapse.set_ylabel(
-        r"Scaled TMI $L^{-\zeta/\nu}\overline{I}_3$"
+        rf"Scaled TMI $L^{{-\zeta/\nu}}\overline{{I}}_3$ [{mi_units}]"
         if fit_zeta
-        else r"TMI $\overline{I}_3$"
+        else rf"TMI $\overline{{I}}_3$ [{mi_units}]"
     )
     ax_collapse.set_title("Finite-size scaling collapse")
     ax_collapse.legend()
@@ -1541,6 +1561,7 @@ def tmi_collapse(
         "quality_interpretation": _collapse_quality_text(quality),
         "success": success,
         "alignment": alignment,
+        "mi_units": mi_units,
         "p_grid": rho,
         "scaled": scaled,
         "raw_fit": raw_fit,
@@ -2081,6 +2102,7 @@ def probe2_collapse(
     file_glob: str | Path | None = None,
     l_by_file: Mapping[str, int] | None = None,
     metric: str = "mi",
+    mi_units: str = "nats",
     x_load: tuple[float | None, float | None] = (None, None),
     fit_x: tuple[float, float | None] = (0.25, 8.0),
     fit_i_min: float = 1e-8,
@@ -2107,9 +2129,11 @@ def probe2_collapse(
     ``"log_negativity"``. The same one-parameter bulk-exponent ansatz and
     collapse objective are used for all three observables. ``fit_i_min`` is
     retained for notebook compatibility and acts as the minimum selected
-    observable value, regardless of metric.
+    observable value, regardless of metric. ``mi_units`` applies only when
+    ``metric="mi"``.
     """
     metric_spec = _probe2_metric_spec(metric)
+    mi_units, mi_scale = _mi_unit_spec(mi_units)
     paths = _resolve_files(files, file_glob)
     curves = [
         _load_probe2_curve(
@@ -2120,6 +2144,12 @@ def probe2_collapse(
         )
         for path in paths
     ]
+    if metric_spec["key"] == "mi":
+        metric_spec = dict(metric_spec)
+        metric_spec["bootstrap_upper"] *= mi_scale
+        for curve in curves:
+            curve["value"] *= mi_scale
+            curve["dvalue"] *= mi_scale
     curves.sort(key=lambda curve: curve["L"])
     sizes = [curve["L"] for curve in curves]
     if len(set(sizes)) != len(sizes):
@@ -2328,14 +2358,22 @@ def probe2_collapse(
     )
     ax_raw.axvspan(fit_x_min, fit_upper, alpha=0.08, label="fit window")
     ax_raw.set_xlabel(r"Scaled time $x=(t-2L)/L$")
-    ax_raw.set_ylabel(metric_spec["raw_ylabel"])
+    ax_raw.set_ylabel(
+        rf"Mutual information $I(A:B)$ [{mi_units}]"
+        if metric_spec["key"] == "mi"
+        else metric_spec["raw_ylabel"]
+    )
     ax_raw.set_title(metric_spec["raw_title"])
     ax_raw.set_yscale(raw_yscale)
     ax_raw.grid(alpha=0.25)
     ax_raw.legend()
 
     ax_collapse.set_xlabel(r"Scaled time $x=(t-2L)/L$")
-    ax_collapse.set_ylabel(metric_spec["collapse_ylabel"])
+    ax_collapse.set_ylabel(
+        metric_spec["collapse_ylabel"] + f" [{mi_units}]"
+        if metric_spec["key"] == "mi"
+        else metric_spec["collapse_ylabel"]
+    )
     ax_collapse.set_title("Bulk-exponent scaling collapse")
     ax_collapse.set_yscale(collapse_yscale)
     ax_collapse.grid(alpha=0.25)
@@ -2365,6 +2403,7 @@ def probe2_collapse(
         "figure": fig,
         "axes": (ax_raw, ax_collapse),
         "metric": metric_spec["key"],
+        "mi_units": mi_units,
         "eta": eta,
         "eta_stderr": eta_stderr,
         "eta_p16": eta_p16,
@@ -2541,6 +2580,7 @@ def probe_anisotropy(
     *,
     file_glob: str | Path | None = None,
     l_by_file: Mapping[str, int] | None = None,
+    mi_units: str = "nats",
     estimate_window: tuple[float, float] = (7.0, 8.0),
     estimate_method: str = "mean",
     full_xlim: tuple[float, float] = (0.0, 8.0),
@@ -2573,10 +2613,15 @@ def probe_anisotropy(
     ``estimate_method="mean"`` averages the selected late-time window while
     conservatively retaining a typical per-time standard error because points
     from the same trajectories are correlated. Use ``"last"`` to reproduce a
-    final-readout-only estimate.
+    final-readout-only estimate. ``mi_units`` changes the displayed MI units
+    but leaves the crossing and anisotropy unchanged.
     """
+    mi_units, mi_scale = _mi_unit_spec(mi_units)
     paths = _resolve_files(files, file_glob)
     curves = [_load_probe_anisotropy_curve(path, l_by_file) for path in paths]
+    for curve in curves:
+        curve["I"] *= mi_scale
+        curve["dI"] *= mi_scale
     sizes = {curve["L"] for curve in curves}
     if len(sizes) != 1:
         raise ValueError(f"Anisotropy files must have one system size; found {sizes}.")
@@ -2704,6 +2749,7 @@ def probe_anisotropy(
                 "delta_t_over_L": item["curve"]["delta_t"] / float(size),
                 "I_late": item["value"],
                 "I_late_stderr": item["error"],
+                "mi_units": mi_units,
                 "late_points": item["points"],
                 "file": str(item["curve"]["path"]),
             }
@@ -2739,7 +2785,10 @@ def probe_anisotropy(
         if curve["branch"] == "spatial":
             label = r"$(\delta x,\delta t)=(L/2,0)$"
         else:
-            label = rf"$(\delta x,\delta t)=(0,{curve['delta_t']/size:g}L)$"
+            label = (
+                rf"$(\delta x,\delta t)="
+                rf"(0,{curve['delta_t']}L/{size})$"
+            )
         every = max(1, int(np.ceil(len(curve["x"]) / max(1, errorbar_points))))
         for axis in (ax_full, ax_zoom):
             if show_errorbars:
@@ -2766,7 +2815,7 @@ def probe_anisotropy(
     ):
         axis.set_xlim(*limits)
         axis.set_xlabel(r"Readout time $\tau/L$")
-        axis.set_ylabel(r"Mutual information $I_{12}$ [nats]")
+        axis.set_ylabel(rf"Mutual information $I_{{12}}$ [{mi_units}]")
         axis.set_title(title)
         axis.grid(alpha=0.22)
     if full_ylim is not None:
@@ -2808,6 +2857,7 @@ def probe_anisotropy(
         "axes": (ax_full, ax_zoom),
         "L": size,
         "p": float(probabilities[0]),
+        "mi_units": mi_units,
         "summary": summary,
         "curves": ordered_curves,
         "spatial_estimate": spatial_estimate,
@@ -3058,6 +3108,7 @@ def probe_pc_collapse(
     fixed_nu: float | None = None,
     fixed_x: float | Mapping[str, float] | None = None,
     sq_units: str = "bits",
+    mi_units: str = "nats",
     interpolation_points: int = 250,
     relative_error_floor: float = 0.02,
     absolute_error_floor: float = 1e-10,
@@ -3076,11 +3127,13 @@ def probe_pc_collapse(
     crossing/collapse protocol of Gullans and Huse. Two-probe inputs plot
     ``I2``; four-probe inputs produce stacked ``I2``, ``I3``, and ``I4`` raw
     and collapse pairs. Supply ``fixed_pc`` and/or ``fixed_nu`` to stabilize
-    the noisier three-parameter multiprobe fits.
+    the noisier three-parameter multiprobe fits. ``mi_units`` controls all
+    multiprobe information metrics independently of ``sq_units``.
     """
     sq_units = str(sq_units).strip().lower()
     if sq_units not in {"bits", "nats"}:
         raise ValueError("sq_units must be 'bits' or 'nats'.")
+    mi_units, mi_scale = _mi_unit_spec(mi_units)
     paths = _resolve_files(files, file_glob)
     first_df = pd.read_csv(paths[0], nrows=2)
     probes = _infer_probe_count(paths[0], first_df)
@@ -3110,6 +3163,10 @@ def probe_pc_collapse(
             for curve in curves:
                 curve["value"] = curve["value"] / np.log(2.0)
                 curve["dvalue"] = curve["dvalue"] / np.log(2.0)
+        elif metric != "sq":
+            for curve in curves:
+                curve["value"] *= mi_scale
+                curve["dvalue"] *= mi_scale
         sizes = [curve["L"] for curve in curves]
         if len(set(sizes)) != len(sizes):
             raise ValueError(f"Duplicate system sizes found: {sizes}")
@@ -3203,7 +3260,11 @@ def probe_pc_collapse(
         ax_raw.set_ylabel(
             r"Reference entropy $\overline{S_Q}$ [bits]"
             if metric == "sq" and sq_units == "bits"
-            else spec["ylabel"]
+            else (
+                spec["ylabel"].replace("[nats]", f"[{mi_units}]")
+                if metric != "sq"
+                else spec["ylabel"]
+            )
         )
         ax_raw.set_title(spec["title"] + " — raw")
         ax_raw.grid(alpha=0.25)
@@ -3212,7 +3273,11 @@ def probe_pc_collapse(
         ax_scaled.axvline(0.0, color="black", linestyle="--", linewidth=1)
         ax_scaled.axhline(0.0, color="black", linewidth=0.7, alpha=0.3)
         ax_scaled.set_xlabel(r"$(p-p_c)L^{1/\nu}$")
-        ax_scaled.set_ylabel(spec["scaled_ylabel"])
+        ax_scaled.set_ylabel(
+            spec["scaled_ylabel"] + f" [{mi_units}]"
+            if metric != "sq"
+            else spec["scaled_ylabel"]
+        )
         ax_scaled.set_title("Finite-size scaling collapse")
         ax_scaled.grid(alpha=0.25)
         ax_scaled.legend()
@@ -3240,6 +3305,7 @@ def probe_pc_collapse(
         "probes": probes,
         "metrics": selected_metrics,
         "sq_units": sq_units,
+        "mi_units": mi_units,
         "fits": fits,
         "curves": curves_by_metric,
     }
@@ -3510,6 +3576,7 @@ def probe4_collapse(
     file_glob: str | Path | None = None,
     l_by_file: Mapping[str, int] | None = None,
     metric: str = "i2",
+    mi_units: str = "nats",
     x_load: tuple[float | None, float | None] = (None, None),
     fit_x: tuple[float, float | None] = (0.25, 8.0),
     fit_abs_min: float = 1e-8,
@@ -3537,9 +3604,11 @@ def probe4_collapse(
     four probe triplets, and ``I4`` is the four-party information. Because
     ``I3`` and ``I4`` may be signed, the fit cutoff is applied to the absolute
     value through ``fit_abs_min`` and bootstrap samples are not clipped.
+    ``mi_units`` selects ``"nats"`` or ``"bits"`` for every information metric.
     """
     if fit_abs_min < 0.0:
         raise ValueError("fit_abs_min must be non-negative.")
+    mi_units, mi_scale = _mi_unit_spec(mi_units)
     metric_spec = _probe4_metric_spec(metric)
     paths = _resolve_files(files, file_glob)
     curves = [
@@ -3551,6 +3620,9 @@ def probe4_collapse(
         )
         for path in paths
     ]
+    for curve in curves:
+        curve["value"] *= mi_scale
+        curve["dvalue"] *= mi_scale
     curves.sort(key=lambda curve: curve["L"])
     sizes = [curve["L"] for curve in curves]
     if len(set(sizes)) != len(sizes):
@@ -3763,7 +3835,9 @@ def probe4_collapse(
     )
     ax_raw.axvspan(fit_x_min, fit_upper, alpha=0.08, label="fit window")
     ax_raw.set_xlabel(r"Scaled time $x=(t-2L)/L$")
-    ax_raw.set_ylabel(metric_spec["raw_ylabel"])
+    ax_raw.set_ylabel(
+        metric_spec["raw_ylabel"].replace("[nats]", f"[{mi_units}]")
+    )
     ax_raw.set_title(metric_spec["raw_title"])
     ax_raw.set_yscale(raw_yscale)
     ax_raw.grid(alpha=0.25)
@@ -3771,7 +3845,9 @@ def probe4_collapse(
 
     ax_collapse.axhline(0.0, linewidth=1, alpha=0.35)
     ax_collapse.set_xlabel(r"Scaled time $x=(t-2L)/L$")
-    ax_collapse.set_ylabel(metric_spec["collapse_ylabel"])
+    ax_collapse.set_ylabel(
+        metric_spec["collapse_ylabel"] + f" [{mi_units}]"
+    )
     ax_collapse.set_title("Bulk-exponent scaling collapse")
     ax_collapse.set_yscale(collapse_yscale)
     ax_collapse.grid(alpha=0.25)
@@ -3801,6 +3877,7 @@ def probe4_collapse(
         "figure": fig,
         "axes": (ax_raw, ax_collapse),
         "metric": metric_spec["key"],
+        "mi_units": mi_units,
         "eta": eta,
         "eta_stderr": eta_stderr,
         "eta_p16": eta_p16,
