@@ -2566,6 +2566,10 @@ def probe_anisotropy(
 
     ``alpha = log(1+sqrt(2)) / (pi * (delta_t_star/L))``.
 
+    If the supplied temporal curves do not bracket the spatial value, the
+    curves are still plotted and all crossing-derived results are returned as
+    ``NaN``.
+
     ``estimate_method="mean"`` averages the selected late-time window while
     conservatively retaining a typical per-time standard error because points
     from the same trajectories are correlated. Use ``"last"`` to reproduce a
@@ -2624,59 +2628,69 @@ def probe_anisotropy(
             span = right["curve"]["delta_t"] - left["curve"]["delta_t"]
             proximity = abs(left_difference) + abs(right_difference)
             candidates.append((span, proximity, left, right))
+    alpha_constant = float(np.log1p(np.sqrt(2.0)) / np.pi)
+    lower = upper = None
+    delta_t_star_over_l = np.nan
+    delta_t_stderr = np.nan
+    alpha = np.nan
+    alpha_stderr = np.nan
+    alpha_interval = (np.nan, np.nan)
+    alpha_bracket = (np.nan, np.nan)
+    bootstrap_alpha = []
+    bootstrap_delta_t = []
     if not candidates:
         values = ", ".join(
             f"delta_t/L={item['curve']['delta_t']/size:g}: I={item['value']:.6g}"
             for item in temporal_estimates
         )
-        raise ValueError(
-            "Temporal late-time values do not bracket the spatial value "
+        warnings.warn(
+            "Temporal late-time values do not bracket the spatial value; "
+            "delta_t*/L and alpha are NaN. "
             f"I_space={spatial_estimate['value']:.6g}. Temporal values: {values}."
         )
-    _, _, lower, upper = min(candidates, key=lambda item: (item[0], item[1]))
-    x_lower = lower["curve"]["delta_t"] / float(size)
-    x_upper = upper["curve"]["delta_t"] / float(size)
-    denominator = upper["value"] - lower["value"]
-    if denominator == 0.0:
-        raise ValueError("The bracketing temporal estimates are equal.")
-    fraction = (spatial_estimate["value"] - lower["value"]) / denominator
-    delta_t_star_over_l = float(x_lower + fraction * (x_upper - x_lower))
-    if delta_t_star_over_l <= 0.0:
-        raise ValueError("The interpolated delta_t_star/L is not positive.")
-    alpha_constant = float(np.log1p(np.sqrt(2.0)) / np.pi)
-    alpha = alpha_constant / delta_t_star_over_l
-    alpha_bracket = tuple(
-        sorted((alpha_constant / x_upper, alpha_constant / x_lower))
-    )
-
-    rng = np.random.default_rng(bootstrap_seed)
-    bootstrap_alpha = []
-    bootstrap_delta_t = []
-    if bootstrap_samples >= 2:
-        for _ in range(bootstrap_samples):
-            sampled_space = rng.normal(
-                spatial_estimate["value"], spatial_estimate["error"]
-            )
-            sampled_lower = rng.normal(lower["value"], lower["error"])
-            sampled_upper = rng.normal(upper["value"], upper["error"])
-            sampled_denominator = sampled_upper - sampled_lower
-            if abs(sampled_denominator) < 1e-15:
-                continue
-            sampled_fraction = (sampled_space - sampled_lower) / sampled_denominator
-            sampled_x = x_lower + sampled_fraction * (x_upper - x_lower)
-            if x_lower <= sampled_x <= x_upper and sampled_x > 0.0:
-                bootstrap_delta_t.append(sampled_x)
-                bootstrap_alpha.append(alpha_constant / sampled_x)
-    if len(bootstrap_alpha) >= 2:
-        alpha_samples = np.asarray(bootstrap_alpha)
-        delta_t_samples = np.asarray(bootstrap_delta_t)
-        alpha_stderr = float(np.std(alpha_samples, ddof=1))
-        alpha_interval = tuple(map(float, np.percentile(alpha_samples, [16, 84])))
-        delta_t_stderr = float(np.std(delta_t_samples, ddof=1))
     else:
-        alpha_stderr = delta_t_stderr = np.nan
-        alpha_interval = (np.nan, np.nan)
+        _, _, lower, upper = min(candidates, key=lambda item: (item[0], item[1]))
+        x_lower = lower["curve"]["delta_t"] / float(size)
+        x_upper = upper["curve"]["delta_t"] / float(size)
+        denominator = upper["value"] - lower["value"]
+        if denominator == 0.0:
+            raise ValueError("The bracketing temporal estimates are equal.")
+        fraction = (spatial_estimate["value"] - lower["value"]) / denominator
+        delta_t_star_over_l = float(x_lower + fraction * (x_upper - x_lower))
+        if delta_t_star_over_l <= 0.0:
+            raise ValueError("The interpolated delta_t_star/L is not positive.")
+        alpha = alpha_constant / delta_t_star_over_l
+        alpha_bracket = tuple(
+            sorted((alpha_constant / x_upper, alpha_constant / x_lower))
+        )
+
+        rng = np.random.default_rng(bootstrap_seed)
         if bootstrap_samples >= 2:
+            for _ in range(bootstrap_samples):
+                sampled_space = rng.normal(
+                    spatial_estimate["value"], spatial_estimate["error"]
+                )
+                sampled_lower = rng.normal(lower["value"], lower["error"])
+                sampled_upper = rng.normal(upper["value"], upper["error"])
+                sampled_denominator = sampled_upper - sampled_lower
+                if abs(sampled_denominator) < 1e-15:
+                    continue
+                sampled_fraction = (
+                    sampled_space - sampled_lower
+                ) / sampled_denominator
+                sampled_x = x_lower + sampled_fraction * (x_upper - x_lower)
+                if x_lower <= sampled_x <= x_upper and sampled_x > 0.0:
+                    bootstrap_delta_t.append(sampled_x)
+                    bootstrap_alpha.append(alpha_constant / sampled_x)
+        if len(bootstrap_alpha) >= 2:
+            alpha_samples = np.asarray(bootstrap_alpha)
+            delta_t_samples = np.asarray(bootstrap_delta_t)
+            alpha_stderr = float(np.std(alpha_samples, ddof=1))
+            alpha_interval = tuple(
+                map(float, np.percentile(alpha_samples, [16, 84]))
+            )
+            delta_t_stderr = float(np.std(delta_t_samples, ddof=1))
+        elif bootstrap_samples >= 2:
             warnings.warn(
                 "Too few bootstrap crossings remained inside the interpolation bracket."
             )

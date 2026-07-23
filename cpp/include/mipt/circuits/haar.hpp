@@ -299,12 +299,13 @@ __qpu__ inline void apply_haar_layers(cudaq::qvector<> &q,
                                 q[gate.q1], q[gate.q0]);
                 x(q[gate.q1]);
 
-                // Cosine-sine core: Ry(theta0) for control=0 and
-                // Ry(theta1) for control=1.
-                ry<cudaq::ctrl>(gate.theta1, q[gate.q1], q[gate.q0]);
-                x(q[gate.q1]);
-                ry<cudaq::ctrl>(gate.theta0, q[gate.q1], q[gate.q0]);
-                x(q[gate.q1]);
+                // The CSD block index is q1, so the core mixes q1 while q0
+                // selects the corresponding diagonal entry of C and S:
+                // Ry(theta0) for q0=0 and Ry(theta1) for q0=1.
+                ry<cudaq::ctrl>(gate.theta1, q[gate.q0], q[gate.q1]);
+                x(q[gate.q0]);
+                ry<cudaq::ctrl>(gate.theta0, q[gate.q0], q[gate.q1]);
+                x(q[gate.q0]);
 
                 // Left block-diagonal factor A0 (+) A1.
                 r1(gate.a1.global_phase, q[gate.q1]);
