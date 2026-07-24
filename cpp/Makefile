@@ -109,6 +109,7 @@ HOST_BUILD := build/host_omp$(OPENMP)
 
 MIPT_BIN := $(BUILD)/mipt.exe
 MIPT_PROBED_BIN := $(BUILD)/mipt_probed.exe
+FREE_ENERGY_BIN := $(BUILD)/free_energy.exe
 SIM_TMI_BIN := $(BUILD)/sim_tmi.exe
 DIST_SCALING_BIN := $(BUILD)/dist_scaling.exe
 ENTROPY_BIN := $(BUILD)/entropy.exe
@@ -121,6 +122,7 @@ DIST_TEST_BIN := $(HOST_BUILD)/dist_metrics_tests
 
 MIPT_OBJS := $(BUILD)/mipt.o
 MIPT_PROBED_OBJS := $(BUILD)/mipt_probed.o
+FREE_ENERGY_OBJS := $(BUILD)/free_energy.o
 SIM_TMI_OBJS := $(BUILD)/sim_tmi.o
 DIST_SCALING_OBJS := $(BUILD)/dist_scaling.o
 ENTROPY_OBJS := $(BUILD)/entropy.o
@@ -134,22 +136,23 @@ DIST_TEST_OBJS := $(HOST_BUILD)/dist_metrics_tests.o
 ifeq ($(CUDA_RHO),1)
   MIPT_OBJS += $(BUILD)/rho_reduce.o
   MIPT_PROBED_OBJS += $(BUILD)/ancilla_rdm.o
+  FREE_ENERGY_OBJS += $(BUILD)/free_energy_measure.o $(BUILD)/tmi_cuda_svd.o
   SIM_TMI_OBJS += $(BUILD)/rho_reduce.o $(BUILD)/tmi_cuda_svd.o $(BUILD)/tmi_cuda_rdm.o
   DIST_SCALING_OBJS += $(BUILD)/rho2_reduce.o
   ENTROPY_OBJS += $(BUILD)/rho_reduce.o $(BUILD)/entropy_cuda.o
 endif
 
-ALL_OBJS := $(MIPT_OBJS) $(MIPT_PROBED_OBJS) \
+ALL_OBJS := $(MIPT_OBJS) $(MIPT_PROBED_OBJS) $(FREE_ENERGY_OBJS) \
   $(SIM_TMI_OBJS) $(DIST_SCALING_OBJS) $(ENTROPY_OBJS) $(GMN_OBJS) $(FGMN_OBJS) \
   $(RING_OBJS) $(EXP_VALS_OBJS) $(CORE_TEST_OBJS) $(DIST_TEST_OBJS)
 DEPS := $(ALL_OBJS:.o=.d)
 
 .PHONY: all simulation analysis clean cpu gpu print-config format test-core test-dist \
-  mipt.exe mipt_probed.exe sim_tmi.exe dist_scaling.exe \
+  mipt.exe mipt_probed.exe free_energy.exe sim_tmi.exe dist_scaling.exe \
   entropy.exe gmn.exe fgmn.exe ring_inflation.exe exp_vals.exe
 
 all: simulation analysis
-simulation: mipt.exe mipt_probed.exe sim_tmi.exe dist_scaling.exe entropy.exe
+simulation: mipt.exe mipt_probed.exe free_energy.exe sim_tmi.exe dist_scaling.exe entropy.exe
 analysis: gmn.exe fgmn.exe ring_inflation.exe exp_vals.exe
 cpu:
 	$(MAKE) all GPU=0 CUDA_RHO=0
@@ -159,6 +162,8 @@ gpu:
 mipt.exe: $(MIPT_BIN)
 	cp $< $@
 mipt_probed.exe: $(MIPT_PROBED_BIN)
+	cp $< $@
+free_energy.exe: $(FREE_ENERGY_BIN)
 	cp $< $@
 sim_tmi.exe: $(SIM_TMI_BIN)
 	cp $< $@
@@ -179,6 +184,8 @@ $(MIPT_BIN): $(MIPT_OBJS)
 	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $^ $(MIPT_CUDA_LIBS) $(DL_LIBS) -o $@
 $(MIPT_PROBED_BIN): $(MIPT_PROBED_OBJS)
 	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $^ $(MIPT_CUDA_LIBS) $(DL_LIBS) -o $@
+$(FREE_ENERGY_BIN): $(FREE_ENERGY_OBJS)
+	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $^ $(MIPT_CUDA_LIBS) $(SIM_TMI_CUDA_LIBS) $(DL_LIBS) -o $@
 $(SIM_TMI_BIN): $(SIM_TMI_OBJS)
 	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $^ $(MIPT_CUDA_LIBS) $(SIM_TMI_CUDA_LIBS) $(DL_LIBS) -o $@
 $(DIST_SCALING_BIN): $(DIST_SCALING_OBJS)
@@ -211,6 +218,8 @@ $(BUILD)/mipt.o: apps/mipt.cpp | $(BUILD)
 	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $(NVQXXFLAGS_COMMON) -c $< -o $@
 $(BUILD)/mipt_probed.o: apps/mipt_probed.cpp | $(BUILD)
 	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $(NVQXXFLAGS_COMMON) -c $< -o $@
+$(BUILD)/free_energy.o: apps/free_energy.cpp | $(BUILD)
+	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $(NVQXXFLAGS_COMMON) -c $< -o $@
 $(BUILD)/sim_tmi.o: apps/sim_tmi.cpp | $(BUILD)
 	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $(NVQXXFLAGS_COMMON) -c $< -o $@
 $(BUILD)/dist_scaling.o: apps/dist_scaling.cpp | $(BUILD)
@@ -223,6 +232,8 @@ $(BUILD)/rho_reduce.o: src/cuda/rho_reduce.cu | $(BUILD)
 $(BUILD)/rho2_reduce.o: src/cuda/rho2_reduce.cu | $(BUILD)
 	$(CUDA_CU_COMPILER) $(CUDA_CU_FLAGS) -c $< -o $@
 $(BUILD)/ancilla_rdm.o: src/cuda/ancilla_rdm.cu | $(BUILD)
+	$(CUDA_CU_COMPILER) $(CUDA_CU_FLAGS) -c $< -o $@
+$(BUILD)/free_energy_measure.o: src/cuda/free_energy_measure.cu | $(BUILD)
 	$(CUDA_CU_COMPILER) $(CUDA_CU_FLAGS) -c $< -o $@
 $(BUILD)/tmi_cuda_svd.o: src/cuda/tmi_cuda_svd.cu | $(BUILD)
 	$(CUDA_CU_COMPILER) $(CUDA_CU_FLAGS) -c $< -o $@

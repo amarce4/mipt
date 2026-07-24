@@ -107,6 +107,11 @@ struct RfgsParityProbeKernel
 class CircuitWorkspace1D
 {
   public:
+    void seed(std::uint32_t value)
+    {
+        rng_.seed(value);
+    }
+
     void reserve(int timesteps)
     {
         if (timesteps < 0)
@@ -363,7 +368,133 @@ class CircuitWorkspace1D
         throw std::invalid_argument("Unsupported probed circuit type.");
     }
 
+    // Advance one prepared brickwork timestep without executing its embedded
+    // measurements.  The measurement flags remain available through
+    // measurement_sites(), allowing callers that need Born probabilities to
+    // apply the projectors sequentially themselves.
+    cudaq::state advance_unitary(cudaq::state &state,
+                                 int timestep,
+                                 std::string_view context = {})
+    {
+        validate_segment(timestep, 1);
+        log_start(context, circuit_type_name(prepared_type_), prepared_n_, 1);
+        const auto start = std::chrono::steady_clock::now();
+
+        switch (prepared_type_)
+        {
+        case CircuitType::MMS:
+            return finish_logged(
+                run_unitary_layer(
+                    mms_layers_, mms_segment_, timestep,
+                    [&](const std::vector<MmsLayer> &layers)
+                    {
+                        return cudaq::get_state(
+                            MmsAdvanceKernel{}, &state, prepared_n_, layers, true);
+                    }),
+                context, circuit_type_name(prepared_type_), start);
+
+        case CircuitType::Haar:
+            return finish_logged(
+                run_unitary_layer(
+                    haar_layers_, haar_segment_, timestep,
+                    [&](const std::vector<HaarLayer> &layers)
+                    {
+                        return cudaq::get_state(
+                            HaarAdvanceKernel{}, &state, prepared_n_, layers);
+                    }),
+                context, circuit_type_name(prepared_type_), start);
+
+        case CircuitType::FermionRPPU:
+        case CircuitType::QubitRPPU:
+            return finish_logged(
+                run_unitary_layer(
+                    rppu_layers_, rppu_segment_, timestep,
+                    [&](const std::vector<RppuLayer> &layers)
+                    {
+                        return cudaq::get_state(
+                            RppuAdvanceKernel{}, &state, prepared_n_, layers);
+                    }),
+                context, circuit_type_name(prepared_type_), start);
+
+        case CircuitType::RFGS:
+            return finish_logged(
+                run_unitary_layer(
+                    rfgs_layers_, rfgs_segment_, timestep,
+                    [&](const std::vector<RfgsLayer> &layers)
+                    {
+                        return cudaq::get_state(
+                            RfgsAdvanceKernel{}, &state, prepared_n_, layers, true);
+                    }),
+                context, circuit_type_name(prepared_type_), start);
+        }
+        throw std::invalid_argument("Unsupported probed circuit type.");
+    }
+
+    std::vector<int> measurement_sites(int timestep) const
+    {
+        if (prepared_n_ <= 0 || timestep < 0 || timestep >= prepared_timesteps_)
+        {
+            throw std::invalid_argument(
+                "Requested measurement layer is outside the prepared trajectory.");
+        }
+
+        const std::vector<int> *flags = nullptr;
+        switch (prepared_type_)
+        {
+        case CircuitType::MMS:
+            flags = &mms_layers_[static_cast<std::size_t>(timestep)].measure_flags;
+            break;
+        case CircuitType::Haar:
+            flags = &haar_layers_[static_cast<std::size_t>(timestep)].measure_flags;
+            break;
+        case CircuitType::FermionRPPU:
+        case CircuitType::QubitRPPU:
+            flags = &rppu_layers_[static_cast<std::size_t>(timestep)].measure_flags;
+            break;
+        case CircuitType::RFGS:
+            flags = &rfgs_layers_[static_cast<std::size_t>(timestep)].measure_flags;
+            break;
+        }
+
+        std::vector<int> sites;
+        sites.reserve(static_cast<std::size_t>(prepared_n_));
+        for (int site = 0; site < prepared_n_; ++site)
+        {
+            if ((*flags)[static_cast<std::size_t>(site)] != 0)
+            {
+                sites.push_back(site);
+            }
+        }
+        return sites;
+    }
+
   private:
+    template <typename Layer, typename Runner>
+    static cudaq::state run_unitary_layer(std::vector<Layer> &source,
+                                          std::vector<Layer> &scratch,
+                                          int timestep,
+                                          Runner &&runner)
+    {
+        Layer &layer = source[static_cast<std::size_t>(timestep)];
+        std::vector<int> measurement_flags;
+        measurement_flags.swap(layer.measure_flags);
+        layer.measure_flags.assign(measurement_flags.size(), 0);
+        try
+        {
+            auto result = run_segment(
+                source, scratch, timestep, 1, std::forward<Runner>(runner));
+            measurement_flags.swap(
+                source[static_cast<std::size_t>(timestep)].measure_flags);
+            return result;
+        }
+        catch (...)
+        {
+            measurement_flags.swap(
+                source[static_cast<std::size_t>(timestep)].measure_flags);
+            throw;
+        }
+    }
+
     template <typename Layer, typename Runner>
     static cudaq::state run_segment(std::vector<Layer> &source,
                                     std::vector<Layer> &destination,

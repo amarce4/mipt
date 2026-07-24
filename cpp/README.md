@@ -35,12 +35,13 @@ cannot drift between `mipt.exe`, `sim_tmi.exe`, and `entropy.exe`.
 ## Build
 
 ```bash
-make simulation                   # mipt, sim_tmi, and entropy
+make simulation                   # mipt, probes, free energy, TMI, and entropy
 make analysis                     # GMN, fGMN, and ring inflation
 make                              # both groups
 make GPU=0 CUDA_RHO=0             # CPU CUDA-Q build
 make sim_tmi.exe GPU=1 FP64=0
 make mipt_probed.exe GPU=1 FP64=0
+make free_energy.exe GPU=1 CUDA_RHO=1 FP64=0
 make test-core                    # no CUDA-Q/MOSEK/SCS required
 make print-config
 ```
@@ -50,6 +51,36 @@ The CUDA helper compiler falls back from `nvcc` to `nvq++` when `nvcc` is not on
 
 Build outputs are isolated in names such as `build/nvidia_fp32_rho1`, preventing
 objects from incompatible configurations from being mixed.
+
+## Measurement-record free energy
+
+`free_energy.exe` implements the leading-Lyapunov/free-energy protocol of
+Zabalo *et al.* (arXiv:2107.03393):
+
+```bash
+./free_energy.exe N P CIRC_TYPE INIT_STATE
+```
+
+`INIT_STATE=0` draws a random product state and `INIT_STATE=1` a random Haar
+state. For parity-preserving circuit types 2, 3, and 4, each draw lies in one
+randomly selected fixed-parity sector. The first `4N` timesteps equilibrate the
+state; the next `24N` timesteps form the production record. Within each
+measurement layer, Born probabilities are evaluated and projectors are applied
+sequentially in site order, with the state renormalized after every outcome.
+
+The number of Monte Carlo trajectories is controlled by
+`MIPT_FREE_ENERGY_REALIZATIONS` (default 1000). The executable writes a
+per-trajectory `*_samples.csv` for `c_eff` bootstrapping and an aggregate
+`*_timeseries.csv` containing the cumulative record entropy from `t=0` for the
+equilibration diagnostic. Half-chain von Neumann entropy is recorded through
+`2N` by default; adjust `MIPT_FREE_ENERGY_ENTROPY_MAX_T` or disable it with
+`MIPT_FREE_ENERGY_HALF_ENTROPY=0`.
+
+The sample column `free_energy_density_tilde` is the production-window slope
+divided by `N`, in natural-log units, before the spacetime anisotropy is
+applied. In the extracted root-level `data_analysis.py`, use
+`free_energy_ceff(..., alpha=...)` for the Fig. 1(b) double fit and
+`free_energy_equilibration(...)` for Supplementary Fig. S1(a,b).
 
 ## Unified probe simulator
 

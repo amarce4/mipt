@@ -1,9 +1,11 @@
 #include "mipt/density.hpp"
 #include "mipt/env.hpp"
+#include "mipt/free_energy_measure.hpp"
 #include "mipt/types.hpp"
 
 #include <cassert>
 #include <cmath>
+#include <complex>
 #include <cstdio>
 #include <cstdlib>
 #include <iostream>
@@ -106,6 +108,39 @@ void test_density_round_trip()
     assert(!reader.read_record(record));
     std::remove(path.c_str());
 }
+
+void test_sequential_measurement_probabilities()
+{
+    // The unnormalized weights are [1,4,9,16]. Measuring q0=1 has
+    // conditional probability 20/30. Given that result, measuring q1=0 has
+    // conditional probability 4/20. Their product must equal the original
+    // joint branch weight 4/30, and every collapse must restore unit norm.
+    std::vector<std::complex<double>> state{
+        {1.0, 0.0}, {2.0, 0.0}, {3.0, 0.0}, {4.0, 0.0}};
+
+    const auto first =
+        mipt::free_energy::measure_collapse_host(state.data(), 2, 0, 0.5);
+    assert(first.outcome == 1);
+    assert(std::abs(first.conditional_probability - 2.0 / 3.0) < 1.0e-14);
+    double norm = 0.0;
+    for (const auto &value : state)
+        norm += std::norm(value);
+    assert(std::abs(norm - 1.0) < 1.0e-14);
+
+    const auto second =
+        mipt::free_energy::measure_collapse_host(state.data(), 2, 1, 0.9);
+    assert(second.outcome == 0);
+    assert(std::abs(second.conditional_probability - 0.2) < 1.0e-14);
+    assert(std::abs(first.conditional_probability *
+                        second.conditional_probability -
+                    4.0 / 30.0) < 1.0e-14);
+    norm = 0.0;
+    for (const auto &value : state)
+        norm += std::norm(value);
+    assert(std::abs(norm - 1.0) < 1.0e-14);
+    assert(std::abs(first.surprisal + second.surprisal +
+                    std::log(4.0 / 30.0)) < 1.0e-14);
+}
 } // namespace
 
 int main()
@@ -114,5 +149,6 @@ int main()
     test_linspace();
     test_environment_parsing();
     test_density_round_trip();
+    test_sequential_measurement_probabilities();
     std::cout << "core tests passed\n";
 }
