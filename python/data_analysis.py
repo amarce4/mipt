@@ -9,6 +9,7 @@ expvals(...)           Plot aggregate fermionic observables and Wick residuals.
 tmi_collapse(...)      Fit and plot the TMI finite-size scaling collapse.
 probe1_collapse(...)   Fit and plot the one-ancilla dynamical collapse.
 probe2_collapse(...)   Fit and plot the two-ancilla bulk-exponent collapse.
+probe_distance_collapse(...) Plot and collapse mode-4 distance-resolved probes.
 probe_anisotropy(...)  Plot mode-3 space/time correlators and estimate alpha.
 probe4_collapse(...)   Fit and plot four-ancilla I2/I3/I4 collapses.
 probe_pc_collapse(...) Fit fixed-t p scans for one/two/four probes.
@@ -40,6 +41,7 @@ __all__ = [
     "tmi_collapse",
     "probe1_collapse",
     "probe2_collapse",
+    "probe_distance_collapse",
     "probe_anisotropy",
     "probe4_collapse",
     "probe_pc_collapse",
@@ -2413,6 +2415,522 @@ def probe2_collapse(
         "summary": summary,
         "curves": curves,
         "fit_result": fit_result,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Distance-resolved two-probe dynamics
+# ---------------------------------------------------------------------------
+
+
+def _load_probe_distance_curves(
+    path: Path,
+    *,
+    metric_spec: Mapping[str, Any],
+    distance_load: tuple[int, int | None],
+) -> list[dict[str, Any]]:
+    df = pd.read_csv(path)
+    if df.empty:
+        raise ValueError(f"{path}: mode-4 CSV is empty.")
+
+    size = int(_constant_csv_value(df, ["N", "L", "system_N"], path, integer=True))
+    p = float(_constant_csv_value(df, ["p"], path))
+    t_eq = int(
+        _constant_csv_value(df, ["t_eq", "teq"], path, integer=True)
+    )
+    distance_col = _find_column(df, ["distance", "r", "delta_x"])
+    tau_col = _find_column(df, ["tau", "elapsed_time", "readout_time"])
+    chord_col = _find_column(
+        df, ["chord_length", "ell_r", "chord"], required=False
+    )
+    mean_col = _find_column(df, metric_spec["mean_columns"])
+    stderr_col = _find_column(df, metric_spec["stderr_columns"])
+    positive_col = _find_column(
+        df,
+        ["negativity_positive_fraction", "positive_negativity_fraction"],
+        required=False,
+    )
+
+    clean = pd.DataFrame(
+        {
+            "distance": pd.to_numeric(df[distance_col], errors="coerce"),
+            "tau": pd.to_numeric(df[tau_col], errors="coerce"),
+            "value": pd.to_numeric(df[mean_col], errors="coerce"),
+            "dvalue": pd.to_numeric(df[stderr_col], errors="coerce"),
+        }
+    )
+    if chord_col is not None:
+        clean["chord_csv"] = pd.to_numeric(df[chord_col], errors="coerce")
+    if positive_col is not None:
+        clean["positive_fraction"] = pd.to_numeric(
+            df[positive_col], errors="coerce"
+        )
+    clean = clean.dropna(subset=["distance", "tau", "value", "dvalue"])
+    if clean.empty:
+        raise ValueError(f"{path}: no finite mode-4 rows were found.")
+
+    rounded_distance = np.rint(clean["distance"])
+    if not np.allclose(clean["distance"], rounded_distance, rtol=0.0, atol=1e-9):
+        raise ValueError(f"{path}: distance must be integer-valued.")
+    clean["distance"] = rounded_distance.astype(int)
+    if np.any((clean["distance"] < 1) | (clean["distance"] > size // 2)):
+        raise ValueError(f"{path}: distance lies outside 1,...,floor(N/2).")
+    if np.any(clean["tau"] < 0):
+        raise ValueError(f"{path}: tau must be non-negative.")
+    if np.any(clean["dvalue"] < 0):
+        warnings.warn(f"{path}: negative standard errors found; using magnitudes.")
+        clean["dvalue"] = np.abs(clean["dvalue"])
+
+    distance_min, distance_max = distance_load
+    if distance_min < 1:
+        raise ValueError("distance_load minimum must be at least 1.")
+    clean = clean.loc[clean["distance"] >= distance_min]
+    if distance_max is not None:
+        clean = clean.loc[clean["distance"] <= distance_max]
+    if clean.empty:
+        raise ValueError(f"{path}: no rows remain after distance_load.")
+
+    curves: list[dict[str, Any]] = []
+    for distance, group in clean.groupby("distance", sort=True):
+        group = group.sort_values("tau").drop_duplicates("tau", keep="last")
+        chord = size / np.pi * np.sin(np.pi * distance / size)
+        if "chord_csv" in group:
+            supplied = group["chord_csv"].dropna().to_numpy(dtype=float)
+            if supplied.size and not np.allclose(
+                supplied, chord, rtol=1e-10, atol=1e-12
+            ):
+                warnings.warn(
+                    f"{path}: stored chord length for r={distance} differs "
+                    "from L/pi sin(pi r/L); using the recomputed value."
+                )
+        curve = {
+            "path": path,
+            "L": size,
+            "p": p,
+            "t_eq": t_eq,
+            "distance": int(distance),
+            "chord": float(chord),
+            "tau": group["tau"].to_numpy(dtype=float),
+            "value": group["value"].to_numpy(dtype=float),
+            "dvalue": group["dvalue"].to_numpy(dtype=float),
+        }
+        if "positive_fraction" in group:
+            curve["positive_fraction"] = group[
+                "positive_fraction"
+            ].to_numpy(dtype=float)
+        curves.append(curve)
+    return curves
+
+
+def probe_distance_collapse(
+    files: Sequence[str | Path] | str | Path | None = None,
+    *,
+    file_glob: str | Path | None = None,
+    metric: str = "mi",
+    mi_units: str = "nats",
+    eta: float | None = None,
+    z: float | None = 1.0,
+    alpha: float = 1.0,
+    eta_bounds: tuple[float, float] = (0.0, 2.0),
+    z_bounds: tuple[float, float] = (0.5, 2.0),
+    distance_load: tuple[int, int | None] = (1, None),
+    fit_distance: tuple[int, int | None] = (2, None),
+    fit_tau: tuple[float, float | None] = (1.0, None),
+    fit_x: tuple[float | None, float | None] = (None, None),
+    fit_value_min: float = 1e-10,
+    interpolation_points: int = 250,
+    relative_error_floor: float = 0.01,
+    absolute_error_floor: float = 1e-10,
+    bootstrap_samples: int = 100,
+    bootstrap_seed: int = 97531,
+    raw_yscale: str = "linear",
+    collapse_yscale: str = "linear",
+    show_errorbars: bool = True,
+    errorbar_points: int = 80,
+    capsize: float = 2,
+    cmap: str = "viridis",
+    figsize: tuple[float, float] = (13, 5),
+    dpi: int = 130,
+    show_summary: bool = True,
+    show: bool = True,
+) -> dict[str, Any]:
+    r"""Plot and fit mode-4 distance-resolved two-probe data.
+
+    The collapse uses
+
+    ``O(tau,r,L) = ell_r**(-eta) G(alpha*tau/ell_r**z)``,
+
+    with ``ell_r=(L/pi) sin(pi*r/L)``. A numeric ``eta`` or ``z`` fixes that
+    parameter; ``None`` fits it. The CFT default is therefore ``z=1`` with
+    ``eta`` fitted. ``alpha`` is always supplied/fixed because a free global
+    rescaling of the unknown scaling function's argument is not identifiable.
+    ``fit_distance=(2,None)`` leaves the microscopic ``r=1`` curve visible but
+    excludes it from the default fit.
+    """
+    if not np.isfinite(alpha) or alpha <= 0:
+        raise ValueError("alpha must be finite and positive.")
+    if eta is not None and (not np.isfinite(eta) or eta < 0):
+        raise ValueError("eta must be non-negative or None.")
+    if z is not None and (not np.isfinite(z) or z <= 0):
+        raise ValueError("z must be positive or None.")
+    if interpolation_points < 3:
+        raise ValueError("interpolation_points must be at least 3.")
+    if errorbar_points < 1:
+        raise ValueError("errorbar_points must be positive.")
+
+    metric_spec = _probe2_metric_spec(metric)
+    mi_units, mi_scale = _mi_unit_spec(mi_units)
+    paths = _resolve_files(files, file_glob)
+    curves = [
+        curve
+        for path in paths
+        for curve in _load_probe_distance_curves(
+            path,
+            metric_spec=metric_spec,
+            distance_load=distance_load,
+        )
+    ]
+    if metric_spec["key"] == "mi":
+        metric_spec = dict(metric_spec)
+        metric_spec["bootstrap_upper"] *= mi_scale
+        for curve in curves:
+            curve["value"] *= mi_scale
+            curve["dvalue"] *= mi_scale
+    curves.sort(key=lambda curve: (curve["L"], curve["distance"], str(curve["path"])))
+    if len(curves) < 2:
+        raise ValueError("At least two distance curves are required for a collapse.")
+
+    finite_ps = sorted({curve["p"] for curve in curves if np.isfinite(curve["p"])})
+    if len(finite_ps) > 1:
+        warnings.warn(f"The files contain multiple p values: {finite_ps}")
+    fit_distance_min, fit_distance_max = fit_distance
+    fit_tau_min, fit_tau_max = fit_tau
+    fit_x_min, fit_x_max = fit_x
+    if fit_distance_min < 1:
+        raise ValueError("fit_distance minimum must be at least 1.")
+    if fit_tau_min < 0:
+        raise ValueError("fit_tau minimum must be non-negative.")
+
+    summary = pd.DataFrame(
+        {
+            "L": [curve["L"] for curve in curves],
+            "r": [curve["distance"] for curve in curves],
+            "chord_length": [curve["chord"] for curve in curves],
+            "p": [curve["p"] for curve in curves],
+            "t_eq": [curve["t_eq"] for curve in curves],
+            "tau_max": [np.max(curve["tau"]) for curve in curves],
+            "points": [len(curve["tau"]) for curve in curves],
+            "file": [str(curve["path"]) for curve in curves],
+        }
+    )
+    if show_summary:
+        try:
+            from IPython.display import display
+
+            display(summary)
+        except ImportError:
+            print(summary.to_string(index=False))
+
+    def transformed(curve, eta_value, z_value):
+        x = alpha * curve["tau"] / curve["chord"] ** z_value
+        mask = (
+            np.isfinite(x)
+            & np.isfinite(curve["value"])
+            & np.isfinite(curve["dvalue"])
+            & (curve["tau"] >= fit_tau_min)
+            & (curve["value"] > fit_value_min)
+            & (curve["distance"] >= fit_distance_min)
+        )
+        if fit_tau_max is not None:
+            mask &= curve["tau"] <= fit_tau_max
+        if fit_distance_max is not None:
+            mask &= curve["distance"] <= fit_distance_max
+        if fit_x_min is not None:
+            mask &= x >= fit_x_min
+        if fit_x_max is not None:
+            mask &= x <= fit_x_max
+        order = np.argsort(x[mask])
+        scale = curve["chord"] ** eta_value
+        return (
+            x[mask][order],
+            (curve["value"][mask] * scale)[order],
+            (curve["dvalue"][mask] * scale)[order],
+            mask,
+        )
+
+    def pair_score(curve_a, curve_b, eta_value, z_value):
+        xa, ya, dya, _ = transformed(curve_a, eta_value, z_value)
+        xb, yb, dyb, _ = transformed(curve_b, eta_value, z_value)
+        if len(xa) < 3 or len(xb) < 3:
+            return np.inf
+        lo, hi = max(xa.min(), xb.min()), min(xa.max(), xb.max())
+        if hi <= lo:
+            return np.inf
+        grid = np.linspace(lo, hi, interpolation_points)
+        ya_g, yb_g = np.interp(grid, xa, ya), np.interp(grid, xb, yb)
+        dya_g, dyb_g = np.interp(grid, xa, dya), np.interp(grid, xb, dyb)
+        typical = max(
+            np.nanmedian(np.abs(ya_g)),
+            np.nanmedian(np.abs(yb_g)),
+            absolute_error_floor,
+        )
+        floor = max(absolute_error_floor, relative_error_floor * typical)
+        return float(
+            np.mean((ya_g - yb_g) ** 2 / (dya_g**2 + dyb_g**2 + floor**2))
+        )
+
+    def score_values(eta_value, z_value, curve_set=curves):
+        scores = [
+            pair_score(curve_set[i], curve_set[j], eta_value, z_value)
+            for i in range(len(curve_set))
+            for j in range(i + 1, len(curve_set))
+        ]
+        finite = [value for value in scores if np.isfinite(value)]
+        return float(np.mean(finite)) if finite else np.inf
+
+    eta_fixed, z_fixed = eta is not None, z is not None
+
+    def fit_parameters(curve_set, *, bootstrap=False):
+        if eta_fixed and z_fixed:
+            return float(eta), float(z), score_values(float(eta), float(z), curve_set)
+        if not eta_fixed and z_fixed:
+            result = minimize_scalar(
+                lambda trial: score_values(trial, float(z), curve_set),
+                bounds=eta_bounds,
+                method="bounded",
+                options={"xatol": 1e-5 if bootstrap else 1e-7},
+            )
+            return float(result.x), float(z), float(result.fun)
+        if eta_fixed and not z_fixed:
+            result = minimize_scalar(
+                lambda trial: score_values(float(eta), trial, curve_set),
+                bounds=z_bounds,
+                method="bounded",
+                options={"xatol": 1e-5 if bootstrap else 1e-7},
+            )
+            return float(eta), float(result.x), float(result.fun)
+        if bootstrap:
+            result = minimize(
+                lambda values: score_values(values[0], values[1], curve_set),
+                x0=np.array([best_eta, best_z]),
+                method="Powell",
+                bounds=[eta_bounds, z_bounds],
+                options={"xtol": 1e-4, "ftol": 1e-4, "maxiter": 400},
+            )
+            return float(result.x[0]), float(result.x[1]), float(result.fun)
+        result = differential_evolution(
+            lambda values: score_values(values[0], values[1], curve_set),
+            bounds=[eta_bounds, z_bounds],
+            seed=bootstrap_seed,
+            polish=True,
+            tol=1e-7,
+        )
+        return float(result.x[0]), float(result.x[1]), float(result.fun)
+
+    best_eta, best_z, best_score = fit_parameters(curves)
+    if not np.isfinite(best_score):
+        raise RuntimeError(
+            "No fitted curve pair has at least three overlapping scaled-time "
+            "points. Widen fit_x/fit_tau or include more distances."
+        )
+
+    estimates: list[tuple[float, float]] = []
+    if bootstrap_samples >= 2 and (not eta_fixed or not z_fixed):
+        rng = np.random.default_rng(bootstrap_seed)
+        for index in range(bootstrap_samples):
+            synthetic_curves = []
+            for curve in curves:
+                synthetic = dict(curve)
+                synthetic["value"] = np.clip(
+                    rng.normal(curve["value"], np.maximum(curve["dvalue"], 0.0)),
+                    0.0,
+                    metric_spec["bootstrap_upper"],
+                )
+                synthetic_curves.append(synthetic)
+            trial_eta, trial_z, trial_score = fit_parameters(
+                synthetic_curves, bootstrap=True
+            )
+            if np.all(np.isfinite([trial_eta, trial_z, trial_score])):
+                estimates.append((trial_eta, trial_z))
+            if (index + 1) % 25 == 0 or index + 1 == bootstrap_samples:
+                print(f"Bootstrap fits: {index + 1}/{bootstrap_samples}")
+
+    estimate_array = np.asarray(estimates, dtype=float)
+    eta_stderr = (
+        0.0
+        if eta_fixed
+        else float(np.std(estimate_array[:, 0], ddof=1))
+        if len(estimates) >= 2
+        else np.nan
+    )
+    z_stderr = (
+        0.0
+        if z_fixed
+        else float(np.std(estimate_array[:, 1], ddof=1))
+        if len(estimates) >= 2
+        else np.nan
+    )
+    print(f"metric = {metric_spec['key']}")
+    print(
+        f"eta = {best_eta:.6f}"
+        + (" (fixed)" if eta_fixed else f" ± {eta_stderr:.6f}")
+    )
+    print(
+        f"z = {best_z:.6f}"
+        + (" (fixed)" if z_fixed else f" ± {z_stderr:.6f}")
+    )
+    print(f"alpha = {alpha:.6f} (fixed)")
+    print(f"collapse score = {best_score:.6g}")
+
+    chord_values = np.asarray([curve["chord"] for curve in curves], dtype=float)
+    if np.ptp(chord_values) > 0:
+        color_values = 0.08 + 0.84 * (
+            chord_values - np.min(chord_values)
+        ) / np.ptp(chord_values)
+    else:
+        color_values = np.full(len(curves), 0.5)
+    colors = [plt.get_cmap(cmap)(value) for value in color_values]
+    one_size = len({curve["L"] for curve in curves}) == 1
+    fig, (ax_raw, ax_collapse) = plt.subplots(
+        1, 2, figsize=figsize, dpi=dpi, constrained_layout=True
+    )
+    for curve, color in zip(curves, colors):
+        label = (
+            rf"$r={curve['distance']},\ \ell_r={curve['chord']:.3g}$"
+            if one_size
+            else rf"$L={curve['L']},\ r={curve['distance']}$"
+        )
+        every = max(1, int(np.ceil(len(curve["tau"]) / errorbar_points)))
+        plot_kwargs = {
+            "color": color,
+            "marker": "o",
+            "markersize": 3.2,
+            "linewidth": 1.1,
+            "label": label,
+        }
+        if show_errorbars:
+            ax_raw.errorbar(
+                curve["tau"],
+                curve["value"],
+                yerr=curve["dvalue"],
+                errorevery=every,
+                elinewidth=0.8,
+                capsize=capsize,
+                **plot_kwargs,
+            )
+        else:
+            ax_raw.plot(curve["tau"], curve["value"], **plot_kwargs)
+
+        x, y, dy, mask = transformed(curve, best_eta, best_z)
+        all_x = alpha * curve["tau"] / curve["chord"] ** best_z
+        excluded = ~mask
+        if np.any(excluded):
+            ax_collapse.plot(
+                all_x[excluded],
+                curve["value"][excluded] * curve["chord"] ** best_eta,
+                linestyle="none",
+                marker="o",
+                markersize=2.8,
+                color=color,
+                alpha=0.18,
+            )
+        collapse_kwargs = dict(plot_kwargs)
+        collapse_kwargs["label"] = label
+        if show_errorbars:
+            collapse_every = max(1, int(np.ceil(len(x) / errorbar_points)))
+            ax_collapse.errorbar(
+                x,
+                y,
+                yerr=dy,
+                errorevery=collapse_every,
+                elinewidth=0.8,
+                capsize=capsize,
+                **collapse_kwargs,
+            )
+        else:
+            ax_collapse.plot(x, y, **collapse_kwargs)
+
+    observable_label = (
+        rf"Mutual information $I(A:B)$ [{mi_units}]"
+        if metric_spec["key"] == "mi"
+        else metric_spec["raw_ylabel"]
+    )
+    ax_raw.set_xlabel(r"Elapsed time $\tau$")
+    ax_raw.set_ylabel(observable_label)
+    ax_raw.set_title("Distance-resolved probe dynamics")
+    ax_raw.set_yscale(raw_yscale)
+    ax_raw.grid(alpha=0.25)
+    ax_raw.legend(fontsize=8, ncols=2 if len(curves) > 8 else 1)
+
+    ax_collapse.set_xlabel(r"$\alpha\tau/\ell_r^z$")
+    collapse_symbol = {
+        "mi": r"I(A:B)",
+        "negativity": r"\mathcal{N}(A:B)",
+        "log_negativity": r"E_{\mathcal{N}}(A:B)",
+    }[metric_spec["key"]]
+    unit_suffix = f" [{mi_units}]" if metric_spec["key"] == "mi" else ""
+    ax_collapse.set_ylabel(
+        rf"$\ell_r^{{\eta}}{collapse_symbol}$" + unit_suffix
+    )
+    ax_collapse.set_title("Chord-length scaling collapse")
+    ax_collapse.set_yscale(collapse_yscale)
+    ax_collapse.grid(alpha=0.25)
+    ax_collapse.legend(fontsize=8, ncols=2 if len(curves) > 8 else 1)
+    eta_text = rf"$\eta={best_eta:.4f}$" + (
+        " fixed"
+        if eta_fixed
+        else rf" $\pm {eta_stderr:.4f}$"
+        if np.isfinite(eta_stderr)
+        else ""
+    )
+    z_text = rf"$z={best_z:.4f}$" + (
+        " fixed"
+        if z_fixed
+        else rf" $\pm {z_stderr:.4f}$"
+        if np.isfinite(z_stderr)
+        else ""
+    )
+    parameter_text = (
+        eta_text
+        + "\n"
+        + z_text
+        + "\n"
+        + rf"$\alpha={alpha:.4g}$ fixed"
+        + "\n"
+        + rf"score $={best_score:.3g}$"
+    )
+    ax_collapse.text(
+        0.97,
+        0.03,
+        parameter_text,
+        transform=ax_collapse.transAxes,
+        ha="right",
+        va="bottom",
+        bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.88},
+    )
+    fig.suptitle(
+        r"$O(\tau,r,L)=\ell_r^{-\eta}"
+        r"G(\alpha\tau/\ell_r^z)$",
+        fontsize=14,
+    )
+    _show(fig, show)
+
+    return {
+        "figure": fig,
+        "axes": (ax_raw, ax_collapse),
+        "metric": metric_spec["key"],
+        "mi_units": mi_units,
+        "eta": best_eta,
+        "eta_stderr": eta_stderr,
+        "eta_fixed": eta_fixed,
+        "z": best_z,
+        "z_stderr": z_stderr,
+        "z_fixed": z_fixed,
+        "alpha": alpha,
+        "score": best_score,
+        "bootstrap_successes": len(estimates),
+        "summary": summary,
+        "curves": curves,
     }
 
 
