@@ -58,7 +58,7 @@ objects from incompatible configurations from being mixed.
 Zabalo *et al.* (arXiv:2107.03393):
 
 ```bash
-./free_energy.exe N P CIRC_TYPE INIT_STATE
+./free_energy.exe N P REALIZATIONS CIRC_TYPE INIT_STATE
 ```
 
 `INIT_STATE=0` draws a random product state and `INIT_STATE=1` a random Haar
@@ -68,13 +68,17 @@ state; the next `24N` timesteps form the production record. Within each
 measurement layer, Born probabilities are evaluated and projectors are applied
 sequentially in site order, with the state renormalized after every outcome.
 
-The number of Monte Carlo trajectories is controlled by
-`MIPT_FREE_ENERGY_REALIZATIONS` (default 1000). The executable writes a
-per-trajectory `*_samples.csv` for `c_eff` bootstrapping and an aggregate
-`*_timeseries.csv` containing the cumulative record entropy from `t=0` for the
-equilibration diagnostic. Half-chain von Neumann entropy is recorded through
-`2N` by default; adjust `MIPT_FREE_ENERGY_ENTROPY_MAX_T` or disable it with
-`MIPT_FREE_ENERGY_HALF_ENTROPY=0`.
+`REALIZATIONS` is the number of Monte Carlo trajectories. It is included in
+both default filenames as `_reals_<count>` (for example, `_reals_10k`). The
+executable writes a per-trajectory `*_samples.csv` for `c_eff` bootstrapping
+and an aggregate `*_timeseries.csv` containing the cumulative record entropy
+from `t=0` for the equilibration diagnostic. Half-chain von Neumann entropy is
+recorded through `2N` by default; adjust
+`MIPT_FREE_ENERGY_ENTROPY_MAX_T` or disable it with
+`MIPT_FREE_ENERGY_HALF_ENTROPY=0`. GPU builds route half-chain cuts of seven
+or more kept sites (starting at `N=14`) to cuSOLVER by default; override this
+free-energy-specific threshold with
+`MIPT_FREE_ENERGY_CUDA_ENTROPY_MIN_KEPT`.
 
 The sample column `free_energy_density_tilde` is the production-window slope
 divided by `N`, in natural-log units, before the spacetime anisotropy is

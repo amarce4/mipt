@@ -279,6 +279,24 @@ struct HalfEntropyWorkspace
     bool cuda_disabled = false;
 };
 
+inline int cuda_entropy_min_kept_modes()
+{
+    // A 7-mode half cut is the N=14 boundary (a 128x128 Schmidt matrix).
+    // Sending that case through host LAPACK requires a device-to-host copy and
+    // makes N=14 markedly slower than N=16, whose 8-mode cut already uses
+    // cuSOLVER through the sim_tmi policy.  Free-energy trajectories evaluate
+    // this SVD repeatedly, so use a dedicated threshold without changing
+    // sim_tmi.exe's tuned small-system behavior.
+    constexpr long default_min_kept_modes = 7;
+    constexpr long max_kept_modes = 30;
+    static const int threshold = static_cast<int>(env::integer(
+        "MIPT_FREE_ENERGY_CUDA_ENTROPY_MIN_KEPT",
+        default_min_kept_modes,
+        0,
+        max_kept_modes));
+    return threshold;
+}
+
 inline double half_chain_entropy_bits(
     cudaq::state &state,
     int n,
@@ -306,7 +324,8 @@ inline double half_chain_entropy_bits(
         state.get_precision() == cudaq::SimulationState::precision::fp64;
     if (state.is_on_gpu() && !workspace.cuda_disabled &&
         env::boolean("MIPT_FREE_ENERGY_CUDA_ENTROPY", true) &&
-        tmi::should_try_cuda_svd_for_problem(n, kept_modes.size()))
+        kept_modes.size() >=
+            static_cast<std::size_t>(cuda_entropy_min_kept_modes()))
     {
         double entropy = 0.0;
         int status = 0;

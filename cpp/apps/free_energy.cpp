@@ -81,6 +81,19 @@ std::string compact_decimal(double value)
     return text == "-0" ? "0" : text;
 }
 
+std::string compact_count(std::uint64_t count)
+{
+    if (count >= 1000000 && count % 1000000 == 0)
+    {
+        return std::to_string(count / 1000000) + "m";
+    }
+    if (count >= 1000 && count % 1000 == 0)
+    {
+        return std::to_string(count / 1000) + "k";
+    }
+    return std::to_string(count);
+}
+
 std::string csv_quote(std::string_view value)
 {
     std::string result;
@@ -208,9 +221,11 @@ void write_timeseries(
 void print_usage(const char *argv0)
 {
     std::cout
-        << "Usage: " << argv0 << " [N] [p] [circ_type] [init_state]\n\n"
+        << "Usage: " << argv0
+        << " [N] [p] [realizations] [circ_type] [init_state]\n\n"
         << "  N          number of sites in the periodic 1D ring\n"
         << "  p          measurement rate in [0,1]\n"
+        << "  realizations number of Monte Carlo trajectories\n"
         << "  circ_type  same convention as the other MIPT simulators:\n";
     print_circuit_type_help(std::cout, "               ");
     std::cout
@@ -221,13 +236,13 @@ void print_usage(const char *argv0)
         << "For circ_type 2, 3, or 4, every initial state has a definite randomly\n"
         << "selected global parity.\n\n"
         << "Environment controls:\n"
-        << "  MIPT_FREE_ENERGY_REALIZATIONS=1000\n"
         << "  MIPT_FREE_ENERGY_SEED=<integer>\n"
         << "  MIPT_FREE_ENERGY_PROGRESS_MS=1000\n"
         << "  MIPT_FREE_ENERGY_HALF_ENTROPY=1\n"
         << "  MIPT_FREE_ENERGY_ENTROPY_MAX_T=<absolute timestep> (default 2L)\n"
         << "  MIPT_FREE_ENERGY_ENTROPY_STRIDE=1\n"
-        << "  MIPT_FREE_ENERGY_CUDA_ENTROPY=1\n";
+        << "  MIPT_FREE_ENERGY_CUDA_ENTROPY=1\n"
+        << "  MIPT_FREE_ENERGY_CUDA_ENTROPY_MIN_KEPT=7\n";
 }
 } // namespace
 
@@ -243,7 +258,7 @@ int main(int argc, char *argv[])
             print_usage(argv[0]);
             return 0;
         }
-        if (argc != 5)
+        if (argc != 6)
         {
             print_usage(argv[0]);
             return 2;
@@ -251,8 +266,15 @@ int main(int argc, char *argv[])
 
         const int n = std::stoi(argv[1]);
         const double p = std::stod(argv[2]);
-        const CircuitType type = parse_circuit_type(std::stoi(argv[3]));
-        const int init_state = std::stoi(argv[4]);
+        const long parsed_realizations = std::stol(argv[3]);
+        if (parsed_realizations < 1 || parsed_realizations > 1000000000L)
+        {
+            throw std::invalid_argument(
+                "realizations must lie in [1,1000000000].");
+        }
+        const int realizations = static_cast<int>(parsed_realizations);
+        const CircuitType type = parse_circuit_type(std::stoi(argv[4]));
+        const int init_state = std::stoi(argv[5]);
         if (n < 2 || n >= 31)
         {
             throw std::invalid_argument(
@@ -271,8 +293,6 @@ int main(int argc, char *argv[])
         const int equilibration_timesteps = 4 * n;
         const int production_timesteps = 24 * n;
         const int total_timesteps = equilibration_timesteps + production_timesteps;
-        const int realizations = static_cast<int>(env::integer(
-            "MIPT_FREE_ENERGY_REALIZATIONS", 1000, 1, 1000000000L));
         const int progress_ms = static_cast<int>(env::integer(
             "MIPT_FREE_ENERGY_PROGRESS_MS", 1000, 50, 600000L));
         const bool record_half_entropy =
@@ -296,7 +316,9 @@ int main(int argc, char *argv[])
             "free_energy_" + std::string(circuit_type_tag(type)) +
             "_n_" + std::to_string(n) +
             "_p_" + compact_decimal(p) +
-            "_init_" + std::to_string(init_state);
+            "_init_" + std::to_string(init_state) +
+            "_reals_" +
+            compact_count(static_cast<std::uint64_t>(realizations));
         const std::string samples_path = prefix + "_samples.csv";
         const std::string timeseries_path = prefix + "_timeseries.csv";
 
