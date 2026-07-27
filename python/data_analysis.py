@@ -10,6 +10,7 @@ tmi_collapse(...)      Fit and plot the TMI finite-size scaling collapse.
 probe1_collapse(...)   Fit and plot the one-ancilla dynamical collapse.
 probe2_collapse(...)   Fit and plot the two-ancilla bulk-exponent collapse.
 probe_distance_collapse(...) Plot and collapse mode-4 distance-resolved probes.
+probe3_dynamics(...)   Plot three-probe mode-4 multipartite metrics and purity.
 probe_anisotropy(...)  Plot mode-3 space/time correlators and estimate alpha.
 free_energy_ceff(...)  Recreate Fig. 1(b) and extract the effective central charge.
 free_energy_equilibration(...) Recreate Supplementary Fig. S1(a,b).
@@ -44,6 +45,7 @@ __all__ = [
     "probe1_collapse",
     "probe2_collapse",
     "probe_distance_collapse",
+    "probe3_dynamics",
     "probe_anisotropy",
     "free_energy_ceff",
     "free_energy_equilibration",
@@ -155,6 +157,28 @@ def _parse_p(path: str | Path) -> float:
         Path(path).name,
     )
     return float(match.group(1)) if match else np.nan
+
+
+def _parse_circuit_name(path: str | Path) -> str:
+    """Return the display name of a circuit encoded in an output filename."""
+    aliases = {
+        "mms": "MMS",
+        "haar": "Haar U(4)",
+        "rppu": "RPPU",
+        "rfgs": "RFGS",
+        "qrppu": "qRPPU",
+    }
+    match = re.search(
+        r"(?:^|[_-])(qrppu|rppu|rfgs|haar|mms)(?:[_-]|$)",
+        Path(path).name,
+        flags=re.IGNORECASE,
+    )
+    if match is None:
+        raise ValueError(
+            f"Could not parse the circuit type from {Path(path).name!r}. "
+            "Expected one of: mms, haar, rppu, rfgs, qrppu."
+        )
+    return aliases[match.group(1).lower()]
 
 
 def _color_map_by_size(sizes: Sequence[int], cmap_name: str) -> dict[int, Any]:
@@ -2422,6 +2446,309 @@ def probe2_collapse(
     }
 
 
+def probe3_dynamics(
+    files: Sequence[str | Path] | str | Path | None = None,
+    *,
+    file_glob: str | Path | None = None,
+    metrics: Sequence[str] = (
+        "tmi",
+        "average_mi",
+        "min_negativity",
+        "gmn",
+        "joint_purity",
+        "mean_single_purity",
+    ),
+    mi_units: str = "nats",
+    geometry_ids: Sequence[int] | None = None,
+    tau_range: tuple[float | None, float | None] = (None, None),
+    time_axis: str = "tau",
+    show_errorbands: bool = True,
+    error_alpha: float = 0.16,
+    linewidth: float = 1.5,
+    cmap: str = "viridis",
+    max_legend_entries: int = 16,
+    figsize: tuple[float, float] = (15, 9),
+    dpi: int = 130,
+    show_summary: bool = True,
+    show: bool = True,
+) -> dict[str, Any]:
+    """Plot the three-probe mode-4 observables for every CFT triangle.
+
+    Curves are colored by the geometric mean of their three chord lengths, but
+    legend labels show only that effective CFT distance. This is a visualization
+    rather than a one-variable collapse: inequivalent triangle shapes generally
+    cannot be reduced completely to one scalar distance.
+
+    ``time_axis="tau"`` plots post-attachment timesteps. ``"scaled"`` plots
+    ``tau / (ell1*ell2*ell3)**(1/3)`` as an exploratory comparison.
+    """
+    metric_specs = {
+        "tmi": ("TMI_mean", "TMI_stderr", "Tripartite mutual information"),
+        "average_mi": (
+            "average_MI_mean",
+            "average_MI_stderr",
+            "Average pairwise mutual information",
+        ),
+        "min_negativity": (
+            "min_bipartite_negativity_mean",
+            "min_bipartite_negativity_stderr",
+            "Minimum bipartite negativity",
+        ),
+        "gmn": ("GMN_mean", "GMN_stderr", "GMN/fGMN"),
+        "joint_purity": (
+            "joint_purity_mean",
+            "joint_purity_stderr",
+            r"Joint purity $\mathrm{Tr}(\rho_{ABC}^2)$",
+        ),
+        "mean_single_purity": (
+            "mean_single_purity_mean",
+            "mean_single_purity_stderr",
+            "Mean single-probe purity",
+        ),
+    }
+    selected_metrics = [str(metric).strip().lower() for metric in metrics]
+    if not selected_metrics:
+        raise ValueError("metrics must contain at least one metric.")
+    unknown = [metric for metric in selected_metrics if metric not in metric_specs]
+    if unknown:
+        raise ValueError(
+            f"Unknown three-probe metric(s): {unknown}. "
+            f"Choose from {sorted(metric_specs)}."
+        )
+    if time_axis not in {"tau", "scaled"}:
+        raise ValueError("time_axis must be 'tau' or 'scaled'.")
+    if max_legend_entries < 0:
+        raise ValueError("max_legend_entries must be non-negative.")
+
+    mi_units, mi_scale = _mi_unit_spec(mi_units)
+    paths = _resolve_files(files, file_glob)
+    filename_sizes = [_parse_size(path) for path in paths]
+    filename_ps = [_parse_p(path) for path in paths]
+    filename_circuits = [_parse_circuit_name(path) for path in paths]
+    if any(not np.isfinite(value) for value in filename_ps):
+        missing = [
+            path.name
+            for path, value in zip(paths, filename_ps)
+            if not np.isfinite(value)
+        ]
+        raise ValueError(
+            "Could not parse p from the following filename(s): "
+            + ", ".join(repr(name) for name in missing)
+        )
+    if len(set(filename_sizes)) != 1:
+        raise ValueError(
+            f"Three-probe inputs contain multiple filename sizes: "
+            f"{sorted(set(filename_sizes))}."
+        )
+    if not np.allclose(filename_ps, filename_ps[0], rtol=0.0, atol=1e-12):
+        raise ValueError(
+            "Three-probe inputs contain multiple filename measurement rates: "
+            f"{sorted(set(filename_ps))}."
+        )
+    if len(set(filename_circuits)) != 1:
+        raise ValueError(
+            "Three-probe inputs contain multiple filename circuit types: "
+            f"{sorted(set(filename_circuits))}."
+        )
+    filename_size = filename_sizes[0]
+    filename_p = filename_ps[0]
+    filename_circuit = filename_circuits[0]
+
+    required = {
+        "N",
+        "p",
+        "geometry_id",
+        "distance_1",
+        "distance_2",
+        "distance_3",
+        "chord_geometric_mean",
+        "tau",
+        "TMI_mean",
+        "TMI_stderr",
+        "average_MI_mean",
+        "average_MI_stderr",
+        "min_bipartite_negativity_mean",
+        "min_bipartite_negativity_stderr",
+        "GMN_mean",
+        "GMN_stderr",
+        "joint_purity_mean",
+        "joint_purity_stderr",
+        "mean_single_purity_mean",
+        "mean_single_purity_stderr",
+    }
+    frames = []
+    for path in paths:
+        frame = pd.read_csv(path)
+        missing = sorted(required - set(frame.columns))
+        if missing:
+            raise ValueError(f"{path}: missing columns {missing}.")
+        frame = frame.copy()
+        frame["source_file"] = str(path)
+        frames.append(frame)
+    data = pd.concat(frames, ignore_index=True)
+
+    numeric_columns = sorted(required - {"gmn_type"})
+    for column in numeric_columns:
+        data[column] = pd.to_numeric(data[column], errors="coerce")
+    data = data.dropna(
+        subset=[
+            "N",
+            "p",
+            "geometry_id",
+            "distance_1",
+            "distance_2",
+            "distance_3",
+            "chord_geometric_mean",
+            "tau",
+        ]
+    )
+    if geometry_ids is not None:
+        requested = {int(value) for value in geometry_ids}
+        data = data.loc[data["geometry_id"].astype(int).isin(requested)]
+    tau_min, tau_max = tau_range
+    if tau_min is not None:
+        data = data.loc[data["tau"] >= tau_min]
+    if tau_max is not None:
+        data = data.loc[data["tau"] <= tau_max]
+    if data.empty:
+        raise ValueError("No three-probe rows remain after filtering.")
+
+    for column in ("TMI_mean", "TMI_stderr", "average_MI_mean", "average_MI_stderr"):
+        data[column] *= mi_scale
+
+    group_columns = ["source_file", "N", "p", "geometry_id"]
+    groups = list(data.groupby(group_columns, sort=True))
+    chord_values = np.asarray(
+        [group["chord_geometric_mean"].iloc[0] for _, group in groups],
+        dtype=float,
+    )
+    chord_min = float(np.nanmin(chord_values))
+    chord_max = float(np.nanmax(chord_values))
+    denominator = chord_max - chord_min
+    color_map = plt.get_cmap(cmap)
+
+    n_metrics = len(selected_metrics)
+    ncols = min(3, n_metrics)
+    nrows = int(np.ceil(n_metrics / ncols))
+    fig, axes_grid = plt.subplots(
+        nrows,
+        ncols,
+        figsize=figsize,
+        dpi=dpi,
+        squeeze=False,
+        sharex=False,
+    )
+    axes = list(axes_grid.flat)
+    curve_records = []
+    for key, group in groups:
+        group = group.sort_values("tau").drop_duplicates("tau", keep="last")
+        chord = float(group["chord_geometric_mean"].iloc[0])
+        color_fraction = 0.5 if denominator <= 0 else (chord - chord_min) / denominator
+        color = color_map(color_fraction)
+        distances = tuple(
+            int(group[f"distance_{index}"].iloc[0]) for index in (1, 2, 3)
+        )
+        size = int(group["N"].iloc[0])
+        label = rf"$\ell_{{\mathrm{{eff}}}}={chord:.3g}$"
+        x = group["tau"].to_numpy(dtype=float)
+        if time_axis == "scaled":
+            x = x / chord
+
+        for axis, metric in zip(axes, selected_metrics):
+            value_column, error_column, title = metric_specs[metric]
+            y = group[value_column].to_numpy(dtype=float)
+            dy = np.abs(group[error_column].to_numpy(dtype=float))
+            finite = np.isfinite(x) & np.isfinite(y)
+            axis.plot(
+                x[finite],
+                y[finite],
+                color=color,
+                linewidth=linewidth,
+                label=label,
+            )
+            if show_errorbands:
+                band = finite & np.isfinite(dy)
+                axis.fill_between(
+                    x[band],
+                    y[band] - dy[band],
+                    y[band] + dy[band],
+                    color=color,
+                    alpha=error_alpha,
+                    linewidth=0,
+                )
+            axis.set_title(title)
+        curve_records.append(
+            {
+                "file": key[0],
+                "L": size,
+                "p": float(group["p"].iloc[0]),
+                "geometry_id": int(group["geometry_id"].iloc[0]),
+                "distances": distances,
+                "chord_geometric_mean": chord,
+                "points": len(group),
+            }
+        )
+
+    x_label = (
+        r"Post-attachment time $\tau$"
+        if time_axis == "tau"
+        else r"$\tau/(\ell_{AB}\ell_{AC}\ell_{BC})^{1/3}$"
+    )
+    for axis, metric in zip(axes, selected_metrics):
+        axis.set_xlabel(x_label)
+        axis.grid(alpha=0.25)
+        if metric in {"tmi", "average_mi"}:
+            axis.set_ylabel(mi_units)
+        elif metric in {"joint_purity", "mean_single_purity"}:
+            axis.set_ylim(0.0, 1.02)
+    for axis in axes[n_metrics:]:
+        axis.set_visible(False)
+
+    if len(groups) <= max_legend_entries and max_legend_entries > 0:
+        axes[0].legend(fontsize=8, ncol=2)
+    else:
+        norm = plt.Normalize(chord_min, chord_max)
+        scalar = plt.cm.ScalarMappable(norm=norm, cmap=color_map)
+        scalar.set_array([])
+        fig.colorbar(
+            scalar,
+            ax=axes[:n_metrics],
+            label=r"Geometric-mean chord length $(\ell_1\ell_2\ell_3)^{1/3}$",
+            shrink=0.85,
+        )
+
+    summary = pd.DataFrame(curve_records)
+    if show_summary:
+        try:
+            from IPython.display import display
+
+            display(summary)
+        except ImportError:
+            print(summary.to_string(index=False))
+
+    fig.suptitle(
+        "Three-probe mode-4 dynamics: "
+        rf"$p={filename_p:g}$, {filename_circuit}, $L={filename_size}$",
+        fontsize=14,
+    )
+    fig.tight_layout()
+    _show(fig, show)
+    return {
+        "figure": fig,
+        "axes": tuple(axes[:n_metrics]),
+        "data": data,
+        "summary": summary,
+        "metrics": tuple(selected_metrics),
+        "mi_units": mi_units,
+        "time_axis": time_axis,
+        "filename_metadata": {
+            "L": filename_size,
+            "p": filename_p,
+            "circuit": filename_circuit,
+        },
+    }
+
+
 # ---------------------------------------------------------------------------
 # Distance-resolved two-probe dynamics
 # ---------------------------------------------------------------------------
@@ -4235,9 +4562,7 @@ def free_energy_ceff(
             warnings.warn("Too few successful c_eff bootstrap fits; using fit errors.")
 
     fig, ax = plt.subplots(figsize=figsize)
-    # Reserve the extra horizontal space for the finite-L_min inset so it does
-    # not obscure the main finite-size data or fits.
-    fig.subplots_adjust(left=0.08, right=0.72, bottom=0.15, top=0.91)
+    fig.subplots_adjust(left=0.08, right=0.97, bottom=0.15, top=0.91)
     colors = plt.get_cmap(cmap)(
         np.linspace(0.35, 0.90, max(1, len(fits)))
     )
@@ -4275,21 +4600,40 @@ def free_energy_ceff(
     ax.set_ylabel(r"$\widetilde{f}(L)=F/(L t)$")
     ax.set_title("Measurement-record free-energy density")
     ax.grid(alpha=0.25)
-    ax.legend(fontsize=8)
-    ax.text(
-        0.03,
-        0.04,
+    information = ax.text(
+        0.025,
+        0.025,
         rf"$\alpha={alpha:.5g}$" + "\n" +
         rf"$c_{{\mathrm{{eff}}}}={c_eff:.5f}\pm{c_eff_stderr:.5f}$",
         transform=ax.transAxes,
         ha="left",
         va="bottom",
         bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.88},
+        zorder=10,
+    )
+    # Stack the legend directly above the information box in the lower-left
+    # corner.  Using its rendered height prevents overlap if fonts or values
+    # change.
+    fig.canvas.draw()
+    information_bbox = information.get_window_extent(
+        renderer=fig.canvas.get_renderer()
+    ).transformed(ax.transAxes.inverted())
+    ax.legend(
+        fontsize=8,
+        loc="lower left",
+        bbox_to_anchor=(0.025, information_bbox.y1 + 0.018),
+        borderaxespad=0.0,
     )
 
-    inset = fig.add_axes([0.77, 0.55, 0.20, 0.34])
+    # Keep the inset's top and right spines exactly aligned with those of the
+    # main axes.
+    inset = ax.inset_axes([0.685, 0.57, 0.315, 0.43])
+    inset.set_facecolor("white")
+    inset.patch.set_alpha(1.0)
+    inset.set_zorder(10)
     inset_x = np.asarray(
-        [1.0 / float(row["L_min"]) ** 2 for row in fits]
+        [int(row["L_min"]) for row in fits],
+        dtype=int,
     )
     inset_y = np.asarray([float(row["slope"]) for row in fits])
     inset_error = np.asarray([float(row["slope_stderr"]) for row in fits])
@@ -4307,15 +4651,29 @@ def free_energy_ceff(
         capthick=0.7,
     )
     if len(fits) >= 2:
-        inset_line_x = np.linspace(0.0, 1.05 * np.max(inset_x), 100)
+        inset_line_x = np.linspace(
+            float(np.min(inset_x)),
+            float(np.max(inset_x)),
+            200,
+        )
         inset.plot(
             inset_line_x,
-            correction_fit["slope"] * inset_line_x + m_tilde_infinite,
+            correction_fit["slope"] / inset_line_x**2 + m_tilde_infinite,
             linestyle=":",
             color="tab:blue",
         )
-    inset.set_xlabel(r"$1/L_{\min}^2$", fontsize=8)
+    inset.set_xlabel(r"$L_{\min}$", fontsize=8)
     inset.set_ylabel(r"$m_0(L_{\min})$", fontsize=8)
+    inset.set_xticks(inset_x)
+    inset.set_xticklabels([str(value) for value in inset_x])
+    if len(inset_x) == 1:
+        inset.set_xlim(inset_x[0] - 0.5, inset_x[0] + 0.5)
+    else:
+        inset_padding = max(0.25, 0.04 * float(np.ptp(inset_x)))
+        inset.set_xlim(
+            float(np.min(inset_x)) - inset_padding,
+            float(np.max(inset_x)) + inset_padding,
+        )
     inset.tick_params(labelsize=8)
     inset.grid(alpha=0.2)
     _show(fig, show)

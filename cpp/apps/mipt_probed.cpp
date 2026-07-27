@@ -1,3 +1,4 @@
+#include "mipt/analysis/fgmn.hpp"
 #include "mipt/ancilla_info.hpp"
 #include "mipt/backend.hpp"
 #include "mipt/env.hpp"
@@ -9,15 +10,18 @@
 #include <chrono>
 #include <cmath>
 #include <complex>
-#include <cstdio>
 #include <cstdint>
-#include <cstring>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <deque>
 #include <fstream>
 #include <future>
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <map>
+#include <memory>
 #include <random>
 #include <sstream>
 #include <stdexcept>
@@ -53,9 +57,7 @@ struct InitializeProductKernel
 
 struct AttachReferencesKernel
 {
-    void operator()(cudaq::state *state,
-                    int n,
-                    const std::vector<int> &sites) __qpu__
+    void operator()(cudaq::state *state, int n, const std::vector<int> &sites) __qpu__
     {
         cudaq::qvector q(state);
         for (std::size_t i = 0; i < sites.size(); ++i)
@@ -69,10 +71,7 @@ struct AttachReferencesKernel
 
 struct AttachReferenceKernel
 {
-    void operator()(cudaq::state *state,
-                    int n,
-                    int site,
-                    int reference) __qpu__
+    void operator()(cudaq::state *state, int n, int site, int reference) __qpu__
     {
         cudaq::qvector q(state);
         reset(q[site]);
@@ -97,8 +96,7 @@ struct RunningStats
         {
             return 0.0;
         }
-        return std::sqrt(std::max(0.0, m2 / static_cast<double>(count - 1)) /
-                         static_cast<double>(count));
+        return std::sqrt(std::max(0.0, m2 / static_cast<double>(count - 1)) / static_cast<double>(count));
     }
 
     std::uint64_t count = 0;
@@ -114,6 +112,11 @@ struct Sample
     double i4 = 0.0;
     double negativity = 0.0;
     double log_negativity = 0.0;
+    double tmi = 0.0;
+    double average_mi = 0.0;
+    double min_bipartite_negativity = 0.0;
+    double joint_purity = 0.0;
+    double mean_single_purity = 0.0;
 };
 
 struct Aggregate
@@ -126,6 +129,11 @@ struct Aggregate
         i4.add(sample.i4);
         negativity.add(sample.negativity);
         log_negativity.add(sample.log_negativity);
+        tmi.add(sample.tmi);
+        average_mi.add(sample.average_mi);
+        min_bipartite_negativity.add(sample.min_bipartite_negativity);
+        joint_purity.add(sample.joint_purity);
+        mean_single_purity.add(sample.mean_single_purity);
         if (sample.negativity > 1.0e-12)
         {
             ++positive_negativity;
@@ -138,7 +146,22 @@ struct Aggregate
     RunningStats i4;
     RunningStats negativity;
     RunningStats log_negativity;
+    RunningStats tmi;
+    RunningStats average_mi;
+    RunningStats min_bipartite_negativity;
+    RunningStats gmn;
+    RunningStats joint_purity;
+    RunningStats mean_single_purity;
     std::uint64_t positive_negativity = 0;
+    std::uint64_t gmn_requested = 0;
+    std::uint64_t gmn_zero_prefiltered = 0;
+    std::uint64_t gmn_solver_failures = 0;
+};
+
+struct ProbeGeometry
+{
+    std::array<int, 3> distances{};
+    std::vector<std::array<int, 3>> embeddings;
 };
 
 struct OutputRow
@@ -147,7 +170,151 @@ struct OutputRow
     int t = 0;
     int t0 = 0;
     int distance = -1;
+    int geometry = -1;
+    std::array<int, 3> distances{};
+    std::size_t embedding_count = 0;
     Aggregate stats;
+};
+
+int periodic_distance(int lhs, int rhs, int n)
+{
+    const int direct = std::abs(lhs - rhs);
+    return std::min(direct, n - direct);
+}
+
+std::vector<ProbeGeometry> enumerate_three_probe_geometries(int n)
+{
+    if (n < 3)
+    {
+        throw std::invalid_argument("Three-probe mode 4 requires N >= 3.");
+    }
+    std::map<std::array<int, 3>, std::vector<std::array<int, 3>>> grouped;
+    for (int a = 0; a < n - 2; ++a)
+    {
+        for (int b = a + 1; b < n - 1; ++b)
+        {
+            for (int c = b + 1; c < n; ++c)
+            {
+                std::array<int, 3> signature{periodic_distance(a, b, n), periodic_distance(a, c, n),
+                                             periodic_distance(b, c, n)};
+                std::sort(signature.begin(), signature.end());
+                grouped[signature].push_back({a, b, c});
+            }
+        }
+    }
+
+    std::vector<ProbeGeometry> geometries;
+    geometries.reserve(grouped.size());
+    for (auto &[distances, embeddings] : grouped)
+    {
+        geometries.push_back({distances, std::move(embeddings)});
+    }
+    return geometries;
+}
+
+std::array<double, 128> interleaved_rdm(const ancilla::Rdm3 &rho)
+{
+    std::array<double, 128> packed{};
+    for (std::size_t i = 0; i < rho.values.size(); ++i)
+    {
+        packed[2 * i] = std::real(rho.values[i]);
+        packed[2 * i + 1] = std::imag(rho.values[i]);
+    }
+    return packed;
+}
+
+struct SdpJob
+{
+    std::size_t aggregate_index = 0;
+    std::array<double, 128> rho{};
+};
+
+struct SdpResult
+{
+    std::size_t aggregate_index = 0;
+    double value = std::numeric_limits<double>::quiet_NaN();
+};
+
+class SdpBatchQueue
+{
+  public:
+    SdpBatchQueue(std::vector<Aggregate> &aggregates, bool fermionic, std::size_t batch_size,
+                  std::size_t max_pending_batches)
+        : aggregates_(aggregates), fermionic_(fermionic), batch_size_(std::max<std::size_t>(1, batch_size)),
+          max_pending_batches_(std::max<std::size_t>(1, max_pending_batches))
+    {
+        batch_.reserve(batch_size_);
+    }
+
+    void submit(SdpJob job)
+    {
+        batch_.push_back(std::move(job));
+        if (batch_.size() >= batch_size_)
+        {
+            dispatch();
+        }
+    }
+
+    void finish()
+    {
+        if (!batch_.empty())
+        {
+            dispatch();
+        }
+        while (!pending_.empty())
+        {
+            collect_front();
+        }
+    }
+
+  private:
+    void dispatch()
+    {
+        while (pending_.size() >= max_pending_batches_)
+        {
+            collect_front();
+        }
+        std::vector<SdpJob> jobs;
+        jobs.swap(batch_);
+        batch_.reserve(batch_size_);
+        const bool fermionic = fermionic_;
+        pending_.push_back(std::async(std::launch::async, [jobs = std::move(jobs), fermionic]() mutable {
+            std::vector<SdpResult> results;
+            results.reserve(jobs.size());
+            for (auto &job : jobs)
+            {
+                const double value = fermionic ? compute_fgmn_mosek_8x8_cpp(job.rho.data())
+                                               : compute_gmn_mosek_complex_8x8_cpp(job.rho.data());
+                results.push_back({job.aggregate_index, value});
+            }
+            return results;
+        }));
+    }
+
+    void collect_front()
+    {
+        auto results = pending_.front().get();
+        pending_.pop_front();
+        for (const auto &result : results)
+        {
+            auto &aggregate = aggregates_.at(result.aggregate_index);
+            if (std::isfinite(result.value))
+            {
+                aggregate.gmn.add(std::max(0.0, result.value));
+            }
+            else
+            {
+                ++aggregate.gmn_solver_failures;
+            }
+        }
+    }
+
+    std::vector<Aggregate> &aggregates_;
+    bool fermionic_ = false;
+    std::size_t batch_size_ = 1;
+    std::size_t max_pending_batches_ = 1;
+    std::vector<SdpJob> batch_;
+    std::deque<std::future<std::vector<SdpResult>>> pending_;
 };
 
 std::string compact_decimal(double value)
@@ -206,8 +373,7 @@ std::string shell_quote(std::string_view value)
 
 bool same_probability(double lhs, double rhs)
 {
-    return std::abs(lhs - rhs) <=
-        1.0e-12 * std::max({1.0, std::abs(lhs), std::abs(rhs)});
+    return std::abs(lhs - rhs) <= 1.0e-12 * std::max({1.0, std::abs(lhs), std::abs(rhs)});
 }
 
 std::vector<double> completed_probabilities(const std::string &path)
@@ -225,8 +391,7 @@ std::vector<double> completed_probabilities(const std::string &path)
     }
     if (line.rfind("p,", 0) != 0)
     {
-        throw std::runtime_error(
-            "Cannot resume from malformed checkpoint CSV: " + path);
+        throw std::runtime_error("Cannot resume from malformed checkpoint CSV: " + path);
     }
 
     std::vector<double> completed;
@@ -239,13 +404,10 @@ std::vector<double> completed_probabilities(const std::string &path)
         const auto comma = line.find(',');
         if (comma == std::string::npos)
         {
-            throw std::runtime_error(
-                "Cannot resume from malformed checkpoint row in: " + path);
+            throw std::runtime_error("Cannot resume from malformed checkpoint row in: " + path);
         }
         const double p = std::stod(line.substr(0, comma));
-        if (std::none_of(
-                completed.begin(), completed.end(),
-                [p](double prior) { return same_probability(p, prior); }))
+        if (std::none_of(completed.begin(), completed.end(), [p](double prior) { return same_probability(p, prior); }))
         {
             completed.push_back(p);
         }
@@ -253,31 +415,26 @@ std::vector<double> completed_probabilities(const std::string &path)
     return completed;
 }
 
-void append_checkpoint_csv(const std::string &point_path,
-                           const std::string &output_path)
+void append_checkpoint_csv(const std::string &point_path, const std::string &output_path)
 {
     std::ifstream point(point_path);
     if (!point)
     {
-        throw std::runtime_error(
-            "Isolated point did not produce its CSV: " + point_path);
+        throw std::runtime_error("Isolated point did not produce its CSV: " + point_path);
     }
 
     std::string point_header;
     if (!std::getline(point, point_header) || point_header.empty())
     {
-        throw std::runtime_error(
-            "Isolated point produced an empty CSV: " + point_path);
+        throw std::runtime_error("Isolated point produced an empty CSV: " + point_path);
     }
 
     std::ifstream existing(output_path);
     std::string existing_header;
-    const bool append = existing && static_cast<bool>(
-        std::getline(existing, existing_header));
+    const bool append = existing && static_cast<bool>(std::getline(existing, existing_header));
     if (append && existing_header != point_header)
     {
-        throw std::runtime_error(
-            "Checkpoint header does not match the new output: " + output_path);
+        throw std::runtime_error("Checkpoint header does not match the new output: " + output_path);
     }
 
     const std::string update_path = output_path + ".update.tmp";
@@ -308,8 +465,7 @@ void append_checkpoint_csv(const std::string &point_path,
     output.close();
     if (std::rename(update_path.c_str(), output_path.c_str()) != 0)
     {
-        throw std::runtime_error(
-            "Could not atomically replace checkpoint CSV: " + output_path);
+        throw std::runtime_error("Could not atomically replace checkpoint CSV: " + output_path);
     }
 }
 
@@ -330,9 +486,8 @@ std::vector<double> linspace(double minimum, double maximum, int count)
     std::vector<double> values(static_cast<std::size_t>(count));
     for (int i = 0; i < count; ++i)
     {
-        values[static_cast<std::size_t>(i)] = minimum +
-            (maximum - minimum) * static_cast<double>(i) /
-                static_cast<double>(count - 1);
+        values[static_cast<std::size_t>(i)] =
+            minimum + (maximum - minimum) * static_cast<double>(i) / static_cast<double>(count - 1);
     }
     values.front() = minimum;
     values.back() = maximum;
@@ -341,8 +496,7 @@ std::vector<double> linspace(double minimum, double maximum, int count)
 
 std::vector<int> integer_linspace(int minimum, int maximum, int count)
 {
-    const auto floating = linspace(
-        static_cast<double>(minimum), static_cast<double>(maximum), count);
+    const auto floating = linspace(static_cast<double>(minimum), static_cast<double>(maximum), count);
     std::vector<int> values;
     values.reserve(floating.size());
     for (double value : floating)
@@ -355,8 +509,8 @@ std::vector<int> integer_linspace(int minimum, int maximum, int count)
     }
     if (static_cast<int>(values.size()) != count)
     {
-        throw std::invalid_argument(
-            "t_res requests duplicate integer times; require t_res <= t_max-t_min+1.");
+        throw std::invalid_argument("t_res requests duplicate integer times; "
+                                    "require t_res <= t_max-t_min+1.");
     }
     return values;
 }
@@ -384,70 +538,72 @@ std::vector<int> probe_sites(int probes, int n, int mode, int delta_x = 0)
     return {n / 4 - 1, n / 2 - 1, 3 * n / 4 - 1, n - 1};
 }
 
-cudaq::state initialize_state(int n,
-                              const std::vector<int> &sites,
-                              bool references_attached)
+cudaq::state initialize_state(int n, const std::vector<int> &sites, bool references_attached)
 {
-    return references_attached
-        ? cudaq::get_state(InitializeReferencesKernel{}, n, sites)
-        : cudaq::get_state(
-              InitializeProductKernel{}, n + static_cast<int>(sites.size()));
+    return references_attached ? cudaq::get_state(InitializeReferencesKernel{}, n, sites)
+                               : cudaq::get_state(InitializeProductKernel{}, n + static_cast<int>(sites.size()));
 }
 
-cudaq::state attach_references(cudaq::state &state,
-                               int n,
-                               const std::vector<int> &sites)
+cudaq::state attach_references(cudaq::state &state, int n, const std::vector<int> &sites)
 {
     return cudaq::get_state(AttachReferencesKernel{}, &state, n, sites);
 }
 
-cudaq::state attach_reference(cudaq::state &state,
-                              int n,
-                              int site,
-                              int reference)
+cudaq::state attach_reference(cudaq::state &state, int n, int site, int reference)
 {
-    return cudaq::get_state(
-        AttachReferenceKernel{}, &state, n, site, reference);
+    return cudaq::get_state(AttachReferenceKernel{}, &state, n, site, reference);
 }
 
-Sample measure_sample(cudaq::state &state,
-                      int probes,
-                      int n,
-                      CircuitType type)
+Sample measure_sample(cudaq::state &state, int probes, int n, CircuitType type)
 {
     const bool fermionic = uses_fermionic_trace(type);
     const int total_qubits = n + probes;
     if (probes == 1)
     {
-        const auto rho = ancilla::reduced_density_matrix(
-            state, total_qubits, n, fermionic);
+        const auto rho = ancilla::reduced_density_matrix(state, total_qubits, n, fermionic);
         return {ancilla::entropy_from_rdm(rho), 0.0, 0.0, 0.0, 0.0, 0.0};
     }
     if (probes == 2)
     {
-        const auto values = ancilla::two_probe_observables(
-            state, total_qubits, n, n + 1, fermionic);
-        return {
-            values.joint_entropy,
-            values.mutual_information,
-            0.0,
-            0.0,
-            values.negativity,
-            values.log_negativity};
+        const auto values = ancilla::two_probe_observables(state, total_qubits, n, n + 1, fermionic);
+        return {values.joint_entropy, values.mutual_information, 0.0, 0.0, values.negativity, values.log_negativity};
     }
-    const auto values = ancilla::four_probe_information(
-        state,
-        total_qubits,
-        {n, n + 1, n + 2, n + 3},
-        fermionic);
+    const auto values = ancilla::four_probe_information(state, total_qubits, {n, n + 1, n + 2, n + 3}, fermionic);
     return {values.entropy, values.i2, values.i3, values.i4, 0.0, 0.0};
+}
+
+struct ThreeProbeMeasurement
+{
+    Sample sample;
+    std::array<double, 128> rho{};
+};
+
+ThreeProbeMeasurement measure_three_probe_sample(cudaq::state &state, int n, CircuitType type)
+{
+    const bool fermionic = uses_fermionic_trace(type);
+    const auto rho = ancilla::reduced_density_matrix_three(state, n + 3, {n, n + 1, n + 2}, fermionic);
+    const auto information = ancilla::three_probe_information(rho, fermionic);
+    auto packed = interleaved_rdm(rho);
+    const double minimum_negativity = fermionic ? compute_min_bipartite_fermionic_negativity_8x8_cpp(packed.data())
+                                                : compute_min_bipartite_negativity_8x8_cpp(packed.data());
+    if (!std::isfinite(minimum_negativity))
+    {
+        throw std::runtime_error("Three-probe bipartite-negativity evaluation "
+                                 "returned a non-finite value.");
+    }
+    Sample sample;
+    sample.tmi = information.tmi;
+    sample.average_mi = information.average_mi;
+    sample.min_bipartite_negativity = std::max(0.0, minimum_negativity);
+    sample.joint_purity = information.joint_purity;
+    sample.mean_single_purity = information.mean_single_purity;
+    return {sample, std::move(packed)};
 }
 
 Sample measure_parity_encoded_probe(cudaq::state &state, int n)
 {
     const auto weights = ancilla::parity_sector_weights(state, n);
-    const double entropy = ancilla::entropy_from_rdm(
-        {weights.even, weights.odd, {0.0, 0.0}});
+    const double entropy = ancilla::entropy_from_rdm({weights.even, weights.odd, {0.0, 0.0}});
     return {entropy, 0.0, 0.0, 0.0, 0.0, 0.0};
 }
 
@@ -457,15 +613,13 @@ std::string format_duration(double seconds)
     {
         return "--h --m --s";
     }
-    const std::uint64_t total_seconds = static_cast<std::uint64_t>(
-        std::ceil(seconds));
+    const std::uint64_t total_seconds = static_cast<std::uint64_t>(std::ceil(seconds));
     const std::uint64_t hours = total_seconds / 3600u;
     const std::uint64_t minutes = (total_seconds % 3600u) / 60u;
     const std::uint64_t remainder = total_seconds % 60u;
     std::ostringstream out;
-    out << std::setfill('0') << std::setw(2) << hours << "h "
-        << std::setw(2) << minutes << "m "
-        << std::setw(2) << remainder << 's';
+    out << std::setfill('0') << std::setw(2) << hours << "h " << std::setw(2) << minutes << "m " << std::setw(2)
+        << remainder << 's';
     return out.str();
 }
 
@@ -473,23 +627,16 @@ class ProgressReporter
 {
   public:
     explicit ProgressReporter(std::uint64_t local_total)
-        : global_offset_(static_cast<std::uint64_t>(env::integer(
-              "MIPT_PROBED_GLOBAL_OFFSET", 0, 0,
-              std::numeric_limits<long>::max()))),
+        : global_offset_(static_cast<std::uint64_t>(
+              env::integer("MIPT_PROBED_GLOBAL_OFFSET", 0, 0, std::numeric_limits<long>::max()))),
           global_total_(static_cast<std::uint64_t>(env::integer(
-              "MIPT_PROBED_GLOBAL_TOTAL",
-              static_cast<long>(local_total), 1,
-              std::numeric_limits<long>::max()))),
-          global_base_done_(static_cast<std::uint64_t>(env::integer(
-              "MIPT_PROBED_GLOBAL_BASE_DONE", 0, 0,
-              std::numeric_limits<long>::max()))),
-          global_start_ms_(static_cast<std::uint64_t>(env::integer(
-              "MIPT_PROBED_GLOBAL_START_MS", 0, 0,
-              std::numeric_limits<long>::max()))),
-          start_(std::chrono::steady_clock::now()),
-          enabled_(env::boolean("MIPT_PROBED_PROGRESS", true)),
-          interval_(env::integer(
-              "MIPT_PROBED_PROGRESS_MS", 500, 0, 60000))
+              "MIPT_PROBED_GLOBAL_TOTAL", static_cast<long>(local_total), 1, std::numeric_limits<long>::max()))),
+          global_base_done_(static_cast<std::uint64_t>(
+              env::integer("MIPT_PROBED_GLOBAL_BASE_DONE", 0, 0, std::numeric_limits<long>::max()))),
+          global_start_ms_(static_cast<std::uint64_t>(
+              env::integer("MIPT_PROBED_GLOBAL_START_MS", 0, 0, std::numeric_limits<long>::max()))),
+          start_(std::chrono::steady_clock::now()), enabled_(env::boolean("MIPT_PROBED_PROGRESS", true)),
+          interval_(env::integer("MIPT_PROBED_PROGRESS_MS", 500, 0, 60000))
     {
         last_ = start_ - interval_;
         point_start_ = start_;
@@ -501,10 +648,7 @@ class ProgressReporter
         point_base_completed_ = local_completed;
     }
 
-    void update(std::uint64_t local_completed,
-                double p,
-                std::size_t point_index,
-                std::size_t point_count,
+    void update(std::uint64_t local_completed, double p, std::size_t point_index, std::size_t point_count,
                 bool force = false)
     {
         if (!enabled_)
@@ -518,59 +662,39 @@ class ProgressReporter
         }
         last_ = now;
         printed_ = true;
-        const double elapsed =
-            std::chrono::duration<double>(now - start_).count();
-        double average_rate = elapsed > 0.0
-            ? static_cast<double>(local_completed) / elapsed
-            : 0.0;
-        const double point_elapsed =
-            std::chrono::duration<double>(now - point_start_).count();
+        const double elapsed = std::chrono::duration<double>(now - start_).count();
+        double average_rate = elapsed > 0.0 ? static_cast<double>(local_completed) / elapsed : 0.0;
+        const double point_elapsed = std::chrono::duration<double>(now - point_start_).count();
         const std::uint64_t point_completed =
-            local_completed >= point_base_completed_
-            ? local_completed - point_base_completed_
-            : 0;
-        const double current_rate = point_elapsed > 0.0
-            ? static_cast<double>(point_completed) / point_elapsed
-            : 0.0;
-        const std::uint64_t global_completed = std::min(
-            global_total_, global_offset_ + local_completed);
+            local_completed >= point_base_completed_ ? local_completed - point_base_completed_ : 0;
+        const double current_rate = point_elapsed > 0.0 ? static_cast<double>(point_completed) / point_elapsed : 0.0;
+        const std::uint64_t global_completed = std::min(global_total_, global_offset_ + local_completed);
         const std::uint64_t remaining = global_total_ - global_completed;
         if (global_start_ms_ > 0)
         {
-            const auto now_ms = static_cast<std::uint64_t>(
-                std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::system_clock::now().time_since_epoch()).count());
-            const double global_elapsed = now_ms > global_start_ms_
-                ? static_cast<double>(now_ms - global_start_ms_) / 1000.0
-                : 0.0;
+            const auto now_ms = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                                               std::chrono::system_clock::now().time_since_epoch())
+                                                               .count());
+            const double global_elapsed =
+                now_ms > global_start_ms_ ? static_cast<double>(now_ms - global_start_ms_) / 1000.0 : 0.0;
             const std::uint64_t completed_this_run =
-                global_completed > global_base_done_
-                ? global_completed - global_base_done_
-                : 0;
+                global_completed > global_base_done_ ? global_completed - global_base_done_ : 0;
             if (global_elapsed > 0.0 && completed_this_run > 0)
             {
-                average_rate =
-                    static_cast<double>(completed_this_run) / global_elapsed;
+                average_rate = static_cast<double>(completed_this_run) / global_elapsed;
             }
         }
-        const double eta = average_rate > 0.0
-            ? static_cast<double>(remaining) / average_rate
+        const double eta = average_rate > 0.0 ? static_cast<double>(remaining) / average_rate
             : std::numeric_limits<double>::quiet_NaN();
         const std::size_t shown_index = static_cast<std::size_t>(env::integer(
-            "MIPT_PROBED_GLOBAL_P_INDEX", static_cast<long>(point_index),
-            1, std::numeric_limits<long>::max()));
+            "MIPT_PROBED_GLOBAL_P_INDEX", static_cast<long>(point_index), 1, std::numeric_limits<long>::max()));
         const std::size_t shown_count = static_cast<std::size_t>(env::integer(
-            "MIPT_PROBED_GLOBAL_P_COUNT", static_cast<long>(point_count),
-            1, std::numeric_limits<long>::max()));
-        std::cout << "\rrealizations: " << global_completed << '/'
-                  << global_total_
-                  << " | p=" << std::fixed << std::setprecision(3) << p
-                  << " [" << shown_index << '/' << shown_count << ']'
-                  << " | avg=" << std::setprecision(3) << average_rate
-                  << " traj/s"
+            "MIPT_PROBED_GLOBAL_P_COUNT", static_cast<long>(point_count), 1, std::numeric_limits<long>::max()));
+        std::cout << "\rrealizations: " << global_completed << '/' << global_total_ << " | p=" << std::fixed
+                  << std::setprecision(3) << p << " [" << shown_index << '/' << shown_count << ']'
+                  << " | avg=" << std::setprecision(3) << average_rate << " traj/s"
                   << " | current=" << current_rate << " traj/s"
-                  << " | ETA=" << format_duration(eta)
-                  << "     " << std::flush;
+                  << " | ETA=" << format_duration(eta) << "     " << std::flush;
     }
 
     void finish() const
@@ -595,20 +719,12 @@ class ProgressReporter
     std::chrono::milliseconds interval_{500};
 };
 
-std::string default_output_name(int probes,
-                                int n,
-                                int realizations,
-                                CircuitType type,
-                                int mode,
-                                const std::vector<double> &p_values,
-                                const std::vector<int> &times,
-                                int delta_x,
-                                int delta_t,
-                                int t_eq)
+std::string default_output_name(int probes, int n, int realizations, CircuitType type, int mode,
+                                const std::vector<double> &p_values, const std::vector<int> &times, int delta_x,
+                                int delta_t, int t_eq)
 {
-    std::string name = "probed_" + std::to_string(probes) + "_" +
-        std::string(circuit_type_tag(type)) + "_n_" + std::to_string(n) +
-        "_reals_" + compact_count(static_cast<std::uint64_t>(realizations)) +
+    std::string name = "probed_" + std::to_string(probes) + "_" + std::string(circuit_type_tag(type)) + "_n_" +
+                       std::to_string(n) + "_reals_" + compact_count(static_cast<std::uint64_t>(realizations)) +
         "_mode_" + std::to_string(mode);
     if (p_values.size() == 1)
     {
@@ -616,28 +732,23 @@ std::string default_output_name(int probes,
     }
     else
     {
-        name += "_p_" + compact_decimal(p_values.front()) + "_" +
-            compact_decimal(p_values.back()) + "_res_" +
+        name += "_p_" + compact_decimal(p_values.front()) + "_" + compact_decimal(p_values.back()) + "_res_" +
             std::to_string(p_values.size());
     }
     if (!times.empty())
     {
         if (mode == 3)
         {
-            name += "_dx_" + std::to_string(delta_x) +
-                "_dt_" + std::to_string(delta_t) +
-                "_tau_" + std::to_string(times.front()) + "_" +
-                std::to_string(times.back());
+            name += "_dx_" + std::to_string(delta_x) + "_dt_" + std::to_string(delta_t) + "_tau_" +
+                    std::to_string(times.front()) + "_" + std::to_string(times.back());
         }
         else if (mode == 4)
         {
-            name += "_teq_" + std::to_string(t_eq) +
-                "_tau_0_" + std::to_string(times.back());
+            name += "_teq_" + std::to_string(t_eq) + "_tau_0_" + std::to_string(times.back());
         }
         else
         {
-            name += "_t_" + std::to_string(times.front()) + "_" +
-                std::to_string(times.back());
+            name += "_t_" + std::to_string(times.front()) + "_" + std::to_string(times.back());
             if (mode == 2)
             {
                 name += "_res_" + std::to_string(times.size());
@@ -649,63 +760,83 @@ std::string default_output_name(int probes,
 
 void print_help(const char *program)
 {
-    std::cout
-        << "Usage: " << program
-        << " [probes] [N] [realizations] [circ_type] [probe_mode] [args]\n\n"
-        << "probes     1, 2, or 4 reference qubits.\n"
+    std::cout << "Usage: " << program << " [probes] [N] [realizations] [circ_type] [probe_mode] [args]\n\n"
+              << "probes     1, 2, 3, or 4 reference qubits. Three probes are mode-4 "
+                 "only.\n"
         << "N          Number of monitored system sites (ancillas excluded).\n"
         << "circ_type  Circuit architecture:\n";
     print_circuit_type_help(std::cout, "               ");
-    std::cout
-        << "probe_mode and args:\n"
+    std::cout << "probe_mode and args:\n"
         << "  0  Legacy time trajectory: [p] [t_min] [t_max]\n"
-        << "     One probe is attached at t=0. Two/four probes are attached at t0=2N;\n"
-        << "     consequently their t_min must be at least 2N. One-probe depth defaults\n"
+              << "     One probe is attached at t=0. Two/four probes are attached at "
+                 "t0=2N;\n"
+              << "     consequently their t_min must be at least 2N. One-probe depth "
+                 "defaults\n"
         << "     to d=1 and can be set with MIPT_PROBED_DISTANCE.\n"
         << "  1  Critical-point scan: [p_min] [p_max] [p_res]\n"
         << "     One probe follows Gullans--Huse: attach at t=0, evolve without\n"
-        << "     measurements to 2N, then at p to 4N. Two/four probes evolve at p to\n"
+              << "     measurements to 2N, then at p to 4N. Two/four probes evolve at "
+                 "p to\n"
         << "     t0=2N, are attached locally, and are sampled at t=4N.\n"
         << "  2  Entropy grid: [t_min] [t_max] [t_res] [p_min] [p_max] [p_res]\n"
-        << "     References are attached at t=0 and the joint entropy S_Q=S(rho_R) is\n"
+              << "     References are attached at t=0 and the joint entropy "
+                 "S_Q=S(rho_R) is\n"
         << "     recorded on the inclusive integer-time and p linspaces.\n"
         << "  3  Anisotropy correlation: [p] [delta_x] [delta_t]\n"
-        << "     Requires probes=2. The first reference is attached to site 1 at\n"
+              << "     Requires probes=2. The first reference is attached to site 1 "
+                 "at\n"
         << "     tau1=4N; the second is attached to site 1+delta_x (periodic,\n"
         << "     one-indexed) at tau2=tau1+\n"
-        << "     delta_t. Use (delta_x,delta_t)=(N/2,0) for the spatial branch or\n"
-        << "     (0,delta_t>0) for the temporal branch. Mutual information is recorded\n"
-        << "     for elapsed readout time tau=0,...,8N after the second insertion, so\n"
+              << "     delta_t. Use (delta_x,delta_t)=(N/2,0) for the spatial branch "
+                 "or\n"
+              << "     (0,delta_t>0) for the temporal branch. Mutual information is "
+                 "recorded\n"
+              << "     for elapsed readout time tau=0,...,8N after the second "
+                 "insertion, so\n"
         << "     the absolute circuit depth is 12N+delta_t.\n\n"
-        << "  4  Distance-resolved two-probe dynamics: [p] [tau_max]\n"
-        << "     Requires probes=2. For every distance r=1,...,floor(N/2), evolve to\n"
-        << "     t_eq=2N, attach the references at a fresh random origin and origin+r,\n"
-        << "     then record tau=0,...,tau_max after attachment. Each (r,realization)\n"
-        << "     uses an independent circuit trajectory.\n\n"
-        << "All entropies use natural logarithms. Four-probe I2/I3 are averages over\n"
-        << "the six pairs/four triplets; I4 is inclusion--exclusion information.\n"
-        << "Output paths are generated from all CLI arguments; output.csv is not accepted.\n\n"
+              << "  4  Distance-resolved probe dynamics: [p] [tau_max]\n"
+              << "     probes=2: simulate every distance r=1,...,floor(N/2), using a "
+                 "fresh\n"
+              << "     random origin for each independent trajectory.\n"
+              << "     probes=3: simulate every unique sorted three-distance triangle "
+                 "with\n"
+              << "     exactly equal representation, choosing uniformly among all "
+                 "lattice\n"
+              << "     embeddings of that triangle. Records TMI, average pair MI, "
+                 "minimum\n"
+              << "     bipartite negativity, GMN/fGMN, joint purity, and mean "
+                 "single-probe\n"
+              << "     purity. Both protocols attach after t_eq and sample "
+                 "tau=0..tau_max.\n\n"
+              << "All entropies use natural logarithms. Four-probe I2/I3 are averages "
+                 "over\n"
+              << "the six pairs/four triplets; I4 is inclusion--exclusion "
+                 "information.\n"
+              << "Output paths are generated from all CLI arguments; output.csv is not "
+                 "accepted.\n\n"
         << "Runtime controls:\n"
         << "  MIPT_PROBED_DISTANCE=1       Legacy one-probe depth d.\n"
         << "  MIPT_PROBED_PREFETCH=0       Disable CPU layer prefetch.\n"
-        << "  MIPT_PROBED_PARITY_ENCODING=0 Disable exact one-probe parity encoding.\n"
+              << "  MIPT_PROBED_PARITY_ENCODING=0 Disable exact one-probe parity "
+                 "encoding.\n"
         << "  MIPT_PROBED_ISOLATE_P=0      Disable per-p subprocess isolation.\n"
-        << "  MIPT_PROBED_RESUME=0         Replace, rather than resume, a p scan.\n"
-        << "  MIPT_PROBED_RETRIES=1        Retries after a failed isolated p point.\n"
+              << "  MIPT_PROBED_RESUME=0         Replace, rather than resume, a p "
+                 "scan.\n"
+              << "  MIPT_PROBED_RETRIES=1        Retries after a failed isolated p "
+                 "point.\n"
         << "  MIPT_PROBED_PROGRESS=0       Disable progress output.\n"
         << "  MIPT_PROBED_PROGRESS_MS=500  Progress-update interval.\n"
-        << "  MIPT_PROBED_T_EQ=2N          Mode-4 equilibration timesteps.\n";
+              << "  MIPT_PROBED_T_EQ=2N          Mode-4 equilibration timesteps.\n"
+              << "  MIPT_PROBED_GMN_BATCH_RECORDS=64  RDMs per deferred SDP batch.\n"
+              << "  MIPT_PROBED_GMN_PENDING_BATCHES=2 Maximum concurrent SDP batches.\n"
+              << "  MIPT_PROBED_GMN_STRIDE=1     Evaluate GMN/fGMN every nth tau.\n"
+              << "  MIPT_PROBED_GMN_SAMPLES_PER_BIN=0  Samples per geometry/tau; "
+                 "0=all.\n"
+              << "  MIPT_PROBED_GMN_ZERO_TOL=1e-10  Zero-prefilter tolerance.\n";
 }
 
-void write_csv(const std::string &path,
-               int probes,
-               int mode,
-               int n,
-               int realizations,
-               const std::vector<OutputRow> &rows,
-               int delta_x,
-               int delta_t,
-               int t_eq)
+void write_csv(const std::string &path, int probes, int mode, int n, int realizations, CircuitType type,
+               const std::vector<OutputRow> &rows, int delta_x, int delta_t, int t_eq)
 {
     std::ofstream csv(path, std::ios::out | std::ios::trunc);
     if (!csv)
@@ -717,6 +848,8 @@ void write_csv(const std::string &path,
     if (mode == 4)
     {
         const double pi = std::acos(-1.0);
+        if (probes == 2)
+        {
         csv << "N,p,distance,chord_length,t_eq,tau,tau_over_chord,"
                "t_absolute,I_mean,I_stderr,negativity_mean,"
                "negativity_stderr,log_negativity_mean,"
@@ -725,20 +858,62 @@ void write_csv(const std::string &path,
         for (const auto &row : rows)
         {
             const double chord = static_cast<double>(n) / pi *
-                std::sin(pi * static_cast<double>(row.distance) /
-                         static_cast<double>(n));
-            csv << n << ',' << row.p << ',' << row.distance << ',' << chord
-                << ',' << t_eq << ',' << row.t << ','
-                << static_cast<double>(row.t) / chord << ',' << t_eq + row.t
-                << ',' << row.stats.i2.mean << ',' << row.stats.i2.stderr()
-                << ',' << row.stats.negativity.mean << ','
-                << row.stats.negativity.stderr() << ','
-                << row.stats.log_negativity.mean << ','
-                << row.stats.log_negativity.stderr() << ','
+                                     std::sin(pi * static_cast<double>(row.distance) / static_cast<double>(n));
+                csv << n << ',' << row.p << ',' << row.distance << ',' << chord << ',' << t_eq << ',' << row.t << ','
+                    << static_cast<double>(row.t) / chord << ',' << t_eq + row.t << ',' << row.stats.i2.mean << ','
+                    << row.stats.i2.stderr() << ',' << row.stats.negativity.mean << ',' << row.stats.negativity.stderr()
+                    << ',' << row.stats.log_negativity.mean << ',' << row.stats.log_negativity.stderr() << ','
                 << row.stats.positive_negativity << ','
                 << static_cast<double>(row.stats.positive_negativity) /
                        static_cast<double>(row.stats.negativity.count)
                 << ",1\n";
+        }
+    }
+        else
+        {
+            const int gmn_stride =
+                static_cast<int>(env::integer("MIPT_PROBED_GMN_STRIDE", 1, 1, std::numeric_limits<int>::max()));
+            const int gmn_limit = static_cast<int>(env::integer("MIPT_PROBED_GMN_SAMPLES_PER_BIN", 0, 0, realizations));
+            const char *measure_name = uses_fermionic_trace(type) ? "fGMN" : "GMN";
+            csv << "N,p,geometry_id,distance_1,distance_2,distance_3,"
+                   "chord_1,chord_2,chord_3,chord_geometric_mean,"
+                   "embedding_count,t_eq,tau,tau_over_chord_geometric_mean,"
+                   "t_absolute,TMI_mean,TMI_stderr,average_MI_mean,"
+                   "average_MI_stderr,min_bipartite_negativity_mean,"
+                   "min_bipartite_negativity_stderr,gmn_type,GMN_mean,"
+                   "GMN_stderr,GMN_sample_count,GMN_requested_count,"
+                   "GMN_zero_prefilter_count,GMN_solver_failure_count,"
+                   "GMN_stride,GMN_samples_per_bin,joint_purity_mean,"
+                   "joint_purity_stderr,mean_single_purity_mean,"
+                   "mean_single_purity_stderr,realizations_per_geometry\n";
+            for (const auto &row : rows)
+            {
+                std::array<double, 3> chords{};
+                for (int i = 0; i < 3; ++i)
+                {
+                    chords[static_cast<std::size_t>(i)] =
+                        static_cast<double>(n) / pi *
+                        std::sin(pi * static_cast<double>(row.distances[static_cast<std::size_t>(i)]) /
+                                 static_cast<double>(n));
+                }
+                const double chord_geometric_mean = std::cbrt(chords[0] * chords[1] * chords[2]);
+                const double gmn_mean =
+                    row.stats.gmn.count > 0 ? row.stats.gmn.mean : std::numeric_limits<double>::quiet_NaN();
+                const double gmn_stderr =
+                    row.stats.gmn.count > 0 ? row.stats.gmn.stderr() : std::numeric_limits<double>::quiet_NaN();
+                csv << n << ',' << row.p << ',' << row.geometry << ',' << row.distances[0] << ',' << row.distances[1]
+                    << ',' << row.distances[2] << ',' << chords[0] << ',' << chords[1] << ',' << chords[2] << ','
+                    << chord_geometric_mean << ',' << row.embedding_count << ',' << t_eq << ',' << row.t << ','
+                    << static_cast<double>(row.t) / chord_geometric_mean << ',' << t_eq + row.t << ','
+                    << row.stats.tmi.mean << ',' << row.stats.tmi.stderr() << ',' << row.stats.average_mi.mean << ','
+                    << row.stats.average_mi.stderr() << ',' << row.stats.min_bipartite_negativity.mean << ','
+                    << row.stats.min_bipartite_negativity.stderr() << ',' << measure_name << ',' << gmn_mean << ','
+                    << gmn_stderr << ',' << row.stats.gmn.count << ',' << row.stats.gmn_requested << ','
+                    << row.stats.gmn_zero_prefiltered << ',' << row.stats.gmn_solver_failures << ',' << gmn_stride
+                    << ',' << gmn_limit << ',' << row.stats.joint_purity.mean << ',' << row.stats.joint_purity.stderr()
+                    << ',' << row.stats.mean_single_purity.mean << ',' << row.stats.mean_single_purity.stderr() << ','
+                    << realizations << '\n';
+            }
         }
     }
     else if (mode == 3)
@@ -750,14 +925,10 @@ void write_csv(const std::string &path,
                "log_negativity_mean,log_negativity_stderr\n";
         for (const auto &row : rows)
         {
-            csv << n << ',' << row.p << ',' << delta_x << ',' << delta_t << ','
-                << tau1 << ',' << tau2 << ',' << row.t << ','
-                << static_cast<double>(row.t) / n << ',' << tau2 + row.t << ','
-                << row.stats.i2.mean << ',' << row.stats.i2.stderr() << ','
-                << row.stats.negativity.mean << ','
-                << row.stats.negativity.stderr() << ','
-                << row.stats.log_negativity.mean << ','
-                << row.stats.log_negativity.stderr() << '\n';
+            csv << n << ',' << row.p << ',' << delta_x << ',' << delta_t << ',' << tau1 << ',' << tau2 << ',' << row.t
+                << ',' << static_cast<double>(row.t) / n << ',' << tau2 + row.t << ',' << row.stats.i2.mean << ','
+                << row.stats.i2.stderr() << ',' << row.stats.negativity.mean << ',' << row.stats.negativity.stderr()
+                << ',' << row.stats.log_negativity.mean << ',' << row.stats.log_negativity.stderr() << '\n';
         }
     }
     else if (mode == 0 && probes == 1)
@@ -765,8 +936,7 @@ void write_csv(const std::string &path,
         csv << "t,S_mean,S_stderr\n";
         for (const auto &row : rows)
         {
-            csv << row.t << ',' << row.stats.sq.mean << ','
-                << row.stats.sq.stderr() << '\n';
+            csv << row.t << ',' << row.stats.sq.mean << ',' << row.stats.sq.stderr() << '\n';
         }
     }
     else if (mode == 0 && probes == 2)
@@ -776,12 +946,9 @@ void write_csv(const std::string &path,
                "log_negativity_mean,log_negativity_stderr\n";
         for (const auto &row : rows)
         {
-            csv << row.t << ',' << row.t - row.t0 << ','
-                << static_cast<double>(row.t - row.t0) / n << ','
-                << row.stats.i2.mean << ',' << row.stats.i2.stderr() << ','
-                << row.stats.negativity.mean << ','
-                << row.stats.negativity.stderr() << ','
-                << row.stats.log_negativity.mean << ','
+            csv << row.t << ',' << row.t - row.t0 << ',' << static_cast<double>(row.t - row.t0) / n << ','
+                << row.stats.i2.mean << ',' << row.stats.i2.stderr() << ',' << row.stats.negativity.mean << ','
+                << row.stats.negativity.stderr() << ',' << row.stats.log_negativity.mean << ','
                 << row.stats.log_negativity.stderr() << '\n';
         }
     }
@@ -791,11 +958,9 @@ void write_csv(const std::string &path,
                "I3_mean,I3_stderr,I4_mean,I4_stderr\n";
         for (const auto &row : rows)
         {
-            csv << row.t << ',' << row.t - row.t0 << ','
-                << static_cast<double>(row.t - row.t0) / n << ','
-                << row.stats.i2.mean << ',' << row.stats.i2.stderr() << ','
-                << row.stats.i3.mean << ',' << row.stats.i3.stderr() << ','
-                << row.stats.i4.mean << ',' << row.stats.i4.stderr() << '\n';
+            csv << row.t << ',' << row.t - row.t0 << ',' << static_cast<double>(row.t - row.t0) / n << ','
+                << row.stats.i2.mean << ',' << row.stats.i2.stderr() << ',' << row.stats.i3.mean << ','
+                << row.stats.i3.stderr() << ',' << row.stats.i4.mean << ',' << row.stats.i4.stderr() << '\n';
         }
     }
     else if (mode == 2)
@@ -803,8 +968,7 @@ void write_csv(const std::string &path,
         csv << "p,t,S_Q_mean,S_Q_stderr\n";
         for (const auto &row : rows)
         {
-            csv << row.p << ',' << row.t << ',' << row.stats.sq.mean << ','
-                << row.stats.sq.stderr() << '\n';
+            csv << row.p << ',' << row.t << ',' << row.stats.sq.mean << ',' << row.stats.sq.stderr() << '\n';
         }
     }
     else
@@ -821,16 +985,15 @@ void write_csv(const std::string &path,
         csv << '\n';
         for (const auto &row : rows)
         {
-            csv << row.p << ',' << row.t << ',' << row.stats.sq.mean << ','
-                << row.stats.sq.stderr();
+            csv << row.p << ',' << row.t << ',' << row.stats.sq.mean << ',' << row.stats.sq.stderr();
             if (probes >= 2)
             {
                 csv << ',' << row.stats.i2.mean << ',' << row.stats.i2.stderr();
             }
             if (probes == 4)
             {
-                csv << ',' << row.stats.i3.mean << ',' << row.stats.i3.stderr()
-                    << ',' << row.stats.i4.mean << ',' << row.stats.i4.stderr();
+                csv << ',' << row.stats.i3.mean << ',' << row.stats.i3.stderr() << ',' << row.stats.i4.mean << ','
+                    << row.stats.i4.stderr();
             }
             csv << '\n';
         }
@@ -850,15 +1013,8 @@ void write_csv(const std::string &path,
     }
 }
 
-int run_isolated_p_scan(const char *program,
-                        int probes,
-                        int n,
-                        int realizations,
-                        CircuitType type,
-                        int mode,
-                        const std::vector<double> &p_values,
-                        const std::vector<int> &times,
-                        const std::string &output)
+int run_isolated_p_scan(const char *program, int probes, int n, int realizations, CircuitType type, int mode,
+                        const std::vector<double> &p_values, const std::vector<int> &times, const std::string &output)
 {
     const bool resume = env::boolean("MIPT_PROBED_RESUME", true);
     if (!resume)
@@ -866,82 +1022,59 @@ int run_isolated_p_scan(const char *program,
         std::remove(output.c_str());
     }
     auto completed = completed_probabilities(output);
-    const int retries = static_cast<int>(env::integer(
-        "MIPT_PROBED_RETRIES", 1, 0, 10));
+    const int retries = static_cast<int>(env::integer("MIPT_PROBED_RETRIES", 1, 0, 10));
 
     const std::uint64_t global_total =
-        static_cast<std::uint64_t>(p_values.size()) *
-        static_cast<std::uint64_t>(realizations);
+        static_cast<std::uint64_t>(p_values.size()) * static_cast<std::uint64_t>(realizations);
     const std::uint64_t global_base_done =
-        static_cast<std::uint64_t>(completed.size()) *
-        static_cast<std::uint64_t>(realizations);
+        static_cast<std::uint64_t>(completed.size()) * static_cast<std::uint64_t>(realizations);
     const auto global_start_ms = static_cast<std::uint64_t>(
-        std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count());
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch())
+            .count());
     if (!completed.empty())
     {
         const std::uint64_t done =
-            static_cast<std::uint64_t>(completed.size()) *
-            static_cast<std::uint64_t>(realizations);
+            static_cast<std::uint64_t>(completed.size()) * static_cast<std::uint64_t>(realizations);
         std::cout << "Resuming: " << completed.size() << '/' << p_values.size()
                   << " p points complete; realizations done=" << done
-                  << ", left=" << global_total - std::min(global_total, done)
-                  << ".\n";
+                  << ", left=" << global_total - std::min(global_total, done) << ".\n";
     }
     for (std::size_t index = 0; index < p_values.size(); ++index)
     {
         const double p = p_values[index];
-        const bool already_done = std::any_of(
-            completed.begin(), completed.end(),
-            [p](double prior) { return same_probability(p, prior); });
+        const bool already_done =
+            std::any_of(completed.begin(), completed.end(), [p](double prior) { return same_probability(p, prior); });
         if (already_done)
         {
-            backend::verbose_log(
-                "p point " + std::to_string(index + 1) + '/' +
-                std::to_string(p_values.size()) + " already checkpointed");
+            backend::verbose_log("p point " + std::to_string(index + 1) + '/' + std::to_string(p_values.size()) +
+                                 " already checkpointed");
             continue;
         }
 
-        const std::string point_output = output + ".point_" +
-            std::to_string(index) + ".tmp";
+        const std::string point_output = output + ".point_" + std::to_string(index) + ".tmp";
         std::ostringstream base;
         const std::uint64_t global_offset =
-            static_cast<std::uint64_t>(completed.size()) *
-            static_cast<std::uint64_t>(realizations);
+            static_cast<std::uint64_t>(completed.size()) * static_cast<std::uint64_t>(realizations);
         base << "MIPT_PROBED_INTERNAL_CHILD=1 "
              << "MIPT_PROBED_ISOLATE_P=0 "
-             << "MIPT_PROBED_GLOBAL_OFFSET=" << global_offset << ' '
-             << "MIPT_PROBED_GLOBAL_TOTAL=" << global_total << ' '
-             << "MIPT_PROBED_GLOBAL_BASE_DONE=" << global_base_done << ' '
-             << "MIPT_PROBED_GLOBAL_START_MS=" << global_start_ms << ' '
-             << "MIPT_PROBED_GLOBAL_P_INDEX=" << index + 1 << ' '
-             << "MIPT_PROBED_GLOBAL_P_COUNT=" << p_values.size() << ' '
-             << "MIPT_PROBED_INTERNAL_OUTPUT=" << shell_quote(point_output)
-             << ' ' << shell_quote(program)
-             << ' ' << probes
-             << ' ' << n
-             << ' ' << realizations
-             << ' ' << static_cast<int>(type)
-             << ' ' << mode;
+             << "MIPT_PROBED_GLOBAL_OFFSET=" << global_offset << ' ' << "MIPT_PROBED_GLOBAL_TOTAL=" << global_total
+             << ' ' << "MIPT_PROBED_GLOBAL_BASE_DONE=" << global_base_done << ' '
+             << "MIPT_PROBED_GLOBAL_START_MS=" << global_start_ms << ' ' << "MIPT_PROBED_GLOBAL_P_INDEX=" << index + 1
+             << ' ' << "MIPT_PROBED_GLOBAL_P_COUNT=" << p_values.size() << ' '
+             << "MIPT_PROBED_INTERNAL_OUTPUT=" << shell_quote(point_output) << ' ' << shell_quote(program) << ' '
+             << probes << ' ' << n << ' ' << realizations << ' ' << static_cast<int>(type) << ' ' << mode;
         if (mode == 1)
         {
-            base << ' ' << precise_decimal(p)
-                 << ' ' << precise_decimal(p)
-                 << " 1";
+            base << ' ' << precise_decimal(p) << ' ' << precise_decimal(p) << " 1";
         }
         else
         {
-            base << ' ' << times.front()
-                 << ' ' << times.back()
-                 << ' ' << times.size()
-                 << ' ' << precise_decimal(p)
-                 << ' ' << precise_decimal(p)
-                 << " 1";
+            base << ' ' << times.front() << ' ' << times.back() << ' ' << times.size() << ' ' << precise_decimal(p)
+                 << ' ' << precise_decimal(p) << " 1";
         }
 
-        backend::verbose_log(
-            "starting p point " + std::to_string(index + 1) + '/' +
-            std::to_string(p_values.size()) + " p=" + precise_decimal(p));
+        backend::verbose_log("starting p point " + std::to_string(index + 1) + '/' + std::to_string(p_values.size()) +
+                             " p=" + precise_decimal(p));
         int status = -1;
         for (int attempt = 0; attempt <= retries; ++attempt)
         {
@@ -950,10 +1083,8 @@ int run_isolated_p_scan(const char *program,
             if (attempt > 0)
             {
                 command = "MIPT_PROBED_PREFETCH=0 ";
-                std::cerr << "Retrying p=" << precise_decimal(p)
-                          << " in a fresh process with CPU prefetch disabled"
-                          << " (attempt " << attempt + 1 << '/' << retries + 1
-                          << ").\n";
+                std::cerr << "Retrying p=" << precise_decimal(p) << " in a fresh process with CPU prefetch disabled"
+                          << " (attempt " << attempt + 1 << '/' << retries + 1 << ").\n";
             }
             command += base.str();
             status = std::system(command.c_str());
@@ -964,9 +1095,8 @@ int run_isolated_p_scan(const char *program,
         }
         if (status != 0)
         {
-            throw std::runtime_error(
-                "Isolated simulation failed for p=" + precise_decimal(p) +
-                " after " + std::to_string(retries + 1) +
+            throw std::runtime_error("Isolated simulation failed for p=" + precise_decimal(p) + " after " +
+                                     std::to_string(retries + 1) +
                 " attempt(s). Earlier p points remain checkpointed; rerun the "
                 "same command to resume.");
         }
@@ -974,26 +1104,21 @@ int run_isolated_p_scan(const char *program,
         append_checkpoint_csv(point_output, output);
         std::remove(point_output.c_str());
         completed.push_back(p);
-        backend::verbose_log(
-            "checkpointed p=" + precise_decimal(p) + " to " + output);
+        backend::verbose_log("checkpointed p=" + precise_decimal(p) + " to " + output);
     }
 
-    std::cout << "Saved " << p_values.size() * times.size()
-              << " rows to " << output << ".\n";
+    std::cout << "Saved " << p_values.size() * times.size() << " rows to " << output << ".\n";
     return 0;
 }
 
 int run_cli(int argc, char *argv[])
 {
-    const bool internal_child = env::boolean(
-        "MIPT_PROBED_INTERNAL_CHILD", false);
+    const bool internal_child = env::boolean("MIPT_PROBED_INTERNAL_CHILD", false);
     if (!internal_child)
     {
         backend::print_backend_banner_once("mipt_probed.exe");
     }
-    if (argc > 1 &&
-        (std::strcmp(argv[1], "--help") == 0 ||
-         std::strcmp(argv[1], "-h") == 0))
+    if (argc > 1 && (std::strcmp(argv[1], "--help") == 0 || std::strcmp(argv[1], "-h") == 0))
     {
         print_help(argv[0]);
         return 0;
@@ -1008,9 +1133,9 @@ int run_cli(int argc, char *argv[])
     const int realizations = std::stoi(argv[3]);
     const CircuitType type = parse_circuit_type(std::stoi(argv[4]));
     const int mode = std::stoi(argv[5]);
-    if (probes != 1 && probes != 2 && probes != 4)
+    if (probes != 1 && probes != 2 && probes != 3 && probes != 4)
     {
-        throw std::invalid_argument("probes must be 1, 2, or 4.");
+        throw std::invalid_argument("probes must be 1, 2, 3, or 4.");
     }
     if (n <= 0 || realizations <= 0)
     {
@@ -1025,11 +1150,14 @@ int run_cli(int argc, char *argv[])
     {
         throw std::invalid_argument("probe_mode must be 0, 1, 2, 3, or 4.");
     }
-    if (env::boolean("MIPT_NATIVE_MPS", false) ||
-        env::boolean("MIPT_NATIVE_TEBD", false))
+    if (env::boolean("MIPT_NATIVE_MPS", false) || env::boolean("MIPT_NATIVE_TEBD", false))
     {
-        throw std::invalid_argument(
-            "Native MPS/TEBD does not support explicit probe ancillas; unset those variables.");
+        throw std::invalid_argument("Native MPS/TEBD does not support explicit "
+                                    "probe ancillas; unset those variables.");
+    }
+    if (probes == 3 && mode != 4)
+    {
+        throw std::invalid_argument("Three probes are currently supported only in mode 4.");
     }
 
     std::vector<double> p_values;
@@ -1042,21 +1170,18 @@ int run_cli(int argc, char *argv[])
     {
         if (argc != 9)
         {
-            throw std::invalid_argument(
-                "Mode 0 requires [p] [t_min] [t_max].");
+            throw std::invalid_argument("Mode 0 requires [p] [t_min] [t_max].");
         }
         const double p = std::stod(argv[6]);
         const int t_min = std::stoi(argv[7]);
         const int t_max = std::stoi(argv[8]);
         if (p < 0.0 || p > 1.0 || t_min < 0 || t_max < t_min)
         {
-            throw std::invalid_argument(
-                "Require p in [0,1] and 0 <= t_min <= t_max.");
+            throw std::invalid_argument("Require p in [0,1] and 0 <= t_min <= t_max.");
         }
         if (probes > 1 && t_min < t0)
         {
-            throw std::invalid_argument(
-                "Two/four-probe legacy mode requires t_min >= t0=2N.");
+            throw std::invalid_argument("Two/four-probe legacy mode requires t_min >= t0=2N.");
         }
         p_values = {p};
         times.reserve(static_cast<std::size_t>(t_max - t_min + 1));
@@ -1069,8 +1194,7 @@ int run_cli(int argc, char *argv[])
     {
         if (argc != 9)
         {
-            throw std::invalid_argument(
-                "Mode 1 requires [p_min] [p_max] [p_res].");
+            throw std::invalid_argument("Mode 1 requires [p_min] [p_max] [p_res].");
         }
         const double p_min = std::stod(argv[6]);
         const double p_max = std::stod(argv[7]);
@@ -1087,8 +1211,7 @@ int run_cli(int argc, char *argv[])
     {
         if (argc != 12)
         {
-            throw std::invalid_argument(
-                "Mode 2 requires [t_min] [t_max] [t_res] [p_min] [p_max] [p_res].");
+            throw std::invalid_argument("Mode 2 requires [t_min] [t_max] [t_res] [p_min] [p_max] [p_res].");
         }
         const int t_min = std::stoi(argv[6]);
         const int t_max = std::stoi(argv[7]);
@@ -1098,8 +1221,7 @@ int run_cli(int argc, char *argv[])
         const int p_res = std::stoi(argv[11]);
         if (t_min < 0 || t_max < t_min || p_min < 0.0 || p_max > 1.0)
         {
-            throw std::invalid_argument(
-                "Require nonnegative ordered times and p endpoints in [0,1].");
+            throw std::invalid_argument("Require nonnegative ordered times and p endpoints in [0,1].");
         }
         times = integer_linspace(t_min, t_max, t_res);
         p_values = linspace(p_min, p_max, p_res);
@@ -1113,28 +1235,23 @@ int run_cli(int argc, char *argv[])
         }
         if (argc != 9)
         {
-            throw std::invalid_argument(
-                "Mode 3 requires [p] [delta_x] [delta_t].");
+            throw std::invalid_argument("Mode 3 requires [p] [delta_x] [delta_t].");
         }
         const double p = std::stod(argv[6]);
         delta_x = std::stoi(argv[7]);
         delta_t = std::stoi(argv[8]);
-        if (p < 0.0 || p > 1.0 || delta_x < 0 || delta_x > n / 2 ||
-            delta_t < 0)
+        if (p < 0.0 || p > 1.0 || delta_x < 0 || delta_x > n / 2 || delta_t < 0)
         {
-            throw std::invalid_argument(
-                "Mode 3 requires p in [0,1], 0 <= delta_x <= N/2, and delta_t >= 0.");
+            throw std::invalid_argument("Mode 3 requires p in [0,1], 0 <= delta_x <= N/2, and delta_t >= 0.");
         }
         const bool spatial_branch = delta_t == 0;
         if (spatial_branch && (n % 2 != 0 || delta_x != n / 2))
         {
-            throw std::invalid_argument(
-                "The mode-3 spatial branch requires even N, delta_x=N/2, delta_t=0.");
+            throw std::invalid_argument("The mode-3 spatial branch requires even N, delta_x=N/2, delta_t=0.");
         }
         if (!spatial_branch && delta_x != 0)
         {
-            throw std::invalid_argument(
-                "The mode-3 temporal branch requires delta_x=0 and delta_t>0.");
+            throw std::invalid_argument("The mode-3 temporal branch requires delta_x=0 and delta_t>0.");
         }
         p_values = {p};
         times.reserve(static_cast<std::size_t>(8 * n + 1));
@@ -1146,31 +1263,26 @@ int run_cli(int argc, char *argv[])
     }
     else
     {
-        if (probes != 2)
+        if (probes != 2 && probes != 3)
         {
-            throw std::invalid_argument("Mode 4 requires probes=2.");
+            throw std::invalid_argument("Mode 4 requires probes=2 or probes=3.");
         }
-        if (n < 2)
+        if (n < probes)
         {
-            throw std::invalid_argument("Mode 4 requires N >= 2.");
+            throw std::invalid_argument("Mode 4 requires N >= probes.");
         }
         if (argc != 8)
         {
-            throw std::invalid_argument(
-                "Mode 4 requires [p] [tau_max].");
+            throw std::invalid_argument("Mode 4 requires [p] [tau_max].");
         }
         const double p = std::stod(argv[6]);
         const int tau_max = std::stoi(argv[7]);
-        if (p < 0.0 || p > 1.0 || tau_max < 0 ||
-            tau_max > std::numeric_limits<int>::max() - 2 * n)
+        if (p < 0.0 || p > 1.0 || tau_max < 0 || tau_max > std::numeric_limits<int>::max() - 2 * n)
         {
-            throw std::invalid_argument(
-                "Mode 4 requires p in [0,1] and a nonnegative tau_max "
+            throw std::invalid_argument("Mode 4 requires p in [0,1] and a nonnegative tau_max "
                 "that leaves room for the default t_eq=2N.");
         }
-        t_eq = static_cast<int>(env::integer(
-            "MIPT_PROBED_T_EQ", 2 * n, 0,
-            std::numeric_limits<int>::max() - tau_max));
+        t_eq = static_cast<int>(env::integer("MIPT_PROBED_T_EQ", 2 * n, 0, std::numeric_limits<int>::max() - tau_max));
         p_values = {p};
         times.reserve(static_cast<std::size_t>(tau_max + 1));
         for (int tau = 0; tau <= tau_max; ++tau)
@@ -1180,28 +1292,22 @@ int run_cli(int argc, char *argv[])
         t0 = t_eq;
     }
 
-    const bool parity_encoding =
-        mode == 1 && probes == 1 && preserves_computational_parity(type) &&
+    const bool parity_encoding = mode == 1 && probes == 1 && preserves_computational_parity(type) &&
         env::boolean("MIPT_PROBED_PARITY_ENCODING", true);
-    const auto sites = mode == 4
-        ? std::vector<int>{}
-        : probe_sites(probes, n, mode, delta_x);
-    const int t_max = mode == 3
-        ? 12 * n + delta_t
-        : mode == 4 ? t_eq + times.back() : times.back();
-    const std::string generated_output = default_output_name(
-        probes, n, realizations, type, mode, p_values, times, delta_x, delta_t,
-        t_eq);
-    const std::string output = env::text(
-        "MIPT_PROBED_INTERNAL_OUTPUT", generated_output.c_str());
+    const auto sites = mode == 4 ? std::vector<int>{} : probe_sites(probes, n, mode, delta_x);
+    const auto geometries =
+        mode == 4 && probes == 3 ? enumerate_three_probe_geometries(n) : std::vector<ProbeGeometry>{};
+    const int t_max = mode == 3 ? 12 * n + delta_t : mode == 4 ? t_eq + times.back() : times.back();
+    const std::string generated_output =
+        default_output_name(probes, n, realizations, type, mode, p_values, times, delta_x, delta_t, t_eq);
+    const std::string output = env::text("MIPT_PROBED_INTERNAL_OUTPUT", generated_output.c_str());
     const std::uint64_t distance_count =
-        mode == 4 ? static_cast<std::uint64_t>(n / 2) : 1u;
+        mode == 4 ? probes == 2 ? static_cast<std::uint64_t>(n / 2) : static_cast<std::uint64_t>(geometries.size())
+                  : 1u;
     const bool prefetch = env::boolean("MIPT_PROBED_PREFETCH", true) &&
-        static_cast<std::uint64_t>(realizations) * distance_count > 1 &&
-        t_max > 0;
+                          static_cast<std::uint64_t>(realizations) * distance_count > 1 && t_max > 0;
     const std::uint64_t total_trajectories =
-        static_cast<std::uint64_t>(p_values.size()) *
-        static_cast<std::uint64_t>(realizations) * distance_count;
+        static_cast<std::uint64_t>(p_values.size()) * static_cast<std::uint64_t>(realizations) * distance_count;
     ProgressReporter progress(total_trajectories);
     std::uint64_t completed = 0;
     const auto start = std::chrono::steady_clock::now();
@@ -1209,70 +1315,81 @@ int run_cli(int argc, char *argv[])
     if (!internal_child)
     {
         std::cout << "Unified probed MIPT simulation\n"
-                  << "probes=" << probes
-                  << ", system_N=" << n
-                  << ", physical_total_qubits=" << n + probes
-                  << ", simulated_qubits=" << n + probes -
-                        (parity_encoding ? 1 : 0)
-                  << ", mode=" << mode
-                  << ", realizations_per_p=" << realizations
-                  << ", total_trajectories=" << total_trajectories
-                  << ", p_points=" << p_values.size()
-                  << ", t_points=" << times.size()
-                  << (mode == 3
-                          ? ", t_absolute=0.." + std::to_string(t_max)
-                          : mode == 4
-                              ? ", t_eq=" + std::to_string(t_eq) +
-                                    ", tau=0.." +
-                                    std::to_string(times.back()) +
-                                    ", distances=1.." +
-                                    std::to_string(n / 2)
+                  << "probes=" << probes << ", system_N=" << n << ", physical_total_qubits=" << n + probes
+                  << ", simulated_qubits=" << n + probes - (parity_encoding ? 1 : 0) << ", mode=" << mode
+                  << ", realizations_per_p=" << realizations << ", total_trajectories=" << total_trajectories
+                  << ", p_points=" << p_values.size() << ", t_points=" << times.size()
+                  << (mode == 3   ? ", t_absolute=0.." + std::to_string(t_max)
+                      : mode == 4 ? ", t_eq=" + std::to_string(t_eq) + ", tau=0.." + std::to_string(times.back()) +
+                                        (probes == 2 ? ", distances=1.." + std::to_string(n / 2)
+                                                     : ", triangle_geometries=" + std::to_string(geometries.size()))
                           : times.size() == 1
                               ? ", t=" + std::to_string(times.front())
-                              : ", t=" + std::to_string(times.front()) + ".." +
-                                    std::to_string(times.back()))
-                  << (mode == 3
-                          ? ", delta_x=" + std::to_string(delta_x) +
-                                ", delta_t=" + std::to_string(delta_t) +
+                          : ", t=" + std::to_string(times.front()) + ".." + std::to_string(times.back()))
+                  << (mode == 3 ? ", delta_x=" + std::to_string(delta_x) + ", delta_t=" + std::to_string(delta_t) +
                                 ", readout_tau_max=8N"
                           : "")
-                  << ", circ_type=" << static_cast<int>(type)
-                  << " (" << circuit_type_name(type) << ')'
-                  << ", fermionic_trace="
-                  << (uses_fermionic_trace(type) ? "on" : "off")
-                  << ", probe_encoding="
-                  << (parity_encoding ? "parity_symmetry" : "explicit_reference")
+                  << ", circ_type=" << static_cast<int>(type) << " (" << circuit_type_name(type) << ')'
+                  << ", fermionic_trace=" << (uses_fermionic_trace(type) ? "on" : "off")
+                  << ", probe_encoding=" << (parity_encoding ? "parity_symmetry" : "explicit_reference")
                   << ", cpu_prefetch=" << (prefetch ? "on" : "off")
+                  << (mode == 4 && probes == 3
+                          ? ", multipartite_measure=" + std::string(uses_fermionic_trace(type) ? "fGMN" : "GMN")
+                          : "")
                   << ", output=" << output << '\n'
                   << std::flush;
     }
 
-    if (mode != 0 && p_values.size() > 1 &&
-        env::boolean("MIPT_PROBED_ISOLATE_P", true))
+    if (mode != 0 && p_values.size() > 1 && env::boolean("MIPT_PROBED_ISOLATE_P", true))
     {
-        return run_isolated_p_scan(
-            argv[0], probes, n, realizations, type, mode, p_values, times, output);
+        return run_isolated_p_scan(argv[0], probes, n, realizations, type, mode, p_values, times, output);
     }
 
     std::vector<OutputRow> rows;
-    rows.reserve(p_values.size() * times.size() *
-                 static_cast<std::size_t>(distance_count));
+    rows.reserve(p_values.size() * times.size() * static_cast<std::size_t>(distance_count));
     std::mt19937 origin_rng{std::random_device{}()};
     std::uniform_int_distribution<int> origin_distribution(0, n - 1);
     for (std::size_t p_index = 0; p_index < p_values.size(); ++p_index)
     {
         progress.begin_point(completed);
         const double p = p_values[p_index];
-        std::vector<Aggregate> aggregates(
-            times.size() * static_cast<std::size_t>(distance_count));
+        std::vector<Aggregate> aggregates(times.size() * static_cast<std::size_t>(distance_count));
+        const int gmn_stride =
+            static_cast<int>(env::integer("MIPT_PROBED_GMN_STRIDE", 1, 1, std::numeric_limits<int>::max()));
+        const int gmn_sample_limit =
+            static_cast<int>(env::integer("MIPT_PROBED_GMN_SAMPLES_PER_BIN", 0, 0, realizations));
+        const double gmn_zero_tolerance = env::real("MIPT_PROBED_GMN_ZERO_TOL", 1.0e-10, 0.0, 1.0);
+        const std::size_t gmn_batch_size =
+            static_cast<std::size_t>(env::integer("MIPT_PROBED_GMN_BATCH_RECORDS", 64, 1, 1000000));
+        const std::size_t gmn_pending_batches =
+            static_cast<std::size_t>(env::integer("MIPT_PROBED_GMN_PENDING_BATCHES", 2, 1, 64));
+        std::vector<std::vector<unsigned char>> gmn_selected;
+        std::unique_ptr<SdpBatchQueue> sdp_queue;
+        if (mode == 4 && probes == 3)
+        {
+            env::set_if_unset("GMN_MOSEK_NUM_THREADS", "1");
+            env::set_if_unset("FGMN_MAX_CONCURRENT_MOSEK", "2");
+            gmn_selected.assign(static_cast<std::size_t>(distance_count),
+                                std::vector<unsigned char>(static_cast<std::size_t>(realizations), 1u));
+            if (gmn_sample_limit > 0 && gmn_sample_limit < realizations)
+            {
+                for (auto &selection : gmn_selected)
+                {
+                    std::fill(selection.begin(), selection.end(), 0u);
+                    std::fill_n(selection.begin(), static_cast<std::size_t>(gmn_sample_limit), 1u);
+                    std::shuffle(selection.begin(), selection.end(), origin_rng);
+                }
+            }
+            sdp_queue = std::make_unique<SdpBatchQueue>(aggregates, uses_fermionic_trace(type), gmn_batch_size,
+                                                        gmn_pending_batches);
+        }
         std::array<probed::CircuitWorkspace1D, 2> workspaces;
         for (auto &workspace : workspaces)
         {
             workspace.reserve(t_max);
         }
         std::array<std::future<void>, 2> jobs;
-        auto prepare = [&](probed::CircuitWorkspace1D &workspace)
-        {
+        auto prepare = [&](probed::CircuitWorkspace1D &workspace) {
             if (mode == 1 && probes == 1)
             {
                 workspace.prepare_quench(n, t_max, 2 * n, p, type);
@@ -1287,11 +1404,8 @@ int run_cli(int argc, char *argv[])
             prepare(workspaces[0]);
         }
 
-        const std::uint64_t trajectories_at_p =
-            static_cast<std::uint64_t>(realizations) * distance_count;
-        for (std::uint64_t trajectory = 0;
-             trajectory < trajectories_at_p;
-             ++trajectory)
+        const std::uint64_t trajectories_at_p = static_cast<std::uint64_t>(realizations) * distance_count;
+        for (std::uint64_t trajectory = 0; trajectory < trajectories_at_p; ++trajectory)
         {
             const std::size_t current = static_cast<std::size_t>(trajectory % 2);
             const std::size_t next = static_cast<std::size_t>((trajectory + 1) % 2);
@@ -1308,29 +1422,35 @@ int run_cli(int argc, char *argv[])
             }
             if (t_max > 0 && prefetch && trajectory + 1 < trajectories_at_p)
             {
-                jobs[next] = std::async(
-                    std::launch::async,
-                    [&workspace = workspaces[next], &prepare]()
-                    {
-                        prepare(workspace);
-                    });
+                jobs[next] =
+                    std::async(std::launch::async, [&workspace = workspaces[next], &prepare]() { prepare(workspace); });
             }
 
-            const int distance = mode == 4
-                ? static_cast<int>(trajectory /
-                      static_cast<std::uint64_t>(realizations)) + 1
-                : -1;
+            const std::size_t geometry_index =
+                mode == 4 ? static_cast<std::size_t>(trajectory / static_cast<std::uint64_t>(realizations)) : 0;
+            const std::size_t realization_index =
+                mode == 4 ? static_cast<std::size_t>(trajectory % static_cast<std::uint64_t>(realizations)) : 0;
+            const int distance = mode == 4 && probes == 2 ? static_cast<int>(geometry_index) + 1 : -1;
             std::vector<int> trajectory_sites;
             if (mode == 4)
+            {
+                if (probes == 2)
             {
                 const int origin = origin_distribution(origin_rng);
                 trajectory_sites = {origin, (origin + distance) % n};
             }
+                else
+                {
+                    const auto &embeddings = geometries.at(geometry_index).embeddings;
+                    std::uniform_int_distribution<std::size_t> embedding_distribution(0, embeddings.size() - 1);
+                    const auto &embedding = embeddings[embedding_distribution(origin_rng)];
+                    trajectory_sites.assign(embedding.begin(), embedding.end());
+                }
+            }
             const auto &active_sites = mode == 4 ? trajectory_sites : sites;
             const bool attach_at_start = mode == 2 || probes == 1;
             auto &workspace = workspaces[current];
-            auto state = parity_encoding
-                ? workspace.simulate_parity_encoded_probe(n, active_sites.front())
+            auto state = parity_encoding ? workspace.simulate_parity_encoded_probe(n, active_sites.front())
                 : initialize_state(n, active_sites, attach_at_start);
             int current_t = parity_encoding ? t_max : 0;
             std::size_t first_sample = 0;
@@ -1343,21 +1463,40 @@ int run_cli(int argc, char *argv[])
                 }
                 current_t = t_eq;
                 state = attach_references(state, n, active_sites);
-                const std::size_t distance_offset =
-                    static_cast<std::size_t>(distance - 1) * times.size();
-                for (std::size_t sample_index = 0;
-                     sample_index < times.size();
-                     ++sample_index)
+                const std::size_t distance_offset = geometry_index * times.size();
+                for (std::size_t sample_index = 0; sample_index < times.size(); ++sample_index)
                 {
                     const int target_t = t_eq + times[sample_index];
                     if (target_t > current_t)
                     {
-                        state = workspace.advance(
-                            state, current_t, target_t - current_t);
+                        state = workspace.advance(state, current_t, target_t - current_t);
                         current_t = target_t;
                     }
-                    aggregates[distance_offset + sample_index].add(
-                        measure_sample(state, probes, n, type));
+                    const std::size_t aggregate_index = distance_offset + sample_index;
+                    if (probes == 2)
+                    {
+                        aggregates[aggregate_index].add(measure_sample(state, probes, n, type));
+                    }
+                    else
+                    {
+                        auto measurement = measure_three_probe_sample(state, n, type);
+                        auto &aggregate = aggregates[aggregate_index];
+                        aggregate.add(measurement.sample);
+                        const bool selected = gmn_selected[geometry_index][realization_index] != 0;
+                        if (selected && times[sample_index] % gmn_stride == 0)
+                        {
+                            ++aggregate.gmn_requested;
+                            if (measurement.sample.min_bipartite_negativity <= gmn_zero_tolerance)
+                            {
+                                aggregate.gmn.add(0.0);
+                                ++aggregate.gmn_zero_prefiltered;
+                            }
+                            else
+                            {
+                                sdp_queue->submit({aggregate_index, std::move(measurement.rho)});
+                            }
+                        }
+                    }
                 }
             }
             else if (mode == 3)
@@ -1372,19 +1511,15 @@ int run_cli(int argc, char *argv[])
                 }
                 state = attach_reference(state, n, sites[1], 1);
 
-                for (std::size_t sample_index = 0;
-                     sample_index < times.size();
-                     ++sample_index)
+                for (std::size_t sample_index = 0; sample_index < times.size(); ++sample_index)
                 {
                     const int target_t = t0 + times[sample_index];
                     if (target_t > current_t)
                     {
-                        state = workspace.advance(
-                            state, current_t, target_t - current_t);
+                        state = workspace.advance(state, current_t, target_t - current_t);
                         current_t = target_t;
                     }
-                    aggregates[sample_index].add(
-                        measure_sample(state, probes, n, type));
+                    aggregates[sample_index].add(measure_sample(state, probes, n, type));
                 }
             }
             else if ((mode == 0 || mode == 1) && probes > 1)
@@ -1396,68 +1531,65 @@ int run_cli(int argc, char *argv[])
 
             if (mode != 3 && mode != 4)
             {
-                for (std::size_t sample_index = first_sample;
-                     sample_index < times.size();
-                     ++sample_index)
+                for (std::size_t sample_index = first_sample; sample_index < times.size(); ++sample_index)
                 {
                     const int target_t = times[sample_index];
                     if (target_t > current_t)
                     {
-                        state = workspace.advance(
-                            state, current_t, target_t - current_t);
+                        state = workspace.advance(state, current_t, target_t - current_t);
                         current_t = target_t;
                     }
                     if (parity_encoding)
                     {
-                        aggregates[sample_index].add(
-                            measure_parity_encoded_probe(state, n));
+                        aggregates[sample_index].add(measure_parity_encoded_probe(state, n));
                     }
                     else if (mode == 2 || mode == 1 || probes != 1 || target_t > 0)
                     {
-                        aggregates[sample_index].add(
-                            measure_sample(state, probes, n, type));
+                        aggregates[sample_index].add(measure_sample(state, probes, n, type));
                     }
                     else
                     {
-                        aggregates[sample_index].add(
-                            {std::log(2.0), 0.0, 0.0, 0.0, 0.0, 0.0});
+                        aggregates[sample_index].add({std::log(2.0), 0.0, 0.0, 0.0, 0.0, 0.0});
                     }
                 }
             }
             ++completed;
-            progress.update(
-                completed,
-                p,
-                p_index + 1,
-                p_values.size(),
-                completed == total_trajectories);
+            progress.update(completed, p, p_index + 1, p_values.size(), completed == total_trajectories);
         }
 
-        for (std::size_t distance_index = 0;
-             distance_index < static_cast<std::size_t>(distance_count);
+        if (sdp_queue)
+        {
+            sdp_queue->finish();
+        }
+        for (std::size_t distance_index = 0; distance_index < static_cast<std::size_t>(distance_count);
              ++distance_index)
         {
             for (std::size_t i = 0; i < times.size(); ++i)
             {
-                rows.push_back(
-                    {p,
-                     times[i],
-                     t0,
-                     mode == 4 ? static_cast<int>(distance_index) + 1 : -1,
-                     aggregates[distance_index * times.size() + i]});
+                OutputRow row;
+                row.p = p;
+                row.t = times[i];
+                row.t0 = t0;
+                row.distance = mode == 4 && probes == 2 ? static_cast<int>(distance_index) + 1 : -1;
+                row.geometry = mode == 4 && probes == 3 ? static_cast<int>(distance_index) : -1;
+                if (mode == 4 && probes == 3)
+                {
+                    row.distances = geometries[distance_index].distances;
+                    row.embedding_count = geometries[distance_index].embeddings.size();
+                }
+                row.stats = aggregates[distance_index * times.size() + i];
+                rows.push_back(std::move(row));
             }
         }
     }
     progress.finish();
-    write_csv(
-        output, probes, mode, n, realizations, rows, delta_x, delta_t, t_eq);
+    write_csv(output, probes, mode, n, realizations, type, rows, delta_x, delta_t, t_eq);
 
-    const double elapsed = std::chrono::duration<double>(
-        std::chrono::steady_clock::now() - start).count();
+    const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
     if (!internal_child)
     {
-        std::cout << "Saved " << rows.size() << " rows to " << output
-                  << ". Elapsed time: " << format_duration(elapsed) << '\n';
+        std::cout << "Saved " << rows.size() << " rows to " << output << ". Elapsed time: " << format_duration(elapsed)
+                  << '\n';
     }
     return 0;
 }

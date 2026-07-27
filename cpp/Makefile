@@ -122,6 +122,8 @@ DIST_TEST_BIN := $(HOST_BUILD)/dist_metrics_tests
 
 MIPT_OBJS := $(BUILD)/mipt.o
 MIPT_PROBED_OBJS := $(BUILD)/mipt_probed.o
+MIPT_PROBED_FGMN_PIC_OBJ := $(HOST_BUILD)/fgmn_pic.o
+MIPT_PROBED_FGMN_LIB := $(BUILD)/libmipt_fgmn.so
 FREE_ENERGY_OBJS := $(BUILD)/free_energy.o
 SIM_TMI_OBJS := $(BUILD)/sim_tmi.o
 DIST_SCALING_OBJS := $(BUILD)/dist_scaling.o
@@ -144,7 +146,8 @@ endif
 
 ALL_OBJS := $(MIPT_OBJS) $(MIPT_PROBED_OBJS) $(FREE_ENERGY_OBJS) \
   $(SIM_TMI_OBJS) $(DIST_SCALING_OBJS) $(ENTROPY_OBJS) $(GMN_OBJS) $(FGMN_OBJS) \
-  $(RING_OBJS) $(EXP_VALS_OBJS) $(CORE_TEST_OBJS) $(DIST_TEST_OBJS)
+  $(RING_OBJS) $(EXP_VALS_OBJS) $(CORE_TEST_OBJS) $(DIST_TEST_OBJS) \
+  $(MIPT_PROBED_FGMN_PIC_OBJ)
 DEPS := $(ALL_OBJS:.o=.d)
 
 .PHONY: all simulation analysis clean cpu gpu print-config format test-core test-dist \
@@ -161,8 +164,9 @@ gpu:
 
 mipt.exe: $(MIPT_BIN)
 	cp $< $@
-mipt_probed.exe: $(MIPT_PROBED_BIN)
-	cp $< $@
+mipt_probed.exe: $(MIPT_PROBED_BIN) $(MIPT_PROBED_FGMN_LIB)
+	cp $(MIPT_PROBED_BIN) $@
+	cp $(MIPT_PROBED_FGMN_LIB) ./libmipt_fgmn.so
 free_energy.exe: $(FREE_ENERGY_BIN)
 	cp $< $@
 sim_tmi.exe: $(SIM_TMI_BIN)
@@ -182,8 +186,13 @@ exp_vals.exe: $(EXP_VALS_BIN)
 
 $(MIPT_BIN): $(MIPT_OBJS)
 	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $^ $(MIPT_CUDA_LIBS) $(DL_LIBS) -o $@
-$(MIPT_PROBED_BIN): $(MIPT_PROBED_OBJS)
-	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $^ $(MIPT_CUDA_LIBS) $(DL_LIBS) -o $@
+$(MIPT_PROBED_BIN): $(MIPT_PROBED_OBJS) $(MIPT_PROBED_FGMN_LIB)
+	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $(HOST_LDFLAGS) $(MIPT_PROBED_OBJS) \
+	  $(MIPT_CUDA_LIBS) -L$(BUILD) -Wl,-rpath,'$$ORIGIN' -lmipt_fgmn \
+	  $(DL_LIBS) -o $@
+$(MIPT_PROBED_FGMN_LIB): $(MIPT_PROBED_FGMN_PIC_OBJ) | $(BUILD)
+	$(HOSTCXX) $(HOST_LDFLAGS) -shared $< $(MOSEK_LDFLAGS) $(MOSEK_LIBS) \
+	  $(DL_LIBS) -Wl,-soname,libmipt_fgmn.so -o $@
 $(FREE_ENERGY_BIN): $(FREE_ENERGY_OBJS)
 	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $^ $(MIPT_CUDA_LIBS) $(SIM_TMI_CUDA_LIBS) $(DL_LIBS) -o $@
 $(SIM_TMI_BIN): $(SIM_TMI_OBJS)
@@ -248,6 +257,8 @@ $(HOST_BUILD)/fgmn_main.o: apps/fgmn.cpp | $(HOST_BUILD)
 	$(HOSTCXX) $(CXXFLAGS_COMMON) -c $< -o $@
 $(HOST_BUILD)/fgmn.o: src/analysis/fgmn.cpp | $(HOST_BUILD)
 	$(HOSTCXX) $(CXXFLAGS_COMMON) $(MOSEK_CPPFLAGS) -c $< -o $@
+$(MIPT_PROBED_FGMN_PIC_OBJ): src/analysis/fgmn.cpp | $(HOST_BUILD)
+	$(HOSTCXX) $(CXXFLAGS_COMMON) $(MOSEK_CPPFLAGS) -fPIC -c $< -o $@
 $(HOST_BUILD)/ring_inflation_main.o: apps/ring_inflation.cpp | $(HOST_BUILD)
 	$(HOSTCXX) $(CXXFLAGS_COMMON) -c $< -o $@
 $(HOST_BUILD)/ring_inflation.o: src/analysis/ring_inflation.cpp | $(HOST_BUILD)
@@ -281,6 +292,6 @@ format:
 	clang-format -i $$(find apps include src tests -type f \( -name '*.cpp' -o -name '*.hpp' -o -name '*.cu' -o -name '*.c' \))
 
 clean:
-	rm -rf build *.exe *.tmp
+	rm -rf build *.exe *.tmp libmipt_fgmn.so
 
 -include $(DEPS)
