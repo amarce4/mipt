@@ -48,6 +48,26 @@ int mipt_cuda_rho2_subsystems_complex_fermion_f32(
     int subsystem_count,
     double *host_rho_ri_row_major);
 
+/*
+ * Computes the ordinary and fermionic partial traces in one statevector pass.
+ * The two output buffers use the same layout described above.
+ */
+int mipt_cuda_rho2_subsystems_complex_both_f64(
+    const void *device_state_vector,
+    int n_qubits,
+    const int *host_subsystems,
+    int subsystem_count,
+    double *host_rho_ri_row_major,
+    double *host_fermion_rho_ri_row_major);
+
+int mipt_cuda_rho2_subsystems_complex_both_f32(
+    const void *device_state_vector,
+    int n_qubits,
+    const int *host_subsystems,
+    int subsystem_count,
+    double *host_rho_ri_row_major,
+    double *host_fermion_rho_ri_row_major);
+
 #ifdef __cplusplus
 }
 #endif

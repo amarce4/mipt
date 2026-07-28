@@ -349,6 +349,20 @@ inline void rho2_subsystems_from_host_statevector(
     }
 }
 
+template <typename Real>
+inline void rho2_subsystems_both_from_host_statevector(
+    const std::complex<Real> *statevector,
+    int n,
+    const std::vector<Pair> &pairs,
+    std::vector<double> &rho_ri,
+    std::vector<double> &fermion_rho_ri)
+{
+    rho2_subsystems_from_host_statevector(
+        statevector, n, pairs, false, rho_ri);
+    rho2_subsystems_from_host_statevector(
+        statevector, n, pairs, true, fermion_rho_ri);
+}
+
 inline void dense_state_from_amplitudes(cudaq::state &state,
                                         int n,
                                         std::vector<std::complex<double>> &out)
@@ -404,6 +418,7 @@ inline void dense_state_from_amplitudes(cudaq::state &state,
 struct RdmWorkspace
 {
     std::vector<double> rho_ri;
+    std::vector<double> fermion_rho_ri;
     std::vector<std::complex<double>> host_state_f64;
     std::vector<std::complex<float>> host_state_f32;
     std::vector<std::complex<double>> amplitude_state;
@@ -531,6 +546,100 @@ inline void rho2_subsystems_from_cudaq_state(cudaq::state &state,
     }
 }
 
+inline void rho2_subsystems_both_from_cudaq_state(
+    cudaq::state &state,
+    int n,
+    const std::vector<Pair> &pairs,
+    RdmWorkspace &workspace)
+{
+    const std::uint64_t dimension_u64 = checked_pow2_u64(n);
+    if (dimension_u64 > static_cast<std::uint64_t>(
+                            std::numeric_limits<std::size_t>::max()))
+    {
+        throw std::invalid_argument("State-vector dimension does not fit in size_t.");
+    }
+    const std::size_t dimension = static_cast<std::size_t>(dimension_u64);
+    const auto precision = state.get_precision();
+    const auto tensor = state.get_tensor();
+    const bool dense = tensor.get_rank() == 1 &&
+                       tensor.get_num_elements() >= dimension &&
+                       tensor.data != nullptr;
+
+#ifdef MIPT_ENABLE_CUDA_RHO
+    if (dense && state.is_on_gpu())
+    {
+        const std::vector<int> flat_pairs = flatten_pairs(pairs);
+        workspace.rho_ri.resize(pairs.size() * RHO2_VALUES);
+        workspace.fermion_rho_ri.resize(pairs.size() * RHO2_VALUES);
+        int status = 0;
+        if (precision == cudaq::SimulationState::precision::fp64)
+        {
+            status = mipt_cuda_rho2_subsystems_complex_both_f64(
+                tensor.data, n, flat_pairs.data(),
+                static_cast<int>(pairs.size()), workspace.rho_ri.data(),
+                workspace.fermion_rho_ri.data());
+        }
+        else
+        {
+            status = mipt_cuda_rho2_subsystems_complex_both_f32(
+                tensor.data, n, flat_pairs.data(),
+                static_cast<int>(pairs.size()), workspace.rho_ri.data(),
+                workspace.fermion_rho_ri.data());
+        }
+        if (status != 0)
+        {
+            throw std::runtime_error(
+                "CUDA ordinary+fermionic two-site RDM reduction failed; status=" +
+                std::to_string(status));
+        }
+        return;
+    }
+#endif
+
+    if (!dense)
+    {
+        dense_state_from_amplitudes(state, n, workspace.amplitude_state);
+        rho2_subsystems_both_from_host_statevector(
+            workspace.amplitude_state.data(), n, pairs, workspace.rho_ri,
+            workspace.fermion_rho_ri);
+        return;
+    }
+
+    if (precision == cudaq::SimulationState::precision::fp64)
+    {
+        if (state.is_on_gpu())
+        {
+            workspace.host_state_f64.resize(dimension);
+            state.to_host(workspace.host_state_f64.data(), dimension);
+            rho2_subsystems_both_from_host_statevector(
+                workspace.host_state_f64.data(), n, pairs, workspace.rho_ri,
+                workspace.fermion_rho_ri);
+        }
+        else
+        {
+            rho2_subsystems_both_from_host_statevector(
+                reinterpret_cast<const std::complex<double> *>(tensor.data), n,
+                pairs, workspace.rho_ri, workspace.fermion_rho_ri);
+        }
+        return;
+    }
+
+    if (state.is_on_gpu())
+    {
+        workspace.host_state_f32.resize(dimension);
+        state.to_host(workspace.host_state_f32.data(), dimension);
+        rho2_subsystems_both_from_host_statevector(
+            workspace.host_state_f32.data(), n, pairs, workspace.rho_ri,
+            workspace.fermion_rho_ri);
+    }
+    else
+    {
+        rho2_subsystems_both_from_host_statevector(
+            reinterpret_cast<const std::complex<float> *>(tensor.data), n,
+            pairs, workspace.rho_ri, workspace.fermion_rho_ri);
+    }
+}
+
 inline void run(int n,
                 int periods,
                 double p,
@@ -539,7 +648,7 @@ inline void run(int n,
                 const std::string &output_path)
 {
     validate_args(n, periods, p, realizations, circuit_type);
-    const bool fermion_trace = uses_fermionic_trace(circuit_type);
+    const bool include_fermionic_metrics = uses_fermionic_trace(circuit_type);
     const std::vector<Pair> pairs = all_unordered_pairs(n);
     const std::uint64_t pairs_per_realization =
         static_cast<std::uint64_t>(pairs.size());
@@ -552,7 +661,8 @@ inline void run(int n,
     {
         throw std::runtime_error("Could not create output CSV: " + output_path);
     }
-    csv << "d,mi,mn\n";
+    csv << (include_fermionic_metrics ? "d,mi,fmi,mn,fmn\n"
+                                     : "d,mi,mn\n");
     csv.flush();
 
     backend::print_backend_banner_once("dist_scaling.exe");
@@ -563,7 +673,7 @@ inline void run(int n,
               << ", realizations=" << realizations
               << ", pairs_per_realization=" << pairs_per_realization
               << ", mode=" << circuit_type_name(circuit_type)
-              << ", fermionic_trace_transpose=" << (fermion_trace ? 1 : 0)
+              << ", fermionic_outputs=" << (include_fermionic_metrics ? 1 : 0)
               << ", output=" << output_path << '\n'
               << "pair_policy=unordered i<j; reversed pairs are observable-equivalent\n";
 
@@ -647,25 +757,58 @@ inline void run(int n,
             backend_reported = true;
         }
 
-        rho2_subsystems_from_cudaq_state(state, n, pairs, fermion_trace,
-                                         rdm_workspace);
+        if (include_fermionic_metrics)
+        {
+            rho2_subsystems_both_from_cudaq_state(
+                state, n, pairs, rdm_workspace);
+        }
+        else
+        {
+            rho2_subsystems_from_cudaq_state(
+                state, n, pairs, false, rdm_workspace);
+        }
         if (rdm_workspace.rho_ri.size() != pairs.size() * RHO2_VALUES)
         {
             throw std::runtime_error("Internal two-site RDM payload-size mismatch.");
+        }
+        if (include_fermionic_metrics &&
+            rdm_workspace.fermion_rho_ri.size() !=
+                pairs.size() * RHO2_VALUES)
+        {
+            throw std::runtime_error(
+                "Internal fermionic two-site RDM payload-size mismatch.");
         }
 
         for (std::size_t pair_index = 0; pair_index < pairs.size(); ++pair_index)
         {
             const double *rho = rdm_workspace.rho_ri.data() +
                                 pair_index * RHO2_VALUES;
-            const PairMetrics metrics = two_party_metrics(rho, fermion_trace);
+            const PairMetrics metrics = two_party_metrics(rho, false);
+            PairMetrics fermion_metrics{};
+            if (include_fermionic_metrics)
+            {
+                const double *fermion_rho =
+                    rdm_workspace.fermion_rho_ri.data() +
+                    pair_index * RHO2_VALUES;
+                fermion_metrics = two_party_metrics(fermion_rho, true);
+            }
 
             line.clear();
             append_double(line, distances[pair_index]);
             line.push_back(',');
             append_double(line, metrics.mi);
             line.push_back(',');
+            if (include_fermionic_metrics)
+            {
+                append_double(line, fermion_metrics.mi);
+                line.push_back(',');
+            }
             append_double(line, metrics.mn);
+            if (include_fermionic_metrics)
+            {
+                line.push_back(',');
+                append_double(line, fermion_metrics.mn);
+            }
             line.push_back('\n');
             csv_buffer += line;
             ++processed;
@@ -732,9 +875,12 @@ inline void print_usage(const char *argv0)
         << "  output.csv defaults to:\n"
         << "    csv/dist_scaling/<tag>/dist_scaling_<tag>_n_<N>_periods_<periods>_p_<p>_real_<realizations>.csv\n\n"
         << "Output CSV columns:\n"
-        << "  d,mi,mn\n"
-        << "where d is the two-party geometric-mean chord distance, mi is"
-           " I(A:B), and mn is bipartite negativity (not logarithmic negativity).\n\n"
+        << "  circ_type 0, 1, or 4: d,mi,mn\n"
+        << "  circ_type 2 or 3:    d,mi,fmi,mn,fmn\n"
+        << "where d is the two-party geometric-mean chord distance. mi and mn"
+           " use ordinary partial tracing/transposition; fmi and fmn use the"
+           " fermionic partial trace/transposition. mn and fmn are negativity,"
+           " not logarithmic negativity.\n\n"
         << "Pair policy:\n"
         << "  Exactly one row is emitted for every unordered pair i<j. Reversing"
            " the retained-mode order does not create a distinct MI, negativity,"

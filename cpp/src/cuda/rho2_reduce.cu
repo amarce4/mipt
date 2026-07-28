@@ -192,6 +192,94 @@ __global__ void rho2_subsystems_complex_kernel(
     }
 }
 
+template <typename Real>
+__global__ void rho2_subsystems_complex_both_kernel(
+    const Cx<Real> *__restrict__ psi,
+    int n_qubits,
+    std::uint64_t env_dim,
+    const int *__restrict__ subsystems,
+    double *__restrict__ rho_ri,
+    double *__restrict__ fermion_rho_ri)
+{
+    const int subsystem = static_cast<int>(blockIdx.x) / RHO_ELEMENTS;
+    const int element = static_cast<int>(blockIdx.x) % RHO_ELEMENTS;
+    const int row = element / RHO_DIM;
+    const int col = element - row * RHO_DIM;
+    const int q0 = subsystems[2 * subsystem + 0];
+    const int q1 = subsystems[2 * subsystem + 1];
+
+    const std::uint64_t row_offset = embed_retained_bits(row, q0, q1);
+    const std::uint64_t col_offset = embed_retained_bits(col, q0, q1);
+    const std::uint64_t row_cross_mask =
+        fermion_env_cross_mask(row, n_qubits, q0, q1);
+    const std::uint64_t col_cross_mask =
+        fermion_env_cross_mask(col, n_qubits, q0, q1);
+    const bool row_internal_odd = fermion_kept_internal_odd(row, q0, q1);
+    const bool col_internal_odd = fermion_kept_internal_odd(col, q0, q1);
+
+    double sum_re = 0.0;
+    double sum_im = 0.0;
+    double fermion_sum_re = 0.0;
+    double fermion_sum_im = 0.0;
+    for (std::uint64_t env = static_cast<std::uint64_t>(threadIdx.x);
+         env < env_dim;
+         env += static_cast<std::uint64_t>(blockDim.x))
+    {
+        const std::uint64_t base = embed_environment_bits(env, n_qubits, q0, q1);
+        const Cx<Real> a = psi[base | row_offset];
+        const Cx<Real> b = psi[base | col_offset];
+        const double value_re =
+            static_cast<double>(a.re) * static_cast<double>(b.re) +
+            static_cast<double>(a.im) * static_cast<double>(b.im);
+        const double value_im =
+            static_cast<double>(a.im) * static_cast<double>(b.re) -
+            static_cast<double>(a.re) * static_cast<double>(b.im);
+        const bool row_odd =
+            row_internal_odd != odd_popcount64(env & row_cross_mask);
+        const bool col_odd =
+            col_internal_odd != odd_popcount64(env & col_cross_mask);
+        const double fermion_sign = (row_odd != col_odd) ? -1.0 : 1.0;
+
+        sum_re += value_re;
+        sum_im += value_im;
+        fermion_sum_re += fermion_sign * value_re;
+        fermion_sum_im += fermion_sign * value_im;
+    }
+
+    __shared__ double scratch_re[THREADS];
+    __shared__ double scratch_im[THREADS];
+    __shared__ double fermion_scratch_re[THREADS];
+    __shared__ double fermion_scratch_im[THREADS];
+    scratch_re[threadIdx.x] = sum_re;
+    scratch_im[threadIdx.x] = sum_im;
+    fermion_scratch_re[threadIdx.x] = fermion_sum_re;
+    fermion_scratch_im[threadIdx.x] = fermion_sum_im;
+    __syncthreads();
+
+    for (int stride = THREADS / 2; stride > 0; stride >>= 1)
+    {
+        if (threadIdx.x < stride)
+        {
+            scratch_re[threadIdx.x] += scratch_re[threadIdx.x + stride];
+            scratch_im[threadIdx.x] += scratch_im[threadIdx.x + stride];
+            fermion_scratch_re[threadIdx.x] +=
+                fermion_scratch_re[threadIdx.x + stride];
+            fermion_scratch_im[threadIdx.x] +=
+                fermion_scratch_im[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0)
+    {
+        const int output = subsystem * RHO_VALUES + 2 * element;
+        rho_ri[output + 0] = scratch_re[0];
+        rho_ri[output + 1] = scratch_im[0];
+        fermion_rho_ri[output + 0] = fermion_scratch_re[0];
+        fermion_rho_ri[output + 1] = fermion_scratch_im[0];
+    }
+}
+
 template <typename T>
 T *thread_buffer(std::size_t required_elements,
                  T *&buffer,
@@ -302,6 +390,103 @@ int launch_rho2_subsystems_complex(
                         cudaMemcpyDeviceToHost);
     return static_cast<int>(status);
 }
+
+template <typename Real>
+int launch_rho2_subsystems_complex_both(
+    const void *device_state_vector,
+    int n_qubits,
+    const int *host_subsystems,
+    int subsystem_count,
+    double *host_rho_ri_row_major,
+    double *host_fermion_rho_ri_row_major)
+{
+    if (device_state_vector == nullptr || host_subsystems == nullptr ||
+        host_rho_ri_row_major == nullptr ||
+        host_fermion_rho_ri_row_major == nullptr || subsystem_count <= 0 ||
+        n_qubits < RETAINED_QUBITS || n_qubits >= 63)
+    {
+        return static_cast<int>(cudaErrorInvalidValue);
+    }
+
+    for (int s = 0; s < subsystem_count; ++s)
+    {
+        const int q0 = host_subsystems[2 * s + 0];
+        const int q1 = host_subsystems[2 * s + 1];
+        if (q0 < 0 || q0 >= n_qubits || q1 < 0 || q1 >= n_qubits || q0 == q1)
+        {
+            return static_cast<int>(cudaErrorInvalidValue);
+        }
+    }
+
+    static thread_local int *d_subsystems = nullptr;
+    static thread_local std::size_t subsystem_capacity = 0;
+    static thread_local double *d_rho = nullptr;
+    static thread_local std::size_t rho_capacity = 0;
+    static thread_local double *d_fermion_rho = nullptr;
+    static thread_local std::size_t fermion_rho_capacity = 0;
+
+    cudaError_t status = cudaSuccess;
+    const std::size_t subsystem_values =
+        2u * static_cast<std::size_t>(subsystem_count);
+    const std::size_t output_values =
+        static_cast<std::size_t>(RHO_VALUES) *
+        static_cast<std::size_t>(subsystem_count);
+
+    if (thread_buffer(subsystem_values, d_subsystems,
+                      subsystem_capacity, status) == nullptr)
+    {
+        return static_cast<int>(status);
+    }
+    if (thread_buffer(output_values, d_rho, rho_capacity, status) == nullptr)
+    {
+        return static_cast<int>(status);
+    }
+    if (thread_buffer(output_values, d_fermion_rho,
+                      fermion_rho_capacity, status) == nullptr)
+    {
+        return static_cast<int>(status);
+    }
+
+    status = cudaMemcpy(d_subsystems,
+                        host_subsystems,
+                        subsystem_values * sizeof(int),
+                        cudaMemcpyHostToDevice);
+    if (status != cudaSuccess)
+    {
+        return static_cast<int>(status);
+    }
+
+    const std::uint64_t env_dim =
+        std::uint64_t{1} << (n_qubits - RETAINED_QUBITS);
+    const int blocks = subsystem_count * RHO_ELEMENTS;
+    rho2_subsystems_complex_both_kernel<Real><<<blocks, THREADS>>>(
+        reinterpret_cast<const Cx<Real> *>(device_state_vector),
+        n_qubits,
+        env_dim,
+        d_subsystems,
+        d_rho,
+        d_fermion_rho);
+
+    status = cudaGetLastError();
+    if (status != cudaSuccess)
+    {
+        return static_cast<int>(status);
+    }
+
+    status = cudaMemcpy(host_rho_ri_row_major,
+                        d_rho,
+                        output_values * sizeof(double),
+                        cudaMemcpyDeviceToHost);
+    if (status != cudaSuccess)
+    {
+        return static_cast<int>(status);
+    }
+    status = cudaMemcpy(host_fermion_rho_ri_row_major,
+                        d_fermion_rho,
+                        output_values * sizeof(double),
+                        cudaMemcpyDeviceToHost);
+    return static_cast<int>(status);
+}
 } // namespace
 
 extern "C" int mipt_cuda_rho2_subsystems_complex_f64(
@@ -350,4 +535,30 @@ extern "C" int mipt_cuda_rho2_subsystems_complex_fermion_f32(
     return launch_rho2_subsystems_complex<float>(
         device_state_vector, n_qubits, host_subsystems,
         subsystem_count, host_rho_ri_row_major, 1);
+}
+
+extern "C" int mipt_cuda_rho2_subsystems_complex_both_f64(
+    const void *device_state_vector,
+    int n_qubits,
+    const int *host_subsystems,
+    int subsystem_count,
+    double *host_rho_ri_row_major,
+    double *host_fermion_rho_ri_row_major)
+{
+    return launch_rho2_subsystems_complex_both<double>(
+        device_state_vector, n_qubits, host_subsystems, subsystem_count,
+        host_rho_ri_row_major, host_fermion_rho_ri_row_major);
+}
+
+extern "C" int mipt_cuda_rho2_subsystems_complex_both_f32(
+    const void *device_state_vector,
+    int n_qubits,
+    const int *host_subsystems,
+    int subsystem_count,
+    double *host_rho_ri_row_major,
+    double *host_fermion_rho_ri_row_major)
+{
+    return launch_rho2_subsystems_complex_both<float>(
+        device_state_vector, n_qubits, host_subsystems, subsystem_count,
+        host_rho_ri_row_major, host_fermion_rho_ri_row_major);
 }

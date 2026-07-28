@@ -613,25 +613,32 @@ def entropy(
 def _chunked_distance_summary(
     path: str | Path,
     *,
+    metrics: Sequence[str],
     chunksize: int,
     distance_round: int,
 ) -> dict[str, pd.DataFrame]:
     """Calculate count, mean, and standard error by chord distance."""
-    partials: dict[str, list[pd.DataFrame]] = {"mi": [], "mn": []}
+    metrics = tuple(metrics)
+    partials: dict[str, list[pd.DataFrame]] = {
+        metric: [] for metric in metrics
+    }
+    required_columns = ["d", *metrics]
 
     try:
         reader = pd.read_csv(
             path,
-            usecols=["d", "mi", "mn"],
+            usecols=required_columns,
             chunksize=chunksize,
         )
     except ValueError as exc:
         raise ValueError(
-            f"{path!r} must contain the columns d, mi, and mn."
+            f"{path!r} must contain the columns "
+            + ", ".join(required_columns)
+            + "."
         ) from exc
 
     for chunk in reader:
-        for column in ("d", "mi", "mn"):
+        for column in required_columns:
             chunk[column] = pd.to_numeric(chunk[column], errors="coerce")
         chunk = chunk.replace([np.inf, -np.inf], np.nan)
         chunk = chunk.loc[np.isfinite(chunk["d"]) & (chunk["d"] > 0.0)]
@@ -639,7 +646,7 @@ def _chunked_distance_summary(
             continue
         chunk["_d"] = chunk["d"].round(distance_round)
 
-        for metric in ("mi", "mn"):
+        for metric in metrics:
             clean = chunk.dropna(subset=[metric])
             if clean.empty:
                 continue
@@ -782,8 +789,15 @@ def dist_scaling(
     sizes: Sequence[int] | None = None,
     l_by_file: Mapping[str, int] | None = None,
     fit_size_mi: int | None = None,
+    fit_size_fmi: int | None = None,
     fit_size_mn: int | None = None,
+    fit_size_fmn: int | None = None,
     fit_range_mi: (
+        tuple[float | None, float | None]
+        | Mapping[int, tuple[float | None, float | None]]
+        | None
+    ) = None,
+    fit_range_fmi: (
         tuple[float | None, float | None]
         | Mapping[int, tuple[float | None, float | None]]
         | None
@@ -793,8 +807,15 @@ def dist_scaling(
         | Mapping[int, tuple[float | None, float | None]]
         | None
     ) = None,
+    fit_range_fmn: (
+        tuple[float | None, float | None]
+        | Mapping[int, tuple[float | None, float | None]]
+        | None
+    ) = None,
     fit_last_mi: int | None = 4,
+    fit_last_fmi: int | None = 4,
     fit_last_mn: int | None = 4,
+    fit_last_fmn: int | None = 4,
     min_relative_error: float = 0.03,
     chunksize: int = 1_000_000,
     distance_round: int = 12,
@@ -802,7 +823,7 @@ def dist_scaling(
     show_errorbars: bool = True,
     capsize: float = 2.0,
     cmap: str = "viridis",
-    figsize: tuple[float, float] = (12.5, 5.2),
+    figsize: tuple[float, float] | None = None,
     dpi: int = 130,
     title: str | None = None,
     show_summary: bool = True,
@@ -810,26 +831,28 @@ def dist_scaling(
 ) -> dict[str, Any]:
     r"""Plot Fig.-4-style two-site distance scaling for MI and negativity.
 
-    Each input CSV must contain one raw row per two-site RDM with columns
-    ``d,mi,mn``. Rows are aggregated at equal chord distance, including zero
-    negativity events. Both panels use logarithmic axes. Power laws
+    Filenames must contain a circuit tag: ``mms``, ``haar``, ``rppu``,
+    ``rfgs``, or ``qrppu``. Qubit-system CSVs use ``d,mi,mn`` and produce two
+    panels. Fermionic-system CSVs use ``d,mi,fmi,mn,fmn`` and produce four
+    panels, comparing ordinary and fermionic partial trace/transposition
+    conventions. Rows are aggregated at equal chord distance, including zero
+    negativity events. All panels use logarithmic axes. Power laws
 
     .. math::
 
-        I_2(d)=A_{MI}d^{-\alpha_2^{MI}},\qquad
-        \mathcal{N}_2(d)=A_{MN}d^{-\alpha_2^{MN}}
+        O(d)=A_O\,d^{-\alpha_2^O}
 
     are fitted by weighted least squares in log coordinates. As in Fig. 4 of
     arXiv:2602.04969, the relative uncertainty used by the fit is floored at
     ``min_relative_error`` (default 0.03).
 
-    ``fit_range_mi`` and ``fit_range_mn`` may be one ``(d_min, d_max)`` tuple
-    applied to every size, or dictionaries keyed by system size. When no range
-    is supplied, the largest ``fit_last_*`` positive-distance points are used.
-    The dashed line is drawn only for ``fit_size_*`` (largest size by default),
+    Each ``fit_range_*`` may be one ``(d_min, d_max)`` tuple applied to every
+    size, or a dictionary keyed by system size. When no range is supplied, the
+    largest ``fit_last_*`` positive-distance points are used. A dashed line is
+    drawn only for the corresponding ``fit_size_*`` (largest size by default),
     while fit results for every supplied size are returned in ``fits``.
-    ``mi_units`` converts the MI panel and fitted prefactor between ``"nats"``
-    and ``"bits"``; it does not change the fitted exponent.
+    ``mi_units`` converts both MI conventions and their fitted prefactors
+    between ``"nats"`` and ``"bits"``; it does not change their exponents.
     """
     if min_relative_error <= 0.0:
         raise ValueError("min_relative_error must be positive.")
@@ -840,6 +863,17 @@ def dist_scaling(
     mi_units, mi_scale = _mi_unit_spec(mi_units)
 
     paths = _resolve_files(files, file_glob)
+    circuit_names = [_parse_circuit_name(path) for path in paths]
+    unique_circuits = sorted(set(circuit_names))
+    if len(unique_circuits) != 1:
+        raise ValueError(
+            "Distance-scaling files must belong to one circuit type; found "
+            f"{unique_circuits}."
+        )
+    circuit_name = unique_circuits[0]
+    is_fermionic = circuit_name in {"RPPU", "RFGS"}
+    metrics = ("mi", "fmi", "mn", "fmn") if is_fermionic else ("mi", "mn")
+
     if sizes is None:
         parsed_sizes = [_parse_size(path, l_by_file) for path in paths]
     else:
@@ -859,21 +893,27 @@ def dist_scaling(
         print(f"Importing L={size}: {path}")
         data[size] = _chunked_distance_summary(
             path,
+            metrics=metrics,
             chunksize=chunksize,
             distance_round=distance_round,
         )
-        data[size]["mi"].loc[:, ["mean", "stderr"]] *= mi_scale
-        if data[size]["mi"].empty and data[size]["mn"].empty:
+        for metric in ("mi", "fmi"):
+            if metric in data[size]:
+                data[size][metric].loc[:, ["mean", "stderr"]] *= mi_scale
+        if all(data[size][metric].empty for metric in metrics):
             raise ValueError(f"No valid distance-scaling rows were found in {path}.")
 
     fit_rows: list[dict[str, Any]] = []
     selected_points: dict[tuple[int, str], pd.DataFrame] = {}
     fit_settings = {
         "mi": (fit_range_mi, fit_last_mi),
+        "fmi": (fit_range_fmi, fit_last_fmi),
         "mn": (fit_range_mn, fit_last_mn),
+        "fmn": (fit_range_fmn, fit_last_fmn),
     }
     for size in parsed_sizes:
-        for metric, (range_spec, last_points) in fit_settings.items():
+        for metric in metrics:
+            range_spec, last_points = fit_settings[metric]
             try:
                 fit, selected = _distance_power_law_fit(
                     data[size][metric],
@@ -903,23 +943,44 @@ def dist_scaling(
                 warnings.warn(f"L={size}, {metric.upper()} fit unavailable: {exc}")
 
     fits = pd.DataFrame(fit_rows)
-    fit_size_mi = max(parsed_sizes) if fit_size_mi is None else int(fit_size_mi)
-    fit_size_mn = max(parsed_sizes) if fit_size_mn is None else int(fit_size_mn)
-    for metric, fit_size in (("mi", fit_size_mi), ("mn", fit_size_mn)):
+    requested_fit_sizes = {
+        "mi": fit_size_mi,
+        "fmi": fit_size_fmi,
+        "mn": fit_size_mn,
+        "fmn": fit_size_fmn,
+    }
+    fit_sizes = {
+        metric: (
+            max(parsed_sizes)
+            if requested_fit_sizes[metric] is None
+            else int(requested_fit_sizes[metric])
+        )
+        for metric in metrics
+    }
+    for metric, fit_size in fit_sizes.items():
         if fit_size not in data:
             raise ValueError(
                 f"fit_size_{metric}={fit_size} is not among {parsed_sizes}."
             )
 
     colors = _color_map_by_size(parsed_sizes, cmap)
-    fig, (ax_mi, ax_mn) = plt.subplots(
-        1, 2, figsize=figsize, dpi=dpi, constrained_layout=True
-    )
-    axes = {"mi": ax_mi, "mn": ax_mn}
+    if figsize is None:
+        figsize = (12.5, 10.0) if is_fermionic else (12.5, 5.2)
+    if is_fermionic:
+        fig, axis_grid = plt.subplots(
+            2, 2, figsize=figsize, dpi=dpi, constrained_layout=True
+        )
+        flat_axes = tuple(axis_grid.flat)
+    else:
+        fig, axis_grid = plt.subplots(
+            1, 2, figsize=figsize, dpi=dpi, constrained_layout=True
+        )
+        flat_axes = tuple(np.atleast_1d(axis_grid).flat)
+    axes = dict(zip(metrics, flat_axes))
 
     for size in parsed_sizes:
         color = colors[size]
-        for metric in ("mi", "mn"):
+        for metric in metrics:
             ax = axes[metric]
             curve = data[size][metric]
             positive = curve.loc[
@@ -971,7 +1032,30 @@ def dist_scaling(
                     alpha=0.95,
                 )
 
-    for metric, fit_size in (("mi", fit_size_mi), ("mn", fit_size_mn)):
+    metric_specs = {
+        "mi": {
+            "exponent": "MI",
+            "ylabel": rf"Two-party mutual information $I_2$ [{mi_units}]",
+            "title": "Ordinary mutual information",
+        },
+        "fmi": {
+            "exponent": r"\mathrm{fMI}",
+            "ylabel": rf"Fermionic mutual information $I_2^f$ [{mi_units}]",
+            "title": "Fermionic mutual information",
+        },
+        "mn": {
+            "exponent": "MN",
+            "ylabel": r"Bipartite negativity $\mathcal{N}_2$",
+            "title": "Ordinary negativity",
+        },
+        "fmn": {
+            "exponent": r"\mathrm{fMN}",
+            "ylabel": r"Fermionic negativity $\mathcal{N}_2^f$",
+            "title": "Fermionic negativity",
+        },
+    }
+
+    for metric, fit_size in fit_sizes.items():
         row = fits.loc[
             (fits["L"] == fit_size) & (fits["metric"] == metric)
         ].iloc[0]
@@ -982,7 +1066,6 @@ def dist_scaling(
             selected["d"].min(), selected["d"].max(), 200
         )
         y_line = row["prefactor"] * x_line ** (-row["alpha"])
-        exponent = "MI" if metric == "mi" else "MN"
         axes[metric].plot(
             x_line,
             y_line,
@@ -991,20 +1074,17 @@ def dist_scaling(
             linewidth=1.5,
             label=(
                 rf"$L={fit_size}$ fit: "
-                rf"$\alpha_2^{{{exponent}}}="
+                rf"$\alpha_2^{{{metric_specs[metric]['exponent']}}}="
                 rf"{row['alpha']:.3g}\pm {row['alpha_stderr']:.2g}$"
             ),
             zorder=5,
         )
 
-    ax_mi.set_xlabel(r"Effective chord distance $d$")
-    ax_mi.set_ylabel(rf"Two-party mutual information $I_2$ [{mi_units}]")
-    ax_mi.set_title("Two-party mutual information")
-    ax_mn.set_xlabel(r"Effective chord distance $d$")
-    ax_mn.set_ylabel(r"Bipartite negativity $\mathcal{N}_2$")
-    ax_mn.set_title("Bipartite negativity")
-
-    for ax in (ax_mi, ax_mn):
+    for metric in metrics:
+        ax = axes[metric]
+        ax.set_xlabel(r"Effective chord distance $d$")
+        ax.set_ylabel(metric_specs[metric]["ylabel"])
+        ax.set_title(metric_specs[metric]["title"])
         ax.set_xscale("log")
         # Plain-number formatting for logarithmic distance axis.
         from matplotlib.ticker import FuncFormatter
@@ -1027,10 +1107,15 @@ def dist_scaling(
             {
                 "L": size,
                 "file": str(path),
-                "distance_points_mi": len(data[size]["mi"]),
-                "distance_points_mn": len(data[size]["mn"]),
-                "rows_mi": int(data[size]["mi"]["count"].sum()),
-                "rows_mn": int(data[size]["mn"]["count"].sum()),
+                "circuit": circuit_name,
+                **{
+                    f"distance_points_{metric}": len(data[size][metric])
+                    for metric in metrics
+                },
+                **{
+                    f"rows_{metric}": int(data[size][metric]["count"].sum())
+                    for metric in metrics
+                },
             }
             for size, path in zip(parsed_sizes, paths)
         ]
@@ -1047,12 +1132,19 @@ def dist_scaling(
 
     return {
         "figure": fig,
-        "axes": (ax_mi, ax_mn),
+        "axes": flat_axes,
+        "axes_by_metric": axes,
+        "metrics": metrics,
+        "circuit_name": circuit_name,
+        "is_fermionic": is_fermionic,
         "data": data,
         "summary": summary,
         "fits": fits,
-        "fit_size_mi": fit_size_mi,
-        "fit_size_mn": fit_size_mn,
+        "fit_sizes": fit_sizes,
+        "fit_size_mi": fit_sizes["mi"],
+        "fit_size_fmi": fit_sizes.get("fmi"),
+        "fit_size_mn": fit_sizes["mn"],
+        "fit_size_fmn": fit_sizes.get("fmn"),
         "mi_units": mi_units,
         "selected_fit_points": selected_points,
     }
