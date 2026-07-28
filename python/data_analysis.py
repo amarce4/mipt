@@ -2859,17 +2859,21 @@ def probe_distance_collapse(
     file_glob: str | Path | None = None,
     metric: str = "mi",
     mi_units: str = "nats",
+    ansatz: str = "lightcone",
     eta: float | None = None,
     z: float | None = 1.0,
     alpha: float = 1.0,
+    delay: float | None = None,
     eta_bounds: tuple[float, float] = (0.0, 2.0),
     z_bounds: tuple[float, float] = (0.5, 2.0),
+    delay_bounds: tuple[float, float] = (0.0, 4.0),
     distance_load: tuple[int, int | None] = (1, None),
     fit_distance: tuple[int, int | None] = (2, None),
     fit_tau: tuple[float, float | None] = (1.0, None),
     fit_x: tuple[float | None, float | None] = (None, None),
     fit_value_min: float = 1e-10,
     interpolation_points: int = 250,
+    minimum_pair_coverage: float = 0.8,
     relative_error_floor: float = 0.01,
     absolute_error_floor: float = 1e-10,
     bootstrap_samples: int = 100,
@@ -2887,27 +2891,69 @@ def probe_distance_collapse(
 ) -> dict[str, Any]:
     r"""Plot and fit mode-4 distance-resolved two-probe data.
 
-    The collapse uses
+    The default finite-size light-cone ansatz is
 
-    ``O(tau,r,L) = ell_r**(-eta) G(alpha*tau/ell_r**z)``,
+    ``O(tau,r,L) = ell_r**(-eta)
+    F(alpha*(tau-delay*ell_r**z)/L**z)``,
 
-    with ``ell_r=(L/pi) sin(pi*r/L)``. A numeric ``eta`` or ``z`` fixes that
-    parameter; ``None`` fits it. The CFT default is therefore ``z=1`` with
-    ``eta`` fitted. ``alpha`` is always supplied/fixed because a free global
-    rescaling of the unknown scaling function's argument is not identifiable.
-    ``fit_distance=(2,None)`` leaves the microscopic ``r=1`` curve visible but
-    excludes it from the default fit.
+    with ``ell_r=(L/pi) sin(pi*r/L)``. It separates the distance-dependent
+    signal-arrival time from the system-size relaxation time. A numeric
+    ``eta``, ``z``, or ``delay`` fixes that parameter; ``None`` fits it.
+    Fitting ``z`` requires at least two system sizes.
+
+    ``ansatz="cylinder"`` uses the finite-cylinder coordinate
+
+    ``x=log(1+sinh(pi*alpha*tau/L)/sin(pi*r/L))``
+
+    and fits only the vertical exponent ``eta``. ``ansatz="legacy_local"``
+    retains the earlier ``alpha*tau/ell_r**z`` form for explicit comparisons.
+    ``alpha`` is supplied rather than fitted because an overall horizontal
+    rescaling of an unknown scaling function is not identifiable.
+
+    The mean fitted pairwise overlap must retain at least
+    ``minimum_pair_coverage`` of the points. ``fit_distance=(2,None)`` leaves
+    the microscopic ``r=1`` curve visible but excludes it from the default fit.
     """
+    ansatz_key = str(ansatz).strip().lower().replace("-", "_")
+    ansatz_key = {
+        "light_cone": "lightcone",
+        "finite_size_lightcone": "lightcone",
+        "finite_size_light_cone": "lightcone",
+        "finite_cylinder": "cylinder",
+        "conformal": "cylinder",
+        "local": "legacy_local",
+        "legacy": "legacy_local",
+        "original": "legacy_local",
+    }.get(ansatz_key, ansatz_key)
+    if ansatz_key not in {"lightcone", "cylinder", "legacy_local"}:
+        raise ValueError(
+            "ansatz must be 'lightcone', 'cylinder', or 'legacy_local'."
+        )
     if not np.isfinite(alpha) or alpha <= 0:
         raise ValueError("alpha must be finite and positive.")
     if eta is not None and (not np.isfinite(eta) or eta < 0):
         raise ValueError("eta must be non-negative or None.")
     if z is not None and (not np.isfinite(z) or z <= 0):
         raise ValueError("z must be positive or None.")
+    if delay is not None and (not np.isfinite(delay) or delay < 0):
+        raise ValueError("delay must be non-negative or None.")
     if interpolation_points < 3:
         raise ValueError("interpolation_points must be at least 3.")
     if errorbar_points < 1:
         raise ValueError("errorbar_points must be positive.")
+    if not 0 < minimum_pair_coverage <= 1:
+        raise ValueError("minimum_pair_coverage must lie in (0,1].")
+    for name, bounds in (
+        ("eta_bounds", eta_bounds),
+        ("z_bounds", z_bounds),
+        ("delay_bounds", delay_bounds),
+    ):
+        if (
+            len(bounds) != 2
+            or not np.all(np.isfinite(bounds))
+            or bounds[0] >= bounds[1]
+        ):
+            raise ValueError(f"{name} must contain two increasing finite values.")
 
     metric_spec = _probe2_metric_spec(metric)
     mi_units, mi_scale = _mi_unit_spec(mi_units)
@@ -2930,6 +2976,12 @@ def probe_distance_collapse(
     curves.sort(key=lambda curve: (curve["L"], curve["distance"], str(curve["path"])))
     if len(curves) < 2:
         raise ValueError("At least two distance curves are required for a collapse.")
+    unique_sizes = sorted({curve["L"] for curve in curves})
+    if ansatz_key == "lightcone" and z is None and len(unique_sizes) < 2:
+        raise ValueError(
+            "The light-cone exponent z cannot be fitted from one system size. "
+            "Supply a numeric z (normally z=1) or include at least two L values."
+        )
 
     finite_ps = sorted({curve["p"] for curve in curves if np.isfinite(curve["p"])})
     if len(finite_ps) > 1:
@@ -2962,8 +3014,37 @@ def probe_distance_collapse(
         except ImportError:
             print(summary.to_string(index=False))
 
-    def transformed(curve, eta_value, z_value):
-        x = alpha * curve["tau"] / curve["chord"] ** z_value
+    eta_active = True
+    z_active = ansatz_key in {"lightcone", "legacy_local"}
+    delay_active = ansatz_key == "lightcone"
+
+    def scaled_x(curve, z_value, delay_value):
+        tau = curve["tau"]
+        if ansatz_key == "lightcone":
+            return (
+                alpha
+                * (tau - delay_value * curve["chord"] ** z_value)
+                / float(curve["L"]) ** z_value
+            )
+        if ansatz_key == "legacy_local":
+            return alpha * tau / curve["chord"] ** z_value
+
+        argument = np.pi * alpha * tau / float(curve["L"])
+        log_sinh = np.full_like(argument, -np.inf, dtype=float)
+        positive = argument > 0
+        small = positive & (argument < 20.0)
+        log_sinh[small] = np.log(np.sinh(argument[small]))
+        large = positive & ~small
+        log_sinh[large] = (
+            argument[large]
+            - np.log(2.0)
+            + np.log1p(-np.exp(-2.0 * argument[large]))
+        )
+        spatial = np.sin(np.pi * curve["distance"] / float(curve["L"]))
+        return np.logaddexp(0.0, log_sinh - np.log(spatial))
+
+    def transformed(curve, eta_value, z_value, delay_value):
+        x = scaled_x(curve, z_value, delay_value)
         mask = (
             np.isfinite(x)
             & np.isfinite(curve["value"])
@@ -2989,14 +3070,21 @@ def probe_distance_collapse(
             mask,
         )
 
-    def pair_score(curve_a, curve_b, eta_value, z_value):
-        xa, ya, dya, _ = transformed(curve_a, eta_value, z_value)
-        xb, yb, dyb, _ = transformed(curve_b, eta_value, z_value)
+    def pair_diagnostics(curve_a, curve_b, eta_value, z_value, delay_value):
+        xa, ya, dya, _ = transformed(
+            curve_a, eta_value, z_value, delay_value
+        )
+        xb, yb, dyb, _ = transformed(
+            curve_b, eta_value, z_value, delay_value
+        )
         if len(xa) < 3 or len(xb) < 3:
-            return np.inf
+            return np.inf, 0.0
         lo, hi = max(xa.min(), xb.min()), min(xa.max(), xb.max())
         if hi <= lo:
-            return np.inf
+            return np.inf, 0.0
+        points_in_overlap = np.count_nonzero((xa >= lo) & (xa <= hi))
+        points_in_overlap += np.count_nonzero((xb >= lo) & (xb <= hi))
+        coverage = points_in_overlap / float(len(xa) + len(xb))
         grid = np.linspace(lo, hi, interpolation_points)
         ya_g, yb_g = np.interp(grid, xa, ya), np.interp(grid, xb, yb)
         dya_g, dyb_g = np.interp(grid, xa, dya), np.interp(grid, xb, dyb)
@@ -3006,67 +3094,150 @@ def probe_distance_collapse(
             absolute_error_floor,
         )
         floor = max(absolute_error_floor, relative_error_floor * typical)
-        return float(
-            np.mean((ya_g - yb_g) ** 2 / (dya_g**2 + dyb_g**2 + floor**2))
+        score = np.mean(
+            (ya_g - yb_g) ** 2 / (dya_g**2 + dyb_g**2 + floor**2)
+        )
+        return float(score), float(coverage)
+
+    def eligible_curves(curve_set):
+        selected = [
+            curve
+            for curve in curve_set
+            if curve["distance"] >= fit_distance_min
+            and (
+                fit_distance_max is None
+                or curve["distance"] <= fit_distance_max
+            )
+        ]
+        return selected
+
+    def score_values(
+        eta_value,
+        z_value,
+        delay_value,
+        curve_set=curves,
+    ):
+        fitted_curve_set = eligible_curves(curve_set)
+        diagnostics = [
+            pair_diagnostics(
+                fitted_curve_set[i],
+                fitted_curve_set[j],
+                eta_value,
+                z_value,
+                delay_value,
+            )
+            for i in range(len(fitted_curve_set))
+            for j in range(i + 1, len(fitted_curve_set))
+        ]
+        finite = [score for score, _ in diagnostics if np.isfinite(score)]
+        coverage = [value for score, value in diagnostics if np.isfinite(score)]
+        return (
+            float(np.mean(finite))
+            if (
+                len(finite) == len(diagnostics)
+                and finite
+                and float(np.mean(coverage)) >= minimum_pair_coverage
+            )
+            else np.inf
         )
 
-    def score_values(eta_value, z_value, curve_set=curves):
-        scores = [
-            pair_score(curve_set[i], curve_set[j], eta_value, z_value)
-            for i in range(len(curve_set))
-            for j in range(i + 1, len(curve_set))
-        ]
-        finite = [value for value in scores if np.isfinite(value)]
-        return float(np.mean(finite)) if finite else np.inf
+    fixed_parameters = {
+        "eta": None if eta is None else float(eta),
+        "z": (
+            None
+            if z_active and z is None
+            else float(z)
+            if z_active
+            else np.nan
+        ),
+        "delay": (
+            None
+            if delay_active and delay is None
+            else float(delay)
+            if delay_active
+            else np.nan
+        ),
+    }
+    free_names = [
+        name
+        for name, active in (
+            ("eta", eta_active),
+            ("z", z_active),
+            ("delay", delay_active),
+        )
+        if active and fixed_parameters[name] is None
+    ]
+    parameter_bounds = {
+        "eta": eta_bounds,
+        "z": z_bounds,
+        "delay": delay_bounds,
+    }
 
-    eta_fixed, z_fixed = eta is not None, z is not None
+    def unpack(values):
+        parameters = dict(fixed_parameters)
+        for name, value in zip(free_names, np.atleast_1d(values)):
+            parameters[name] = float(value)
+        return parameters
+
+    def objective(values, curve_set):
+        parameters = unpack(values)
+        return score_values(
+            parameters["eta"],
+            parameters["z"],
+            parameters["delay"],
+            curve_set,
+        )
+
+    best_parameters: dict[str, float] | None = None
 
     def fit_parameters(curve_set, *, bootstrap=False):
-        if eta_fixed and z_fixed:
-            return float(eta), float(z), score_values(float(eta), float(z), curve_set)
-        if not eta_fixed and z_fixed:
+        if not free_names:
+            parameters = unpack([])
+            return parameters, objective([], curve_set)
+        bounds = [parameter_bounds[name] for name in free_names]
+        if len(free_names) == 1:
             result = minimize_scalar(
-                lambda trial: score_values(trial, float(z), curve_set),
-                bounds=eta_bounds,
+                lambda trial: objective([trial], curve_set),
+                bounds=bounds[0],
                 method="bounded",
                 options={"xatol": 1e-5 if bootstrap else 1e-7},
             )
-            return float(result.x), float(z), float(result.fun)
-        if eta_fixed and not z_fixed:
-            result = minimize_scalar(
-                lambda trial: score_values(float(eta), trial, curve_set),
-                bounds=z_bounds,
-                method="bounded",
-                options={"xatol": 1e-5 if bootstrap else 1e-7},
-            )
-            return float(eta), float(result.x), float(result.fun)
+            return unpack([result.x]), float(result.fun)
         if bootstrap:
+            if best_parameters is None:
+                raise RuntimeError("The main collapse fit must precede bootstrapping.")
             result = minimize(
-                lambda values: score_values(values[0], values[1], curve_set),
-                x0=np.array([best_eta, best_z]),
+                lambda values: objective(values, curve_set),
+                x0=np.asarray(
+                    [best_parameters[name] for name in free_names], dtype=float
+                ),
                 method="Powell",
-                bounds=[eta_bounds, z_bounds],
+                bounds=bounds,
                 options={"xtol": 1e-4, "ftol": 1e-4, "maxiter": 400},
             )
-            return float(result.x[0]), float(result.x[1]), float(result.fun)
+            return unpack(result.x), float(result.fun)
         result = differential_evolution(
-            lambda values: score_values(values[0], values[1], curve_set),
-            bounds=[eta_bounds, z_bounds],
+            lambda values: objective(values, curve_set),
+            bounds=bounds,
             seed=bootstrap_seed,
             polish=True,
             tol=1e-7,
         )
-        return float(result.x[0]), float(result.x[1]), float(result.fun)
+        return unpack(result.x), float(result.fun)
 
-    best_eta, best_z, best_score = fit_parameters(curves)
+    best_parameters, best_score = fit_parameters(curves)
+    best_eta = float(best_parameters["eta"])
+    best_z = float(best_parameters["z"])
+    best_delay = float(best_parameters["delay"])
     if not np.isfinite(best_score):
         raise RuntimeError(
             "No fitted curve pair has at least three overlapping scaled-time "
-            "points. Widen fit_x/fit_tau or include more distances."
+            "points with the required coverage. Widen fit_x/fit_tau, lower "
+            "minimum_pair_coverage, or include more distances."
         )
 
-    estimates: list[tuple[float, float]] = []
-    if bootstrap_samples >= 2 and (not eta_fixed or not z_fixed):
+    estimates: list[dict[str, float]] = []
+    if bootstrap_samples >= 2 and free_names:
         rng = np.random.default_rng(bootstrap_seed)
         for index in range(bootstrap_samples):
             synthetic_curves = []
@@ -3078,40 +3249,83 @@ def probe_distance_collapse(
                     metric_spec["bootstrap_upper"],
                 )
                 synthetic_curves.append(synthetic)
-            trial_eta, trial_z, trial_score = fit_parameters(
+            trial_parameters, trial_score = fit_parameters(
                 synthetic_curves, bootstrap=True
             )
-            if np.all(np.isfinite([trial_eta, trial_z, trial_score])):
-                estimates.append((trial_eta, trial_z))
+            if np.all(
+                np.isfinite(
+                    [trial_score] + [trial_parameters[name] for name in free_names]
+                )
+            ):
+                estimates.append(trial_parameters)
             if (index + 1) % 25 == 0 or index + 1 == bootstrap_samples:
                 print(f"Bootstrap fits: {index + 1}/{bootstrap_samples}")
 
-    estimate_array = np.asarray(estimates, dtype=float)
-    eta_stderr = (
-        0.0
-        if eta_fixed
-        else float(np.std(estimate_array[:, 0], ddof=1))
-        if len(estimates) >= 2
-        else np.nan
+    def parameter_stderr(name):
+        if name not in free_names:
+            return 0.0 if np.isfinite(best_parameters[name]) else np.nan
+        if len(estimates) < 2:
+            return np.nan
+        return float(
+            np.std([sample[name] for sample in estimates], ddof=1)
+        )
+
+    eta_fixed = "eta" not in free_names
+    z_fixed = "z" not in free_names
+    delay_fixed = "delay" not in free_names
+    eta_stderr = parameter_stderr("eta")
+    z_stderr = parameter_stderr("z")
+    delay_stderr = parameter_stderr("delay")
+    fitted_curves = eligible_curves(curves)
+    best_diagnostics = [
+        pair_diagnostics(
+            fitted_curves[i],
+            fitted_curves[j],
+            best_eta,
+            best_z,
+            best_delay,
+        )
+        for i in range(len(fitted_curves))
+        for j in range(i + 1, len(fitted_curves))
+    ]
+    finite_diagnostics = [
+        (score, coverage)
+        for score, coverage in best_diagnostics
+        if np.isfinite(score)
+    ]
+    mean_pair_coverage = float(
+        np.mean([coverage for _, coverage in finite_diagnostics])
     )
-    z_stderr = (
-        0.0
-        if z_fixed
-        else float(np.std(estimate_array[:, 1], ddof=1))
-        if len(estimates) >= 2
-        else np.nan
+    minimum_fitted_pair_coverage = float(
+        np.min([coverage for _, coverage in finite_diagnostics])
     )
+    fitted_pairs = len(finite_diagnostics)
+    possible_pairs = len(fitted_curves) * (len(fitted_curves) - 1) // 2
+
+    print(f"ansatz = {ansatz_key}")
     print(f"metric = {metric_spec['key']}")
     print(
         f"eta = {best_eta:.6f}"
         + (" (fixed)" if eta_fixed else f" ± {eta_stderr:.6f}")
     )
-    print(
-        f"z = {best_z:.6f}"
-        + (" (fixed)" if z_fixed else f" ± {z_stderr:.6f}")
-    )
+    if z_active:
+        print(
+            f"z = {best_z:.6f}"
+            + (" (fixed)" if z_fixed else f" ± {z_stderr:.6f}")
+        )
+    if delay_active:
+        print(
+            f"delay = {best_delay:.6f}"
+            + (" (fixed)" if delay_fixed else f" ± {delay_stderr:.6f}")
+        )
     print(f"alpha = {alpha:.6f} (fixed)")
     print(f"collapse score = {best_score:.6g}")
+    print(
+        "pair coverage = "
+        f"{mean_pair_coverage:.1%} mean, "
+        f"{minimum_fitted_pair_coverage:.1%} minimum "
+        f"({fitted_pairs}/{possible_pairs} pairs)"
+    )
 
     chord_values = np.asarray([curve["chord"] for curve in curves], dtype=float)
     if np.ptp(chord_values) > 0:
@@ -3152,8 +3366,10 @@ def probe_distance_collapse(
         else:
             ax_raw.plot(curve["tau"], curve["value"], **plot_kwargs)
 
-        x, y, dy, mask = transformed(curve, best_eta, best_z)
-        all_x = alpha * curve["tau"] / curve["chord"] ** best_z
+        x, y, dy, mask = transformed(
+            curve, best_eta, best_z, best_delay
+        )
+        all_x = scaled_x(curve, best_z, best_delay)
         excluded = ~mask
         if np.any(excluded):
             ax_collapse.plot(
@@ -3193,7 +3409,16 @@ def probe_distance_collapse(
     ax_raw.grid(alpha=0.25)
     ax_raw.legend(fontsize=8, ncols=2 if len(curves) > 8 else 1)
 
-    ax_collapse.set_xlabel(r"$\alpha\tau/\ell_r^z$")
+    x_labels = {
+        "lightcone": (
+            r"$\alpha(\tau-\lambda\ell_r^z)/L^z$"
+        ),
+        "cylinder": (
+            r"$\log[1+\sinh(\pi\alpha\tau/L)/\sin(\pi r/L)]$"
+        ),
+        "legacy_local": r"$\alpha\tau/\ell_r^z$",
+    }
+    ax_collapse.set_xlabel(x_labels[ansatz_key])
     collapse_symbol = {
         "mi": r"I(A:B)",
         "negativity": r"\mathcal{N}(A:B)",
@@ -3203,7 +3428,12 @@ def probe_distance_collapse(
     ax_collapse.set_ylabel(
         rf"$\ell_r^{{\eta}}{collapse_symbol}$" + unit_suffix
     )
-    ax_collapse.set_title("Chord-length scaling collapse")
+    collapse_titles = {
+        "lightcone": "Finite-size light-cone collapse",
+        "cylinder": "Finite-cylinder collapse",
+        "legacy_local": "Legacy local-time collapse",
+    }
+    ax_collapse.set_title(collapse_titles[ansatz_key])
     ax_collapse.set_yscale(collapse_yscale)
     ax_collapse.grid(alpha=0.25)
     ax_collapse.legend(fontsize=8, ncols=2 if len(curves) > 8 else 1)
@@ -3214,22 +3444,37 @@ def probe_distance_collapse(
         if np.isfinite(eta_stderr)
         else ""
     )
-    z_text = rf"$z={best_z:.4f}$" + (
-        " fixed"
-        if z_fixed
-        else rf" $\pm {z_stderr:.4f}$"
-        if np.isfinite(z_stderr)
-        else ""
+    parameter_lines = [eta_text]
+    if z_active:
+        parameter_lines.append(
+            rf"$z={best_z:.4f}$"
+            + (
+                " fixed"
+                if z_fixed
+                else rf" $\pm {z_stderr:.4f}$"
+                if np.isfinite(z_stderr)
+                else ""
+            )
+        )
+    if delay_active:
+        parameter_lines.append(
+            rf"$\lambda={best_delay:.4f}$"
+            + (
+                " fixed"
+                if delay_fixed
+                else rf" $\pm {delay_stderr:.4f}$"
+                if np.isfinite(delay_stderr)
+                else ""
+            )
+        )
+    parameter_lines.extend(
+        [
+            rf"$\alpha={alpha:.4g}$ fixed",
+            rf"score $={best_score:.3g}$",
+            f"coverage = {mean_pair_coverage:.1%}",
+        ]
     )
-    parameter_text = (
-        eta_text
-        + "\n"
-        + z_text
-        + "\n"
-        + rf"$\alpha={alpha:.4g}$ fixed"
-        + "\n"
-        + rf"score $={best_score:.3g}$"
-    )
+    parameter_text = "\n".join(parameter_lines)
     ax_collapse.text(
         0.97,
         0.03,
@@ -3239,11 +3484,20 @@ def probe_distance_collapse(
         va="bottom",
         bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.88},
     )
-    fig.suptitle(
-        r"$O(\tau,r,L)=\ell_r^{-\eta}"
-        r"G(\alpha\tau/\ell_r^z)$",
-        fontsize=14,
-    )
+    ansatz_titles = {
+        "lightcone": (
+            r"$O(\tau,r,L)=\ell_r^{-\eta}"
+            r"F[\alpha(\tau-\lambda\ell_r^z)/L^z]$"
+        ),
+        "cylinder": (
+            r"$O(\tau,r,L)=\ell_r^{-\eta}F(u_{\rm cyl})$"
+        ),
+        "legacy_local": (
+            r"$O(\tau,r,L)=\ell_r^{-\eta}"
+            r"G(\alpha\tau/\ell_r^z)$"
+        ),
+    }
+    fig.suptitle(ansatz_titles[ansatz_key], fontsize=14)
     _show(fig, show)
 
     return {
@@ -3251,14 +3505,22 @@ def probe_distance_collapse(
         "axes": (ax_raw, ax_collapse),
         "metric": metric_spec["key"],
         "mi_units": mi_units,
+        "ansatz": ansatz_key,
         "eta": best_eta,
         "eta_stderr": eta_stderr,
         "eta_fixed": eta_fixed,
-        "z": best_z,
+        "z": best_z if z_active else None,
         "z_stderr": z_stderr,
         "z_fixed": z_fixed,
         "alpha": alpha,
+        "delay": best_delay if delay_active else None,
+        "delay_stderr": delay_stderr,
+        "delay_fixed": delay_fixed,
         "score": best_score,
+        "mean_pair_coverage": mean_pair_coverage,
+        "minimum_pair_coverage": minimum_fitted_pair_coverage,
+        "fitted_pairs": fitted_pairs,
+        "possible_pairs": possible_pairs,
         "bootstrap_successes": len(estimates),
         "summary": summary,
         "curves": curves,

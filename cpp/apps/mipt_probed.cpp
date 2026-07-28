@@ -161,6 +161,7 @@ struct Aggregate
 struct ProbeGeometry
 {
     std::array<int, 3> distances{};
+    double balance = 0.0;
     std::vector<std::array<int, 3>> embeddings;
 };
 
@@ -172,6 +173,7 @@ struct OutputRow
     int distance = -1;
     int geometry = -1;
     std::array<int, 3> distances{};
+    double triangle_balance = 0.0;
     std::size_t embedding_count = 0;
     Aggregate stats;
 };
@@ -182,7 +184,23 @@ int periodic_distance(int lhs, int rhs, int n)
     return std::min(direct, n - direct);
 }
 
-std::vector<ProbeGeometry> enumerate_three_probe_geometries(int n)
+double chord_distance(int distance, int n)
+{
+    const double pi = std::acos(-1.0);
+    return static_cast<double>(n) / pi *
+           std::sin(pi * static_cast<double>(distance) / static_cast<double>(n));
+}
+
+double triangle_balance(const std::array<int, 3> &distances, int n)
+{
+    std::array<double, 3> chords{};
+    std::transform(distances.begin(), distances.end(), chords.begin(),
+                   [n](int distance) { return chord_distance(distance, n); });
+    const auto [minimum, maximum] = std::minmax_element(chords.begin(), chords.end());
+    return *minimum / *maximum;
+}
+
+std::vector<ProbeGeometry> enumerate_three_probe_geometries(int n, double minimum_balance)
 {
     if (n < 3)
     {
@@ -207,7 +225,18 @@ std::vector<ProbeGeometry> enumerate_three_probe_geometries(int n)
     geometries.reserve(grouped.size());
     for (auto &[distances, embeddings] : grouped)
     {
-        geometries.push_back({distances, std::move(embeddings)});
+        const double balance = triangle_balance(distances, n);
+        if (balance + 1.0e-12 >= minimum_balance)
+        {
+            geometries.push_back({distances, balance, std::move(embeddings)});
+        }
+    }
+    if (geometries.empty())
+    {
+        throw std::invalid_argument("No three-probe triangle geometry satisfies B >= " +
+                                    std::to_string(minimum_balance) +
+                                    "; lower the mode-4 B_min argument or "
+                                    "MIPT_PROBED_TRIANGLE_BALANCE.");
     }
     return geometries;
 }
@@ -721,7 +750,7 @@ class ProgressReporter
 
 std::string default_output_name(int probes, int n, int realizations, CircuitType type, int mode,
                                 const std::vector<double> &p_values, const std::vector<int> &times, int delta_x,
-                                int delta_t, int t_eq)
+                                int delta_t, int t_eq, double triangle_balance_cutoff)
 {
     std::string name = "probed_" + std::to_string(probes) + "_" + std::string(circuit_type_tag(type)) + "_n_" +
                        std::to_string(n) + "_reals_" + compact_count(static_cast<std::uint64_t>(realizations)) +
@@ -744,6 +773,10 @@ std::string default_output_name(int probes, int n, int realizations, CircuitType
         }
         else if (mode == 4)
         {
+            if (probes == 3)
+            {
+                name += "_b_" + compact_decimal(triangle_balance_cutoff);
+            }
             name += "_teq_" + std::to_string(t_eq) + "_tau_0_" + std::to_string(times.back());
         }
         else
@@ -794,12 +827,13 @@ void print_help(const char *program)
               << "     for elapsed readout time tau=0,...,8N after the second "
                  "insertion, so\n"
         << "     the absolute circuit depth is 12N+delta_t.\n\n"
-              << "  4  Distance-resolved probe dynamics: [p] [tau_max]\n"
+              << "  4  Distance-resolved probe dynamics: [p] [tau_max] [B_min]\n"
               << "     probes=2: simulate every distance r=1,...,floor(N/2), using a "
                  "fresh\n"
               << "     random origin for each independent trajectory.\n"
               << "     probes=3: simulate every unique sorted three-distance triangle "
-                 "with\n"
+                 "whose\n"
+              << "     CFT chord balance B=ell_min/ell_max satisfies B>=B_min, with\n"
               << "     exactly equal representation, choosing uniformly among all "
                  "lattice\n"
               << "     embeddings of that triangle. Records TMI, average pair MI, "
@@ -807,7 +841,9 @@ void print_help(const char *program)
               << "     bipartite negativity, GMN/fGMN, joint purity, and mean "
                  "single-probe\n"
               << "     purity. Both protocols attach after t_eq and sample "
-                 "tau=0..tau_max.\n\n"
+                 "tau=0..tau_max.\n"
+              << "     B_min is optional for probes=3 and defaults to "
+                 "MIPT_PROBED_TRIANGLE_BALANCE or 0.5.\n\n"
               << "All entropies use natural logarithms. Four-probe I2/I3 are averages "
                  "over\n"
               << "the six pairs/four triplets; I4 is inclusion--exclusion "
@@ -827,6 +863,8 @@ void print_help(const char *program)
         << "  MIPT_PROBED_PROGRESS=0       Disable progress output.\n"
         << "  MIPT_PROBED_PROGRESS_MS=500  Progress-update interval.\n"
               << "  MIPT_PROBED_T_EQ=2N          Mode-4 equilibration timesteps.\n"
+              << "  MIPT_PROBED_TRIANGLE_BALANCE=0.5  Minimum three-probe CFT chord "
+                 "balance.\n"
               << "  MIPT_PROBED_GMN_BATCH_RECORDS=64  RDMs per deferred SDP batch.\n"
               << "  MIPT_PROBED_GMN_PENDING_BATCHES=2 Maximum concurrent SDP batches.\n"
               << "  MIPT_PROBED_GMN_STRIDE=1     Evaluate GMN/fGMN every nth tau.\n"
@@ -836,7 +874,8 @@ void print_help(const char *program)
 }
 
 void write_csv(const std::string &path, int probes, int mode, int n, int realizations, CircuitType type,
-               const std::vector<OutputRow> &rows, int delta_x, int delta_t, int t_eq)
+               const std::vector<OutputRow> &rows, int delta_x, int delta_t, int t_eq,
+               double triangle_balance_cutoff)
 {
     std::ofstream csv(path, std::ios::out | std::ios::trunc);
     if (!csv)
@@ -877,7 +916,8 @@ void write_csv(const std::string &path, int probes, int mode, int n, int realiza
             const char *measure_name = uses_fermionic_trace(type) ? "fGMN" : "GMN";
             csv << "N,p,geometry_id,distance_1,distance_2,distance_3,"
                    "chord_1,chord_2,chord_3,chord_geometric_mean,"
-                   "embedding_count,t_eq,tau,tau_over_chord_geometric_mean,"
+                   "triangle_balance,triangle_balance_cutoff,embedding_count,"
+                   "t_eq,tau,tau_over_chord_geometric_mean,"
                    "t_absolute,TMI_mean,TMI_stderr,average_MI_mean,"
                    "average_MI_stderr,min_bipartite_negativity_mean,"
                    "min_bipartite_negativity_stderr,gmn_type,GMN_mean,"
@@ -903,7 +943,8 @@ void write_csv(const std::string &path, int probes, int mode, int n, int realiza
                     row.stats.gmn.count > 0 ? row.stats.gmn.stderr() : std::numeric_limits<double>::quiet_NaN();
                 csv << n << ',' << row.p << ',' << row.geometry << ',' << row.distances[0] << ',' << row.distances[1]
                     << ',' << row.distances[2] << ',' << chords[0] << ',' << chords[1] << ',' << chords[2] << ','
-                    << chord_geometric_mean << ',' << row.embedding_count << ',' << t_eq << ',' << row.t << ','
+                    << chord_geometric_mean << ',' << row.triangle_balance << ',' << triangle_balance_cutoff << ','
+                    << row.embedding_count << ',' << t_eq << ',' << row.t << ','
                     << static_cast<double>(row.t) / chord_geometric_mean << ',' << t_eq + row.t << ','
                     << row.stats.tmi.mean << ',' << row.stats.tmi.stderr() << ',' << row.stats.average_mi.mean << ','
                     << row.stats.average_mi.stderr() << ',' << row.stats.min_bipartite_negativity.mean << ','
@@ -1166,6 +1207,7 @@ int run_cli(int argc, char *argv[])
     int delta_t = -1;
     int t0 = probes == 1 ? 0 : 2 * n;
     int t_eq = 2 * n;
+    double triangle_balance_cutoff = 0.0;
     if (mode == 0)
     {
         if (argc != 9)
@@ -1271,9 +1313,9 @@ int run_cli(int argc, char *argv[])
         {
             throw std::invalid_argument("Mode 4 requires N >= probes.");
         }
-        if (argc != 8)
+        if ((probes == 2 && argc != 8) || (probes == 3 && argc != 8 && argc != 9))
         {
-            throw std::invalid_argument("Mode 4 requires [p] [tau_max].");
+            throw std::invalid_argument("Mode 4 requires [p] [tau_max], with optional [B_min] for probes=3.");
         }
         const double p = std::stod(argv[6]);
         const int tau_max = std::stoi(argv[7]);
@@ -1289,17 +1331,29 @@ int run_cli(int argc, char *argv[])
         {
             times.push_back(tau);
         }
+        if (probes == 3)
+        {
+            triangle_balance_cutoff =
+                argc == 9 ? std::stod(argv[8]) : env::real("MIPT_PROBED_TRIANGLE_BALANCE", 0.5, 0.0, 1.0);
+            if (!std::isfinite(triangle_balance_cutoff) || triangle_balance_cutoff < 0.0 ||
+                triangle_balance_cutoff > 1.0)
+            {
+                throw std::invalid_argument("Three-probe mode 4 requires B_min in [0,1].");
+            }
+        }
         t0 = t_eq;
     }
 
     const bool parity_encoding = mode == 1 && probes == 1 && preserves_computational_parity(type) &&
         env::boolean("MIPT_PROBED_PARITY_ENCODING", true);
     const auto sites = mode == 4 ? std::vector<int>{} : probe_sites(probes, n, mode, delta_x);
-    const auto geometries =
-        mode == 4 && probes == 3 ? enumerate_three_probe_geometries(n) : std::vector<ProbeGeometry>{};
+    const auto geometries = mode == 4 && probes == 3
+        ? enumerate_three_probe_geometries(n, triangle_balance_cutoff)
+        : std::vector<ProbeGeometry>{};
     const int t_max = mode == 3 ? 12 * n + delta_t : mode == 4 ? t_eq + times.back() : times.back();
     const std::string generated_output =
-        default_output_name(probes, n, realizations, type, mode, p_values, times, delta_x, delta_t, t_eq);
+        default_output_name(probes, n, realizations, type, mode, p_values, times, delta_x, delta_t, t_eq,
+                            triangle_balance_cutoff);
     const std::string output = env::text("MIPT_PROBED_INTERNAL_OUTPUT", generated_output.c_str());
     const std::uint64_t distance_count =
         mode == 4 ? probes == 2 ? static_cast<std::uint64_t>(n / 2) : static_cast<std::uint64_t>(geometries.size())
@@ -1335,6 +1389,7 @@ int run_cli(int argc, char *argv[])
                   << ", cpu_prefetch=" << (prefetch ? "on" : "off")
                   << (mode == 4 && probes == 3
                           ? ", multipartite_measure=" + std::string(uses_fermionic_trace(type) ? "fGMN" : "GMN")
+                                + ", triangle_balance_cutoff=" + compact_decimal(triangle_balance_cutoff)
                           : "")
                   << ", output=" << output << '\n'
                   << std::flush;
@@ -1575,6 +1630,7 @@ int run_cli(int argc, char *argv[])
                 if (mode == 4 && probes == 3)
                 {
                     row.distances = geometries[distance_index].distances;
+                    row.triangle_balance = geometries[distance_index].balance;
                     row.embedding_count = geometries[distance_index].embeddings.size();
                 }
                 row.stats = aggregates[distance_index * times.size() + i];
@@ -1583,7 +1639,8 @@ int run_cli(int argc, char *argv[])
         }
     }
     progress.finish();
-    write_csv(output, probes, mode, n, realizations, type, rows, delta_x, delta_t, t_eq);
+    write_csv(output, probes, mode, n, realizations, type, rows, delta_x, delta_t, t_eq,
+              triangle_balance_cutoff);
 
     const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
     if (!internal_child)
