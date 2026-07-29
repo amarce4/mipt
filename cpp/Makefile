@@ -51,12 +51,15 @@ CXXFLAGS_COMMON := $(CPPFLAGS_COMMON) -std=c++20 -O3 -DNDEBUG -march=native \
 CFLAGS_COMMON := $(CPPFLAGS_COMMON) -std=c11 -O3 -DNDEBUG -march=native \
   -MMD -MP
 MOSEK_CPPFLAGS := -I$(MOSEK_INC)
-# The distro nvcc on PATH is 11.5, which predates Ada and has no -arch for it.
-# Prefer a newer toolkit when one is installed. Without an explicit -arch, nvcc
+# The distro nvcc on PATH may be far older than the installed toolkit (11.5 on
+# one of our hosts, which predates Ada and has no -arch for it), so prefer a
+# /usr/local toolkit. /usr/local/cuda comes first because it is the symlink the
+# system considers current; the version-sorted wildcard is the fallback and its
+# last entry is the highest version present. Without an explicit -arch, nvcc
 # defaults to sm_52 and every hand-written kernel is JIT-recompiled from PTX at
 # load with no architecture-specific code generation.
-NVCC ?= $(firstword $(wildcard /usr/local/cuda-12.4/bin/nvcc /usr/local/cuda-12/bin/nvcc \
-  /usr/local/cuda/bin/nvcc) nvcc)
+NVCC ?= $(firstword $(wildcard /usr/local/cuda/bin/nvcc) \
+  $(lastword $(wildcard /usr/local/cuda-*/bin/nvcc)) nvcc)
 # sm_75 = Turing (GTX 16xx / RTX 20xx), sm_89 = Ada (RTX 40xx). The trailing
 # compute_89 keeps PTX in the binary so it still runs on newer architectures.
 CUDA_ARCHS ?= -gencode arch=compute_75,code=sm_75 \
@@ -94,19 +97,37 @@ ifeq ($(GPU),1)
   endif
 endif
 
-# Pin the CUDA math libraries to one toolkit.
+# Locate one CUDA toolkit and use it for both headers and libraries.
 #
-# A bare -lcublas resolves to /lib/x86_64-linux-gnu/libcublas.so.11 (the distro
-# CUDA 11 packages) while cuSOLVER drags in CUDA 12's libcublas.so.12, so a GPU
-# executable could load both runtimes at once. That mix is silently tolerated
-# until libcustatevec (built against CUDA 12) becomes a direct dependency, at
-# which point it initialises against the CUDA 11 runtime and every device query
-# fails with "no CUDA-capable device is detected". Linking and rpath-ing one
-# toolkit keeps the process on a single runtime.
+# Two separate hazards make this explicit rather than implicit:
+#
+#  * Headers. custatevec.h does `#include <library_types.h>`, which lives in the
+#    CUDA toolkit, not in ~/.cudaq/include. On a host that also has the distro
+#    nvidia-cuda-dev package the header happens to be in /usr/include (a default
+#    clang search path) and the build succeeds by accident -- with a CUDA 11
+#    header. On a host without that package the compile fails outright with
+#    "'library_types.h' file not found". Pass -I explicitly so neither happens.
+#
+#  * Libraries. A bare -lcublas resolves to the distro CUDA 11 libcublas.so.11
+#    while cuSOLVER drags in CUDA 12's libcublas.so.12, so a GPU executable can
+#    load two runtimes at once. That is tolerated until libcustatevec (built
+#    against CUDA 12) becomes a direct dependency, at which point it initialises
+#    against the CUDA 11 runtime and every device query fails with "no
+#    CUDA-capable device is detected".
+#
+# Override CUDA_HOME (or CUDA_INC_DIR / CUDA_LIB_DIR individually) if the
+# toolkit is somewhere unusual.
+NVCC_PATH := $(shell command -v $(NVCC) 2>/dev/null)
+CUDA_HOME ?= $(firstword \
+  $(wildcard $(CUDA_PATH)) \
+  $(if $(NVCC_PATH),$(patsubst %/bin/,%,$(dir $(realpath $(NVCC_PATH))))) \
+  $(wildcard /usr/local/cuda /usr/local/cuda-13 /usr/local/cuda-12))
+CUDA_INC_DIR ?= $(firstword $(wildcard \
+  $(CUDA_HOME)/include \
+  $(CUDA_HOME)/targets/x86_64-linux/include))
 CUDA_LIB_DIR ?= $(firstword $(wildcard \
-  /usr/local/cuda-12.4/targets/x86_64-linux/lib \
-  /usr/local/cuda-12/targets/x86_64-linux/lib \
-  /usr/local/cuda/targets/x86_64-linux/lib))
+  $(CUDA_HOME)/targets/x86_64-linux/lib \
+  $(CUDA_HOME)/lib64))
 ifneq ($(strip $(CUDA_LIB_DIR)),)
   CUDA_LDFLAGS := -L$(CUDA_LIB_DIR) -Wl,-rpath,$(CUDA_LIB_DIR)
 endif
@@ -125,12 +146,17 @@ endif
 # there is no extra dependency to install.
 CUSV ?= $(if $(filter 1,$(GPU)),$(if $(filter nvidia,$(CUDAQ_BACKEND)),1,0),0)
 ifeq ($(CUSV),1)
-  NVQXXFLAGS_COMMON += -DMIPT_ENABLE_CUSV
+  ifeq ($(strip $(CUDA_INC_DIR)),)
+    $(error CUSV=1 needs the CUDA toolkit headers, because custatevec.h includes \
+      <library_types.h>. No toolkit include directory was found (looked at CUDA_PATH, \
+      the directory containing $(NVCC), and /usr/local/cuda*). Set CUDA_HOME=/path/to/cuda \
+      or CUDA_INC_DIR=/path/to/cuda/include, or build with CUSV=0 to use the CUDA-Q path)
+  endif
+  NVQXXFLAGS_COMMON += -DMIPT_ENABLE_CUSV -I$(CUDA_INC_DIR)
   CUSV_LIBS := -lcustatevec
 endif
 
-NVCC_FOUND := $(shell command -v $(NVCC) 2>/dev/null)
-ifeq ($(strip $(NVCC_FOUND)),)
+ifeq ($(strip $(NVCC_PATH)),)
   CUDA_CU_COMPILER ?= $(NVQXX)
   CUDA_CU_FLAGS ?= $(CUDAQ_TARGET_FLAGS) $(NVQXXFLAGS_COMMON)
   CUDA_CU_BACKEND := nvq++ fallback
@@ -379,6 +405,9 @@ print-config:
 	@echo "CUDAQ_TARGET_FLAGS=$(CUDAQ_TARGET_FLAGS)"
 	@echo "CUDA_RHO=$(CUDA_RHO)"
 	@echo "CUSV=$(CUSV)"
+	@echo "CUDA_HOME=$(CUDA_HOME)"
+	@echo "CUDA_INC_DIR=$(CUDA_INC_DIR)"
+	@echo "CUDA_LIB_DIR=$(CUDA_LIB_DIR)"
 	@echo "CUDA_CU_COMPILER=$(CUDA_CU_COMPILER)"
 	@echo "CUDA_CU_BACKEND=$(CUDA_CU_BACKEND)"
 	@echo "CUDA_ARCHS=$(CUDA_ARCHS)"

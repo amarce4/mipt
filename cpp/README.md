@@ -188,6 +188,27 @@ RTX 4080 Super should favour k=6. Re-run `make bench-cusv` on new hardware.
 
 RFGS (`circ_type 3`) is not implemented in the engine and falls back to CUDA-Q.
 
+### CUDA toolkit discovery
+
+`custatevec.h` includes `<library_types.h>`, which comes from the CUDA toolkit
+rather than from `~/.cudaq/include`, so `CUSV=1` compiles with an explicit
+`-I$(CUDA_INC_DIR)`. The toolkit root is discovered from `CUDA_PATH`, then from
+the real path of the selected `nvcc`, then from `/usr/local/cuda*`:
+
+```bash
+make print-config | grep CUDA_       # shows CUDA_HOME / CUDA_INC_DIR / CUDA_LIB_DIR
+make CUDA_HOME=/opt/cuda-12.6 ...    # override when the toolkit is elsewhere
+make CUSV=0 ...                      # build without the engine at all
+```
+
+If no toolkit is found, `CUSV=1` fails fast with an explanatory error rather
+than a `'library_types.h' file not found` deep inside `cudaq-quake`.
+
+Do not rely on the header being picked up implicitly: hosts with the distro
+`nvidia-cuda-dev` package have a **CUDA 11** copy in `/usr/include`, which is on
+clang's default search path, so a build can succeed there against the wrong
+headers and fail on a host without that package.
+
 The old Makefile referenced `tmi.cpp`, but that source was absent from the supplied
 archive. The stale `tmi.exe` target was therefore removed; `sim_tmi.exe` remains the
 maintained online TMI path.
