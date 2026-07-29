@@ -9,7 +9,7 @@
 NVQXX   ?= nvq++
 HOSTCXX ?= g++
 HOSTCC  ?= gcc
-NVCC    ?= nvcc
+# NVCC is resolved further down, after the toolkit search.
 
 GPU ?= 1
 FP64 ?= 0
@@ -51,7 +51,18 @@ CXXFLAGS_COMMON := $(CPPFLAGS_COMMON) -std=c++20 -O3 -DNDEBUG -march=native \
 CFLAGS_COMMON := $(CPPFLAGS_COMMON) -std=c11 -O3 -DNDEBUG -march=native \
   -MMD -MP
 MOSEK_CPPFLAGS := -I$(MOSEK_INC)
-NVCCFLAGS := $(CPPFLAGS_COMMON) -std=c++14 -O3
+# The distro nvcc on PATH is 11.5, which predates Ada and has no -arch for it.
+# Prefer a newer toolkit when one is installed. Without an explicit -arch, nvcc
+# defaults to sm_52 and every hand-written kernel is JIT-recompiled from PTX at
+# load with no architecture-specific code generation.
+NVCC ?= $(firstword $(wildcard /usr/local/cuda-12.4/bin/nvcc /usr/local/cuda-12/bin/nvcc \
+  /usr/local/cuda/bin/nvcc) nvcc)
+# sm_75 = Turing (GTX 16xx / RTX 20xx), sm_89 = Ada (RTX 40xx). The trailing
+# compute_89 keeps PTX in the binary so it still runs on newer architectures.
+CUDA_ARCHS ?= -gencode arch=compute_75,code=sm_75 \
+  -gencode arch=compute_89,code=sm_89 \
+  -gencode arch=compute_89,code=compute_89
+NVCCFLAGS := $(CPPFLAGS_COMMON) -std=c++17 -O3 $(CUDA_ARCHS)
 DL_LIBS ?= -ldl
 MOSEK_LDFLAGS := -L$(MOSEK_LIB) -Wl,-rpath,$(MOSEK_LIB)
 MOSEK_LIBS := -lmosek64 -lfusion64
@@ -83,11 +94,39 @@ ifeq ($(GPU),1)
   endif
 endif
 
+# Pin the CUDA math libraries to one toolkit.
+#
+# A bare -lcublas resolves to /lib/x86_64-linux-gnu/libcublas.so.11 (the distro
+# CUDA 11 packages) while cuSOLVER drags in CUDA 12's libcublas.so.12, so a GPU
+# executable could load both runtimes at once. That mix is silently tolerated
+# until libcustatevec (built against CUDA 12) becomes a direct dependency, at
+# which point it initialises against the CUDA 11 runtime and every device query
+# fails with "no CUDA-capable device is detected". Linking and rpath-ing one
+# toolkit keeps the process on a single runtime.
+CUDA_LIB_DIR ?= $(firstword $(wildcard \
+  /usr/local/cuda-12.4/targets/x86_64-linux/lib \
+  /usr/local/cuda-12/targets/x86_64-linux/lib \
+  /usr/local/cuda/targets/x86_64-linux/lib))
+ifneq ($(strip $(CUDA_LIB_DIR)),)
+  CUDA_LDFLAGS := -L$(CUDA_LIB_DIR) -Wl,-rpath,$(CUDA_LIB_DIR)
+endif
+
 ifeq ($(CUDA_RHO),1)
   NVQXXFLAGS_COMMON += -DMIPT_ENABLE_CUDA_RHO
-  MIPT_CUDA_LIBS := -lcudart
+  MIPT_CUDA_LIBS := $(CUDA_LDFLAGS) -lcudart
   SIM_TMI_CUDA_LIBS := -lcusolver -lcublas
   ENTROPY_CUDA_LIBS := -lcublas
+endif
+
+# Direct cuStateVec circuit engine (mipt/cusv). Replaces CUDA-Q's gate-by-gate
+# dispatch with fused bond matrices, a single diagonal pass for the
+# Jordan-Wigner string, a joint measurement layer, and an in-place state vector.
+# Requires the GPU statevector target; cuStateVec ships with CUDA-Q itself, so
+# there is no extra dependency to install.
+CUSV ?= $(if $(filter 1,$(GPU)),$(if $(filter nvidia,$(CUDAQ_BACKEND)),1,0),0)
+ifeq ($(CUSV),1)
+  NVQXXFLAGS_COMMON += -DMIPT_ENABLE_CUSV
+  CUSV_LIBS := -lcustatevec
 endif
 
 NVCC_FOUND := $(shell command -v $(NVCC) 2>/dev/null)
@@ -135,6 +174,11 @@ EXP_VALS_OBJS := $(HOST_BUILD)/exp_vals_main.o $(HOST_BUILD)/exp_vals_analysis.o
 CORE_TEST_OBJS := $(HOST_BUILD)/core_tests.o
 DIST_TEST_OBJS := $(HOST_BUILD)/dist_metrics_tests.o
 
+ifeq ($(CUSV),1)
+  MIPT_PROBED_OBJS += $(BUILD)/cusv_diag.o
+  FREE_ENERGY_OBJS += $(BUILD)/cusv_diag.o
+endif
+
 ifeq ($(CUDA_RHO),1)
   MIPT_OBJS += $(BUILD)/rho_reduce.o
   MIPT_PROBED_OBJS += $(BUILD)/ancilla_rdm.o
@@ -150,7 +194,14 @@ ALL_OBJS := $(MIPT_OBJS) $(MIPT_PROBED_OBJS) $(FREE_ENERGY_OBJS) \
   $(MIPT_PROBED_FGMN_PIC_OBJ)
 DEPS := $(ALL_OBJS:.o=.d)
 
+# nvq++ accepts -MMD/-MP but does not emit dependency files, so the CUDA-Q
+# objects below would never notice an edited header and would silently link a
+# stale binary. Depend them on every header instead: coarse, but a header
+# change must never produce a stale simulation executable.
+MIPT_HEADERS := $(shell find include -name '*.hpp' 2>/dev/null)
+
 .PHONY: all simulation analysis clean cpu gpu print-config format test-core test-dist \
+  test-cusv test-cusv-gates bench-cusv \
   mipt.exe mipt_probed.exe free_energy.exe sim_tmi.exe dist_scaling.exe \
   entropy.exe gmn.exe fgmn.exe ring_inflation.exe exp_vals.exe
 
@@ -188,13 +239,13 @@ $(MIPT_BIN): $(MIPT_OBJS)
 	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $^ $(MIPT_CUDA_LIBS) $(DL_LIBS) -o $@
 $(MIPT_PROBED_BIN): $(MIPT_PROBED_OBJS) $(MIPT_PROBED_FGMN_LIB)
 	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $(HOST_LDFLAGS) $(MIPT_PROBED_OBJS) \
-	  $(MIPT_CUDA_LIBS) -L$(BUILD) -Wl,-rpath,'$$ORIGIN' -lmipt_fgmn \
+	  $(MIPT_CUDA_LIBS) $(CUSV_LIBS) -L$(BUILD) -Wl,-rpath,'$$ORIGIN' -lmipt_fgmn \
 	  $(DL_LIBS) -o $@
 $(MIPT_PROBED_FGMN_LIB): $(MIPT_PROBED_FGMN_PIC_OBJ) | $(BUILD)
 	$(HOSTCXX) $(HOST_LDFLAGS) -shared $< $(MOSEK_LDFLAGS) $(MOSEK_LIBS) \
 	  $(DL_LIBS) -Wl,-soname,libmipt_fgmn.so -o $@
 $(FREE_ENERGY_BIN): $(FREE_ENERGY_OBJS)
-	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $^ $(MIPT_CUDA_LIBS) $(SIM_TMI_CUDA_LIBS) $(DL_LIBS) -o $@
+	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $^ $(MIPT_CUDA_LIBS) $(SIM_TMI_CUDA_LIBS) $(CUSV_LIBS) $(DL_LIBS) -o $@
 $(SIM_TMI_BIN): $(SIM_TMI_OBJS)
 	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $^ $(MIPT_CUDA_LIBS) $(SIM_TMI_CUDA_LIBS) $(DL_LIBS) -o $@
 $(DIST_SCALING_BIN): $(DIST_SCALING_OBJS)
@@ -220,20 +271,64 @@ test-core: $(CORE_TEST_BIN)
 test-dist: $(DIST_TEST_BIN)
 	$(DIST_TEST_BIN)
 
+# --- cuStateVec engine tests ------------------------------------------------
+#
+# dump_bond extracts each bond's 4x4 matrix from the *CUDA-Q runtime* by
+# applying the historical gate decomposition to every basis state. It is always
+# built in fp64 so the comparison tolerance can be tight regardless of FP64.
+# cusv_gate_tests then checks the fused matrices against that dump, and
+# cusv_equiv runs whole circuits both ways and compares state vectors.
+CUDAQ_INC ?= $(HOME)/.cudaq/include
+CUSV_GATE_TEST_BIN := $(HOST_BUILD)/cusv_gate_tests
+DUMP_BOND_BIN := $(BUILD)/dump_bond
+CUSV_EQUIV_BIN := $(BUILD)/cusv_equiv
+CUSV_BENCH_BIN := $(BUILD)/cusv_bench
+CUSV_GROUND_TRUTH := $(BUILD)/cusv_ground_truth.txt
+CUSV_TEST_SEED ?= 12345
+
+$(CUSV_GATE_TEST_BIN): tests/cusv_gate_tests.cpp $(MIPT_HEADERS) | $(HOST_BUILD)
+	$(HOSTCXX) $(CPPFLAGS_COMMON) -I$(CUDAQ_INC) -std=c++20 -O2 -Wno-attributes $< -o $@
+
+$(DUMP_BOND_BIN): tests/dump_bond.cpp $(MIPT_HEADERS) | $(BUILD)
+	$(NVQXX) --target nvidia --target-option fp64 $(CPPFLAGS_COMMON) -std=c++20 -O2 \
+	  -DNDEBUG -DMIPT_CUDAQ_BACKEND_NAME=\"nvidia\" -DMIPT_CUDAQ_PRECISION=64 $< -o $@
+
+$(CUSV_EQUIV_BIN): tests/cusv_equiv.cpp $(BUILD)/cusv_diag.o $(MIPT_HEADERS) | $(BUILD)
+	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $(NVQXXFLAGS_COMMON) $< $(BUILD)/cusv_diag.o \
+	  $(MIPT_CUDA_LIBS) $(CUSV_LIBS) $(DL_LIBS) -o $@
+
+$(CUSV_BENCH_BIN): tests/cusv_bench.cpp $(BUILD)/cusv_diag.o $(MIPT_HEADERS) | $(BUILD)
+	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $(NVQXXFLAGS_COMMON) $< $(BUILD)/cusv_diag.o \
+	  $(MIPT_CUDA_LIBS) $(CUSV_LIBS) $(DL_LIBS) -o $@
+
+$(CUSV_GROUND_TRUTH): $(DUMP_BOND_BIN)
+	$(DUMP_BOND_BIN) $(CUSV_TEST_SEED) > $@
+
+# Host-only: no GPU, no cuStateVec. Needs the ground-truth dump, which does.
+test-cusv-gates: $(CUSV_GATE_TEST_BIN) $(CUSV_GROUND_TRUTH)
+	$(CUSV_GATE_TEST_BIN) $(CUSV_GROUND_TRUTH) $(CUSV_TEST_SEED)
+
+test-cusv: test-cusv-gates $(CUSV_EQUIV_BIN)
+	$(CUSV_EQUIV_BIN) 12 6 2024
+	$(CUSV_EQUIV_BIN) 14 8 31337
+
+bench-cusv: $(CUSV_BENCH_BIN)
+	$(CUSV_BENCH_BIN) 20 16 0.15 2
+
 $(BUILD) $(HOST_BUILD):
 	mkdir -p $@
 
-$(BUILD)/mipt.o: apps/mipt.cpp | $(BUILD)
+$(BUILD)/mipt.o: apps/mipt.cpp $(MIPT_HEADERS) | $(BUILD)
 	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $(NVQXXFLAGS_COMMON) -c $< -o $@
-$(BUILD)/mipt_probed.o: apps/mipt_probed.cpp | $(BUILD)
+$(BUILD)/mipt_probed.o: apps/mipt_probed.cpp $(MIPT_HEADERS) | $(BUILD)
 	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $(NVQXXFLAGS_COMMON) -c $< -o $@
-$(BUILD)/free_energy.o: apps/free_energy.cpp | $(BUILD)
+$(BUILD)/free_energy.o: apps/free_energy.cpp $(MIPT_HEADERS) | $(BUILD)
 	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $(NVQXXFLAGS_COMMON) -c $< -o $@
-$(BUILD)/sim_tmi.o: apps/sim_tmi.cpp | $(BUILD)
+$(BUILD)/sim_tmi.o: apps/sim_tmi.cpp $(MIPT_HEADERS) | $(BUILD)
 	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $(NVQXXFLAGS_COMMON) -c $< -o $@
-$(BUILD)/dist_scaling.o: apps/dist_scaling.cpp | $(BUILD)
+$(BUILD)/dist_scaling.o: apps/dist_scaling.cpp $(MIPT_HEADERS) | $(BUILD)
 	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $(NVQXXFLAGS_COMMON) -c $< -o $@
-$(BUILD)/entropy.o: apps/entropy.cpp | $(BUILD)
+$(BUILD)/entropy.o: apps/entropy.cpp $(MIPT_HEADERS) | $(BUILD)
 	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $(NVQXXFLAGS_COMMON) -c $< -o $@
 
 $(BUILD)/rho_reduce.o: src/cuda/rho_reduce.cu | $(BUILD)
@@ -249,6 +344,8 @@ $(BUILD)/tmi_cuda_svd.o: src/cuda/tmi_cuda_svd.cu | $(BUILD)
 $(BUILD)/tmi_cuda_rdm.o: src/cuda/tmi_cuda_rdm.cu | $(BUILD)
 	$(CUDA_CU_COMPILER) $(CUDA_CU_FLAGS) -c $< -o $@
 $(BUILD)/entropy_cuda.o: src/cuda/entropy_cuda.cu | $(BUILD)
+	$(CUDA_CU_COMPILER) $(CUDA_CU_FLAGS) -c $< -o $@
+$(BUILD)/cusv_diag.o: src/cuda/cusv_diag.cu | $(BUILD)
 	$(CUDA_CU_COMPILER) $(CUDA_CU_FLAGS) -c $< -o $@
 
 $(HOST_BUILD)/gmn.o: apps/gmn.cpp | $(HOST_BUILD)
@@ -281,8 +378,10 @@ print-config:
 	@echo "COMPILED_BACKEND=$(COMPILED_BACKEND)"
 	@echo "CUDAQ_TARGET_FLAGS=$(CUDAQ_TARGET_FLAGS)"
 	@echo "CUDA_RHO=$(CUDA_RHO)"
+	@echo "CUSV=$(CUSV)"
 	@echo "CUDA_CU_COMPILER=$(CUDA_CU_COMPILER)"
 	@echo "CUDA_CU_BACKEND=$(CUDA_CU_BACKEND)"
+	@echo "CUDA_ARCHS=$(CUDA_ARCHS)"
 	@echo "BUILD=$(BUILD)"
 	@echo "SCS_LDFLAGS=$(SCS_LDFLAGS)"
 	@echo "OPENMP=$(OPENMP)"

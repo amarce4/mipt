@@ -45,56 +45,6 @@ enum class TraceMode
     Fermion
 };
 
-inline std::string sim_tmi_pause_file_path()
-{
-    const char *value = std::getenv("SIM_TMI_PAUSE_FILE");
-    if (env::disables_path(value))
-    {
-        return {};
-    }
-    if (value != nullptr && *value != '\0')
-    {
-        return std::string(value);
-    }
-    return "PAUSE_MIPT";
-}
-
-inline bool file_exists_for_pause(const std::string &path)
-{
-    if (path.empty())
-    {
-        return false;
-    }
-    struct stat st;
-    return ::stat(path.c_str(), &st) == 0;
-}
-
-inline bool is_absolute_path(const std::string &path)
-{
-    return !path.empty() && path.front() == '/';
-}
-
-inline std::string pause_file_display_path(const std::string &path)
-{
-    if (path.empty() || is_absolute_path(path))
-    {
-        return path;
-    }
-
-    const char *pwd = std::getenv("PWD");
-    if (pwd != nullptr && *pwd != '\0')
-    {
-        return std::string(pwd) + "/" + path;
-    }
-
-    char cwd[4096];
-    if (::getcwd(cwd, sizeof(cwd)) != nullptr)
-    {
-        return std::string(cwd) + "/" + path;
-    }
-    return path;
-}
-
 inline int cuda_svd_min_kept_modes()
 {
     // Default policy:

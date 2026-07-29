@@ -6,6 +6,7 @@
 #include "mipt/rdm.hpp"
 #include "mipt/tmi/compute.hpp"
 #include "mipt/types.hpp"
+#include "mipt/util/stats.hpp"
 
 #ifdef MIPT_ENABLE_CUDA_RHO
 #include "mipt/cuda/free_energy_measure.hpp"
@@ -26,34 +27,7 @@
 
 namespace mipt::free_energy
 {
-struct RunningStats
-{
-    std::uint64_t count = 0;
-    double mean = 0.0;
-    double m2 = 0.0;
-
-    void add(double value)
-    {
-        ++count;
-        const double delta = value - mean;
-        mean += delta / static_cast<double>(count);
-        m2 += delta * (value - mean);
-    }
-
-    double sample_stddev() const
-    {
-        return count > 1
-                   ? std::sqrt(std::max(0.0, m2 / static_cast<double>(count - 1)))
-                   : 0.0;
-    }
-
-    double stderr() const
-    {
-        return count > 1
-                   ? sample_stddev() / std::sqrt(static_cast<double>(count))
-                   : 0.0;
-    }
-};
+using util::RunningStats;
 
 inline MeasurementResult measure_and_collapse(
     cudaq::state &state,

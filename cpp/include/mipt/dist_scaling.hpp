@@ -3,6 +3,8 @@
 #include "mipt/backend.hpp"
 #include "mipt/circuit.hpp"
 #include "mipt/dist_metrics.hpp"
+#include "mipt/util/pause.hpp"
+#include "mipt/util/text.hpp"
 #include "mipt/env.hpp"
 #include "mipt/rdm.hpp"
 #include "mipt/types.hpp"
@@ -116,26 +118,7 @@ inline std::string default_output_path(int n,
 
 inline std::string format_duration(double seconds)
 {
-    if (!std::isfinite(seconds) || seconds < 0.0)
-    {
-        return "--";
-    }
-    const auto total = static_cast<std::uint64_t>(std::llround(seconds));
-    const std::uint64_t hours = total / 3600;
-    const std::uint64_t minutes = (total % 3600) / 60;
-    const std::uint64_t secs = total % 60;
-
-    std::ostringstream out;
-    if (hours > 0)
-    {
-        out << hours << "h ";
-    }
-    if (hours > 0 || minutes > 0)
-    {
-        out << minutes << "m ";
-    }
-    out << secs << 's';
-    return out.str();
+    return util::format_duration(seconds, util::DurationStyle::Compact);
 }
 
 inline long dense_fallback_max_qubits()
@@ -146,20 +129,6 @@ inline long dense_fallback_max_qubits()
 inline long progress_interval_ms()
 {
     return env::integer("MIPT_DIST_PROGRESS_MS", 1000, 0, 60000);
-}
-
-inline std::string pause_file_path()
-{
-    const char *value = std::getenv("MIPT_DIST_PAUSE_FILE");
-    if (env::disables_path(value))
-    {
-        return {};
-    }
-    if (value != nullptr && *value != '\0')
-    {
-        return std::string(value);
-    }
-    return "PAUSE_MIPT";
 }
 
 inline bool file_exists(const std::string &path)
@@ -693,12 +662,11 @@ inline void run(int n,
     std::string line;
     line.reserve(128);
 
-    const std::string pause_file = pause_file_path();
+    util::PauseSentinel pause_sentinel("MIPT_DIST_PAUSE_FILE");
     const auto progress_interval =
         std::chrono::milliseconds(progress_interval_ms());
     const auto start = std::chrono::steady_clock::now();
     auto last_report = start - progress_interval;
-    double paused_seconds = 0.0;
     std::uint64_t processed = 0;
     std::uint64_t last_processed = 0;
     bool backend_reported = false;
@@ -719,25 +687,10 @@ inline void run(int n,
     };
 
     auto wait_if_paused = [&]() {
-        if (pause_file.empty() || !file_exists(pause_file))
-        {
-            return;
-        }
-        flush();
-        const auto pause_start = std::chrono::steady_clock::now();
-        std::cerr << "\nPAUSED by host sentinel " << pause_file
-                  << "; remove it to resume.\n";
-        while (file_exists(pause_file))
-        {
-            std::this_thread::sleep_for(std::chrono::seconds(1));
-        }
-        const auto pause_end = std::chrono::steady_clock::now();
-        const double duration =
-            std::chrono::duration<double>(pause_end - pause_start).count();
-        paused_seconds += duration;
+        const double duration = pause_sentinel.wait(flush);
+        // Keep the progress line from reporting a burst after a long pause.
         last_report += std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-            pause_end - pause_start);
-        std::cerr << "RESUMED after " << format_duration(duration) << ".\n";
+            std::chrono::duration<double>(duration));
     };
 
     for (int realization = 0; realization < realizations; ++realization)
@@ -821,7 +774,7 @@ inline void run(int n,
                 const double wall_elapsed =
                     std::chrono::duration<double>(now - start).count();
                 const double active_elapsed =
-                    std::max(1.0e-12, wall_elapsed - paused_seconds);
+                    std::max(1.0e-12, wall_elapsed - pause_sentinel.paused_seconds());
                 const double average_rate =
                     static_cast<double>(processed) / active_elapsed;
                 const double recent_elapsed = std::max(
@@ -853,7 +806,7 @@ inline void run(int n,
     const double wall_seconds =
         std::chrono::duration<double>(finish - start).count();
     const double active_seconds = std::max(1.0e-12,
-                                           wall_seconds - paused_seconds);
+                                           wall_seconds - pause_sentinel.paused_seconds());
     std::cerr << "\nCompleted " << processed << " pair row(s) in "
               << format_duration(active_seconds) << " active time at "
               << std::fixed << std::setprecision(2)
@@ -887,7 +840,8 @@ inline void print_usage(const char *argv0)
            " or chord-distance observable.\n\n"
         << "Environment variables:\n"
         << "  MIPT_DIST_PROGRESS_MS=1000 controls progress updates (0 = every row).\n"
-        << "  MIPT_DIST_PAUSE_FILE=path selects a pause sentinel; 0 disables it.\n"
+        << "  MIPT_PAUSE_FILE=path or MIPT_DIST_PAUSE_FILE=path selects the pause sentinel;\n"
+        << "    0 disables it. Default: PAUSE_MIPT.\n"
         << "  MIPT_DIST_MPS_DENSE_MAX_QUBITS=16 bounds exact amplitude reconstruction"
            " when a tensor/MPS backend exposes no dense state tensor.\n";
 }

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "mipt/util/geometry.hpp"
+
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -320,17 +322,7 @@ inline PairMetrics two_party_metrics(const double *rho_ri, bool fermionic)
     return {std::max(0.0, mi), detail::negativity(rho, fermionic)};
 }
 
-inline double chord_length(int n, int separation)
-{
-    if (n < 2 || separation <= 0 || separation >= n)
-    {
-        throw std::invalid_argument("Chord length requires 0 < separation < N.");
-    }
-    const double pi = std::acos(-1.0);
-    return static_cast<double>(n) / pi *
-           std::sin(pi * static_cast<double>(separation) /
-                    static_cast<double>(n));
-}
+using util::chord_length;
 
 inline double two_party_geometric_chord_distance(int n, int site_a, int site_b)
 {

@@ -1,6 +1,7 @@
 #include "mipt/density.hpp"
 #include "mipt/env.hpp"
 #include "mipt/analysis/fgmn.hpp"
+#include "mipt/analysis/rdm_batch_cli.hpp"
 
 #include <algorithm>
 #include <array>
@@ -28,6 +29,8 @@
 
 namespace
 {
+using namespace mipt;
+
     constexpr std::size_t RHO3_VALUES = 2u * 8u * 8u;
     constexpr std::size_t RHO3_QUBITS = 3u;
 
@@ -293,14 +296,8 @@ int main(int argc, char *argv[])
         const std::uint64_t limit_per_p = parse_limit_per_p(argc, argv);
         const ZeroPrefilterSettings zero_prefilter = parse_zero_prefilter_settings();
 
+        analysis::limit_nested_solver_threads();
 #ifdef _OPENMP
-        // Parallelism is at the independent-SDP level.  Avoid nested thread
-        // oversubscription inside each small MOSEK solve unless the user
-        // explicitly requested a different MOSEK thread count.
-        if (omp_get_max_threads() > 1)
-        {
-            mipt::env::set_if_unset("GMN_MOSEK_NUM_THREADS", "1");
-        }
         // Empirically, MOSEK Fusion 11.2 can segfault under some 4+ OpenMP
         // concurrent in-process workloads even when numThreads=1 per solve.
         // Cap concurrent Fusion calls by default at 2 for OMP>=4.  Set
@@ -316,12 +313,7 @@ int main(int argc, char *argv[])
 
         mipt::io::DensityMatrixReader reader(input_path);
         const auto &metadata = reader.metadata();
-
-        if (metadata.kept_qubits != 3 || metadata.matrix_dimension != 8)
-        {
-            throw std::runtime_error(
-                "Input file must contain three-qubit 8x8 reduced density matrices.");
-        }
+        analysis::require_three_qubit_input(metadata);
 
         std::ofstream outfile(output_path);
         if (!outfile)
@@ -330,28 +322,17 @@ int main(int argc, char *argv[])
         }
         outfile << "p,fgmn,bipneg\n";
         outfile << std::setprecision(17);
+        analysis::write_metadata_sidecar(output_path, metadata, input_path, "fgmn.exe");
 
-        const std::uint64_t max_records_evaluated = [&]() -> std::uint64_t {
-            if (limit_per_p == 0)
-            {
-                return metadata.record_count;
-            }
-            const std::uint64_t resolution =
-                static_cast<std::uint64_t>(metadata.resolution);
-            const std::uint64_t limit_total =
-                (resolution != 0 &&
-                 limit_per_p > std::numeric_limits<std::uint64_t>::max() / resolution)
-                    ? std::numeric_limits<std::uint64_t>::max()
-                    : limit_per_p * resolution;
-            return std::min<std::uint64_t>(metadata.record_count, limit_total);
-        }();
-        const std::uint64_t total_solves =
-            max_records_evaluated * static_cast<std::uint64_t>(metadata.subsystem_count);
+        analysis::BatchOptions options;
+        options.limit_per_p = limit_per_p;
+        options.batch_records = parse_batch_records();
 
         std::cout << "Calculating three-mode fermionic GMN values from "
                   << input_path << " (" << metadata.record_count
                   << " input records, " << metadata.subsystem_count
-                  << " retained subsystems each, up to " << total_solves
+                  << " retained subsystems each, up to "
+                  << analysis::solves_to_perform(metadata, limit_per_p)
                   << " total solves";
         if (limit_per_p != 0)
         {
@@ -359,17 +340,7 @@ int main(int argc, char *argv[])
                       << " records/p-value";
         }
         std::cout << ").\n";
-
-#ifdef _OPENMP
-        std::cout << "OpenMP fGMN workers: " << omp_get_max_threads()
-                  << "; GMN_MOSEK_NUM_THREADS="
-                  << (std::getenv("GMN_MOSEK_NUM_THREADS")
-                          ? std::getenv("GMN_MOSEK_NUM_THREADS")
-                          : "MOSEK default")
-                  << ".\n";
-#else
-        std::cout << "OpenMP is not enabled in this build; fGMN solves are serial.\n";
-#endif
+        analysis::print_worker_configuration("fGMN");
 
         const int fusion_limit = fgmn::configured_fusion_concurrency_limit();
         std::cout << "MOSEK tolerance override: "
@@ -385,173 +356,41 @@ int main(int argc, char *argv[])
                   << " (tol=" << std::scientific << std::setprecision(1)
                   << zero_prefilter.tolerance << std::defaultfloat << ").\n";
 
-        const int batch_records = parse_batch_records();
-        std::vector<FgmnJob> jobs;
-        jobs.reserve(static_cast<std::size_t>(batch_records) * metadata.subsystem_count);
-        std::vector<double> fgmn_values;
-        std::vector<double> bipneg_values;
-        std::vector<unsigned char> prefilter_skipped_flags;
-
-        mipt::io::DensityRecord record;
-        std::vector<std::uint64_t> accepted_records_per_p(metadata.resolution, 0);
-        std::uint64_t records_scanned = 0;
-        std::uint64_t records_evaluated = 0;
-        std::uint64_t records_skipped_by_limit = 0;
-        bool reader_exhausted = false;
-        std::uint64_t processed = 0;
-        std::uint64_t nonfinite_count = 0;
-        std::uint64_t zero_prefilter_skipped = 0;
         double max_imag_norm = 0.0;
-        const auto start = std::chrono::steady_clock::now();
-        auto interval_start = start;
-        std::uint64_t interval_processed = 0;
 
-        while (processed < total_solves && !reader_exhausted)
+        const auto totals = analysis::run_rdm_batches<FgmnJob>(
+            reader, outfile, options,
+            [&](const mipt::io::DensityFileMetadata &file_metadata,
+                const mipt::io::DensityRecord &record, std::vector<FgmnJob> &jobs) {
+                append_jobs_from_record(file_metadata, record, jobs, max_imag_norm);
+            },
+            [&](const FgmnJob &job) {
+                analysis::SolveResult result;
+                const double *rho = job.rho_ri.data();
+
+                result.bipneg = compute_min_bipartite_fermionic_negativity_8x8_cpp(rho);
+                if (zero_prefilter.enabled && std::isfinite(result.bipneg) &&
+                    result.bipneg <= zero_prefilter.tolerance)
+                {
+                    // A vanishing minimum bipartite negativity certifies fGMN=0.
+                    result.value = 0.0;
+                    result.prefiltered = true;
+                    return result;
+                }
+
+                result.value = compute_fgmn_mosek_8x8_cpp(rho);
+                return result;
+            },
+            [](std::ostream &out, const FgmnJob &job, const analysis::SolveResult &result) {
+                out << job.p << ',' << result.value << ',' << result.bipneg << '\n';
+            },
+            /*show_prefilter_progress=*/true);
+
+        analysis::report_batch_summary(output_path, totals, max_imag_norm,
+                                       "Maximum imaginary Frobenius norm in evaluated records");
+        if (totals.nonfinite_values != 0)
         {
-            jobs.clear();
-
-            int records_in_batch = 0;
-            while (records_in_batch < batch_records)
-            {
-                if (!reader.read_record(record))
-                {
-                    reader_exhausted = true;
-                    break;
-                }
-
-                ++records_scanned;
-                ++records_in_batch;
-
-                if (record.p_index >= accepted_records_per_p.size())
-                {
-                    throw std::runtime_error("Input record has p_index outside metadata.resolution.");
-                }
-
-                if (limit_per_p != 0 &&
-                    accepted_records_per_p[record.p_index] >= limit_per_p)
-                {
-                    ++records_skipped_by_limit;
-                    continue;
-                }
-
-                ++accepted_records_per_p[record.p_index];
-                ++records_evaluated;
-                append_jobs_from_record(metadata, record, jobs, max_imag_norm);
-            }
-
-            if (jobs.empty())
-            {
-                if (!reader_exhausted)
-                {
-                    std::cout << "\rScanned " << records_scanned
-                              << " records; skipped " << records_skipped_by_limit
-                              << " by limit_per_p; waiting for next accepted p-record...        "
-                              << std::flush;
-                    continue;
-                }
-                break;
-            }
-
-            fgmn_values.assign(jobs.size(), std::numeric_limits<double>::quiet_NaN());
-            bipneg_values.assign(jobs.size(), std::numeric_limits<double>::quiet_NaN());
-            prefilter_skipped_flags.assign(jobs.size(), 0);
-
-#ifdef _OPENMP
-#pragma omp parallel for schedule(dynamic, 1)
-#endif
-            for (std::int64_t i = 0; i < static_cast<std::int64_t>(jobs.size()); ++i)
-            {
-                const std::size_t idx = static_cast<std::size_t>(i);
-                const double *rho = jobs[idx].rho_ri.data();
-
-                const double min_bipartite_fneg =
-                    compute_min_bipartite_fermionic_negativity_8x8_cpp(rho);
-                bipneg_values[idx] = min_bipartite_fneg;
-
-                if (zero_prefilter.enabled &&
-                    std::isfinite(min_bipartite_fneg) &&
-                    min_bipartite_fneg <= zero_prefilter.tolerance)
-                {
-                    fgmn_values[idx] = 0.0;
-                    prefilter_skipped_flags[idx] = 1;
-                    continue;
-                }
-
-                fgmn_values[idx] = compute_fgmn_mosek_8x8_cpp(rho);
-            }
-
-            for (std::size_t i = 0; i < jobs.size(); ++i)
-            {
-                const FgmnJob &job = jobs[i];
-                const double value = fgmn_values[i];
-                if (prefilter_skipped_flags[i] != 0)
-                {
-                    ++zero_prefilter_skipped;
-                }
-                if (!std::isfinite(value))
-                {
-                    ++nonfinite_count;
-                }
-                outfile << job.p << ',' << value << ',' << bipneg_values[i] << '\n';
-            }
-            outfile.flush();
-
-            processed += jobs.size();
-            interval_processed += jobs.size();
-
-            const auto now = std::chrono::steady_clock::now();
-            const std::chrono::duration<double> elapsed = now - start;
-            const std::chrono::duration<double> interval_elapsed = now - interval_start;
-            const double average_rate =
-                (elapsed.count() > 0.0) ? processed / elapsed.count() : 0.0;
-            const double recent_rate =
-                (interval_elapsed.count() > 0.0)
-                    ? interval_processed / interval_elapsed.count()
-                    : 0.0;
-            const double eta_seconds =
-                (average_rate > 0.0)
-                    ? (total_solves - processed) / average_rate
-                    : 0.0;
-
-            std::cout << "\rProcessed " << processed << "/"
-                      << total_solves << " matrices from "
-                      << records_evaluated << " records";
-            if (records_skipped_by_limit != 0)
-            {
-                std::cout << " (skipped " << records_skipped_by_limit
-                          << " by limit)";
-            }
-            if (zero_prefilter_skipped != 0)
-            {
-                std::cout << "; zero-prefilter " << zero_prefilter_skipped;
-            }
-            std::cout << "; avg "
-                      << std::fixed << std::setprecision(2)
-                      << average_rate << "/s, recent "
-                      << recent_rate << "/s, ETA "
-                      << eta_seconds << " s        "
-                      << std::flush;
-
-            if (interval_elapsed.count() >= 5.0)
-            {
-                interval_start = now;
-                interval_processed = 0;
-            }
-        }
-
-        std::cout << "\nWrote " << output_path << ".\n"
-                  << "Records scanned: " << records_scanned
-                  << "; records evaluated: " << records_evaluated
-                  << "; records skipped by limit_per_p: "
-                  << records_skipped_by_limit << "\n"
-                  << "Matrices skipped by bipartite-negativity zero prefilter: "
-                  << zero_prefilter_skipped << "\n"
-                  << "Maximum imaginary Frobenius norm in evaluated records: "
-                  << std::scientific << std::setprecision(6)
-                  << max_imag_norm << "\n";
-        if (nonfinite_count != 0)
-        {
-            std::cerr << "Warning: solver returned " << nonfinite_count
+            std::cerr << "Warning: solver returned " << totals.nonfinite_values
                       << " non-finite fGMN value(s).\n";
         }
 

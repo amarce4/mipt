@@ -23,6 +23,32 @@ Executable entry points are thin and do not own circuit kernels or include anoth
 implementation file. Simulation CLIs contain argument parsing and orchestration;
 external solver implementations remain under `src/analysis/`.
 
+## Why the simulation side is header-only
+
+The headers that reach `mipt/circuits/*.hpp` — `circuit.hpp`, `rdm.hpp`,
+`native_mps.hpp`, `entropy.hpp`, `dist_scaling.hpp`, `probed*.hpp`, and
+`tmi/compute.hpp` — carry their implementations inline on purpose. `nvq++` emits
+a definition of every `__qpu__` kernel into each translation unit that sees it,
+so compiling any second CUDA-Q translation unit that includes a circuit header
+produces duplicate-symbol link errors of the form:
+
+```text
+ld.lld: error: duplicate symbol: __nvqpp__mlirgen__N4mipt11MmsKernel1DE
+```
+
+That is why there is exactly one CUDA-Q translation unit per executable
+(`apps/*.cpp`), and why moving these implementations into `src/` is not a
+refactor that can be applied on its own. Doing it would first require splitting
+each circuit header into a data-only part (layer structs and the samplers that
+fill them, no CUDA-Q) and a kernel part, so the non-kernel code could be
+compiled once by the host compiler.
+
+The restriction does not apply to code that never includes a circuit header.
+`src/analysis/` and `src/cuda/` are compiled separately for exactly that reason,
+and `tmi/linalg.hpp` is the one remaining large header that could join them —
+its seven `template <typename Real>` entry points would need explicit
+instantiation for `float` and `double` first.
+
 ## Circuit model
 
 `mipt::Circuit1D` is the abstract simulation interface. A concrete circuit class

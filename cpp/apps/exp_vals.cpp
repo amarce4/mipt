@@ -1,5 +1,7 @@
 #include "mipt/analysis/exp_vals.hpp"
 #include "mipt/density.hpp"
+#include "mipt/util/pause.hpp"
+#include "mipt/util/text.hpp"
 
 #include <algorithm>
 #include <array>
@@ -167,15 +169,6 @@ namespace
         return value;
     }
 
-    std::string realization_label(std::uint64_t realizations)
-    {
-        if (realizations >= 1000 && realizations % 1000 == 0)
-        {
-            return std::to_string(realizations / 1000) + "k";
-        }
-        return std::to_string(realizations);
-    }
-
     std::string default_output_name(
         const mipt::io::DensityFileMetadata &metadata,
         std::uint64_t limit_per_p)
@@ -187,26 +180,13 @@ namespace
 
         std::ostringstream name;
         name << "expvals_n_" << metadata.total_qubits
-             << "_real_" << realization_label(output_realizations) << ".csv";
+             << "_real_" << mipt::util::compact_count(output_realizations) << ".csv";
         return name.str();
     }
 
     std::string format_duration(double seconds)
     {
-        if (!std::isfinite(seconds) || seconds < 0.0)
-        {
-            return "--:--:--";
-        }
-
-        const auto rounded = static_cast<std::uint64_t>(std::llround(seconds));
-        const std::uint64_t hours = rounded / 3600;
-        const std::uint64_t minutes = (rounded % 3600) / 60;
-        const std::uint64_t secs = rounded % 60;
-
-        std::ostringstream out;
-        out << std::setfill('0') << std::setw(2) << hours << ':'
-            << std::setw(2) << minutes << ':' << std::setw(2) << secs;
-        return out.str();
+        return mipt::util::format_duration(seconds, mipt::util::DurationStyle::Clock);
     }
 
     void print_usage(const char *program)
@@ -483,8 +463,12 @@ int main(int argc, char *argv[])
         };
 
         mipt::io::DensityRecord record;
+        mipt::util::PauseSentinel pause_sentinel;
+
         while (reader.read_record(record))
         {
+            // Safe checkpoint: between input records.
+            pause_sentinel.wait(flush_batch);
             ++records_scanned;
             if (record.p_index >= accepted_per_p.size())
             {

@@ -1,4 +1,5 @@
 #include "mipt/analysis/ring_inflation.hpp"
+#include "mipt/util/pause.hpp"
 #include "mipt/density.hpp"
 #include "mipt/env.hpp"
 
@@ -1161,6 +1162,7 @@ int mipt::analysis::run_ring_inflation_cli(int argc, char **argv)
 
         mipt::io::DensityRecord record;
         std::uint64_t records_processed = 0;
+        mipt::util::PauseSentinel pause_sentinel;
         std::uint64_t rows_written = 0;
         std::uint64_t skipped_by_p_range = 0;
         std::uint64_t skipped_before_record_window = 0;
@@ -1213,6 +1215,9 @@ int mipt::analysis::run_ring_inflation_cli(int argc, char **argv)
             {
                 throw std::runtime_error("Density record payload size is inconsistent with metadata.");
             }
+
+            // Safe checkpoint: the previous record's rows are already flushed.
+            pause_sentinel.wait([&]() { out.flush(); });
 
             std::vector<SCSResult> inflations(static_cast<std::size_t>(metadata.subsystem_count));
 #ifdef _OPENMP

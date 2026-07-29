@@ -3,6 +3,8 @@
 #include "mipt/free_energy.hpp"
 #include "mipt/probed.hpp"
 #include "mipt/types.hpp"
+#include "mipt/util/pause.hpp"
+#include "mipt/util/text.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -24,6 +26,15 @@
 
 namespace
 {
+using mipt::util::compact_count;
+using mipt::util::compact_decimal;
+using mipt::util::csv_quote;
+
+std::string format_duration(double seconds)
+{
+    return mipt::util::format_duration(seconds, mipt::util::DurationStyle::Padded);
+}
+
 using namespace mipt;
 using mipt::free_energy::RunningStats;
 
@@ -65,52 +76,6 @@ struct TimeStats
     RunningStats half_entropy;
 };
 
-std::string compact_decimal(double value)
-{
-    std::ostringstream out;
-    out << std::fixed << std::setprecision(12) << value;
-    std::string text = out.str();
-    while (!text.empty() && text.back() == '0')
-    {
-        text.pop_back();
-    }
-    if (!text.empty() && text.back() == '.')
-    {
-        text.pop_back();
-    }
-    return text == "-0" ? "0" : text;
-}
-
-std::string compact_count(std::uint64_t count)
-{
-    if (count >= 1000000 && count % 1000000 == 0)
-    {
-        return std::to_string(count / 1000000) + "m";
-    }
-    if (count >= 1000 && count % 1000 == 0)
-    {
-        return std::to_string(count / 1000) + "k";
-    }
-    return std::to_string(count);
-}
-
-std::string csv_quote(std::string_view value)
-{
-    std::string result;
-    result.reserve(value.size() + 2);
-    result.push_back('"');
-    for (char c : value)
-    {
-        if (c == '"')
-        {
-            result.push_back('"');
-        }
-        result.push_back(c);
-    }
-    result.push_back('"');
-    return result;
-}
-
 std::uint64_t splitmix64(std::uint64_t value)
 {
     value += 0x9e3779b97f4a7c15ULL;
@@ -129,23 +94,6 @@ std::uint64_t default_seed()
 double uniform_01(std::mt19937_64 &rng)
 {
     return std::generate_canonical<double, 53>(rng);
-}
-
-std::string format_duration(double seconds)
-{
-    if (!std::isfinite(seconds) || seconds < 0.0)
-    {
-        return "--h --m --s";
-    }
-    const auto rounded = static_cast<std::uint64_t>(std::llround(seconds));
-    const auto hours = rounded / 3600;
-    const auto minutes = (rounded % 3600) / 60;
-    const auto remaining = rounded % 60;
-    std::ostringstream out;
-    out << std::setfill('0') << std::setw(2) << hours << "h "
-        << std::setw(2) << minutes << "m "
-        << std::setw(2) << remaining << 's';
-    return out.str();
 }
 
 void write_stat(std::ostream &out, const RunningStats &stats)
@@ -363,8 +311,12 @@ int main(int argc, char *argv[])
         auto last_progress = run_start;
         double last_trajectory_rate = 0.0;
 
+        mipt::util::PauseSentinel pause_sentinel;
+
         for (int trajectory = 0; trajectory < realizations; ++trajectory)
         {
+            // Safe checkpoint: per-trajectory samples are already flushed.
+            pause_sentinel.wait([&]() { samples.flush(); });
             const auto trajectory_start = std::chrono::steady_clock::now();
             const std::uint64_t trajectory_seed = splitmix64(
                 master_seed ^ static_cast<std::uint64_t>(trajectory));
@@ -398,15 +350,23 @@ int main(int argc, char *argv[])
             {
                 const std::vector<int> measured_sites =
                     workspace.measurement_sites(timestep);
-                state = workspace.advance_unitary(
-                    state, timestep, "free-energy");
+                workspace.advance_unitary(state, timestep, "free-energy");
 
                 double layer_surprisal = 0.0;
-                for (int site : measured_sites)
+#ifdef MIPT_ENABLE_CUSV
+                // One joint draw for the whole layer. The returned value is
+                // -log P(m_1..m_k), which the chain rule makes identical to the
+                // sum of the sequential conditional surprisals below.
+                if (!workspace.measure_layer_in_place(state, timestep, layer_surprisal))
+#endif
                 {
-                    const auto measurement = free_energy::measure_and_collapse(
-                        state, n, site, uniform_01(outcome_rng));
-                    layer_surprisal += measurement.surprisal;
+                    layer_surprisal = 0.0;
+                    for (int site : measured_sites)
+                    {
+                        const auto measurement = free_energy::measure_and_collapse(
+                            state, n, site, uniform_01(outcome_rng));
+                        layer_surprisal += measurement.surprisal;
+                    }
                 }
 
                 const int t = timestep + 1;

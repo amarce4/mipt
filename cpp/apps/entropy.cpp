@@ -1,6 +1,7 @@
 // Translation-averaged second-Renyi entropy scaling for 1D MIPT trajectories.
 
 #include "mipt/entropy.hpp"
+#include "mipt/util/pause.hpp"
 
 #include <cstring>
 #include <exception>
@@ -88,8 +89,12 @@ int main(int argc, char *argv[])
         double recent_seconds_sum = 0.0;
         const auto total_start = std::chrono::steady_clock::now();
 
+        mipt::util::PauseSentinel pause_sentinel;
+
         for (int r = 0; r < realizations; ++r)
         {
+            // Safe checkpoint: the CSV is rewritten after every trajectory.
+            pause_sentinel.wait();
             const auto trajectory_start = std::chrono::steady_clock::now();
             const auto circuit_start = trajectory_start;
             auto state = workspace.simulate(n, periods, p, circ_type, "entropy");

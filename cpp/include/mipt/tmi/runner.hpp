@@ -1,6 +1,7 @@
 #pragma once
 
 #include "mipt/tmi/compute.hpp"
+#include "mipt/util/pause.hpp"
 
 #include <chrono>
 #include <cmath>
@@ -43,29 +44,7 @@ inline const char *state_precision_name(cudaq::SimulationState::precision precis
 
 inline std::string format_duration(double seconds)
 {
-    if (!std::isfinite(seconds) || seconds < 0.0)
-    {
-        return "--";
-    }
-    const auto total = static_cast<std::uint64_t>(std::llround(seconds));
-    const std::uint64_t h = total / 3600;
-    const std::uint64_t m = (total % 3600) / 60;
-    const std::uint64_t s = total % 60;
-
-    std::string out;
-    if (h > 0)
-    {
-        out += std::to_string(h);
-        out += "h ";
-    }
-    if (h > 0 || m > 0)
-    {
-        out += std::to_string(m);
-        out += "m ";
-    }
-    out += std::to_string(s);
-    out += "s";
-    return out;
+    return util::format_duration(seconds, util::DurationStyle::Compact);
 }
 
 inline void validate_sim_args(int n, int periods, int realizations, int res, double p_min, double p_max)
@@ -132,9 +111,8 @@ inline void run_1d_sim_tmi(int n,
     }
 
     const std::uint64_t flush_rows = csv_flush_row_interval(n, cycle_count);
-    const std::string pause_file = sim_tmi_pause_file_path();
+    util::PauseSentinel pause_sentinel("SIM_TMI_PAUSE_FILE");
     mipt::backend::print_backend_banner_once("sim_tmi.exe");
-    const std::string pause_file_display = pause_file_display_path(pause_file);
 
     std::cerr << "Online TMI simulation\n"
               << "n=" << n
@@ -158,15 +136,7 @@ inline void run_1d_sim_tmi(int n,
               << (force_cuda_svd_for_small_n() ? "forced-on" : "cpu-for-n8-n12")
               << ", csv_flush_rows=" << flush_rows
               << '\n';
-    if (pause_file.empty())
-    {
-        std::cerr << "host_pause_control=disabled by SIM_TMI_PAUSE_FILE\n";
-    }
-    else
-    {
-        std::cerr << "host_pause_file=" << pause_file_display
-                  << " ; create this file to pause at the next safe checkpoint, remove it to resume\n";
-    }
+    std::cerr << pause_sentinel.describe() << '\n';
 
     TmiWorkspace workspace;
     std::string line;
@@ -194,47 +164,15 @@ inline void run_1d_sim_tmi(int n,
 
     const auto start = std::chrono::steady_clock::now();
     auto last_report = start;
-    double paused_seconds = 0.0;
     std::uint64_t processed = 0;
     std::uint64_t last_processed = 0;
     bool printed_state_backend = false;
 
     auto wait_if_host_paused = [&]() {
-        if (pause_file.empty() || !file_exists_for_pause(pause_file))
-        {
-            return;
-        }
-
-        flush_csv_buffer();
-        const auto pause_start = std::chrono::steady_clock::now();
-        auto last_pause_notice = pause_start;
-        std::cerr << "\nPAUSED by host: found pause file \"" << pause_file_display << "\". "
-                  << "CSV output is flushed. Remove the file to resume.\n"
-                  << std::flush;
-
-        while (file_exists_for_pause(pause_file))
-        {
-            std::this_thread::sleep_for(std::chrono::seconds(1));
-            const auto now = std::chrono::steady_clock::now();
-            if (std::chrono::duration<double>(now - last_pause_notice).count() >= 30.0)
-            {
-                std::cerr << "Still paused by host for "
-                          << format_duration(std::chrono::duration<double>(now - pause_start).count())
-                          << "; remove \"" << pause_file_display << "\" to resume.\n"
-                          << std::flush;
-                last_pause_notice = now;
-            }
-        }
-
-        const auto pause_end = std::chrono::steady_clock::now();
-        const auto pause_duration = pause_end - pause_start;
-        const double this_pause_seconds = std::chrono::duration<double>(pause_duration).count();
-        paused_seconds += this_pause_seconds;
-        last_report += std::chrono::duration_cast<std::chrono::steady_clock::duration>(pause_duration);
-
-        std::cerr << "RESUMED after host pause of " << format_duration(this_pause_seconds)
-                  << "; progress rates and ETA exclude paused time.\n"
-                  << std::flush;
+        const double duration = pause_sentinel.wait(flush_csv_buffer);
+        // Keep the progress line from reporting a burst after a long pause.
+        last_report += std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+            std::chrono::duration<double>(duration));
     };
 
     for (std::size_t p_index = 0; p_index < ps.size(); ++p_index)
@@ -324,7 +262,7 @@ inline void run_1d_sim_tmi(int n,
                 if (since_last >= 1.0 || processed == total)
                 {
                     const double wall_elapsed = std::chrono::duration<double>(now - start).count();
-                    const double active_elapsed = std::max(1.0e-12, wall_elapsed - paused_seconds);
+                    const double active_elapsed = std::max(1.0e-12, wall_elapsed - pause_sentinel.paused_seconds());
                     const double avg = static_cast<double>(processed) / active_elapsed;
                     const double recent = static_cast<double>(processed - last_processed) / std::max(1.0e-12, since_last);
                     const double eta = avg > 0.0 ? static_cast<double>(total - processed) / avg : 0.0;
@@ -354,13 +292,13 @@ inline void run_1d_sim_tmi(int n,
     }
     const auto finish = std::chrono::steady_clock::now();
     const double wall_total = std::chrono::duration<double>(finish - start).count();
-    const double active_total = std::max(1.0e-12, wall_total - paused_seconds);
+    const double active_total = std::max(1.0e-12, wall_total - pause_sentinel.paused_seconds());
     std::cerr << '\n'
               << "Completed " << processed << " TMI row(s) in "
               << format_duration(active_total) << " active time";
-    if (paused_seconds > 0.0)
+    if (pause_sentinel.paused_seconds() > 0.0)
     {
-        std::cerr << " plus " << format_duration(paused_seconds) << " paused by host";
+        std::cerr << " plus " << format_duration(pause_sentinel.paused_seconds()) << " paused by host";
     }
     std::cerr << ". Overall active throughput "
               << std::fixed << std::setprecision(2)

@@ -3,6 +3,7 @@
 #include "mipt/density.hpp"
 #include "mipt/native_mps.hpp"
 #include "mipt/rdm.hpp"
+#include "mipt/util/pause.hpp"
 #include <algorithm>
 
 #include <chrono>
@@ -105,6 +106,8 @@ void run_1d(int n, int periods, int realizations, int res, double p_min, double 
     std::mt19937 native_mps_rng(std::random_device{}());
     std::vector<double> rho3_ri(subsystems.size() * RHO3_VALUES);
 
+    mipt::util::PauseSentinel pause_sentinel;
+
     for (std::size_t p_index = 0; p_index < ps.size(); ++p_index)
     {
         const double p = ps[p_index];
@@ -114,6 +117,8 @@ void run_1d(int n, int periods, int realizations, int res, double p_min, double 
 
         for (int r = 0; r < realizations; ++r)
         {
+            // Safe checkpoint: the previous trajectory is already written.
+            pause_sentinel.wait([&]() { rho3_file.flush(); });
             auto circ_time_start = std::chrono::steady_clock::now();
             std::chrono::steady_clock::time_point start, lap1, lap2, lap3, lap4;
 
@@ -224,6 +229,8 @@ void run_2d(int x, int y, int periods, int realizations, int res, double p_min, 
     mms_layers.reserve(static_cast<std::size_t>(2 * periods + 1));
     std::vector<double> rho3_ri(subsystems.size() * RHO3_VALUES);
 
+    mipt::util::PauseSentinel pause_sentinel;
+
     for (std::size_t p_index = 0; p_index < ps.size(); ++p_index)
     {
         const double p = ps[p_index];
@@ -233,6 +240,8 @@ void run_2d(int x, int y, int periods, int realizations, int res, double p_min, 
 
         for (int r = 0; r < realizations; ++r)
         {
+            // Safe checkpoint: the previous trajectory is already written.
+            pause_sentinel.wait([&]() { rho3_file.flush(); });
             auto circ_time_start = std::chrono::steady_clock::now();
             std::chrono::steady_clock::time_point start, lap1, lap2, lap3, lap4;
 

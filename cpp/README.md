@@ -14,6 +14,7 @@ No executable includes another `.cpp` file.
 - `include/mipt/density.hpp` — binary density-matrix file format.
 - `include/mipt/cuda/`, `src/cuda/` — CUDA reduction and entropy helpers.
 - `include/mipt/analysis/`, `src/analysis/` — GMN, fGMN, and ring-inflation interfaces and implementations.
+- `include/mipt/cusv/` — direct cuStateVec circuit engine (see below).
 - `apps/` — one source file per executable.
 - `tests/` — dependency-free regression tests for shared infrastructure.
 - `docs/` — architecture and migration notes.
@@ -43,6 +44,8 @@ make sim_tmi.exe GPU=1 FP64=0
 make mipt_probed.exe GPU=1 FP64=0
 make free_energy.exe GPU=1 CUDA_RHO=1 FP64=0
 make test-core                    # no CUDA-Q/MOSEK/SCS required
+make test-cusv                    # cuStateVec engine equivalence (needs a GPU)
+make bench-cusv                   # CUDA-Q vs cuStateVec timing
 make print-config
 ```
 
@@ -132,23 +135,85 @@ Build the NVIDIA target in FP32 (the banner should say
 make mipt_probed.exe GPU=1 CUDA_RHO=1 FP64=0
 ```
 
-CUDA-Q gate-fusion performance depends on the GPU and circuit. The included
-benchmark sweeps fusion widths 4, 5, and 6 and host fusion thread counts 4, 8,
-and 16 using the real mode-1 workload:
+> **Correction.** Earlier revisions of this file recommended tuning
+> `CUDAQ_FUSION_MAX_QUBITS` and `CUDAQ_FUSION_NUM_HOST_THREADS` with a
+> `benchmark_probed_gpu.sh` sweep. CUDA-Q 0.14.2 has **no gate fusion at all** —
+> neither string appears in the installed runtime, and there is no fusion pass in
+> `cudaq-opt` — so those variables are no-ops. The script is gone as well. The
+> cuStateVec engine below replaces that tuning path; benchmark it with
+> `make bench-cusv`.
+
+## cuStateVec circuit engine
+
+`include/mipt/cusv/` drives cuStateVec directly instead of going through
+CUDA-Q's gate-by-gate dispatch. cuStateVec ships inside CUDA-Q, so nothing extra
+needs installing. It is on by default for `GPU=1` with the `nvidia` backend
+(`CUSV=1`) and covers `mipt_probed.exe` and `free_energy.exe`.
+
+What it changes, relative to one full state-vector pass per gate:
+
+1. each two-site bond is applied as the single 4×4 matrix its 8-, 13-, or
+   20-gate decomposition multiplies out to;
+2. the periodic Jordan–Wigner CZ chain becomes one diagonal sign pass;
+3. a measurement layer is sampled from its joint distribution in one pass and
+   collapsed in one more, instead of ~2 passes per measured site;
+4. the state vector is mutated in place, so no state is copied per timestep and
+   only one 2^N buffer is live;
+5. consecutive bonds with disjoint supports are fused into one larger matrix.
+
+Points 1 and 5 do not change the circuit: a fused matrix is the product of the
+gates it replaces, so its support is unchanged, and a block is a Kronecker
+product of disjoint bond gates, so it cannot entangle sites the circuit did not.
+Blocking only merges consecutive ops, so nothing is reordered past a
+non-commuting neighbour. Point 3 is exact by the chain rule — sequential Born
+sampling with renormalisation samples the joint distribution, and Z-basis
+projectors on distinct sites commute.
 
 ```bash
-./benchmark_probed_gpu.sh ./mipt_probed.exe 24 8 0.35 2
+make test-cusv        # fused matrices vs CUDA-Q ground truth, then whole circuits
+make bench-cusv       # CUDA-Q vs cuStateVec on one trajectory
+MIPT_CUSV=0 ./mipt_probed.exe ...   # A/B against the CUDA-Q path
 ```
 
-It writes `probed_gpu_benchmark.csv`; use the fastest row by exporting
-`CUDAQ_FUSION_MAX_QUBITS` and `CUDAQ_FUSION_NUM_HOST_THREADS` in production.
-The sweep can be changed with `MIPT_FUSION_LEVELS` and
-`MIPT_FUSION_HOST_THREADS`. CUDA-Q's defaults remain untouched unless the user
-sets them, since their optimum is hardware-dependent.
+| Variable | Default | Meaning |
+|---|---:|---|
+| `MIPT_CUSV` | 1 | 0 restores the CUDA-Q gate-by-gate path |
+| `MIPT_CUSV_BLOCK_TARGETS` | 4 | qubits per fused block (4 = two bonds per pass) |
+| `MIPT_CUSV_MEASURE_BITS` | 16 | max sites sampled in one joint draw before chunking |
+
+`MIPT_CUSV_BLOCK_TARGETS` is hardware-dependent. A 2^k apply moves the same bytes
+as a 2-target apply but costs 2^(k-1) flop/byte, so the best k tracks the GPU's
+compute-to-bandwidth balance: ~23 flop/byte on a GTX 1650 favours k=4, ~68 on an
+RTX 4080 Super should favour k=6. Re-run `make bench-cusv` on new hardware.
+
+RFGS (`circ_type 3`) is not implemented in the engine and falls back to CUDA-Q.
 
 The old Makefile referenced `tmi.cpp`, but that source was absent from the supplied
 archive. The stale `tmi.exe` target was therefore removed; `sim_tmi.exe` remains the
 maintained online TMI path.
+
+## Host pause control
+
+Every executable honours the same cooperative pause. Creating `PAUSE_MIPT` in
+the process working directory stops the run at its next safe checkpoint —
+between trajectories, batches, or records, with output already flushed — and
+prints:
+
+```text
+PAUSED by host sentinel PAUSE_MIPT; remove it to resume.
+```
+
+Removing the file resumes it and prints the time lost:
+
+```text
+RESUMED after 37m 28s.
+```
+
+Paused time is excluded from progress rates and ETAs. `MIPT_PAUSE_FILE=path`
+selects a different sentinel for any executable and `MIPT_PAUSE_FILE=0`
+disables it; `MIPT_DIST_PAUSE_FILE` and `SIM_TMI_PAUSE_FILE` remain as
+per-executable overrides for `dist_scaling.exe` and `sim_tmi.exe`. The shared
+implementation is `include/mipt/util/pause.hpp`.
 
 ## Refactor invariants
 
@@ -158,7 +223,10 @@ maintained online TMI path.
 - qRPPU is now exposed consistently by the shared circuit factory, including
   `entropy.exe`.
 - Generated dependency files (`-MMD -MP`) replace hand-maintained header lists in
-  the Makefile.
+  the Makefile, except for the CUDA-Q objects: nvq++ accepts those flags but
+  writes no `.d` files, so those objects depend on every header explicitly.
+- The cuStateVec engine reproduces the circuits exactly; see the equivalence
+  tests in `tests/cusv_gate_tests.cpp` and `tests/cusv_equiv.cpp`.
 
 ## Documentation
 

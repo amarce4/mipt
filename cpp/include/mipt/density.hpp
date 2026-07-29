@@ -199,6 +199,22 @@ namespace mipt::io
             ++records_written_;
         }
 
+        // Push completed records to the operating system without ending the
+        // file. Used before a host pause so a suspended run has its finished
+        // trajectories on disk.
+        void flush()
+        {
+            if (closed_)
+            {
+                return;
+            }
+            stream_.flush();
+            if (!stream_)
+            {
+                throw std::runtime_error("Failed while flushing density-matrix file.");
+            }
+        }
+
         void close()
         {
             if (closed_)

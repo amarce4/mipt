@@ -4,6 +4,8 @@
 #include "mipt/circuit.hpp"
 #include "mipt/native_mps.hpp"
 #include "mipt/rdm.hpp"
+#include "mipt/util/stats.hpp"
+#include "mipt/util/text.hpp"
 
 #ifdef MIPT_ENABLE_CUDA_RHO
 #include "mipt/cuda/entropy_cuda.hpp"
@@ -30,35 +32,7 @@ namespace mipt::entropy
 {
 using Complex = std::complex<double>;
 
-struct RunningStats
-{
-    std::uint64_t count = 0;
-    double mean = 0.0;
-    double m2 = 0.0;
-
-    void add(double value)
-    {
-        ++count;
-        const double delta = value - mean;
-        mean += delta / static_cast<double>(count);
-        const double delta2 = value - mean;
-        m2 += delta * delta2;
-    }
-
-    double sample_stddev() const
-    {
-        return (count > 1)
-                   ? std::sqrt(std::max(0.0, m2 / static_cast<double>(count - 1)))
-                   : 0.0;
-    }
-
-    double standard_error() const
-    {
-        return (count > 0)
-                   ? sample_stddev() / std::sqrt(static_cast<double>(count))
-                   : 0.0;
-    }
-};
+using util::RunningStats;
 
 inline std::vector<Complex> cudaq_state_to_host_complex128(cudaq::state &state, int n)
 {
@@ -500,22 +474,7 @@ inline std::vector<double> host_hierarchical_translation_means(
 }
 
 
-inline std::string csv_quote(std::string_view value)
-{
-    std::string escaped;
-    escaped.reserve(value.size() + 2);
-    escaped.push_back('"');
-    for (char c : value)
-    {
-        if (c == '"')
-        {
-            escaped.push_back('"');
-        }
-        escaped.push_back(c);
-    }
-    escaped.push_back('"');
-    return escaped;
-}
+using util::csv_quote;
 
 inline void write_results(const std::string &path,
                    int n,

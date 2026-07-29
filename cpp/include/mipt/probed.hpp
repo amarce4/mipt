@@ -2,10 +2,16 @@
 
 #include "mipt/circuit.hpp"
 
+#ifdef MIPT_ENABLE_CUSV
+#include "mipt/cusv/engine.hpp"
+#endif
+
 #include <cudaq.h>
 
 #include <chrono>
+#include <cmath>
 #include <cstddef>
+#include <memory>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -71,6 +77,17 @@ struct RfgsAdvanceKernel
     }
 };
 
+// |0...0> on n qubits. Used as the starting buffer when the cuStateVec engine
+// drives the parity-encoded probe, so the state object still belongs to CUDA-Q
+// and downstream readout is unchanged.
+struct ZeroStateKernel
+{
+    void operator()(int n) __qpu__
+    {
+        cudaq::qvector q(n);
+    }
+};
+
 struct RppuParityProbeKernel
 {
     void operator()(int n,
@@ -110,6 +127,8 @@ class CircuitWorkspace1D
     void seed(std::uint32_t value)
     {
         rng_.seed(value);
+        // Offset so the two streams never coincide for adjacent seeds.
+        measure_rng_.seed(value ^ 0x9e3779b9u);
     }
 
     void reserve(int timesteps)
@@ -259,7 +278,7 @@ class CircuitWorkspace1D
     cudaq::state simulate_parity_encoded_probe(
         int n,
         int probe_site,
-        std::string_view context = {}) const
+        std::string_view context = {})
     {
         if (n != prepared_n_ || probe_site < 0 || probe_site >= n)
         {
@@ -271,6 +290,27 @@ class CircuitWorkspace1D
             throw std::invalid_argument(
                 "Parity-encoded probes require a parity-preserving circuit.");
         }
+#ifdef MIPT_ENABLE_CUSV
+        // Same construction as the kernels below -- H on the probe site, then
+        // the whole prepared history -- but through the cuStateVec engine.
+        if (cusv_available() && prepared_type_ != CircuitType::RFGS)
+        {
+            auto state = cudaq::get_state(ZeroStateKernel{}, n);
+            if (adopt_state(state))
+            {
+                engine_->apply_matrix({probe_site},
+                                      cusv::single_qubit_on(1, 0, cusv::mat_hadamard()));
+                const int block = cusv::max_block_targets();
+                for (int t = 0; t < prepared_timesteps_; ++t)
+                {
+                    const auto ops = layer_ops(t);
+                    engine_->apply_ops(ops.ops, block);
+                    engine_->measure_layer(ops.measure_sites, measure_rng_);
+                }
+                return state;
+            }
+        }
+#endif
         log_start(
             context,
             circuit_type_name(prepared_type_),
@@ -309,10 +349,31 @@ class CircuitWorkspace1D
             "Unsupported parity-encoded probe circuit.");
     }
 
-    cudaq::state advance(cudaq::state &state,
-                         int first_timestep,
-                         int timestep_count,
-                         std::string_view context = {})
+    // Advances `state` in place through [first_timestep, first_timestep+count).
+    //
+    // The cuStateVec engine mutates the CUDA-Q device buffer directly, so no
+    // state is copied per timestep and the caller's `state` object stays valid
+    // (optimization #4). When that path is unavailable the CUDA-Q kernel path
+    // runs as before and the result is move-assigned back.
+    void advance(cudaq::state &state,
+                 int first_timestep,
+                 int timestep_count,
+                 std::string_view context = {})
+    {
+        validate_segment(first_timestep, timestep_count);
+#ifdef MIPT_ENABLE_CUSV
+        if (run_segment_cusv(state, first_timestep, timestep_count, /*unitary_only=*/false))
+        {
+            return;
+        }
+#endif
+        state = advance_via_cudaq(state, first_timestep, timestep_count, context);
+    }
+
+    cudaq::state advance_via_cudaq(cudaq::state &state,
+                                   int first_timestep,
+                                   int timestep_count,
+                                   std::string_view context = {})
     {
         validate_segment(first_timestep, timestep_count);
         log_start(context, circuit_type_name(prepared_type_), prepared_n_, timestep_count);
@@ -372,9 +433,23 @@ class CircuitWorkspace1D
     // measurements.  The measurement flags remain available through
     // measurement_sites(), allowing callers that need Born probabilities to
     // apply the projectors sequentially themselves.
-    cudaq::state advance_unitary(cudaq::state &state,
-                                 int timestep,
-                                 std::string_view context = {})
+    void advance_unitary(cudaq::state &state,
+                         int timestep,
+                         std::string_view context = {})
+    {
+        validate_segment(timestep, 1);
+#ifdef MIPT_ENABLE_CUSV
+        if (run_segment_cusv(state, timestep, 1, /*unitary_only=*/true))
+        {
+            return;
+        }
+#endif
+        state = advance_unitary_via_cudaq(state, timestep, context);
+    }
+
+    cudaq::state advance_unitary_via_cudaq(cudaq::state &state,
+                                           int timestep,
+                                           std::string_view context = {})
     {
         validate_segment(timestep, 1);
         log_start(context, circuit_type_name(prepared_type_), prepared_n_, 1);
@@ -468,7 +543,102 @@ class CircuitWorkspace1D
         return sites;
     }
 
+#ifdef MIPT_ENABLE_CUSV
+    // Samples and applies the measurement layer of `timestep` in one joint
+    // draw (optimization #3) and returns -log P(joint outcome), which equals
+    // the sum of the per-site conditional surprisals the sequential path
+    // accumulates. Returns false if the cuStateVec path is unavailable.
+    bool measure_layer_in_place(cudaq::state &state, int timestep, double &surprisal)
+    {
+        validate_segment(timestep, 1);
+        if (!adopt_state(state))
+        {
+            return false;
+        }
+        surprisal = engine_->measure_layer(layer_ops(timestep).measure_sites, measure_rng_);
+        return true;
+    }
+
+    bool cusv_available() const
+    {
+        static const bool enabled = env::boolean("MIPT_CUSV", true);
+        return enabled && !backend::compiled_for_tensor_backend();
+    }
+#endif
+
   private:
+#ifdef MIPT_ENABLE_CUSV
+    cusv::LayerOps layer_ops(int timestep) const
+    {
+        const auto index = static_cast<std::size_t>(timestep);
+        switch (prepared_type_)
+        {
+        case CircuitType::MMS:
+            return cusv::build_mms_layer_ops(mms_layers_[index], prepared_n_, true);
+        case CircuitType::Haar:
+            return cusv::build_haar_layer_ops(haar_layers_[index], prepared_n_);
+        case CircuitType::FermionRPPU:
+        case CircuitType::QubitRPPU:
+            return cusv::build_rppu_layer_ops(rppu_layers_[index], prepared_n_);
+        case CircuitType::RFGS:
+            break;
+        }
+        throw std::invalid_argument("cuStateVec engine does not implement this circuit type.");
+    }
+
+    // Points the engine at the CUDA-Q device buffer. The buffer keeps its
+    // CUDA-Q owner, so every downstream consumer that reads
+    // state.get_tensor().data observes the mutations.
+    bool adopt_state(cudaq::state &state)
+    {
+        if (!cusv_available() || prepared_type_ == CircuitType::RFGS)
+        {
+            return false;
+        }
+        const auto tensor = state.get_tensor();
+        if (tensor.get_rank() != 1 || tensor.data == nullptr || !state.is_on_gpu())
+        {
+            return false;
+        }
+        const auto elements = tensor.get_num_elements();
+        int total_qubits = 0;
+        while ((std::size_t{1} << total_qubits) < elements)
+        {
+            ++total_qubits;
+        }
+        if ((std::size_t{1} << total_qubits) != elements || total_qubits < prepared_n_)
+        {
+            return false;
+        }
+        const bool fp64 = state.get_precision() == cudaq::SimulationState::precision::fp64;
+        if (!engine_ || engine_->fp64() != fp64)
+        {
+            engine_ = std::make_unique<cusv::Engine>(fp64);
+        }
+        engine_->adopt(tensor.data, total_qubits);
+        return true;
+    }
+
+    bool run_segment_cusv(cudaq::state &state, int first, int count, bool unitary_only)
+    {
+        if (!adopt_state(state))
+        {
+            return false;
+        }
+        const int block = cusv::max_block_targets();
+        for (int t = first; t < first + count; ++t)
+        {
+            const auto ops = layer_ops(t);
+            engine_->apply_ops(ops.ops, block);
+            if (!unitary_only)
+            {
+                engine_->measure_layer(ops.measure_sites, measure_rng_);
+            }
+        }
+        return true;
+    }
+#endif
+
     template <typename Layer, typename Runner>
     static cudaq::state run_unitary_layer(std::vector<Layer> &source,
                                           std::vector<Layer> &scratch,
@@ -594,6 +764,11 @@ class CircuitWorkspace1D
     }
 
     std::mt19937 rng_{std::random_device{}()};
+    // Separate stream so measurement outcomes never perturb layer sampling.
+    std::mt19937 measure_rng_{std::random_device{}()};
+#ifdef MIPT_ENABLE_CUSV
+    std::unique_ptr<cusv::Engine> engine_;
+#endif
     int prepared_n_ = -1;
     int prepared_timesteps_ = -1;
     CircuitType prepared_type_ = CircuitType::MMS;
