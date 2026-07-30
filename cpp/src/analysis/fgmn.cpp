@@ -1,4 +1,5 @@
 #include "mipt/analysis/fgmn.hpp"
+#include "mipt/util/spectral.hpp"
 
 #include <algorithm>
 #include <array>
@@ -901,78 +902,6 @@ namespace fgmn
         }
     }
 
-    double jacobi_trace_sqrt_real_symmetric_16(std::array<std::array<double, 2 * D>, 2 * D> A)
-    {
-        constexpr int N = 2 * D;
-        constexpr int MAX_SWEEPS = 128;
-        constexpr double OFFDIAG_TOL = 1.0e-14;
-
-        for (int sweep = 0; sweep < MAX_SWEEPS; ++sweep)
-        {
-            int p = 0;
-            int q = 1;
-            double max_offdiag = 0.0;
-            for (int i = 0; i < N; ++i)
-            {
-                for (int j = i + 1; j < N; ++j)
-                {
-                    const double aij = std::abs(A[i][j]);
-                    if (aij > max_offdiag)
-                    {
-                        max_offdiag = aij;
-                        p = i;
-                        q = j;
-                    }
-                }
-            }
-
-            if (max_offdiag < OFFDIAG_TOL)
-            {
-                break;
-            }
-
-            const double app = A[p][p];
-            const double aqq = A[q][q];
-            const double apq = A[p][q];
-            const double theta = 0.5 * std::atan2(2.0 * apq, aqq - app);
-            const double c = std::cos(theta);
-            const double s = std::sin(theta);
-
-            for (int k = 0; k < N; ++k)
-            {
-                if (k == p || k == q)
-                {
-                    continue;
-                }
-                const double akp = A[k][p];
-                const double akq = A[k][q];
-                const double new_kp = c * akp - s * akq;
-                const double new_kq = s * akp + c * akq;
-                A[k][p] = A[p][k] = new_kp;
-                A[k][q] = A[q][k] = new_kq;
-            }
-
-            A[p][p] = c * c * app - 2.0 * s * c * apq + s * s * aqq;
-            A[q][q] = s * s * app + 2.0 * s * c * apq + c * c * aqq;
-            A[p][q] = A[q][p] = 0.0;
-        }
-
-        double trace_sqrt = 0.0;
-        for (int i = 0; i < N; ++i)
-        {
-            double ev = A[i][i];
-            if (ev < 0.0 && ev > -1.0e-10)
-            {
-                ev = 0.0;
-            }
-            if (ev > 0.0)
-            {
-                trace_sqrt += std::sqrt(ev);
-            }
-        }
-        return trace_sqrt;
-    }
-
     double bipartite_negativity_numeric(const double *rho, int subsystem, bool fermionic)
     {
         if (rho == nullptr)
@@ -984,7 +913,7 @@ namespace fgmn
             return std::numeric_limits<double>::quiet_NaN();
         }
 
-        std::array<std::array<std::complex<double>, D>, D> A{};
+        std::array<std::complex<double>, D * D> pt{};
         const int mask = subsystem_mask(subsystem);
 
         for (int r = 0; r < D; ++r)
@@ -1004,50 +933,23 @@ namespace fgmn
                 {
                     value = std::complex<double>(-value.imag(), value.real());
                 }
-                A[r][c] = value;
+                pt[static_cast<std::size_t>(r * D + c)] = value;
             }
         }
 
-        std::array<std::array<std::complex<double>, D>, D> H{};
-        for (int i = 0; i < D; ++i)
+        // The ordinary partial transpose of a Hermitian matrix is Hermitian, so
+        // its singular values are just the absolute eigenvalues.  Only the
+        // fermionic partial transpose, which carries the extra factor of i on
+        // parity-violating entries, is non-Hermitian and needs the Gram matrix.
+        double trace_norm = 0.0;
+        const bool converged =
+            fermionic ? mipt::util::gram_trace_norm<D>(pt, trace_norm)
+                      : mipt::util::hermitian_trace_norm<D>(pt, trace_norm);
+        if (!converged)
         {
-            for (int j = 0; j < D; ++j)
-            {
-                std::complex<double> sum(0.0, 0.0);
-                for (int k = 0; k < D; ++k)
-                {
-                    sum += std::conj(A[k][i]) * A[k][j];
-                }
-                H[i][j] = sum;
-            }
+            return std::numeric_limits<double>::quiet_NaN();
         }
 
-        std::array<std::array<double, 2 * D>, 2 * D> B{};
-        for (int i = 0; i < D; ++i)
-        {
-            for (int j = 0; j < D; ++j)
-            {
-                const double re = H[i][j].real();
-                const double im = H[i][j].imag();
-                B[i][j] = re;
-                B[i][j + D] = -im;
-                B[i + D][j] = im;
-                B[i + D][j + D] = re;
-            }
-        }
-
-        // Remove roundoff-level asymmetry before the Jacobi diagonalization.
-        for (int i = 0; i < 2 * D; ++i)
-        {
-            for (int j = i + 1; j < 2 * D; ++j)
-            {
-                const double sym = 0.5 * (B[i][j] + B[j][i]);
-                B[i][j] = B[j][i] = sym;
-            }
-        }
-
-        // The realification duplicates every singular value, so divide by 2.
-        const double trace_norm = 0.5 * jacobi_trace_sqrt_real_symmetric_16(B);
         double negativity = 0.5 * (trace_norm - 1.0);
         if (negativity < 0.0 && negativity > -1.0e-10)
         {

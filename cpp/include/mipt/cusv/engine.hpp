@@ -87,6 +87,15 @@ inline int max_block_targets()
     return static_cast<int>(env::integer("MIPT_CUSV_BLOCK_TARGETS", 4, 2, 12));
 }
 
+// Whether the engine should be used at all. MIPT_CUSV=0 restores the CUDA-Q
+// gate-by-gate path; the tensor-network targets never expose the dense device
+// buffer the engine needs.
+inline bool enabled()
+{
+    static const bool on = env::boolean("MIPT_CUSV", true);
+    return on && !backend::compiled_for_tensor_backend();
+}
+
 class Engine
 {
   public:

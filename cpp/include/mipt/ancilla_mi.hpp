@@ -1,6 +1,7 @@
 #pragma once
 
 #include "mipt/ancilla_rdm.hpp"
+#include "mipt/util/spectral.hpp"
 
 #include <algorithm>
 #include <array>
@@ -51,67 +52,28 @@ inline double entropy_from_rdm(const Rdm &rho)
     return entropy_term(lambda0) + entropy_term(lambda1);
 }
 
-inline void jacobi_eigenvalues_symmetric_8x8(
-    std::array<std::array<double, 8>, 8> &matrix)
+// Eigenvalues of a 4x4 complex Hermitian ancilla block, as a flat row-major
+// array for mipt::util::hermitian_eigenvalues.  This used to embed the block in
+// a real symmetric 8x8, which duplicates every eigenvalue and quadruples the
+// work of the diagonalization.
+inline std::array<double, 4> ancilla_eigenvalues(const Rdm2 &matrix)
 {
-    constexpr int dimension = 8;
-    constexpr int max_rotations = 2048;
-    constexpr double tolerance = 1e-14;
-
-    for (int rotation = 0; rotation < max_rotations; ++rotation)
+    std::array<std::complex<double>, 16> flat{};
+    for (std::size_t row = 0; row < Rdm2::dimension; ++row)
     {
-        int p = 0;
-        int q = 1;
-        double largest = std::abs(matrix[0][1]);
-        for (int row = 0; row < dimension; ++row)
+        for (std::size_t col = 0; col < Rdm2::dimension; ++col)
         {
-            for (int col = row + 1; col < dimension; ++col)
-            {
-                const double candidate = std::abs(matrix[row][col]);
-                if (candidate > largest)
-                {
-                    largest = candidate;
-                    p = row;
-                    q = col;
-                }
-            }
+            flat[row * Rdm2::dimension + col] = matrix(row, col);
         }
-        if (largest < tolerance)
-        {
-            return;
-        }
-
-        const double app = matrix[p][p];
-        const double aqq = matrix[q][q];
-        const double apq = matrix[p][q];
-        const double tau = (aqq - app) / (2.0 * apq);
-        const double t = tau >= 0.0
-            ? 1.0 / (tau + std::sqrt(1.0 + tau * tau))
-            : -1.0 / (-tau + std::sqrt(1.0 + tau * tau));
-        const double c = 1.0 / std::sqrt(1.0 + t * t);
-        const double s = t * c;
-
-        for (int k = 0; k < dimension; ++k)
-        {
-            if (k == p || k == q)
-            {
-                continue;
-            }
-            const double akp = matrix[k][p];
-            const double akq = matrix[k][q];
-            const double new_kp = c * akp - s * akq;
-            const double new_kq = s * akp + c * akq;
-            matrix[k][p] = matrix[p][k] = new_kp;
-            matrix[k][q] = matrix[q][k] = new_kq;
-        }
-
-        matrix[p][p] = c * c * app - 2.0 * s * c * apq + s * s * aqq;
-        matrix[q][q] = s * s * app + 2.0 * s * c * apq + c * c * aqq;
-        matrix[p][q] = matrix[q][p] = 0.0;
     }
 
-    throw std::runtime_error(
-        "The 4x4 ancilla density-matrix eigensolver did not converge.");
+    std::array<double, 4> eigenvalues{};
+    if (!mipt::util::hermitian_eigenvalues<4>(flat, eigenvalues))
+    {
+        throw std::runtime_error(
+            "The 4x4 ancilla density-matrix eigensolver did not converge.");
+    }
+    return eigenvalues;
 }
 
 inline Rdm2 normalized_hermitian_rdm2(const Rdm2 &rho)
@@ -145,36 +107,15 @@ inline Rdm2 normalized_hermitian_rdm2(const Rdm2 &rho)
     return normalized;
 }
 
-inline std::array<std::array<double, 8>, 8> real_embedding(const Rdm2 &matrix)
-{
-    std::array<std::array<double, 8>, 8> embedding{};
-    for (std::size_t row = 0; row < Rdm2::dimension; ++row)
-    {
-        for (std::size_t col = 0; col < Rdm2::dimension; ++col)
-        {
-            const std::complex<double> value = matrix(row, col);
-            const double real = std::real(value);
-            const double imag = std::imag(value);
-            embedding[row][col] = real;
-            embedding[row][col + 4] = -imag;
-            embedding[row + 4][col] = imag;
-            embedding[row + 4][col + 4] = real;
-        }
-    }
-    return embedding;
-}
-
 inline double entropy_from_normalized_rdm2(const Rdm2 &rho)
 {
-    auto embedding = real_embedding(rho);
-    jacobi_eigenvalues_symmetric_8x8(embedding);
+    const auto eigenvalues = ancilla_eigenvalues(rho);
 
-    double entropy_twice = 0.0;
+    double entropy = 0.0;
     double eigenvalue_sum = 0.0;
     constexpr double negative_tolerance = 2e-6;
-    for (std::size_t i = 0; i < 8; ++i)
+    for (double lambda : eigenvalues)
     {
-        double lambda = embedding[i][i];
         if (!std::isfinite(lambda))
         {
             throw std::runtime_error(
@@ -190,16 +131,16 @@ inline double entropy_from_normalized_rdm2(const Rdm2 &rho)
         eigenvalue_sum += lambda;
         if (lambda > 0.0)
         {
-            entropy_twice -= lambda * std::log(lambda);
+            entropy -= lambda * std::log(lambda);
         }
     }
 
-    if (std::abs(eigenvalue_sum - 2.0) > 2e-5)
+    if (std::abs(eigenvalue_sum - 1.0) > 1e-5)
     {
         throw std::runtime_error(
             "Two-ancilla eigenspectrum has invalid normalization.");
     }
-    return 0.5 * entropy_twice;
+    return entropy;
 }
 
 inline double entropy_from_rdm2(const Rdm2 &rho)
@@ -207,59 +148,33 @@ inline double entropy_from_rdm2(const Rdm2 &rho)
     return entropy_from_normalized_rdm2(normalized_hermitian_rdm2(rho));
 }
 
-inline double trace_norm_rdm2(const Rdm2 &matrix)
+// Trace norm of a partially transposed two-ancilla block.
+//
+// `hermitian` selects the cheap route: an ordinary partial transpose of a
+// Hermitian matrix stays Hermitian, so its singular values are the absolute
+// eigenvalues and no Gram matrix is needed.  Only the fermionic partial
+// transpose, which multiplies parity-violating entries by i, is non-Hermitian.
+inline double trace_norm_rdm2(const Rdm2 &matrix, bool hermitian)
 {
-    Rdm2 gram;
+    std::array<std::complex<double>, 16> flat{};
     for (std::size_t row = 0; row < Rdm2::dimension; ++row)
     {
         for (std::size_t col = 0; col < Rdm2::dimension; ++col)
         {
-            std::complex<double> sum = 0.0;
-            for (std::size_t k = 0; k < Rdm2::dimension; ++k)
-            {
-                sum += std::conj(matrix(k, row)) * matrix(k, col);
-            }
-            gram(row, col) = sum;
+            flat[row * Rdm2::dimension + col] = matrix(row, col);
         }
     }
 
-    for (std::size_t row = 0; row < Rdm2::dimension; ++row)
+    double norm = 0.0;
+    const bool converged = hermitian
+        ? mipt::util::hermitian_trace_norm<4>(flat, norm)
+        : mipt::util::gram_trace_norm<4>(flat, norm);
+    if (!converged || !std::isfinite(norm))
     {
-        for (std::size_t col = row; col < Rdm2::dimension; ++col)
-        {
-            std::complex<double> value =
-                0.5 * (gram(row, col) + std::conj(gram(col, row)));
-            if (row == col)
-            {
-                value = {std::real(value), 0.0};
-            }
-            gram(row, col) = value;
-            gram(col, row) = std::conj(value);
-        }
+        throw std::runtime_error(
+            "Two-ancilla partial-transpose eigensolver did not converge.");
     }
-
-    auto embedding = real_embedding(gram);
-    jacobi_eigenvalues_symmetric_8x8(embedding);
-
-    double norm_twice = 0.0;
-    constexpr double negative_tolerance = 2e-10;
-    for (std::size_t i = 0; i < 8; ++i)
-    {
-        double lambda = embedding[i][i];
-        if (!std::isfinite(lambda))
-        {
-            throw std::runtime_error(
-                "Two-ancilla partial transpose produced a non-finite singular value.");
-        }
-        if (lambda < -negative_tolerance)
-        {
-            throw std::runtime_error(
-                "Two-ancilla partial-transpose Gram matrix is not positive semidefinite.");
-        }
-        lambda = std::max(0.0, lambda);
-        norm_twice += std::sqrt(lambda);
-    }
-    return 0.5 * norm_twice;
+    return norm;
 }
 
 inline double negativity_from_normalized_rdm2(
@@ -285,7 +200,7 @@ inline double negativity_from_normalized_rdm2(
         }
     }
 
-    double value = 0.5 * (trace_norm_rdm2(partial_transpose) - 1.0);
+    double value = 0.5 * (trace_norm_rdm2(partial_transpose, !fermion_trace) - 1.0);
     if (value < 0.0 && value > -2e-8)
     {
         value = 0.0;

@@ -77,17 +77,6 @@ struct RfgsAdvanceKernel
     }
 };
 
-// |0...0> on n qubits. Used as the starting buffer when the cuStateVec engine
-// drives the parity-encoded probe, so the state object still belongs to CUDA-Q
-// and downstream readout is unchanged.
-struct ZeroStateKernel
-{
-    void operator()(int n) __qpu__
-    {
-        cudaq::qvector q(n);
-    }
-};
-
 struct RppuParityProbeKernel
 {
     void operator()(int n,
@@ -295,7 +284,7 @@ class CircuitWorkspace1D
         // the whole prepared history -- but through the cuStateVec engine.
         if (cusv_available() && prepared_type_ != CircuitType::RFGS)
         {
-            auto state = cudaq::get_state(ZeroStateKernel{}, n);
+            auto state = cudaq::get_state(mipt::ZeroStateKernel{}, n);
             if (adopt_state(state))
             {
                 engine_->apply_matrix({probe_site},
@@ -559,11 +548,7 @@ class CircuitWorkspace1D
         return true;
     }
 
-    bool cusv_available() const
-    {
-        static const bool enabled = env::boolean("MIPT_CUSV", true);
-        return enabled && !backend::compiled_for_tensor_backend();
-    }
+    bool cusv_available() const { return cusv::enabled(); }
 #endif
 
   private:

@@ -270,10 +270,16 @@ inline bool entropy_subsystem_svd_from_device_state(const void *device_state_vec
 
 inline bool device_small_rdm_enabled()
 {
-    // Off by default because the optimal threshold is hardware dependent.
-    // Enable with SIM_TMI_DEVICE_SMALL_RDM=1 to avoid full GPU->host
-    // statevector copies for the A/B/C/D small-block entropies.
-    static const bool enabled = mipt::env::boolean("SIM_TMI_DEVICE_SMALL_RDM", false);
+    // On by default since 2026-07-29.  This was off because the old device
+    // kernel launched one block per output element and re-streamed the whole
+    // environment for each, costing 2*2^(N+kept) loads -- 128x redundant for a
+    // kept=6 quarter at N=24 -- which made a full GPU->host statevector copy
+    // plus host reduction the cheaper option.  tmi_cuda_rdm.cu now gathers the
+    // state once and reduces with cuBLAS herk, so the device path wins at every
+    // size and the per-sample state copy disappears.
+    //
+    // Set SIM_TMI_DEVICE_SMALL_RDM=0 to fall back to the host path.
+    static const bool enabled = mipt::env::boolean("SIM_TMI_DEVICE_SMALL_RDM", true);
     return enabled;
 }
 

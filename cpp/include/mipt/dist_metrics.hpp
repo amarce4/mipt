@@ -1,6 +1,7 @@
 #pragma once
 
 #include "mipt/util/geometry.hpp"
+#include "mipt/util/spectral.hpp"
 
 #include <algorithm>
 #include <array>
@@ -24,114 +25,22 @@ struct PairMetrics
 
 namespace detail
 {
-template <std::size_t N>
-using RealMatrix = std::array<std::array<double, N>, N>;
-
 inline double entropy_term(double lambda)
 {
     constexpr double eps = 1.0e-15;
     return lambda > eps ? -lambda * std::log2(lambda) : 0.0;
 }
 
-template <std::size_t N>
-inline std::array<double, N> jacobi_eigenvalues(RealMatrix<N> a)
-{
-    constexpr int max_sweeps = 256;
-    constexpr double relative_tolerance = 1.0e-14;
-
-    double scale = 1.0;
-    for (std::size_t i = 0; i < N; ++i)
-    {
-        scale = std::max(scale, std::abs(a[i][i]));
-        for (std::size_t j = i + 1; j < N; ++j)
-        {
-            const double sym = 0.5 * (a[i][j] + a[j][i]);
-            a[i][j] = a[j][i] = sym;
-            scale = std::max(scale, std::abs(sym));
-        }
-    }
-    const double tolerance = relative_tolerance * scale;
-
-    for (int sweep = 0; sweep < max_sweeps; ++sweep)
-    {
-        std::size_t p = 0;
-        std::size_t q = 1;
-        double max_offdiag = 0.0;
-        for (std::size_t i = 0; i + 1 < N; ++i)
-        {
-            for (std::size_t j = i + 1; j < N; ++j)
-            {
-                const double value = std::abs(a[i][j]);
-                if (value > max_offdiag)
-                {
-                    max_offdiag = value;
-                    p = i;
-                    q = j;
-                }
-            }
-        }
-        if (max_offdiag <= tolerance)
-        {
-            break;
-        }
-
-        const double app = a[p][p];
-        const double aqq = a[q][q];
-        const double apq = a[p][q];
-        const double theta = 0.5 * std::atan2(2.0 * apq, aqq - app);
-        const double c = std::cos(theta);
-        const double s = std::sin(theta);
-
-        for (std::size_t k = 0; k < N; ++k)
-        {
-            if (k == p || k == q)
-            {
-                continue;
-            }
-            const double akp = a[k][p];
-            const double akq = a[k][q];
-            const double new_kp = c * akp - s * akq;
-            const double new_kq = s * akp + c * akq;
-            a[k][p] = a[p][k] = new_kp;
-            a[k][q] = a[q][k] = new_kq;
-        }
-
-        a[p][p] = c * c * app - 2.0 * s * c * apq + s * s * aqq;
-        a[q][q] = s * s * app + 2.0 * s * c * apq + c * c * aqq;
-        a[p][q] = a[q][p] = 0.0;
-    }
-
-    std::array<double, N> eigenvalues{};
-    for (std::size_t i = 0; i < N; ++i)
-    {
-        eigenvalues[i] = a[i][i];
-    }
-    return eigenvalues;
-}
-
-template <std::size_t D>
-inline RealMatrix<2 * D> complex_hermitian_realification(
-    const std::array<Complex, D * D> &matrix)
-{
-    RealMatrix<2 * D> out{};
-    for (std::size_t i = 0; i < D; ++i)
-    {
-        for (std::size_t j = 0; j < D; ++j)
-        {
-            const Complex value = matrix[i * D + j];
-            out[i][j] = value.real();
-            out[i][j + D] = -value.imag();
-            out[i + D][j] = value.imag();
-            out[i + D][j + D] = value.real();
-        }
-    }
-    return out;
-}
-
 template <std::size_t D>
 inline double von_neumann_entropy(const std::array<Complex, D * D> &rho)
 {
-    const auto eigenvalues = jacobi_eigenvalues(complex_hermitian_realification<D>(rho));
+    std::array<double, D> eigenvalues{};
+    if (!util::hermitian_eigenvalues<D>(rho, eigenvalues))
+    {
+        throw std::runtime_error(
+            "Two-site density-matrix eigensolver did not converge.");
+    }
+
     double entropy = 0.0;
     for (double lambda : eigenvalues)
     {
@@ -141,8 +50,6 @@ inline double von_neumann_entropy(const std::array<Complex, D * D> &rho)
         }
         entropy += entropy_term(lambda);
     }
-    // The realification duplicates every eigenvalue.
-    entropy *= 0.5;
     return std::abs(entropy) < 1.0e-12 ? 0.0 : entropy;
 }
 
@@ -233,39 +140,6 @@ inline Matrix2 trace_to_one_mode(const Matrix4 &rho,
     return out;
 }
 
-inline double trace_norm(const Matrix4 &matrix)
-{
-    Matrix4 gram{};
-    for (std::size_t i = 0; i < 4; ++i)
-    {
-        for (std::size_t j = 0; j < 4; ++j)
-        {
-            Complex sum(0.0, 0.0);
-            for (std::size_t k = 0; k < 4; ++k)
-            {
-                sum += std::conj(matrix[k * 4 + i]) * matrix[k * 4 + j];
-            }
-            gram[i * 4 + j] = sum;
-        }
-    }
-
-    const auto eigenvalues = jacobi_eigenvalues(complex_hermitian_realification<4>(gram));
-    double norm = 0.0;
-    for (double lambda : eigenvalues)
-    {
-        if (lambda < 0.0 && lambda > -1.0e-11)
-        {
-            lambda = 0.0;
-        }
-        if (lambda > 0.0)
-        {
-            norm += std::sqrt(lambda);
-        }
-    }
-    // The realification duplicates every singular value.
-    return 0.5 * norm;
-}
-
 inline double negativity(const Matrix4 &rho, bool fermionic)
 {
     Matrix4 partial_transpose{};
@@ -288,7 +162,19 @@ inline double negativity(const Matrix4 &rho, bool fermionic)
         }
     }
 
-    double result = 0.5 * (trace_norm(partial_transpose) - 1.0);
+    // The ordinary partial transpose stays Hermitian, so its singular values are
+    // the absolute eigenvalues; only the fermionic one needs the Gram matrix.
+    double norm = 0.0;
+    const bool converged =
+        fermionic ? util::gram_trace_norm<4>(partial_transpose, norm)
+                  : util::hermitian_trace_norm<4>(partial_transpose, norm);
+    if (!converged)
+    {
+        throw std::runtime_error(
+            "Two-site partial-transpose eigensolver did not converge.");
+    }
+
+    double result = 0.5 * (norm - 1.0);
     if (result < 0.0 && result > -1.0e-10)
     {
         result = 0.0;

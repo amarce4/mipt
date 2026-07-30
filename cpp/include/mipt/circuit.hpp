@@ -4,10 +4,15 @@
 #include "mipt/circuits/haar.hpp"
 #include "mipt/circuits/fermion.hpp"
 
+#ifdef MIPT_ENABLE_CUSV
+#include "mipt/cusv/engine.hpp"
+#endif
+
 #include <cudaq.h>
 
 #include <chrono>
 #include <memory>
+#include <optional>
 #include <random>
 #include <string>
 #include <string_view>
@@ -19,6 +24,17 @@ namespace mipt
 struct CircuitBuildTiming
 {
     std::chrono::steady_clock::time_point frontend_done{};
+};
+
+// |0...0> on n qubits. The cuStateVec engine starts from a CUDA-Q-owned buffer
+// so that the returned cudaq::state is an ordinary state as far as every
+// downstream RDM/entropy consumer is concerned.
+struct ZeroStateKernel
+{
+    void operator()(int n) __qpu__
+    {
+        cudaq::qvector q(n);
+    }
 };
 
 class Circuit1D
@@ -80,6 +96,56 @@ class Circuit1D
                 label.c_str(), stats, n, periods, p));
         }
     }
+
+#ifdef MIPT_ENABLE_CUSV
+    // Runs a complete prepared layer history through the cuStateVec engine.
+    //
+    // The state starts as a CUDA-Q |0...0> and is then mutated in place, so the
+    // returned object is a normal cudaq::state whose device buffer CUDA-Q still
+    // owns -- every RDM, entropy, and TMI consumer reads it unchanged. Returns
+    // nullopt when the engine cannot drive this run (MIPT_CUSV=0, a tensor
+    // backend, a CPU state, or a circuit the engine does not implement), and
+    // the caller falls back to the CUDA-Q kernel.
+    //
+    // `build_ops` maps one layer to its operator list; measurement layers are
+    // sampled jointly, exactly as in the CUDA-Q path but in two passes instead
+    // of two per measured site.
+    template <typename Layer, typename BuildOps>
+    std::optional<cudaq::state> try_cusv(int n, const std::vector<Layer> &layers,
+                                         BuildOps build_ops)
+    {
+        if (!cusv::enabled())
+        {
+            return std::nullopt;
+        }
+        auto state = cudaq::get_state(ZeroStateKernel{}, n);
+        const auto tensor = state.get_tensor();
+        if (tensor.get_rank() != 1 || tensor.data == nullptr || !state.is_on_gpu() ||
+            tensor.get_num_elements() != (std::size_t{1} << n))
+        {
+            return std::nullopt;
+        }
+        const bool fp64 = state.get_precision() == cudaq::SimulationState::precision::fp64;
+        if (!engine_ || engine_->fp64() != fp64)
+        {
+            engine_ = std::make_unique<cusv::Engine>(fp64);
+        }
+        engine_->adopt(tensor.data, n);
+
+        const int block = cusv::max_block_targets();
+        for (const auto &layer : layers)
+        {
+            const auto ops = build_ops(layer);
+            engine_->apply_ops(ops.ops, block);
+            engine_->measure_layer(ops.measure_sites, measure_rng_);
+        }
+        return state;
+    }
+
+    std::unique_ptr<cusv::Engine> engine_;
+    // Separate stream so measurement outcomes never perturb layer sampling.
+    std::mt19937 measure_rng_{std::random_device{}()};
+#endif
 };
 
 class MmsCircuit1D final : public Circuit1D
@@ -97,6 +163,15 @@ class MmsCircuit1D final : public Circuit1D
         mark_frontend_done(timing);
         log_start(context, "MMS", n, layers_.size());
         const auto start = std::chrono::steady_clock::now();
+#ifdef MIPT_ENABLE_CUSV
+        if (auto fast = try_cusv(n, layers_,
+                                 [n](const MmsLayer &layer)
+                                 { return cusv::build_mms_layer_ops(layer, n, true); }))
+        {
+            log_done(context, "MMS", start);
+            return *fast;
+        }
+#endif
         auto state = cudaq::get_state(MmsKernel1D{}, n, layers_, true);
         log_done(context, "MMS", start);
         return state;
@@ -121,6 +196,15 @@ class HaarCircuit1D final : public Circuit1D
         mark_frontend_done(timing);
         log_start(context, "Haar", n, layers_.size());
         const auto start = std::chrono::steady_clock::now();
+#ifdef MIPT_ENABLE_CUSV
+        if (auto fast = try_cusv(n, layers_,
+                                 [n](const HaarLayer &layer)
+                                 { return cusv::build_haar_layer_ops(layer, n); }))
+        {
+            log_done(context, "Haar", start);
+            return *fast;
+        }
+#endif
         auto state = cudaq::get_state(HaarKernel1D{}, n, layers_);
         log_done(context, "Haar", start);
         return state;
@@ -147,6 +231,15 @@ class RppuCircuit1D final : public Circuit1D
         mark_frontend_done(timing);
         log_start(context, "FermionRPPU", n, layers_.size());
         const auto start = std::chrono::steady_clock::now();
+#ifdef MIPT_ENABLE_CUSV
+        if (auto fast = try_cusv(n, layers_,
+                                 [n](const RppuLayer &layer)
+                                 { return cusv::build_rppu_layer_ops(layer, n); }))
+        {
+            log_done(context, "FermionRPPU", start);
+            return *fast;
+        }
+#endif
         auto state = cudaq::get_state(RppuKernel1D{}, n, layers_);
         log_done(context, "FermionRPPU", start);
         return state;
@@ -197,6 +290,15 @@ class QrppuCircuit1D final : public Circuit1D
         mark_frontend_done(timing);
         log_start(context, "qRPPU", n, layers_.size());
         const auto start = std::chrono::steady_clock::now();
+#ifdef MIPT_ENABLE_CUSV
+        if (auto fast = try_cusv(n, layers_,
+                                 [n](const RppuLayer &layer)
+                                 { return cusv::build_rppu_layer_ops(layer, n); }))
+        {
+            log_done(context, "qRPPU", start);
+            return *fast;
+        }
+#endif
         auto state = cudaq::get_state(RppuKernel1D{}, n, layers_);
         log_done(context, "qRPPU", start);
         return state;

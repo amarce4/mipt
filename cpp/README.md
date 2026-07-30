@@ -148,7 +148,17 @@ make mipt_probed.exe GPU=1 CUDA_RHO=1 FP64=0
 `include/mipt/cusv/` drives cuStateVec directly instead of going through
 CUDA-Q's gate-by-gate dispatch. cuStateVec ships inside CUDA-Q, so nothing extra
 needs installing. It is on by default for `GPU=1` with the `nvidia` backend
-(`CUSV=1`) and covers `mipt_probed.exe` and `free_energy.exe`.
+(`CUSV=1`) and covers **all six simulation executables**, through two entry
+points:
+
+| Entry point | Used by |
+|---|---|
+| `Circuit1D::try_cusv` (`circuit.hpp`) | `mipt.exe`, `sim_tmi.exe`, `entropy.exe`, `dist_scaling.exe` |
+| `probed::CircuitWorkspace1D` (`probed.hpp`) | `mipt_probed.exe`, `free_energy.exe` |
+
+Both start from a CUDA-Q `|0...0>` and mutate that buffer in place, so what they
+return is an ordinary `cudaq::state` and no RDM, entropy, or TMI consumer had to
+change.
 
 What it changes, relative to one full state-vector pass per gate:
 

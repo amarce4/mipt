@@ -184,6 +184,7 @@ RING_BIN := $(HOST_BUILD)/ring_inflation.exe
 EXP_VALS_BIN := $(HOST_BUILD)/exp_vals.exe
 CORE_TEST_BIN := $(HOST_BUILD)/core_tests
 DIST_TEST_BIN := $(HOST_BUILD)/dist_metrics_tests
+SPECTRAL_TEST_BIN := $(HOST_BUILD)/spectral_tests
 
 MIPT_OBJS := $(BUILD)/mipt.o
 MIPT_PROBED_OBJS := $(BUILD)/mipt_probed.o
@@ -199,10 +200,16 @@ RING_OBJS := $(HOST_BUILD)/ring_inflation_main.o $(HOST_BUILD)/ring_inflation.o 
 EXP_VALS_OBJS := $(HOST_BUILD)/exp_vals_main.o $(HOST_BUILD)/exp_vals_analysis.o
 CORE_TEST_OBJS := $(HOST_BUILD)/core_tests.o
 DIST_TEST_OBJS := $(HOST_BUILD)/dist_metrics_tests.o
+SPECTRAL_TEST_OBJS := $(HOST_BUILD)/spectral_tests.o
 
+# Every executable that builds circuit states now goes through mipt/cusv.
 ifeq ($(CUSV),1)
+  MIPT_OBJS += $(BUILD)/cusv_diag.o
   MIPT_PROBED_OBJS += $(BUILD)/cusv_diag.o
   FREE_ENERGY_OBJS += $(BUILD)/cusv_diag.o
+  SIM_TMI_OBJS += $(BUILD)/cusv_diag.o
+  DIST_SCALING_OBJS += $(BUILD)/cusv_diag.o
+  ENTROPY_OBJS += $(BUILD)/cusv_diag.o
 endif
 
 ifeq ($(CUDA_RHO),1)
@@ -217,6 +224,7 @@ endif
 ALL_OBJS := $(MIPT_OBJS) $(MIPT_PROBED_OBJS) $(FREE_ENERGY_OBJS) \
   $(SIM_TMI_OBJS) $(DIST_SCALING_OBJS) $(ENTROPY_OBJS) $(GMN_OBJS) $(FGMN_OBJS) \
   $(RING_OBJS) $(EXP_VALS_OBJS) $(CORE_TEST_OBJS) $(DIST_TEST_OBJS) \
+  $(SPECTRAL_TEST_OBJS) \
   $(MIPT_PROBED_FGMN_PIC_OBJ)
 DEPS := $(ALL_OBJS:.o=.d)
 
@@ -225,9 +233,14 @@ DEPS := $(ALL_OBJS:.o=.d)
 # stale binary. Depend them on every header instead: coarse, but a header
 # change must never produce a stale simulation executable.
 MIPT_HEADERS := $(shell find include -name '*.hpp' 2>/dev/null)
+# The .cu objects are built by nvcc without -MMD/-MP, so nothing noticed an
+# edited .cuh and the link picked up a stale object. Depend them on every CUDA
+# header explicitly: coarse, but a header change must never silently survive
+# into a binary. (Same reasoning as MIPT_HEADERS above, which covers nvq++.)
+MIPT_CUDA_HEADERS := $(shell find include -name '*.cuh' 2>/dev/null) $(MIPT_HEADERS)
 
 .PHONY: all simulation analysis clean cpu gpu print-config format test-core test-dist \
-  test-cusv test-cusv-gates bench-cusv \
+  test-spectral test-rdm-gram test-cusv test-cusv-gates bench-cusv \
   mipt.exe mipt_probed.exe free_energy.exe sim_tmi.exe dist_scaling.exe \
   entropy.exe gmn.exe fgmn.exe ring_inflation.exe exp_vals.exe
 
@@ -262,7 +275,7 @@ exp_vals.exe: $(EXP_VALS_BIN)
 	cp $< $@
 
 $(MIPT_BIN): $(MIPT_OBJS)
-	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $^ $(MIPT_CUDA_LIBS) $(DL_LIBS) -o $@
+	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $^ $(MIPT_CUDA_LIBS) $(CUSV_LIBS) $(DL_LIBS) -o $@
 $(MIPT_PROBED_BIN): $(MIPT_PROBED_OBJS) $(MIPT_PROBED_FGMN_LIB)
 	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $(HOST_LDFLAGS) $(MIPT_PROBED_OBJS) \
 	  $(MIPT_CUDA_LIBS) $(CUSV_LIBS) -L$(BUILD) -Wl,-rpath,'$$ORIGIN' -lmipt_fgmn \
@@ -273,11 +286,11 @@ $(MIPT_PROBED_FGMN_LIB): $(MIPT_PROBED_FGMN_PIC_OBJ) | $(BUILD)
 $(FREE_ENERGY_BIN): $(FREE_ENERGY_OBJS)
 	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $^ $(MIPT_CUDA_LIBS) $(SIM_TMI_CUDA_LIBS) $(CUSV_LIBS) $(DL_LIBS) -o $@
 $(SIM_TMI_BIN): $(SIM_TMI_OBJS)
-	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $^ $(MIPT_CUDA_LIBS) $(SIM_TMI_CUDA_LIBS) $(DL_LIBS) -o $@
+	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $^ $(MIPT_CUDA_LIBS) $(SIM_TMI_CUDA_LIBS) $(CUSV_LIBS) $(DL_LIBS) -o $@
 $(DIST_SCALING_BIN): $(DIST_SCALING_OBJS)
-	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $^ $(MIPT_CUDA_LIBS) $(DL_LIBS) -o $@
+	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $^ $(MIPT_CUDA_LIBS) $(CUSV_LIBS) $(DL_LIBS) -o $@
 $(ENTROPY_BIN): $(ENTROPY_OBJS)
-	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $^ $(MIPT_CUDA_LIBS) $(ENTROPY_CUDA_LIBS) $(DL_LIBS) -o $@
+	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $^ $(MIPT_CUDA_LIBS) $(ENTROPY_CUDA_LIBS) $(CUSV_LIBS) $(DL_LIBS) -o $@
 $(GMN_BIN): $(GMN_OBJS)
 	$(HOSTCXX) $(HOST_LDFLAGS) $^ $(MOSEK_LDFLAGS) $(MOSEK_LIBS) -o $@
 $(FGMN_BIN): $(FGMN_OBJS)
@@ -291,11 +304,26 @@ $(CORE_TEST_BIN): $(CORE_TEST_OBJS)
 	$(HOSTCXX) $^ -o $@
 $(DIST_TEST_BIN): $(DIST_TEST_OBJS)
 	$(HOSTCXX) $^ -o $@
+$(SPECTRAL_TEST_BIN): $(SPECTRAL_TEST_OBJS)
+	$(HOSTCXX) $^ -o $@
 
 test-core: $(CORE_TEST_BIN)
 	$(CORE_TEST_BIN)
 test-dist: $(DIST_TEST_BIN)
 	$(DIST_TEST_BIN)
+test-spectral: $(SPECTRAL_TEST_BIN)
+	$(SPECTRAL_TEST_BIN)
+
+# --- reduction-kernel equivalence -------------------------------------------
+#
+# Checks the gather + cuBLAS-herk RDM/entropy path against a host fp64
+# reference. Needs a GPU. Built with nvcc directly since it drives the CUDA
+# reduction objects without any CUDA-Q involvement.
+RDM_GRAM_TEST_BIN := $(BUILD)/rdm_gram_tests
+$(RDM_GRAM_TEST_BIN): tests/rdm_gram_tests.cu $(BUILD)/tmi_cuda_rdm.o $(BUILD)/tmi_cuda_svd.o | $(BUILD)
+	$(NVCC) $(NVCCFLAGS) $^ $(if $(CUDA_LIB_DIR),-L$(CUDA_LIB_DIR) -Xlinker -rpath -Xlinker $(CUDA_LIB_DIR)) -lcublas -lcusolver -o $@
+test-rdm-gram: $(RDM_GRAM_TEST_BIN)
+	$(RDM_GRAM_TEST_BIN)
 
 # --- cuStateVec engine tests ------------------------------------------------
 #
@@ -357,21 +385,21 @@ $(BUILD)/dist_scaling.o: apps/dist_scaling.cpp $(MIPT_HEADERS) | $(BUILD)
 $(BUILD)/entropy.o: apps/entropy.cpp $(MIPT_HEADERS) | $(BUILD)
 	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $(NVQXXFLAGS_COMMON) -c $< -o $@
 
-$(BUILD)/rho_reduce.o: src/cuda/rho_reduce.cu | $(BUILD)
+$(BUILD)/rho_reduce.o: src/cuda/rho_reduce.cu $(MIPT_CUDA_HEADERS) | $(BUILD)
 	$(CUDA_CU_COMPILER) $(CUDA_CU_FLAGS) -c $< -o $@
-$(BUILD)/rho2_reduce.o: src/cuda/rho2_reduce.cu | $(BUILD)
+$(BUILD)/rho2_reduce.o: src/cuda/rho2_reduce.cu $(MIPT_CUDA_HEADERS) | $(BUILD)
 	$(CUDA_CU_COMPILER) $(CUDA_CU_FLAGS) -c $< -o $@
-$(BUILD)/ancilla_rdm.o: src/cuda/ancilla_rdm.cu | $(BUILD)
+$(BUILD)/ancilla_rdm.o: src/cuda/ancilla_rdm.cu $(MIPT_CUDA_HEADERS) | $(BUILD)
 	$(CUDA_CU_COMPILER) $(CUDA_CU_FLAGS) -c $< -o $@
-$(BUILD)/free_energy_measure.o: src/cuda/free_energy_measure.cu | $(BUILD)
+$(BUILD)/free_energy_measure.o: src/cuda/free_energy_measure.cu $(MIPT_CUDA_HEADERS) | $(BUILD)
 	$(CUDA_CU_COMPILER) $(CUDA_CU_FLAGS) -c $< -o $@
-$(BUILD)/tmi_cuda_svd.o: src/cuda/tmi_cuda_svd.cu | $(BUILD)
+$(BUILD)/tmi_cuda_svd.o: src/cuda/tmi_cuda_svd.cu $(MIPT_CUDA_HEADERS) | $(BUILD)
 	$(CUDA_CU_COMPILER) $(CUDA_CU_FLAGS) -c $< -o $@
-$(BUILD)/tmi_cuda_rdm.o: src/cuda/tmi_cuda_rdm.cu | $(BUILD)
+$(BUILD)/tmi_cuda_rdm.o: src/cuda/tmi_cuda_rdm.cu $(MIPT_CUDA_HEADERS) | $(BUILD)
 	$(CUDA_CU_COMPILER) $(CUDA_CU_FLAGS) -c $< -o $@
-$(BUILD)/entropy_cuda.o: src/cuda/entropy_cuda.cu | $(BUILD)
+$(BUILD)/entropy_cuda.o: src/cuda/entropy_cuda.cu $(MIPT_CUDA_HEADERS) | $(BUILD)
 	$(CUDA_CU_COMPILER) $(CUDA_CU_FLAGS) -c $< -o $@
-$(BUILD)/cusv_diag.o: src/cuda/cusv_diag.cu | $(BUILD)
+$(BUILD)/cusv_diag.o: src/cuda/cusv_diag.cu $(MIPT_CUDA_HEADERS) | $(BUILD)
 	$(CUDA_CU_COMPILER) $(CUDA_CU_FLAGS) -c $< -o $@
 
 $(HOST_BUILD)/gmn.o: apps/gmn.cpp | $(HOST_BUILD)
@@ -395,6 +423,8 @@ $(HOST_BUILD)/gmn_mosek.o: src/analysis/gmn_mosek.c | $(HOST_BUILD)
 $(HOST_BUILD)/core_tests.o: tests/core_tests.cpp | $(HOST_BUILD)
 	$(HOSTCXX) $(CPPFLAGS_COMMON) -std=c++20 -O2 -MMD -MP -c $< -o $@
 $(HOST_BUILD)/dist_metrics_tests.o: tests/dist_metrics_tests.cpp | $(HOST_BUILD)
+	$(HOSTCXX) $(CPPFLAGS_COMMON) -std=c++20 -O2 -MMD -MP -c $< -o $@
+$(HOST_BUILD)/spectral_tests.o: tests/spectral_tests.cpp | $(HOST_BUILD)
 	$(HOSTCXX) $(CPPFLAGS_COMMON) -std=c++20 -O2 -MMD -MP -c $< -o $@
 
 print-config:
