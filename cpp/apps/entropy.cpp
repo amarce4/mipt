@@ -62,17 +62,23 @@ int main(int argc, char *argv[])
         {
             std::cerr
                 << "Warning: MIPT_NATIVE_MPS=1 is not used by entropy.exe because arbitrary-block "
-                   "second-Renyi entropy requires an explicit trajectory state. The selected CUDA-Q "
+                   "entropies require an explicit trajectory state. The selected CUDA-Q "
                    "get_state backend is used instead.\n";
         }
 
         const bool fermion_trace = uses_fermionic_trace(circ_type);
         const int max_small_block = n / 2;
-        std::vector<RunningStats> stats(static_cast<std::size_t>(n + 1));
+        constexpr int min_kept = 2;
+        // 0 disables the von Neumann path entirely; otherwise it is the largest
+        // L_A whose spectrum is computed.
+        const int max_s1_block =
+            von_neumann_enabled() ? von_neumann_max_block(max_small_block) : 0;
+        std::vector<RunningStats> s1_stats(static_cast<std::size_t>(n + 1));
+        std::vector<RunningStats> s2_stats(static_cast<std::size_t>(n + 1));
         CircuitWorkspace1D workspace;
         workspace.reserve(periods);
 
-        std::cout << "Running second-Renyi chord-length scan: N=" << n
+        std::cout << "Running entanglement-entropy chord-length scan: N=" << n
                   << ", periods=" << periods
                   << ", p=" << p
                   << ", realizations=" << realizations
@@ -82,6 +88,22 @@ int main(int argc, char *argv[])
                   << "\n";
         std::cout << "Averaging each L_A over " << n
                   << " contiguous cyclic translations per traj.\n";
+        std::cout << "Entropies: S2 for L_A=" << min_kept << ".." << max_small_block
+                  << "; S1 ";
+        if (max_s1_block < min_kept)
+        {
+            std::cout << "disabled (MIPT_ENTROPY_S1=0 or MIPT_ENTROPY_S1_MAX_LA below "
+                      << min_kept << ")\n";
+        }
+        else
+        {
+            std::cout << "for L_A=" << min_kept << ".." << max_s1_block;
+            if (max_s1_block < max_small_block)
+            {
+                std::cout << " (larger blocks report NaN)";
+            }
+            std::cout << '\n';
+        }
 
         double seconds_per_trajectory = 0.0;
         constexpr std::size_t recent_rate_window = 10;
@@ -100,24 +122,29 @@ int main(int argc, char *argv[])
             auto state = workspace.simulate(n, periods, p, circ_type, "entropy");
             const auto circuit_end = std::chrono::steady_clock::now();
 
-            constexpr int min_kept = 2;
-            std::vector<double> trajectory_means;
-            const bool used_cuda_entropy = cuda_hierarchical_translation_means(
-                state, n, min_kept, max_small_block, fermion_trace,
-                trajectory_means);
+            std::vector<double> s1_means;
+            std::vector<double> s2_means;
+            const bool used_cuda_entropy = cuda_hierarchical_translation_entropies(
+                state, n, min_kept, max_small_block, fermion_trace, max_s1_block,
+                s1_means, s2_means);
             if (!used_cuda_entropy)
             {
                 const std::vector<Complex> psi =
                     cudaq_state_to_host_complex128(state, n);
-                trajectory_means = host_hierarchical_translation_means(
-                    psi, n, min_kept, max_small_block, fermion_trace);
+                host_hierarchical_translation_entropies(
+                    psi, n, min_kept, max_small_block, fermion_trace, max_s1_block,
+                    s1_means, s2_means);
             }
             const auto entropy_end = std::chrono::steady_clock::now();
 
             for (int kept = min_kept; kept <= max_small_block; ++kept)
             {
-                stats[static_cast<std::size_t>(kept)].add(
-                    trajectory_means[static_cast<std::size_t>(kept - min_kept)]);
+                const std::size_t index = static_cast<std::size_t>(kept - min_kept);
+                s2_stats[static_cast<std::size_t>(kept)].add(s2_means[index]);
+                if (std::isfinite(s1_means[index]))
+                {
+                    s1_stats[static_cast<std::size_t>(kept)].add(s1_means[index]);
+                }
             }
 
             if (r == 0)
@@ -137,7 +164,8 @@ int main(int argc, char *argv[])
             // Keep a valid checkpoint after every completed trajectory. The CSV
             // is small (O(N) rows), so this is negligible beside state evolution
             // and reduced-density construction.
-            write_results(output_csv, n, periods, p, realizations, circ_type, stats);
+            write_results(output_csv, n, periods, p, realizations, circ_type,
+                          s1_stats, s2_stats);
 
             const auto trajectory_end = std::chrono::steady_clock::now();
             const double elapsed =
@@ -183,7 +211,7 @@ int main(int argc, char *argv[])
         const auto total_end = std::chrono::steady_clock::now();
         const double total_seconds =
             std::chrono::duration<double>(total_end - total_start).count();
-        std::cout << "\nSaved second-Renyi scaling data to " << output_csv
+        std::cout << "\nSaved entropy scaling data to " << output_csv
                   << ". Elapsed: " << total_seconds << "s\n";
         return 0;
     }

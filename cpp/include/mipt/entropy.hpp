@@ -4,6 +4,11 @@
 #include "mipt/circuit.hpp"
 #include "mipt/native_mps.hpp"
 #include "mipt/rdm.hpp"
+// The host von Neumann path reuses sim_tmi's Hermitian eigen-entropy: a
+// dlopen'd LAPACK zheevd with a cyclic-Jacobi fallback. Keeping one
+// implementation matters here -- the duplicated small-matrix Jacobi in the
+// negativity paths is exactly what util/spectral.hpp was created to end.
+#include "mipt/tmi/linalg.hpp"
 #include "mipt/util/stats.hpp"
 #include "mipt/util/text.hpp"
 
@@ -346,6 +351,72 @@ inline double second_renyi_entropy_nats(const std::vector<Complex> &rho_col_majo
     return -std::log(purity);
 }
 
+// von Neumann entropy S1 = -Tr(rho ln rho), in nats.
+//
+// Unlike S2, this needs the whole spectrum, so the cost grows as dim^3 rather
+// than dim^2. The matrix is taken by value because the eigensolver destroys it
+// and the caller still needs rho for the recursive partial trace.
+inline double von_neumann_entropy_nats(std::vector<Complex> rho_col_major,
+                                       std::size_t dim,
+                                       mipt::tmi::EntropyWorkspace &workspace)
+{
+    if (rho_col_major.size() != dim * dim)
+    {
+        throw std::invalid_argument("Reduced-density matrix payload has the wrong size.");
+    }
+
+    double trace = 0.0;
+    for (std::size_t i = 0; i < dim; ++i)
+    {
+        trace += std::real(rho_col_major[i * dim + i]);
+    }
+    if (!(trace > 0.0) || !std::isfinite(trace))
+    {
+        throw std::runtime_error("Reduced-density matrix has a non-positive or non-finite trace.");
+    }
+
+    // Divide out the trajectory-normalization drift the same way the purity
+    // path divides by trace^2, so the eigenvalues really are probabilities.
+    const double inverse_trace = 1.0 / trace;
+    for (Complex &value : rho_col_major)
+    {
+        value *= inverse_trace;
+    }
+
+    // entropy_hermitian_inplace works in bits and is indifferent to row- versus
+    // column-major storage: transposing a Hermitian matrix conjugates it, which
+    // leaves the (real) spectrum alone.
+    constexpr double ln2 = 0.693147180559945309417232121458;
+    const double entropy_bits =
+        mipt::tmi::entropy_hermitian_inplace(rho_col_major, dim, workspace);
+    if (!std::isfinite(entropy_bits))
+    {
+        throw std::runtime_error("von Neumann entropy is non-finite.");
+    }
+    return entropy_bits * ln2;
+}
+
+// Runtime controls for the von Neumann path. It is on by default, but it is
+// also the expensive half of this executable: one dense eigensolve per
+// (subsystem size, cyclic translation) against S2's single Frobenius pass.
+inline bool von_neumann_enabled()
+{
+    return mipt::env::boolean("MIPT_ENTROPY_S1", true);
+}
+
+// Largest L_A the von Neumann entropy is computed for. 0 means "no cap".
+// Larger blocks report NaN instead, which keeps a big-N scan affordable without
+// pretending the missing values are zero.
+inline int von_neumann_max_block(int max_kept)
+{
+    const long cap = mipt::env::integer("MIPT_ENTROPY_S1_MAX_LA", 0, 0, 62);
+    if (cap <= 0)
+    {
+        return max_kept;
+    }
+    return std::min(max_kept, static_cast<int>(cap));
+}
+
 inline std::vector<Complex> partial_trace_trailing_mode_col_major(
     const std::vector<Complex> &rho_col_major,
     std::size_t input_dim)
@@ -377,12 +448,14 @@ inline bool entropy_cuda_enabled()
     return mipt::env::boolean("MIPT_ENTROPY_CUDA", true);
 }
 
-inline bool cuda_hierarchical_translation_means(cudaq::state &state,
-                                         int n,
-                                         int min_kept,
-                                         int max_kept,
-                                         bool fermionic_trace,
-                                         std::vector<double> &means)
+inline bool cuda_hierarchical_translation_entropies(cudaq::state &state,
+                                            int n,
+                                            int min_kept,
+                                            int max_kept,
+                                            bool fermionic_trace,
+                                            int max_s1_kept,
+                                            std::vector<double> &s1_means,
+                                            std::vector<double> &s2_means)
 {
 #ifdef MIPT_ENABLE_CUDA_RHO
     if (!entropy_cuda_enabled() || !state.is_on_gpu() || n >= 31)
@@ -401,23 +474,30 @@ inline bool cuda_hierarchical_translation_means(cudaq::state &state,
         return false;
     }
 
-    means.assign(static_cast<std::size_t>(max_kept - min_kept + 1), 0.0);
+    const std::size_t size_count =
+        static_cast<std::size_t>(max_kept - min_kept + 1);
+    s2_means.assign(size_count, 0.0);
+    const bool want_s1 = max_s1_kept >= min_kept;
+    s1_means.assign(size_count, std::numeric_limits<double>::quiet_NaN());
+
     int status = 0;
     if (state.get_precision() == cudaq::SimulationState::precision::fp64)
     {
-        status = mipt_cuda_cyclic_s2_f64(
+        status = mipt_cuda_cyclic_entropies_f64(
             tensor.data, n, min_kept, max_kept,
-            fermionic_trace ? 1 : 0, means.data());
+            fermionic_trace ? 1 : 0, max_s1_kept,
+            want_s1 ? s1_means.data() : nullptr, s2_means.data());
     }
     else
     {
-        status = mipt_cuda_cyclic_s2_f32(
+        status = mipt_cuda_cyclic_entropies_f32(
             tensor.data, n, min_kept, max_kept,
-            fermionic_trace ? 1 : 0, means.data());
+            fermionic_trace ? 1 : 0, max_s1_kept,
+            want_s1 ? s1_means.data() : nullptr, s2_means.data());
     }
     if (status != 0)
     {
-        const char *detail = mipt_cuda_cyclic_s2_last_error();
+        const char *detail = mipt_cuda_cyclic_entropies_last_error();
         throw std::runtime_error(
             "CUDA hierarchical entropy evaluation failed (status=" +
             std::to_string(status) + "): " +
@@ -430,20 +510,33 @@ inline bool cuda_hierarchical_translation_means(cudaq::state &state,
     (void)min_kept;
     (void)max_kept;
     (void)fermionic_trace;
-    (void)means;
+    (void)max_s1_kept;
+    (void)s1_means;
+    (void)s2_means;
     return false;
 #endif
 }
 
-inline std::vector<double> host_hierarchical_translation_means(
+inline void host_hierarchical_translation_entropies(
     const std::vector<Complex> &psi,
     int n,
     int min_kept,
     int max_kept,
-    bool fermionic_trace)
+    bool fermionic_trace,
+    int max_s1_kept,
+    std::vector<double> &s1_means,
+    std::vector<double> &s2_means)
 {
-    std::vector<double> sums(
-        static_cast<std::size_t>(max_kept - min_kept + 1), 0.0);
+    const std::size_t size_count =
+        static_cast<std::size_t>(max_kept - min_kept + 1);
+    s2_means.assign(size_count, 0.0);
+    s1_means.assign(size_count, 0.0);
+    std::vector<unsigned char> has_s1(size_count, 0);
+
+    // One LAPACK workspace for the whole trajectory: it is re-queried only when
+    // the matrix dimension changes, so reusing it across translations of the
+    // same size costs nothing.
+    static thread_local mipt::tmi::EntropyWorkspace eigen_workspace;
 
     for (int start = 0; start < n; ++start)
     {
@@ -456,8 +549,13 @@ inline std::vector<double> host_hierarchical_translation_means(
 
         for (int kept = max_kept; kept >= min_kept; --kept)
         {
-            sums[static_cast<std::size_t>(kept - min_kept)] +=
-                second_renyi_entropy_nats(rho, dim);
+            const std::size_t index = static_cast<std::size_t>(kept - min_kept);
+            s2_means[index] += second_renyi_entropy_nats(rho, dim);
+            if (kept <= max_s1_kept)
+            {
+                s1_means[index] += von_neumann_entropy_nats(rho, dim, eigen_workspace);
+                has_s1[index] = 1;
+            }
             if (kept > min_kept)
             {
                 rho = partial_trace_trailing_mode_col_major(rho, dim);
@@ -466,11 +564,13 @@ inline std::vector<double> host_hierarchical_translation_means(
         }
     }
 
-    for (double &value : sums)
+    for (std::size_t index = 0; index < size_count; ++index)
     {
-        value /= static_cast<double>(n);
+        s2_means[index] /= static_cast<double>(n);
+        s1_means[index] = has_s1[index]
+                              ? s1_means[index] / static_cast<double>(n)
+                              : std::numeric_limits<double>::quiet_NaN();
     }
-    return sums;
 }
 
 
@@ -482,7 +582,8 @@ inline void write_results(const std::string &path,
                    double p,
                    int requested_realizations,
                    CircuitType circ_type,
-                   const std::vector<RunningStats> &stats)
+                   const std::vector<RunningStats> &s1_stats,
+                   const std::vector<RunningStats> &s2_stats)
 {
     std::ofstream csv(path, std::ios::out | std::ios::trunc);
     if (!csv)
@@ -491,7 +592,8 @@ inline void write_results(const std::string &path,
     }
     csv << std::setprecision(17);
     csv << "N,periods,p,requested_realizations,completed_realizations,circ_type,"
-           "circuit_name,fermionic_trace,L_A,x,ln_x,S2_mean,S2_stddev,S2_stderr,"
+           "circuit_name,fermionic_trace,L_A,x,ln_x,"
+           "S1_mean,S1_stddev,S1_stderr,S2_mean,S2_stddev,S2_stderr,"
            "subsystems_per_realization,total_subsystems\n";
 
     constexpr double pi = 3.141592653589793238462643383279502884;
@@ -502,23 +604,31 @@ inline void write_results(const std::string &path,
         const double x = (static_cast<double>(n) / pi) *
                          std::sin(pi * static_cast<double>(kept) /
                                   static_cast<double>(n));
-        const RunningStats &s = stats[static_cast<std::size_t>(kept)];
+        const RunningStats &s1 = s1_stats[static_cast<std::size_t>(kept)];
+        const RunningStats &s2 = s2_stats[static_cast<std::size_t>(kept)];
+        // A block whose von Neumann entropy was skipped has no samples, so its
+        // columns are NaN rather than the 0 an empty accumulator would report.
+        const bool has_s1 = s1.count > 0;
+        const double nan_value = std::numeric_limits<double>::quiet_NaN();
         csv << n << ','
             << periods << ','
             << p << ','
             << requested_realizations << ','
-            << s.count << ','
+            << s2.count << ','
             << static_cast<int>(circ_type) << ','
             << csv_quote(circuit_type_name(circ_type)) << ','
             << (fermionic_trace ? 1 : 0) << ','
             << kept << ','
             << x << ','
             << std::log(x) << ','
-            << s.mean << ','
-            << s.sample_stddev() << ','
-            << s.standard_error() << ','
+            << (has_s1 ? s1.mean : nan_value) << ','
+            << (has_s1 ? s1.sample_stddev() : nan_value) << ','
+            << (has_s1 ? s1.standard_error() : nan_value) << ','
+            << s2.mean << ','
+            << s2.sample_stddev() << ','
+            << s2.standard_error() << ','
             << n << ','
-            << static_cast<std::uint64_t>(n) * s.count << '\n';
+            << static_cast<std::uint64_t>(n) * s2.count << '\n';
     }
     csv.flush();
     if (!csv)
@@ -540,13 +650,24 @@ inline void print_usage(const char *argv0)
     print_circuit_type_help(std::cout, "                 ");
     std::cout
         << "  output_csv   one row per L_A=2,...,floor(N/2)\n\n"
-        << "The CSV directly provides ln_x and S2_mean for the entropy-versus-ln(x) plot.\n"
-        << "S2=-ln Tr(rho_A^2) uses natural logarithms. Fermionic partial tracing is\n"
-        << "used automatically for circ_type 2 and 3; circ_type 4 uses the qubit trace. Smaller-block RDMs are obtained\n"
-        << "by recursively tracing the largest L_A=floor(N/2) RDM.\n\n"
+        << "The CSV provides ln_x together with S1_mean and S2_mean for the\n"
+        << "entropy-versus-ln(x) plot. Both use natural logarithms:\n"
+        << "  S1 = -Tr(rho_A ln rho_A)   von Neumann, from the full spectrum\n"
+        << "  S2 = -ln Tr(rho_A^2)       second Renyi, from the purity\n"
+        << "Fermionic partial tracing is used automatically for circ_type 2 and 3;\n"
+        << "circ_type 4 uses the qubit trace. Smaller-block RDMs are obtained by\n"
+        << "recursively tracing the largest L_A=floor(N/2) RDM.\n\n"
+        << "S1 costs one dense eigensolve per (L_A, translation) and so scales as\n"
+        << "(2^L_A)^3, against a single O((2^L_A)^2) pass for S2. Skipped blocks\n"
+        << "report NaN in the S1 columns, never 0.\n"
+        << "  MIPT_ENTROPY_S1=0            report S2 only\n"
+        << "  MIPT_ENTROPY_S1_MAX_LA=k     compute S1 only for L_A<=k (0 = no cap)\n\n"
         << "GPU controls (GPU=1 CUDA_RHO=1 builds):\n"
         << "  MIPT_ENTROPY_CUDA=0          disable CUDA entropy evaluation\n"
-        << "  MIPT_ENTROPY_CUDA_MAX_MB=512 cap temporary CUDA workspace in MiB\n";
+        << "  MIPT_ENTROPY_CUDA_MAX_MB=512 cap temporary CUDA workspace in MiB\n"
+        << "  MIPT_ENTROPY_HEEVD_MAX_ROWS=512\n"
+        << "                               largest RDM cuSOLVER heevd is trusted with\n"
+        << "                               for S1; larger blocks use the slower gesvd\n";
 }
 
 } // namespace mipt::entropy

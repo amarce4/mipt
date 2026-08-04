@@ -1,5 +1,18 @@
 #pragma once
 
+// Site-resolved entanglement measures for dist_scaling.exe.
+//
+// Two-party metrics act on one 4x4 RDM; three-party metrics act on one 8x8.
+// Both take the interleaved row-major complex buffer the reduction kernels
+// write, and both are expressed in *bits* -- dist_scaling has always used
+// log2 for its mutual information, and the k=3 additions follow it rather
+// than the nats convention of the probe executables. The CSV writer states
+// the unit explicitly so no reader has to remember which is which.
+//
+// Nothing here needs CUDA-Q, MOSEK, or a state vector, which is what lets
+// `make test-dist` check it on the host.
+
+#include "mipt/small_rdm.hpp"
 #include "mipt/util/geometry.hpp"
 #include "mipt/util/spectral.hpp"
 
@@ -21,6 +34,19 @@ struct PairMetrics
 {
     double mi = 0.0;
     double mn = 0.0;
+};
+
+// The three-party analogue. `tmi` is the tripartite information
+// I_3 = S_A + S_B + S_C - S_AB - S_AC - S_BC + S_ABC, which is the same
+// combination three-probe mode 4 reports; `average_mi` is the mean of the
+// three pairwise mutual informations, and the purities are diagnostics that
+// say whether a small |I_3| means "weakly correlated" or "nearly pure".
+struct TripleMetrics
+{
+    double tmi = 0.0;
+    double average_mi = 0.0;
+    double joint_purity = 0.0;
+    double mean_single_purity = 0.0;
 };
 
 namespace detail
@@ -187,6 +213,98 @@ inline double negativity(const Matrix4 &rho, bool fermionic)
 }
 } // namespace detail
 
+// Trace-normalized, Hermitized copy of an interleaved row-major complex block.
+//
+// The reduction kernels accumulate |psi|^2 in the working precision, so an
+// fp32 trajectory arrives with a trace that is 1 only to about 1e-6 and with
+// a small anti-Hermitian part. Both are removed once here so that every
+// downstream consumer -- entropies, purities, and the negativity prefilter
+// that decides whether an SDP runs at all -- sees the same matrix.
+inline ancilla::SmallRdm normalized_small_rdm(const double *rho_ri, int dimension)
+{
+    if (rho_ri == nullptr || dimension < 2)
+    {
+        throw std::invalid_argument("Invalid interleaved density-matrix block.");
+    }
+
+    double trace = 0.0;
+    for (int i = 0; i < dimension; ++i)
+    {
+        trace += rho_ri[2 * static_cast<std::size_t>(i * dimension + i)];
+    }
+    if (!(trace > 0.0) || !std::isfinite(trace))
+    {
+        throw std::runtime_error("Reduced density matrix has a non-positive or non-finite trace.");
+    }
+
+    ancilla::SmallRdm rho(dimension);
+    for (int row = 0; row < dimension; ++row)
+    {
+        for (int col = row; col < dimension; ++col)
+        {
+            const std::size_t rc = 2u * static_cast<std::size_t>(row * dimension + col);
+            const std::size_t cr = 2u * static_cast<std::size_t>(col * dimension + row);
+            const Complex a(rho_ri[rc], rho_ri[rc + 1]);
+            const Complex b(rho_ri[cr], rho_ri[cr + 1]);
+            Complex value = 0.5 * (a + std::conj(b)) / trace;
+            if (row == col)
+            {
+                value = Complex(value.real(), 0.0);
+            }
+            rho(row, col) = value;
+            rho(col, row) = std::conj(value);
+        }
+    }
+    return rho;
+}
+
+namespace detail
+{
+inline double bits_from_nats(double nats)
+{
+    static const double inverse_ln2 = 1.0 / std::log(2.0);
+    return nats * inverse_ln2;
+}
+} // namespace detail
+
+// Three-party information measures for one 8x8 site block.
+//
+// `fermionic` selects the Jordan-Wigner reorder signs inside the block. It
+// must match the trace that produced `rho_ri`: the caller hands in the
+// ordinary RDM with `fermionic=false` and the fermionic RDM with `true`,
+// because the sub-traces taken here are the continuation of the same
+// convention, not an independent choice.
+inline TripleMetrics three_party_metrics(const double *rho_ri, bool fermionic)
+{
+    const ancilla::SmallRdm rho = normalized_small_rdm(rho_ri, 8);
+
+    std::array<ancilla::SmallRdm, 8> reduced{ancilla::SmallRdm(1), ancilla::SmallRdm(2), ancilla::SmallRdm(2),
+                                             ancilla::SmallRdm(4), ancilla::SmallRdm(2), ancilla::SmallRdm(4),
+                                             ancilla::SmallRdm(4), ancilla::SmallRdm(8)};
+    std::array<double, 8> entropies{};
+    for (unsigned mask = 1; mask < 8; ++mask)
+    {
+        reduced[mask] = ancilla::partial_trace_fixed(rho, 3, mask, fermionic);
+        entropies[mask] = detail::bits_from_nats(ancilla::entropy_from_small_rdm(reduced[mask]));
+    }
+
+    const double i_ab = entropies[1] + entropies[2] - entropies[3];
+    const double i_ac = entropies[1] + entropies[4] - entropies[5];
+    const double i_bc = entropies[2] + entropies[4] - entropies[6];
+    const double tmi = entropies[1] + entropies[2] + entropies[4] - entropies[3] - entropies[5] - entropies[6] +
+                       entropies[7];
+    if (!std::isfinite(tmi) || !std::isfinite(i_ab) || !std::isfinite(i_ac) || !std::isfinite(i_bc))
+    {
+        throw std::runtime_error("Three-party information calculation produced a non-finite value.");
+    }
+
+    const double mean_single_purity = (ancilla::purity_from_small_rdm(reduced[1]) +
+                                       ancilla::purity_from_small_rdm(reduced[2]) +
+                                       ancilla::purity_from_small_rdm(reduced[4])) /
+                                      3.0;
+    return {tmi, (i_ab + i_ac + i_bc) / 3.0, ancilla::purity_from_small_rdm(reduced[7]), mean_single_purity};
+}
+
 inline PairMetrics two_party_metrics(const double *rho_ri, bool fermionic)
 {
     const Matrix4 rho = detail::normalized_hermitian_rho(rho_ri);
@@ -209,6 +327,7 @@ inline PairMetrics two_party_metrics(const double *rho_ri, bool fermionic)
 }
 
 using util::chord_length;
+using util::periodic_distance;
 
 inline double two_party_geometric_chord_distance(int n, int site_a, int site_b)
 {
@@ -219,5 +338,40 @@ inline double two_party_geometric_chord_distance(int n, int site_a, int site_b)
     const int forward = std::abs(site_b - site_a);
     const int backward = n - forward;
     return std::sqrt(chord_length(n, forward) * chord_length(n, backward));
+}
+
+// The k=3 analogue: the geometric mean of the triangle's three chord lengths.
+//
+// This is the same effective distance three-probe mode 4 writes as
+// `chord_geometric_mean`, so a triangle measured by either protocol lands on
+// the same abscissa. Note that the two-party version above is the geometric
+// mean over the ring's *two arcs* rather than over pairs; on a periodic chain
+// l(s) = l(N-s), so it reduces to the single chord and the two definitions
+// agree on what "distance" means.
+inline double triangle_chord_geometric_mean(int n, const std::array<int, 3> &separations)
+{
+    double product = 1.0;
+    for (int separation : separations)
+    {
+        product *= chord_length(n, separation);
+    }
+    return std::cbrt(product);
+}
+
+inline std::array<int, 3> triangle_separations(int n, int site_a, int site_b, int site_c)
+{
+    if (site_a == site_b || site_a == site_c || site_b == site_c)
+    {
+        throw std::invalid_argument("Invalid three-site triangle: sites must be distinct.");
+    }
+    std::array<int, 3> separations{periodic_distance(site_a, site_b, n), periodic_distance(site_a, site_c, n),
+                                   periodic_distance(site_b, site_c, n)};
+    std::sort(separations.begin(), separations.end());
+    return separations;
+}
+
+inline double three_party_geometric_chord_distance(int n, int site_a, int site_b, int site_c)
+{
+    return triangle_chord_geometric_mean(n, triangle_separations(n, site_a, site_b, site_c));
 }
 } // namespace mipt::dist

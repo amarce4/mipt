@@ -6,7 +6,7 @@
 // the p and t grids, where the references attach, which encoding is used, and
 // the generated output path. The runner then has no argv to interpret.
 //
-// The five protocols share one executable because they share one circuit
+// The six protocols share one executable because they share one circuit
 // evolution and one reference-attachment mechanism; only the schedule of
 // "advance, attach, measure" differs between them.
 
@@ -47,14 +47,27 @@ struct ProbeRunConfig
     int t0 = 0;
     int t_eq = 0;
     double triangle_balance_cutoff = 0.0;
+    int x_max = -1;
 
     // Derived once the grids are known.
     bool parity_encoding = false;
     std::vector<int> sites;
     std::vector<ProbeGeometry> geometries;
+    ReceiverGrid receivers;
+    StaggerGrid staggers;
+    // Whether the Holevo quantity is maximized over all reference measurements
+    // (giving J and the discord) rather than only the three Pauli axes.
+    bool optimize_classical = false;
     int t_max = 0;
     std::string output;
+    // How many independent trajectory groups one p point runs. Mode 4 samples
+    // one geometry per trajectory, so its groups multiply the workload; every
+    // other mode leaves this at one.
     std::uint64_t distance_count = 1;
+    // How many accumulator bins each readout time carries. This equals
+    // distance_count for mode 4, but mode 5 measures its whole (width,
+    // distance) grid inside a single trajectory, so there the two differ.
+    std::uint64_t bin_count = 1;
     bool prefetch = false;
     std::uint64_t total_trajectories = 0;
 };
@@ -112,6 +125,46 @@ inline void print_help(const char *program)
                  "tau=0..tau_max.\n"
               << "     B_min is optional for probes=3 and defaults to "
                  "MIPT_PROBED_TRIANGLE_BALANCE or 0.5.\n\n"
+              << "  5  Information-front velocities.\n"
+              << "     probes=1: [p] [tau_max] [x_max]\n"
+              << "     Equilibrate to t_eq=4N, reset a random site x0 and "
+                 "Bell-entangle it\n"
+              << "     with the reference, then resume and read out the receiver "
+                 "blocks\n"
+              << "     B_w(x) of w consecutive system sites whose innermost site lies "
+                 "at arc\n"
+              << "     distance x from x0, averaging the two directions. Records the\n"
+              << "     classical (Holevo) information C_X, C_Y, C_Z reaching the "
+                 "block,\n"
+              << "     I(R:B), negativity, logarithmic negativity, coherent "
+                 "information, and\n"
+              << "     the fraction of trajectories with nonzero negativity, for every "
+                 "(w, x,\n"
+              << "     tau). x_max is optional and defaults to N/2; times past the "
+                 "point where\n"
+              << "     a front wraps the ring should be discarded in analysis.\n"
+              << "     probes=2: [p] [s_max] [r_max] [delta_max]\n"
+              << "     Staggered insertion. Equilibrate to t_eq=2N, Bell-entangle a "
+                 "random\n"
+              << "     site x0 with ancilla A, evolve `delta` further timesteps, then\n"
+              << "     Bell-entangle x0+r with ancilla B and record rho_AB for elapsed "
+                 "times\n"
+              << "     s=0..s_max. Both ancillas are isolated, so system unitaries "
+                 "alone\n"
+              << "     cannot correlate them and every A-B correlation is "
+                 "measurement-\n"
+              << "     mediated. Records I(A:B), the optimized classical correlation "
+                 "J(A->B),\n"
+              << "     the discord D=I-J, negativity, log-negativity, P(N>0), "
+                 "E[N|N>0], and\n"
+              << "     the survival entropies S_A and S_B over the whole (r, delta, s) "
+                 "grid.\n"
+              << "     r_max defaults to max(2,N/4) and delta_max to 2*r_max. Each "
+                 "(r, delta)\n"
+              << "     is an independent trajectory group, so the workload is "
+                 "realizations\n"
+              << "     times the grid size. The ancillas are never evolved or "
+                 "measured.\n\n"
               << "All entropies use natural logarithms. Four-probe I2/I3 are averages "
                  "over\n"
               << "the six pairs/four triplets; I4 is inclusion--exclusion "
@@ -130,7 +183,16 @@ inline void print_help(const char *program)
                  "point.\n"
         << "  MIPT_PROBED_PROGRESS=0       Disable progress output.\n"
         << "  MIPT_PROBED_PROGRESS_MS=500  Progress-update interval.\n"
-              << "  MIPT_PROBED_T_EQ=2N          Mode-4 equilibration timesteps.\n"
+              << "  MIPT_PROBED_T_EQ=2N          Mode-4 equilibration timesteps "
+                 "(one-probe mode 5: 4N).\n"
+              << "  MIPT_PROBED_RECEIVER_WIDTHS=1,2,3  One-probe mode-5 receiver-block "
+                 "widths.\n"
+              << "  MIPT_PROBED_R_MIN=1          Two-probe mode-5 smallest probe "
+                 "separation.\n"
+              << "  MIPT_PROBED_DISCORD          Optimize the Holevo quantity over all "
+                 "reference\n"
+              << "                               measurements (default: on for "
+                 "two-probe mode 5).\n"
               << "  MIPT_PROBED_TRIANGLE_BALANCE=0.5  Minimum three-probe CFT chord "
                  "balance.\n"
               << "  MIPT_PROBED_GMN_BATCH_RECORDS=64  RDMs per deferred SDP batch.\n"
@@ -170,9 +232,9 @@ inline void parse_common_arguments(int argc, char *argv[], ProbeRunConfig &confi
     {
         throw std::invalid_argument("N+probes must be below 63.");
     }
-    if (config.mode < 0 || config.mode > 4)
+    if (config.mode < 0 || config.mode > 5)
     {
-        throw std::invalid_argument("probe_mode must be 0, 1, 2, 3, or 4.");
+        throw std::invalid_argument("probe_mode must be 0, 1, 2, 3, 4, or 5.");
     }
     if (env::boolean("MIPT_NATIVE_MPS", false) || env::boolean("MIPT_NATIVE_TEBD", false))
     {
@@ -182,6 +244,11 @@ inline void parse_common_arguments(int argc, char *argv[], ProbeRunConfig &confi
     if (config.probes == 3 && config.mode != 4)
     {
         throw std::invalid_argument("Three probes are currently supported only in mode 4.");
+    }
+    if (config.mode == 5 && config.probes != 1 && config.probes != 2)
+    {
+        throw std::invalid_argument("Mode 5 requires probes=1 (receiver blocks are observed system "
+                                    "sites, not additional probes) or probes=2 (staggered insertion).");
     }
 }
 
@@ -332,6 +399,85 @@ inline void parse_mode4(int argc, char *argv[], ProbeRunConfig &config)
     config.t0 = config.t_eq;
 }
 
+// Mode 5, two probes: staggered insertion. A goes in at (x0, t_eq) and B at
+// (x0+r, t_eq+delta); the readout times are the elapsed s after B.
+inline void parse_mode5_stagger(int argc, char *argv[], ProbeRunConfig &config)
+{
+    if (argc < 8 || argc > 10)
+    {
+        throw std::invalid_argument("Two-probe mode 5 requires [p] [s_max], with optional "
+                                    "[r_max] and [delta_max].");
+    }
+    const double p = std::stod(argv[6]);
+    const int s_max = std::stoi(argv[7]);
+    if (p < 0.0 || p > 1.0 || s_max < 0)
+    {
+        throw std::invalid_argument("Two-probe mode 5 requires p in [0,1] and s_max >= 0.");
+    }
+    const int r_max = argc >= 9 ? std::stoi(argv[8]) : -1;
+    const int delta_max = argc == 10 ? std::stoi(argv[9]) : -1;
+    if (argc >= 9 && r_max < 1)
+    {
+        throw std::invalid_argument("Two-probe mode 5 requires r_max >= 1.");
+    }
+    if (argc == 10 && delta_max < 0)
+    {
+        throw std::invalid_argument("Two-probe mode 5 requires delta_max >= 0.");
+    }
+    config.staggers = make_stagger_grid(config.n, r_max, delta_max);
+
+    // The protocol's t_0 = 2L, with 4L available as an equilibration control.
+    const int headroom = config.staggers.delta_max + s_max;
+    config.t_eq = static_cast<int>(
+        env::integer("MIPT_PROBED_T_EQ", 2 * config.n, 0, std::numeric_limits<int>::max() - headroom));
+    config.p_values = {p};
+    config.times.reserve(static_cast<std::size_t>(s_max + 1));
+    for (int s = 0; s <= s_max; ++s)
+    {
+        config.times.push_back(s);
+    }
+    config.t0 = config.t_eq;
+}
+
+// Mode 5: one probe injected at a random site after a long equilibration, then
+// followed outward across the receiver-block grid.
+inline void parse_mode5(int argc, char *argv[], ProbeRunConfig &config)
+{
+    if (config.probes == 2)
+    {
+        parse_mode5_stagger(argc, argv, config);
+        return;
+    }
+    if (argc != 8 && argc != 9)
+    {
+        throw std::invalid_argument("Mode 5 requires [p] [tau_max], with an optional [x_max].");
+    }
+    const double p = std::stod(argv[6]);
+    const int tau_max = std::stoi(argv[7]);
+    if (p < 0.0 || p > 1.0 || tau_max < 0 || tau_max > std::numeric_limits<int>::max() - 4 * config.n)
+    {
+        throw std::invalid_argument("Mode 5 requires p in [0,1] and a nonnegative tau_max that leaves "
+                                    "room for the default t_eq=4N.");
+    }
+    config.x_max = argc == 9 ? std::stoi(argv[8]) : -1;
+    if (argc == 9 && config.x_max < 1)
+    {
+        throw std::invalid_argument("Mode 5 requires x_max >= 1.");
+    }
+
+    // The protocol equilibrates for 4L, twice the mode-4 default: the front has
+    // to start from a steady state, not from the encoding transient.
+    config.t_eq = static_cast<int>(
+        env::integer("MIPT_PROBED_T_EQ", 4 * config.n, 0, std::numeric_limits<int>::max() - tau_max));
+    config.p_values = {p};
+    config.times.reserve(static_cast<std::size_t>(tau_max + 1));
+    for (int tau = 0; tau <= tau_max; ++tau)
+    {
+        config.times.push_back(tau);
+    }
+    config.t0 = config.t_eq;
+}
+
 // Probe placement, encoding choice, output path, and workload size.
 inline void resolve_derived_settings(ProbeRunConfig &config)
 {
@@ -339,24 +485,39 @@ inline void resolve_derived_settings(ProbeRunConfig &config)
     config.parity_encoding = config.mode == 1 && config.probes == 1 &&
                              preserves_computational_parity(config.type) &&
                              env::boolean("MIPT_PROBED_PARITY_ENCODING", true);
-    config.sites = config.mode == 4 ? std::vector<int>{} : probe_sites(config.probes, n, config.mode, config.delta_x);
+    const bool fronts = config.mode == 5 && config.probes == 1;
+    const bool stagger = config.mode == 5 && config.probes == 2;
+    const bool random_origin = config.mode == 4 || config.mode == 5;
+    config.sites = random_origin ? std::vector<int>{} : probe_sites(config.probes, n, config.mode, config.delta_x);
     config.geometries = config.mode == 4 && config.probes == 3
                             ? enumerate_three_probe_geometries(n, config.triangle_balance_cutoff)
                             : std::vector<ProbeGeometry>{};
-    config.t_max = config.mode == 3   ? 12 * n + config.delta_t
-                   : config.mode == 4 ? config.t_eq + config.times.back()
-                                      : config.times.back();
+    config.receivers = fronts ? make_receiver_grid(n, config.x_max) : ReceiverGrid{};
+    config.optimize_classical = env::boolean("MIPT_PROBED_DISCORD", stagger);
+    // The staggered protocol runs its readout window after the *second*
+    // insertion, so its deepest circuit is t_eq + delta_max + s_max.
+    config.t_max = config.mode == 3 ? 12 * n + config.delta_t
+                   : stagger        ? config.t_eq + config.staggers.delta_max + config.times.back()
+                   : random_origin  ? config.t_eq + config.times.back()
+                                    : config.times.back();
 
-    const std::string generated_output =
-        default_output_name(config.probes, n, config.realizations, config.type, config.mode, config.p_values,
-                            config.times, config.delta_x, config.delta_t, config.t_eq,
-                            config.triangle_balance_cutoff);
+    const std::string generated_output = default_output_name(
+        config.probes, n, config.realizations, config.type, config.mode, config.p_values, config.times, config.delta_x,
+        config.delta_t, config.t_eq, config.triangle_balance_cutoff, config.receivers.x_max, config.staggers.r_min,
+        config.staggers.r_max, config.staggers.delta_max);
     config.output = env::text("MIPT_PROBED_INTERNAL_OUTPUT", generated_output.c_str());
 
-    config.distance_count = config.mode == 4 ? config.probes == 2
-                                                   ? static_cast<std::uint64_t>(n / 2)
-                                                   : static_cast<std::uint64_t>(config.geometries.size())
-                                             : 1u;
+    config.distance_count = config.mode == 4  ? config.probes == 2
+                                                    ? static_cast<std::uint64_t>(n / 2)
+                                                    : static_cast<std::uint64_t>(config.geometries.size())
+                            : stagger ? static_cast<std::uint64_t>(config.staggers.bin_count())
+                                      : 1u;
+    // One-probe mode 5 sweeps its whole grid inside every trajectory, so the
+    // grid sizes the accumulators without multiplying the trajectory count.
+    // Every other mode, the staggered protocol included, samples one bin per
+    // trajectory and the two counts coincide.
+    config.bin_count =
+        fronts ? static_cast<std::uint64_t>(config.receivers.bin_count()) : config.distance_count;
     config.prefetch = env::boolean("MIPT_PROBED_PREFETCH", true) &&
                       static_cast<std::uint64_t>(config.realizations) * config.distance_count > 1 && config.t_max > 0;
     config.total_trajectories = static_cast<std::uint64_t>(config.p_values.size()) *
@@ -386,8 +547,11 @@ inline ProbeRunConfig parse_probe_arguments(int argc, char *argv[])
     case 3:
         detail::parse_mode3(argc, argv, config);
         break;
-    default:
+    case 4:
         detail::parse_mode4(argc, argv, config);
+        break;
+    default:
+        detail::parse_mode5(argc, argv, config);
         break;
     }
 
@@ -418,6 +582,26 @@ inline std::string describe_run(const ProbeRunConfig &config)
         text += ", t_eq=" + std::to_string(config.t_eq) + ", tau=0.." + std::to_string(config.times.back()) +
                 (config.probes == 2 ? ", distances=1.." + std::to_string(n / 2)
                                     : ", triangle_geometries=" + std::to_string(config.geometries.size()));
+    }
+    else if (mode == 5 && config.probes == 2)
+    {
+        text += ", t_eq=" + std::to_string(config.t_eq) + ", s=0.." + std::to_string(config.times.back()) +
+                ", r=" + std::to_string(config.staggers.r_min) + ".." + std::to_string(config.staggers.r_max) +
+                ", delta=0.." + std::to_string(config.staggers.delta_max) +
+                ", bins=" + std::to_string(config.bin_count) + ", max_depth=" + std::to_string(config.t_max) +
+                ", classical_correlation=" + (config.optimize_classical ? "optimized_J" : "pauli_axes_only");
+    }
+    else if (mode == 5)
+    {
+        std::string widths;
+        for (const int width : config.receivers.widths)
+        {
+            widths += (widths.empty() ? "" : "/") + std::to_string(width);
+        }
+        text += ", t_eq=" + std::to_string(config.t_eq) + ", tau=0.." + std::to_string(config.times.back()) +
+                ", receiver_widths=" + widths + ", x=0.." + std::to_string(config.receivers.x_max) +
+                ", bins=" + std::to_string(config.bin_count) +
+                ", classical_correlation=" + (config.optimize_classical ? "optimized_J" : "pauli_axes_only");
     }
     else if (config.times.size() == 1)
     {

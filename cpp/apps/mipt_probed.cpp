@@ -4,9 +4,10 @@
 // include/mipt/probed/:
 //
 //   config.hpp      argument parsing into one ProbeRunConfig
-//   geometry.hpp    where the references attach
+//   geometry.hpp    where the references attach, and the mode-5 receiver grid
 //   kernels.hpp     state preparation and reference readout
-//   runner.hpp      the trajectory loop for all five modes
+//   front.hpp       mode-5 receiver-block readout
+//   runner.hpp      the trajectory loop for all six modes
 //   sdp.hpp         deferred GMN/fGMN batches for three probes
 //   output.hpp      per-mode CSV schemas
 //   checkpoint.hpp  per-p subprocess isolation and resume

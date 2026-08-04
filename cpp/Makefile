@@ -136,7 +136,9 @@ ifeq ($(CUDA_RHO),1)
   NVQXXFLAGS_COMMON += -DMIPT_ENABLE_CUDA_RHO
   MIPT_CUDA_LIBS := $(CUDA_LDFLAGS) -lcudart
   SIM_TMI_CUDA_LIBS := -lcusolver -lcublas
-  ENTROPY_CUDA_LIBS := -lcublas
+  # cuSOLVER is for the von Neumann (S1) spectrum; the Renyi-2 path needs only
+  # the cuBLAS batched GEMM.
+  ENTROPY_CUDA_LIBS := -lcublas -lcusolver
 endif
 
 # Direct cuStateVec circuit engine (mipt/cusv). Replaces CUDA-Q's gate-by-gate
@@ -185,6 +187,7 @@ EXP_VALS_BIN := $(HOST_BUILD)/exp_vals.exe
 CORE_TEST_BIN := $(HOST_BUILD)/core_tests
 DIST_TEST_BIN := $(HOST_BUILD)/dist_metrics_tests
 SPECTRAL_TEST_BIN := $(HOST_BUILD)/spectral_tests
+FRONT_TEST_BIN := $(HOST_BUILD)/front_metrics_tests
 
 MIPT_OBJS := $(BUILD)/mipt.o
 MIPT_PROBED_OBJS := $(BUILD)/mipt_probed.o
@@ -201,6 +204,7 @@ EXP_VALS_OBJS := $(HOST_BUILD)/exp_vals_main.o $(HOST_BUILD)/exp_vals_analysis.o
 CORE_TEST_OBJS := $(HOST_BUILD)/core_tests.o
 DIST_TEST_OBJS := $(HOST_BUILD)/dist_metrics_tests.o
 SPECTRAL_TEST_OBJS := $(HOST_BUILD)/spectral_tests.o
+FRONT_TEST_OBJS := $(HOST_BUILD)/front_metrics_tests.o
 
 # Every executable that builds circuit states now goes through mipt/cusv.
 ifeq ($(CUSV),1)
@@ -217,14 +221,15 @@ ifeq ($(CUDA_RHO),1)
   MIPT_PROBED_OBJS += $(BUILD)/ancilla_rdm.o
   FREE_ENERGY_OBJS += $(BUILD)/free_energy_measure.o $(BUILD)/tmi_cuda_svd.o
   SIM_TMI_OBJS += $(BUILD)/rho_reduce.o $(BUILD)/tmi_cuda_svd.o $(BUILD)/tmi_cuda_rdm.o
-  DIST_SCALING_OBJS += $(BUILD)/rho2_reduce.o
+  # k=2 uses the batched two-site reduction, k=3 the batched three-site one.
+  DIST_SCALING_OBJS += $(BUILD)/rho2_reduce.o $(BUILD)/rho_reduce.o
   ENTROPY_OBJS += $(BUILD)/rho_reduce.o $(BUILD)/entropy_cuda.o
 endif
 
 ALL_OBJS := $(MIPT_OBJS) $(MIPT_PROBED_OBJS) $(FREE_ENERGY_OBJS) \
   $(SIM_TMI_OBJS) $(DIST_SCALING_OBJS) $(ENTROPY_OBJS) $(GMN_OBJS) $(FGMN_OBJS) \
   $(RING_OBJS) $(EXP_VALS_OBJS) $(CORE_TEST_OBJS) $(DIST_TEST_OBJS) \
-  $(SPECTRAL_TEST_OBJS) \
+  $(SPECTRAL_TEST_OBJS) $(FRONT_TEST_OBJS) \
   $(MIPT_PROBED_FGMN_PIC_OBJ)
 DEPS := $(ALL_OBJS:.o=.d)
 
@@ -239,7 +244,7 @@ MIPT_HEADERS := $(shell find include -name '*.hpp' 2>/dev/null)
 # into a binary. (Same reasoning as MIPT_HEADERS above, which covers nvq++.)
 MIPT_CUDA_HEADERS := $(shell find include -name '*.cuh' 2>/dev/null) $(MIPT_HEADERS)
 
-.PHONY: all simulation analysis clean cpu gpu print-config format test-core test-dist \
+.PHONY: all simulation analysis clean cpu gpu print-config format test-core test-dist test-front \
   test-spectral test-rdm-gram test-cusv test-cusv-gates bench-cusv \
   mipt.exe mipt_probed.exe free_energy.exe sim_tmi.exe dist_scaling.exe \
   entropy.exe gmn.exe fgmn.exe ring_inflation.exe exp_vals.exe
@@ -261,8 +266,9 @@ free_energy.exe: $(FREE_ENERGY_BIN)
 	cp $< $@
 sim_tmi.exe: $(SIM_TMI_BIN)
 	cp $< $@
-dist_scaling.exe: $(DIST_SCALING_BIN)
-	cp $< $@
+dist_scaling.exe: $(DIST_SCALING_BIN) $(MIPT_PROBED_FGMN_LIB)
+	cp $(DIST_SCALING_BIN) $@
+	cp $(MIPT_PROBED_FGMN_LIB) ./libmipt_fgmn.so
 entropy.exe: $(ENTROPY_BIN)
 	cp $< $@
 gmn.exe: $(GMN_BIN)
@@ -287,8 +293,11 @@ $(FREE_ENERGY_BIN): $(FREE_ENERGY_OBJS)
 	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $^ $(MIPT_CUDA_LIBS) $(SIM_TMI_CUDA_LIBS) $(CUSV_LIBS) $(DL_LIBS) -o $@
 $(SIM_TMI_BIN): $(SIM_TMI_OBJS)
 	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $^ $(MIPT_CUDA_LIBS) $(SIM_TMI_CUDA_LIBS) $(CUSV_LIBS) $(DL_LIBS) -o $@
-$(DIST_SCALING_BIN): $(DIST_SCALING_OBJS)
-	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $^ $(MIPT_CUDA_LIBS) $(CUSV_LIBS) $(DL_LIBS) -o $@
+# k=3 solves GMN/fGMN, so this links the same MOSEK shim mipt_probed uses.
+$(DIST_SCALING_BIN): $(DIST_SCALING_OBJS) $(MIPT_PROBED_FGMN_LIB)
+	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $(HOST_LDFLAGS) $(DIST_SCALING_OBJS) \
+	  $(MIPT_CUDA_LIBS) $(CUSV_LIBS) -L$(BUILD) -Wl,-rpath,'$$ORIGIN' -lmipt_fgmn \
+	  $(DL_LIBS) -o $@
 $(ENTROPY_BIN): $(ENTROPY_OBJS)
 	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $^ $(MIPT_CUDA_LIBS) $(ENTROPY_CUDA_LIBS) $(CUSV_LIBS) $(DL_LIBS) -o $@
 $(GMN_BIN): $(GMN_OBJS)
@@ -306,6 +315,8 @@ $(DIST_TEST_BIN): $(DIST_TEST_OBJS)
 	$(HOSTCXX) $^ -o $@
 $(SPECTRAL_TEST_BIN): $(SPECTRAL_TEST_OBJS)
 	$(HOSTCXX) $^ -o $@
+$(FRONT_TEST_BIN): $(FRONT_TEST_OBJS)
+	$(HOSTCXX) $^ -o $@
 
 test-core: $(CORE_TEST_BIN)
 	$(CORE_TEST_BIN)
@@ -313,6 +324,8 @@ test-dist: $(DIST_TEST_BIN)
 	$(DIST_TEST_BIN)
 test-spectral: $(SPECTRAL_TEST_BIN)
 	$(SPECTRAL_TEST_BIN)
+test-front: $(FRONT_TEST_BIN)
+	$(FRONT_TEST_BIN)
 
 # --- reduction-kernel equivalence -------------------------------------------
 #
@@ -425,6 +438,8 @@ $(HOST_BUILD)/core_tests.o: tests/core_tests.cpp | $(HOST_BUILD)
 $(HOST_BUILD)/dist_metrics_tests.o: tests/dist_metrics_tests.cpp | $(HOST_BUILD)
 	$(HOSTCXX) $(CPPFLAGS_COMMON) -std=c++20 -O2 -MMD -MP -c $< -o $@
 $(HOST_BUILD)/spectral_tests.o: tests/spectral_tests.cpp | $(HOST_BUILD)
+	$(HOSTCXX) $(CPPFLAGS_COMMON) -std=c++20 -O2 -MMD -MP -c $< -o $@
+$(HOST_BUILD)/front_metrics_tests.o: tests/front_metrics_tests.cpp | $(HOST_BUILD)
 	$(HOSTCXX) $(CPPFLAGS_COMMON) -std=c++20 -O2 -MMD -MP -c $< -o $@
 
 print-config:

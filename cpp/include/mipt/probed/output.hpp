@@ -44,7 +44,8 @@ inline void write_metadata_fields(std::ostream &csv, int n, CircuitType type, in
 
 inline std::string default_output_name(int probes, int n, int realizations, CircuitType type, int mode,
                                        const std::vector<double> &p_values, const std::vector<int> &times, int delta_x,
-                                       int delta_t, int t_eq, double triangle_balance_cutoff)
+                                       int delta_t, int t_eq, double triangle_balance_cutoff, int x_max = -1,
+                                       int r_min = -1, int r_max = -1, int delta_max = -1)
 {
     std::string name = "probed_" + std::to_string(probes) + "_" + std::string(circuit_type_tag(type)) + "_n_" +
                        std::to_string(n) + "_reals_" + compact_count(static_cast<std::uint64_t>(realizations)) +
@@ -72,6 +73,16 @@ inline std::string default_output_name(int probes, int n, int realizations, Circ
                 name += "_b_" + compact_decimal(triangle_balance_cutoff);
             }
             name += "_teq_" + std::to_string(t_eq) + "_tau_0_" + std::to_string(times.back());
+        }
+        else if (mode == 5 && probes == 2)
+        {
+            name += "_teq_" + std::to_string(t_eq) + "_r_" + std::to_string(r_min) + "_" + std::to_string(r_max) +
+                    "_d_0_" + std::to_string(delta_max) + "_s_0_" + std::to_string(times.back());
+        }
+        else if (mode == 5)
+        {
+            name += "_teq_" + std::to_string(t_eq) + "_tau_0_" + std::to_string(times.back()) + "_xmax_" +
+                    std::to_string(x_max);
         }
         else
         {
@@ -157,6 +168,110 @@ inline void write_mode4_triangles(std::ostream &csv, int n, int realizations, Ci
             << gmn_limit << ',' << row.stats.joint_purity.mean << ',' << row.stats.joint_purity.stderr() << ','
             << row.stats.mean_single_purity.mean << ',' << row.stats.mean_single_purity.stderr() << ','
             << realizations << '\n';
+    }
+}
+
+// Mode 5: the classical and entanglement fronts across the (width, x, tau) grid.
+//
+// One row per admissible (width, distance, elapsed time). `chord_length` is the
+// periodic chord for the block's innermost site, which is the anchor the
+// distance is measured from; `t_absolute` locates the row in the full circuit
+// so that a truncated run can be compared with a longer one.
+inline void write_mode5(std::ostream &csv, int n, int realizations, CircuitType type,
+                        const std::vector<OutputRow> &rows, int t_eq)
+{
+    csv << METADATA_COLUMNS
+        << ",t_eq,width,x,chord_length,tau,t_absolute,"
+           "C_X_mean,C_X_stderr,C_Y_mean,C_Y_stderr,C_Z_mean,C_Z_stderr,"
+           "C_mean_mean,C_mean_stderr,C_max_mean,C_max_stderr,"
+           "I_mean,I_stderr,negativity_mean,negativity_stderr,"
+           "log_negativity_mean,log_negativity_stderr,"
+           "coherent_information_mean,coherent_information_stderr,"
+           "S_RB_mean,S_RB_stderr,S_B_mean,S_B_stderr,"
+           "negativity_positive_count,negativity_positive_fraction,"
+           "samples,origins_randomized\n";
+    for (const auto &row : rows)
+    {
+        const auto &stats = row.stats;
+        // x=0 is the injection site itself, which has no chord to itself; it is
+        // kept as the source amplitude that thresholds can be normalized to.
+        const double chord = row.distance > 0 ? util::chord_length(n, row.distance) : 0.0;
+        const double positive_fraction =
+            stats.negativity.count > 0
+                ? static_cast<double>(stats.positive_negativity) / static_cast<double>(stats.negativity.count)
+                : std::numeric_limits<double>::quiet_NaN();
+        write_metadata_fields(csv, n, type, realizations, row.p);
+        csv << ',' << t_eq << ',' << row.width << ',' << row.distance << ',' << chord << ',' << row.t << ','
+            << t_eq + row.t << ','
+            << stats.classical_x.mean << ',' << stats.classical_x.stderr() << ',' << stats.classical_y.mean << ','
+            << stats.classical_y.stderr() << ',' << stats.classical_z.mean << ',' << stats.classical_z.stderr() << ','
+            << stats.classical_mean.mean << ',' << stats.classical_mean.stderr() << ',' << stats.classical_max.mean
+            << ',' << stats.classical_max.stderr() << ',' << stats.i2.mean << ',' << stats.i2.stderr() << ','
+            << stats.negativity.mean << ',' << stats.negativity.stderr() << ',' << stats.log_negativity.mean << ','
+            << stats.log_negativity.stderr() << ',' << stats.coherent_information.mean << ','
+            << stats.coherent_information.stderr() << ',' << stats.sq.mean << ',' << stats.sq.stderr() << ','
+            << stats.block_entropy.mean << ',' << stats.block_entropy.stderr() << ',' << stats.positive_negativity
+            << ',' << positive_fraction << ',' << stats.sq.count << ",1\n";
+    }
+}
+
+// Mode 5, two probes: the staggered-insertion grid.
+//
+// One row per (separation r, insertion delay delta, elapsed time s). The
+// readout clock starts at the *second* insertion, so `t_absolute` is
+// t_eq + delta + s; `t_second_insertion` is written alongside it because the
+// two probes have been in the circuit for different lengths of time and the
+// survival entropies S_A and S_B are only comparable once that is accounted for.
+//
+// `J` and `discord` are NaN unless the run enabled the measurement
+// optimization (MIPT_PROBED_DISCORD); C_max is the three-axis lower bound on J
+// and is always present.
+inline void write_mode5_stagger(std::ostream &csv, int n, int realizations, CircuitType type,
+                                const std::vector<OutputRow> &rows, int t_eq)
+{
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    csv << METADATA_COLUMNS
+        << ",t_eq,r,chord_length,delta,s,t_second_insertion,t_absolute,"
+           "I_mean,I_stderr,J_mean,J_stderr,discord_mean,discord_stderr,"
+           "C_X_mean,C_X_stderr,C_Y_mean,C_Y_stderr,C_Z_mean,C_Z_stderr,"
+           "C_max_mean,C_max_stderr,"
+           "negativity_mean,negativity_stderr,"
+           "log_negativity_mean,log_negativity_stderr,"
+           "negativity_positive_count,negativity_positive_fraction,"
+           "conditional_negativity_mean,conditional_negativity_stderr,"
+           "coherent_information_mean,coherent_information_stderr,"
+           "S_AB_mean,S_AB_stderr,S_A_mean,S_A_stderr,S_B_mean,S_B_stderr,"
+           "samples,origins_randomized\n";
+    for (const auto &row : rows)
+    {
+        const auto &stats = row.stats;
+        const double chord = row.distance > 0 ? util::chord_length(n, row.distance) : 0.0;
+        const double positive_fraction =
+            stats.negativity.count > 0
+                ? static_cast<double>(stats.positive_negativity) / static_cast<double>(stats.negativity.count)
+                : nan;
+        // An empty accumulator means "never measured", which is a different
+        // statement from "measured and found to be zero".
+        const double j_mean = stats.classical_optimized.count > 0 ? stats.classical_optimized.mean : nan;
+        const double j_stderr = stats.classical_optimized.count > 0 ? stats.classical_optimized.stderr() : nan;
+        const double discord_mean = stats.discord.count > 0 ? stats.discord.mean : nan;
+        const double discord_stderr = stats.discord.count > 0 ? stats.discord.stderr() : nan;
+        const double conditional_mean = stats.conditional_negativity.count > 0 ? stats.conditional_negativity.mean : nan;
+        const double conditional_stderr =
+            stats.conditional_negativity.count > 0 ? stats.conditional_negativity.stderr() : nan;
+        write_metadata_fields(csv, n, type, realizations, row.p);
+        csv << ',' << t_eq << ',' << row.distance << ',' << chord << ',' << row.delay << ',' << row.t << ','
+            << t_eq + row.delay << ',' << t_eq + row.delay + row.t << ',' << stats.i2.mean << ',' << stats.i2.stderr()
+            << ',' << j_mean << ',' << j_stderr << ',' << discord_mean << ',' << discord_stderr << ','
+            << stats.classical_x.mean << ',' << stats.classical_x.stderr() << ',' << stats.classical_y.mean << ','
+            << stats.classical_y.stderr() << ',' << stats.classical_z.mean << ',' << stats.classical_z.stderr() << ','
+            << stats.classical_max.mean << ',' << stats.classical_max.stderr() << ',' << stats.negativity.mean << ','
+            << stats.negativity.stderr() << ',' << stats.log_negativity.mean << ',' << stats.log_negativity.stderr()
+            << ',' << stats.positive_negativity << ',' << positive_fraction << ',' << conditional_mean << ','
+            << conditional_stderr << ',' << stats.coherent_information.mean << ','
+            << stats.coherent_information.stderr() << ',' << stats.sq.mean << ',' << stats.sq.stderr() << ','
+            << stats.reference_entropy.mean << ',' << stats.reference_entropy.stderr() << ','
+            << stats.block_entropy.mean << ',' << stats.block_entropy.stderr() << ',' << stats.sq.count << ",1\n";
     }
 }
 
@@ -278,7 +393,15 @@ inline void write_csv(const std::string &path, int probes, int mode, int n, int 
     }
     csv << std::setprecision(17);
 
-    if (mode == 4 && probes == 2)
+    if (mode == 5 && probes == 2)
+    {
+        detail::write_mode5_stagger(csv, n, realizations, type, rows, t_eq);
+    }
+    else if (mode == 5)
+    {
+        detail::write_mode5(csv, n, realizations, type, rows, t_eq);
+    }
+    else if (mode == 4 && probes == 2)
     {
         detail::write_mode4_pairs(csv, n, realizations, type, rows, t_eq);
     }

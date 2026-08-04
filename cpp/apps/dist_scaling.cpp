@@ -1,4 +1,4 @@
-// Online two-site mutual-information and negativity distance scaling.
+// Online distance scaling of two- and three-party entanglement measures.
 
 #include "mipt/dist_scaling.hpp"
 
@@ -18,27 +18,29 @@ int main(int argc, char **argv)
             mipt::dist::print_usage(argv[0]);
             return 0;
         }
-        if (argc > 7)
+        if (argc > 9)
         {
             std::cerr << "Too many arguments. Use --help for usage.\n";
             return 2;
         }
 
-        const int n = (argc > 1) ? std::stoi(argv[1]) : 10;
-        const int periods = (argc > 2) ? std::stoi(argv[2]) : 10;
-        const double p = (argc > 3) ? std::stod(argv[3]) : 0.17;
-        const int realizations = (argc > 4) ? std::stoi(argv[4]) : 10;
-        const int circuit_type_value = (argc > 5) ? std::stoi(argv[5]) : 0;
-        const mipt::CircuitType circuit_type =
-            mipt::parse_circuit_type(circuit_type_value);
-        const std::string output_path =
-            (argc > 6)
-                ? std::string(argv[6])
-                : mipt::dist::default_output_path(
-                      n, periods, p, realizations, circuit_type);
+        mipt::dist::RunConfig config;
+        config.k = (argc > 1) ? std::stoi(argv[1]) : 2;
+        config.n = (argc > 2) ? std::stoi(argv[2]) : 10;
+        config.periods = (argc > 3) ? std::stoi(argv[3]) : 10;
+        config.p = (argc > 4) ? std::stod(argv[4]) : 0.17;
+        config.realizations = (argc > 5) ? std::stoi(argv[5]) : 10;
+        config.type = mipt::parse_circuit_type((argc > 6) ? std::stoi(argv[6]) : 0);
+        config.triangle_balance_cutoff =
+            (argc > 8) ? std::stod(argv[8])
+                       : mipt::env::real("MIPT_DIST_TRIANGLE_BALANCE", 0.5, 0.0, 1.0);
+        // An explicit output path is taken as given; the default depends on
+        // every other argument, so it is resolved after they are parsed.
+        config.output_path = (argc > 7 && argv[7][0] != '\0')
+                                 ? std::string(argv[7])
+                                 : mipt::dist::default_output_path(config);
 
-        mipt::dist::run(n, periods, p, realizations,
-                        circuit_type, output_path);
+        mipt::dist::run(config);
         return 0;
     }
     catch (const std::exception &error)

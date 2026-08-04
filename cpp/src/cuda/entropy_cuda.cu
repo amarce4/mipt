@@ -10,8 +10,64 @@
 #include <cstdio>
 #include <cstdlib>
 
+// Minimal cuSOLVER declarations, for the von Neumann (S1) path only. Do not
+// include <cusolverDn.h> here: some CUDA 11.x + GCC 11 setups fail while
+// parsing that header through nvcc, and tmi_cuda_svd.cu already declares the
+// same entry points by hand for the same reason. The C ABI is stable and the
+// enum arguments are int-sized.
+extern "C" {
+struct cusolverDnContext;
+typedef cusolverDnContext *cusolverDnHandle_t;
+typedef int cusolverStatus_t;
+
+cusolverStatus_t cusolverDnCreate(cusolverDnHandle_t *handle);
+cusolverStatus_t cusolverDnDestroy(cusolverDnHandle_t handle);
+
+cusolverStatus_t cusolverDnCheevd_bufferSize(cusolverDnHandle_t handle, int jobz,
+                                             int uplo, int n, const cuComplex *A,
+                                             int lda, const float *W, int *lwork);
+cusolverStatus_t cusolverDnCheevd(cusolverDnHandle_t handle, int jobz, int uplo,
+                                  int n, cuComplex *A, int lda, float *W,
+                                  cuComplex *work, int lwork, int *devInfo);
+cusolverStatus_t cusolverDnZheevd_bufferSize(cusolverDnHandle_t handle, int jobz,
+                                             int uplo, int n,
+                                             const cuDoubleComplex *A, int lda,
+                                             const double *W, int *lwork);
+cusolverStatus_t cusolverDnZheevd(cusolverDnHandle_t handle, int jobz, int uplo,
+                                  int n, cuDoubleComplex *A, int lda, double *W,
+                                  cuDoubleComplex *work, int lwork, int *devInfo);
+
+cusolverStatus_t cusolverDnCgesvd_bufferSize(cusolverDnHandle_t handle, int m,
+                                             int n, int *lwork);
+cusolverStatus_t cusolverDnCgesvd(cusolverDnHandle_t handle, signed char jobu,
+                                  signed char jobvt, int m, int n, cuComplex *A,
+                                  int lda, float *S, cuComplex *U, int ldu,
+                                  cuComplex *VT, int ldvt, cuComplex *work,
+                                  int lwork, float *rwork, int *devInfo);
+cusolverStatus_t cusolverDnZgesvd_bufferSize(cusolverDnHandle_t handle, int m,
+                                             int n, int *lwork);
+cusolverStatus_t cusolverDnZgesvd(cusolverDnHandle_t handle, signed char jobu,
+                                  signed char jobvt, int m, int n,
+                                  cuDoubleComplex *A, int lda, double *S,
+                                  cuDoubleComplex *U, int ldu,
+                                  cuDoubleComplex *VT, int ldvt,
+                                  cuDoubleComplex *work, int lwork,
+                                  double *rwork, int *devInfo);
+}
+
+#ifndef CUSOLVER_STATUS_SUCCESS
+#define CUSOLVER_STATUS_SUCCESS 0
+#endif
+
 namespace
 {
+enum
+{
+    // cusolverEigMode_t / cublasFillMode_t, which are int-sized enums.
+    EIG_MODE_NOVECTOR = 0,
+    FILL_MODE_LOWER = 0
+};
+
     // This CUDA translation unit deliberately avoids C++ standard-library
     // containers, strings, and streams. nvcc normally compiles those against
     // libstdc++, while CUDA-Q's nvq++ driver links against libc++; mixing the
@@ -85,6 +141,166 @@ namespace
             static_cast<unsigned long long>(static_cast<std::size_t>(-1) / mib);
         const unsigned long long clamped = mb < max_mb ? mb : max_mb;
         return static_cast<std::size_t>(clamped) * mib;
+    }
+
+    // Largest RDM dimension the divide-and-conquer eigensolver is trusted with.
+    //
+    // Same caveat tmi_cuda_svd.cu records: cusolverDn?heevd stops converging on
+    // physical trajectory RDMs once the matrix gets large (it returns info != 0
+    // at 1024 on inputs verified exactly Hermitian, trace-1 and NaN-free, in
+    // both fp32 and fp64), while gesvd handles the same matrices. Cap the fast
+    // path and keep gesvd for the rest.
+    int heevd_max_rows()
+    {
+        static int cap = -1;
+        if (cap < 0)
+        {
+            const char *env = std::getenv("MIPT_ENTROPY_HEEVD_MAX_ROWS");
+            if (env == nullptr || *env == '\0')
+            {
+                cap = 512;
+            }
+            else
+            {
+                const long value = std::strtol(env, nullptr, 10);
+                cap = (value < 0) ? 0 : static_cast<int>(value);
+            }
+        }
+        return cap;
+    }
+
+    // Dimensions where heevd has already failed once, per precision. Retrying it
+    // at every subsystem size of every trajectory would cost a wasted
+    // eigensolve each, and heevd fails deterministically on a given size rather
+    // than sporadically.
+    //
+    // These are not hypothetical. On a GTX 1650 with CUDA 12.4 the fp32 Cheevd
+    // stops converging on physical trajectory RDMs at dim=256 -- roughly where
+    // sim_tmi sees it, allowing for the different matrices -- while fp64 Zheevd
+    // handles the same states at 8 ms against gesvd's 55 ms. Hence the ordering
+    // below: native precision, then fp64, then gesvd.
+    bool heevd_known_bad(int dim, bool double_precision, bool record)
+    {
+        static thread_local int bad[2][32] = {{0}};
+        static thread_local int count[2] = {0, 0};
+        const int slot = double_precision ? 1 : 0;
+        for (int i = 0; i < count[slot]; ++i)
+        {
+            if (bad[slot][i] == dim) { return true; }
+        }
+        if (record && count[slot] < 32)
+        {
+            bad[slot][count[slot]++] = dim;
+            // A silent demotion here reads as an unexplained slowdown, which is
+            // exactly the trap sim_tmi's "half-cut SVD was disabled" warning
+            // exists to avoid. Say so once per (dimension, precision).
+            std::fprintf(stderr,
+                         "\nentropy: cuSOLVER %sheevd did not converge on the %dx%d "
+                         "von Neumann RDM; %s for this size from now on.\n",
+                         double_precision ? "Z" : "C", dim, dim,
+                         double_precision ? "falling back to gesvd"
+                                          : "retrying in fp64");
+        }
+        return false;
+    }
+
+    template <typename T>
+    struct SolverTraits;
+
+    template <>
+    struct SolverTraits<cuFloatComplex>
+    {
+        using Real = float;
+        static constexpr bool is_single = true;
+        // Eigenvalues at or below the fp32 Gram noise floor are dropped: the
+        // logarithm of a negative roundoff eigenvalue would poison the sum.
+        static double eigenvalue_floor() { return 1.0e-12; }
+    };
+
+    template <>
+    struct SolverTraits<cuDoubleComplex>
+    {
+        using Real = double;
+        static constexpr bool is_single = false;
+        static double eigenvalue_floor() { return 1.0e-15; }
+    };
+
+    __global__ void promote_to_f64_kernel(const cuFloatComplex *input,
+                                          cuDoubleComplex *output,
+                                          std::uint64_t count)
+    {
+        const std::uint64_t index =
+            static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+        if (index >= count)
+        {
+            return;
+        }
+        const cuFloatComplex value = input[index];
+        output[index] = make_cuDoubleComplex(static_cast<double>(value.x),
+                                             static_cast<double>(value.y));
+    }
+
+    cusolverStatus_t heevd_buffer_size(cusolverDnHandle_t handle, int n,
+                                       const cuFloatComplex *a, const float *w,
+                                       int *lwork)
+    {
+        return cusolverDnCheevd_bufferSize(handle, EIG_MODE_NOVECTOR,
+                                           FILL_MODE_LOWER, n, a, n, w, lwork);
+    }
+
+    cusolverStatus_t heevd_buffer_size(cusolverDnHandle_t handle, int n,
+                                       const cuDoubleComplex *a, const double *w,
+                                       int *lwork)
+    {
+        return cusolverDnZheevd_bufferSize(handle, EIG_MODE_NOVECTOR,
+                                           FILL_MODE_LOWER, n, a, n, w, lwork);
+    }
+
+    cusolverStatus_t heevd(cusolverDnHandle_t handle, int n, cuFloatComplex *a,
+                           float *w, cuFloatComplex *work, int lwork, int *info)
+    {
+        return cusolverDnCheevd(handle, EIG_MODE_NOVECTOR, FILL_MODE_LOWER, n, a,
+                                n, w, work, lwork, info);
+    }
+
+    cusolverStatus_t heevd(cusolverDnHandle_t handle, int n, cuDoubleComplex *a,
+                           double *w, cuDoubleComplex *work, int lwork, int *info)
+    {
+        return cusolverDnZheevd(handle, EIG_MODE_NOVECTOR, FILL_MODE_LOWER, n, a,
+                                n, w, work, lwork, info);
+    }
+
+    cusolverStatus_t gesvd_buffer_size(cusolverDnHandle_t handle, int n,
+                                       const cuFloatComplex *, int *lwork)
+    {
+        return cusolverDnCgesvd_bufferSize(handle, n, n, lwork);
+    }
+
+    cusolverStatus_t gesvd_buffer_size(cusolverDnHandle_t handle, int n,
+                                       const cuDoubleComplex *, int *lwork)
+    {
+        return cusolverDnZgesvd_bufferSize(handle, n, n, lwork);
+    }
+
+    // rho is Hermitian positive semidefinite, so its singular values *are* its
+    // eigenvalues and gesvd is a drop-in replacement for heevd on the same
+    // buffer. Both destroy their input.
+    cusolverStatus_t gesvd_novectors(cusolverDnHandle_t handle, int n,
+                                     cuFloatComplex *a, float *s,
+                                     cuFloatComplex *work, int lwork,
+                                     float *rwork, int *info)
+    {
+        return cusolverDnCgesvd(handle, 'N', 'N', n, n, a, n, s, nullptr, 1,
+                                nullptr, 1, work, lwork, rwork, info);
+    }
+
+    cusolverStatus_t gesvd_novectors(cusolverDnHandle_t handle, int n,
+                                     cuDoubleComplex *a, double *s,
+                                     cuDoubleComplex *work, int lwork,
+                                     double *rwork, int *info)
+    {
+        return cusolverDnZgesvd(handle, 'N', 'N', n, n, a, n, s, nullptr, 1,
+                                nullptr, 1, work, lwork, rwork, info);
     }
 
     template <typename T>
@@ -364,6 +580,28 @@ namespace
         std::size_t positions_bytes = 0;
         std::size_t results_bytes = 0;
 
+        // S1 only. The eigensolvers destroy their input, so the RDM batch is
+        // copied into `solver` and the RDMs themselves stay intact for the
+        // recursive partial trace that produces the next subsystem size.
+        cusolverDnHandle_t solver_handle = nullptr;
+        void *solver = nullptr;
+        void *eigenvalues = nullptr;
+        void *solver_work = nullptr;
+        void *solver_rwork = nullptr;
+        int *solver_info = nullptr;
+        std::size_t solver_bytes = 0;
+        std::size_t eigenvalues_bytes = 0;
+        std::size_t solver_work_bytes = 0;
+        std::size_t solver_rwork_bytes = 0;
+        std::size_t solver_info_bytes = 0;
+        // Allocated only if an fp32 eigensolve actually fails. Bounded by
+        // MIPT_ENTROPY_HEEVD_MAX_ROWS, which is why it stays outside the
+        // MIPT_ENTROPY_CUDA_MAX_MB batching budget.
+        void *solver64 = nullptr;
+        void *eigenvalues64 = nullptr;
+        std::size_t solver64_bytes = 0;
+        std::size_t eigenvalues64_bytes = 0;
+
         ~Workspace()
         {
             if (matrices != nullptr) cudaFree(matrices);
@@ -372,6 +610,14 @@ namespace
             if (positions != nullptr) cudaFree(positions);
             if (results != nullptr) cudaFree(results);
             if (numeric_error != nullptr) cudaFree(numeric_error);
+            if (solver != nullptr) cudaFree(solver);
+            if (eigenvalues != nullptr) cudaFree(eigenvalues);
+            if (solver64 != nullptr) cudaFree(solver64);
+            if (eigenvalues64 != nullptr) cudaFree(eigenvalues64);
+            if (solver_work != nullptr) cudaFree(solver_work);
+            if (solver_rwork != nullptr) cudaFree(solver_rwork);
+            if (solver_info != nullptr) cudaFree(solver_info);
+            if (solver_handle != nullptr) cusolverDnDestroy(solver_handle);
             if (handle != nullptr) cublasDestroy(handle);
         }
     };
@@ -474,6 +720,377 @@ namespace
         }
     }
 
+    // --- von Neumann entropy ------------------------------------------------
+    //
+    // S2 needs only Tr(rho^2), which the purity kernel reads straight off the
+    // Frobenius norm. S1 = -Tr(rho ln rho) needs the whole spectrum, so every
+    // (subsystem size, cyclic translation) pair costs one dense eigensolve of a
+    // 2^L_A matrix. That is the dominant cost of this routine at large L_A and
+    // is why the caller can cap it or turn it off.
+
+    bool ensure_solver_handle(Workspace &ws)
+    {
+        if (ws.solver_handle != nullptr)
+        {
+            return true;
+        }
+        const cusolverStatus_t status = cusolverDnCreate(&ws.solver_handle);
+        if (status != CUSOLVER_STATUS_SUCCESS)
+        {
+            std::snprintf(g_last_error, sizeof(g_last_error),
+                          "cusolverDnCreate failed with status=%d",
+                          static_cast<int>(status));
+            ws.solver_handle = nullptr;
+            return false;
+        }
+        return true;
+    }
+
+    // Host landing buffer for one level's eigenvalues. Grown, never shrunk; a
+    // plain malloc keeps this translation unit free of libstdc++ containers.
+    void *host_eigenvalue_buffer(std::size_t bytes)
+    {
+        static thread_local void *buffer = nullptr;
+        static thread_local std::size_t capacity = 0;
+        if (bytes > capacity)
+        {
+            std::free(buffer);
+            buffer = std::malloc(bytes);
+            capacity = (buffer != nullptr) ? bytes : 0;
+        }
+        return buffer;
+    }
+
+    // Eigenvalues -> S1 in nats, for one matrix. The eigenvalues are rescaled by
+    // their sum rather than assumed to be normalized, which removes the same
+    // trajectory-normalization drift the purity path divides out with trace^2.
+    //
+    // `floor_value` follows the precision of the *state vector*, not of the
+    // eigensolver: an fp64 retry on an fp32 RDM does not make the roundoff-level
+    // end of the spectrum meaningful.
+    template <typename Real>
+    bool von_neumann_nats(const Real *values,
+                          int count,
+                          double floor_value,
+                          double &entropy_out)
+    {
+        double trace = 0.0;
+        for (int i = 0; i < count; ++i)
+        {
+            trace += static_cast<double>(values[i]);
+        }
+        if (!(trace > 0.0) || !isfinite(trace))
+        {
+            return false;
+        }
+
+        double entropy = 0.0;
+        for (int i = 0; i < count; ++i)
+        {
+            const double lambda = static_cast<double>(values[i]) / trace;
+            if (lambda > floor_value)
+            {
+                entropy -= lambda * log(lambda);
+            }
+        }
+        if (!isfinite(entropy))
+        {
+            return false;
+        }
+        entropy_out = (fabs(entropy) < 1.0e-12) ? 0.0 : entropy;
+        return true;
+    }
+
+    // Enqueue one heevd per matrix and read the convergence flags once.
+    //
+    // Sharing a single workspace buffer across the batch is safe because every
+    // solve is issued on the default stream and so runs on its own. Reading the
+    // info flags per level rather than per solve keeps the host synchronizations
+    // down to one, which matters when a level is 30 solves of a 4x4.
+    //
+    // Returns 0 on success. `converged` distinguishes an ordinary cuSOLVER
+    // non-convergence, which the caller answers by demoting to the next solver,
+    // from a hard failure, which it propagates.
+    template <typename SolveT>
+    int run_heevd_batch(Workspace &ws,
+                        SolveT *matrices,
+                        typename SolverTraits<SolveT>::Real *eigenvalues,
+                        int dim,
+                        int batch_count,
+                        int *host_info,
+                        bool &converged)
+    {
+        converged = false;
+
+        int lwork = 0;
+        cusolverStatus_t solver_status =
+            heevd_buffer_size(ws.solver_handle, dim, matrices, eigenvalues, &lwork);
+        if (solver_status != CUSOLVER_STATUS_SUCCESS)
+        {
+            return 0;
+        }
+        if (!ensure_buffer(&ws.solver_work, ws.solver_work_bytes,
+                           static_cast<std::size_t>(max_int(1, lwork)) * sizeof(SolveT),
+                           "cudaMalloc(entropy eigensolver workspace)"))
+        {
+            return 24;
+        }
+
+        const std::size_t elements =
+            static_cast<std::size_t>(dim) * static_cast<std::size_t>(dim);
+        for (int b = 0; b < batch_count; ++b)
+        {
+            solver_status = heevd(ws.solver_handle, dim,
+                                  matrices + static_cast<std::size_t>(b) * elements,
+                                  eigenvalues + static_cast<std::size_t>(b) * dim,
+                                  static_cast<SolveT *>(ws.solver_work), lwork,
+                                  ws.solver_info + b);
+            if (solver_status != CUSOLVER_STATUS_SUCCESS)
+            {
+                return 0;
+            }
+        }
+
+        const cudaError_t cuda_status =
+            cudaMemcpy(host_info, ws.solver_info,
+                       static_cast<std::size_t>(batch_count) * sizeof(int),
+                       cudaMemcpyDeviceToHost);
+        if (cuda_status != cudaSuccess)
+        {
+            set_cuda_error("cudaMemcpy(entropy eigensolver status)", cuda_status);
+            return 25;
+        }
+
+        converged = true;
+        for (int b = 0; b < batch_count; ++b)
+        {
+            if (host_info[b] != 0) { converged = false; break; }
+        }
+        return 0;
+    }
+
+    // One eigensolve per translation for a single subsystem size. `rho_batch`
+    // holds `batch_count` matrices of dimension `dim`, packed with stride
+    // dim*dim, and is left untouched -- the caller still needs it for the
+    // partial trace down to the next size, and every solver here destroys its
+    // input, which is why each stage refills its own copy.
+    template <typename ComplexT>
+    int compute_level_s1(Workspace &ws,
+                         const ComplexT *rho_batch,
+                         int dim,
+                         int batch_count,
+                         double *host_out)
+    {
+        using Real = typename SolverTraits<ComplexT>::Real;
+
+        if (!ensure_solver_handle(ws))
+        {
+            return 20;
+        }
+
+        const std::size_t elements =
+            static_cast<std::size_t>(dim) * static_cast<std::size_t>(dim);
+        const std::size_t batch = static_cast<std::size_t>(batch_count);
+        const std::size_t solver_bytes = batch * elements * sizeof(ComplexT);
+        const std::size_t eigenvalues_bytes =
+            batch * static_cast<std::size_t>(dim) * sizeof(Real);
+        const std::size_t info_bytes = batch * sizeof(int);
+
+        if (!ensure_buffer(&ws.solver, ws.solver_bytes, solver_bytes,
+                           "cudaMalloc(entropy eigensolver input)") ||
+            !ensure_buffer(&ws.eigenvalues, ws.eigenvalues_bytes, eigenvalues_bytes,
+                           "cudaMalloc(entropy eigenvalues)") ||
+            !ensure_buffer(reinterpret_cast<void **>(&ws.solver_info),
+                           ws.solver_info_bytes, info_bytes,
+                           "cudaMalloc(entropy eigensolver status)"))
+        {
+            return 21;
+        }
+
+        ComplexT *solver = static_cast<ComplexT *>(ws.solver);
+        Real *eigenvalues = static_cast<Real *>(ws.eigenvalues);
+
+        int *host_info = static_cast<int *>(std::malloc(info_bytes));
+        if (host_info == nullptr)
+        {
+            set_error("Could not allocate the host eigensolver status buffer.");
+            return 22;
+        }
+
+        const bool heevd_allowed = dim <= heevd_max_rows();
+        bool solved = false;
+        bool solved_in_f64 = false;
+        cudaError_t cuda_status = cudaSuccess;
+        int status = 0;
+
+        if (heevd_allowed && !heevd_known_bad(dim, false, false))
+        {
+            cuda_status = cudaMemcpy(solver, rho_batch, solver_bytes,
+                                     cudaMemcpyDeviceToDevice);
+            if (cuda_status != cudaSuccess)
+            {
+                set_cuda_error("cudaMemcpy(entropy eigensolver input)", cuda_status);
+                std::free(host_info);
+                return 23;
+            }
+            status = run_heevd_batch<ComplexT>(ws, solver, eigenvalues, dim,
+                                               batch_count, host_info, solved);
+            if (status != 0) { std::free(host_info); return status; }
+            if (!solved) { heevd_known_bad(dim, false, true); }
+        }
+
+        // fp32 heevd gives up on physical RDMs well before fp64 does, and fp64
+        // is still an order of magnitude faster than gesvd, so promote before
+        // demoting. The promotion reads the untouched originals.
+        if (!solved && heevd_allowed && SolverTraits<ComplexT>::is_single &&
+            !heevd_known_bad(dim, true, false))
+        {
+            if (!ensure_buffer(&ws.solver64, ws.solver64_bytes,
+                               batch * elements * sizeof(cuDoubleComplex),
+                               "cudaMalloc(entropy fp64 eigensolver input)") ||
+                !ensure_buffer(&ws.eigenvalues64, ws.eigenvalues64_bytes,
+                               batch * static_cast<std::size_t>(dim) * sizeof(double),
+                               "cudaMalloc(entropy fp64 eigenvalues)"))
+            {
+                std::free(host_info);
+                return 26;
+            }
+
+            const std::uint64_t promote_count =
+                static_cast<std::uint64_t>(batch) * elements;
+            constexpr int threads = 256;
+            const int blocks = static_cast<int>((promote_count + threads - 1) / threads);
+            promote_to_f64_kernel<<<blocks, threads>>>(
+                reinterpret_cast<const cuFloatComplex *>(rho_batch),
+                static_cast<cuDoubleComplex *>(ws.solver64), promote_count);
+            cuda_status = cudaGetLastError();
+            if (cuda_status != cudaSuccess)
+            {
+                set_cuda_error("promote_to_f64_kernel", cuda_status);
+                std::free(host_info);
+                return 27;
+            }
+
+            status = run_heevd_batch<cuDoubleComplex>(
+                ws, static_cast<cuDoubleComplex *>(ws.solver64),
+                static_cast<double *>(ws.eigenvalues64), dim, batch_count,
+                host_info, solved);
+            if (status != 0) { std::free(host_info); return status; }
+            if (solved) { solved_in_f64 = true; }
+            else { heevd_known_bad(dim, true, true); }
+        }
+
+        if (!solved)
+        {
+            cuda_status = cudaMemcpy(solver, rho_batch, solver_bytes,
+                                     cudaMemcpyDeviceToDevice);
+            if (cuda_status != cudaSuccess)
+            {
+                set_cuda_error("cudaMemcpy(entropy eigensolver input)", cuda_status);
+                std::free(host_info);
+                return 28;
+            }
+
+            int lwork = 0;
+            cusolverStatus_t solver_status =
+                gesvd_buffer_size(ws.solver_handle, dim, solver, &lwork);
+            if (solver_status != CUSOLVER_STATUS_SUCCESS)
+            {
+                std::snprintf(g_last_error, sizeof(g_last_error),
+                              "cusolverDn?gesvd_bufferSize failed with status=%d",
+                              static_cast<int>(solver_status));
+                std::free(host_info);
+                return 29;
+            }
+            if (!ensure_buffer(&ws.solver_work, ws.solver_work_bytes,
+                               static_cast<std::size_t>(max_int(1, lwork)) * sizeof(ComplexT),
+                               "cudaMalloc(entropy eigensolver workspace)") ||
+                !ensure_buffer(&ws.solver_rwork, ws.solver_rwork_bytes,
+                               static_cast<std::size_t>(max_int(1, 5 * dim)) * sizeof(Real),
+                               "cudaMalloc(entropy eigensolver real workspace)"))
+            {
+                std::free(host_info);
+                return 30;
+            }
+
+            for (int b = 0; b < batch_count; ++b)
+            {
+                solver_status = gesvd_novectors(
+                    ws.solver_handle, dim,
+                    solver + static_cast<std::size_t>(b) * elements,
+                    eigenvalues + static_cast<std::size_t>(b) * dim,
+                    static_cast<ComplexT *>(ws.solver_work), lwork,
+                    static_cast<Real *>(ws.solver_rwork), ws.solver_info + b);
+                if (solver_status != CUSOLVER_STATUS_SUCCESS)
+                {
+                    std::snprintf(g_last_error, sizeof(g_last_error),
+                                  "cusolverDn?gesvd failed with status=%d at dim=%d",
+                                  static_cast<int>(solver_status), dim);
+                    std::free(host_info);
+                    return 31;
+                }
+            }
+
+            cuda_status = cudaMemcpy(host_info, ws.solver_info, info_bytes,
+                                     cudaMemcpyDeviceToHost);
+            if (cuda_status != cudaSuccess)
+            {
+                set_cuda_error("cudaMemcpy(entropy eigensolver status)", cuda_status);
+                std::free(host_info);
+                return 32;
+            }
+            for (int b = 0; b < batch_count; ++b)
+            {
+                if (host_info[b] != 0)
+                {
+                    std::snprintf(g_last_error, sizeof(g_last_error),
+                                  "cusolverDn?gesvd did not converge (info=%d) at dim=%d",
+                                  host_info[b], dim);
+                    std::free(host_info);
+                    return 33;
+                }
+            }
+        }
+        std::free(host_info);
+
+        const std::size_t landing_bytes =
+            solved_in_f64 ? batch * static_cast<std::size_t>(dim) * sizeof(double)
+                          : eigenvalues_bytes;
+        void *host_eigenvalues = host_eigenvalue_buffer(landing_bytes);
+        if (host_eigenvalues == nullptr)
+        {
+            set_error("Could not allocate the host eigenvalue buffer.");
+            return 34;
+        }
+        cuda_status = cudaMemcpy(host_eigenvalues,
+                                 solved_in_f64 ? ws.eigenvalues64 : ws.eigenvalues,
+                                 landing_bytes, cudaMemcpyDeviceToHost);
+        if (cuda_status != cudaSuccess)
+        {
+            set_cuda_error("cudaMemcpy(entropy eigenvalues)", cuda_status);
+            return 35;
+        }
+
+        const double floor_value = SolverTraits<ComplexT>::eigenvalue_floor();
+        for (int b = 0; b < batch_count; ++b)
+        {
+            const std::size_t offset = static_cast<std::size_t>(b) * dim;
+            const bool ok =
+                solved_in_f64
+                    ? von_neumann_nats(static_cast<const double *>(host_eigenvalues) + offset,
+                                       dim, floor_value, host_out[b])
+                    : von_neumann_nats(static_cast<const Real *>(host_eigenvalues) + offset,
+                                       dim, floor_value, host_out[b]);
+            if (!ok)
+            {
+                set_error("GPU von Neumann entropy produced a non-positive trace "
+                          "or a non-finite value.");
+                return 36;
+            }
+        }
+        return 0;
+    }
+
     template <typename ComplexT>
     cublasStatus_t batched_rho(cublasHandle_t handle,
                                const ComplexT *matrices,
@@ -551,15 +1168,17 @@ namespace
     }
 
     template <typename ComplexT>
-    int compute_cyclic_s2(const void *device_state,
-                          int n,
-                          int min_kept,
-                          int max_kept,
-                          int fermionic_trace,
-                          double *host_means)
+    int compute_cyclic_entropies(const void *device_state,
+                                 int n,
+                                 int min_kept,
+                                 int max_kept,
+                                 int fermionic_trace,
+                                 int max_s1_kept,
+                                 double *host_s1_means,
+                                 double *host_s2_means)
     {
         clear_error();
-        if (device_state == nullptr || host_means == nullptr)
+        if (device_state == nullptr || host_s2_means == nullptr)
         {
             set_error("Null device statevector or output pointer.");
             return 1;
@@ -569,6 +1188,9 @@ namespace
             set_error("Invalid N or retained-subsystem range for CUDA cyclic entropy.");
             return 2;
         }
+
+        const int s1_kept_limit = min_int(max_kept, max_s1_kept);
+        const bool want_s1 = (host_s1_means != nullptr) && (s1_kept_limit >= min_kept);
 
         // Form only the largest requested RDM. Smaller contiguous intervals are
         // prefixes in the same cyclic local-mode order, so recursively tracing
@@ -586,9 +1208,15 @@ namespace
             static_cast<std::size_t>(size_count) * static_cast<std::size_t>(n);
         const std::size_t workspace_limit = max_workspace_bytes();
 
+        // The eigensolver works on its own copy of the RDM batch, capped at the
+        // largest size S1 is actually asked for.
+        const std::uint64_t s1_elements_max =
+            want_s1 ? (std::uint64_t{1} << (2 * s1_kept_limit)) : std::uint64_t{0};
+
         const std::size_t bytes_per_translation =
             static_cast<std::size_t>(total_dim) * sizeof(ComplexT) +
             static_cast<std::size_t>(rho_elements_max) * sizeof(ComplexT) +
+            static_cast<std::size_t>(s1_elements_max) * sizeof(ComplexT) +
             static_cast<std::size_t>(n + 1) * sizeof(int);
         const std::size_t translations_by_memory =
             workspace_limit / max_size(std::size_t{1}, bytes_per_translation);
@@ -620,6 +1248,8 @@ namespace
         // Fixed host scratch avoids libstdc++ allocations in this nvcc object.
         // The input guard n<31 makes these bounds sufficient.
         double all_results[31 * 31] = {0.0};
+        double all_s1[31 * 31] = {0.0};
+        double level_s1[31] = {0.0};
         int starts_host[31] = {0};
         int positions_host[31 * 31] = {0};
 
@@ -707,6 +1337,20 @@ namespace
                     return 9;
                 }
 
+                if (want_s1 && kept <= s1_kept_limit)
+                {
+                    const int s1_status = compute_level_s1<ComplexT>(
+                        ws, current_rho, current_dim, current_batch, level_s1);
+                    if (s1_status != 0)
+                    {
+                        return s1_status;
+                    }
+                    for (int batch = 0; batch < current_batch; ++batch)
+                    {
+                        all_s1[result_offset + batch] = level_s1[batch];
+                    }
+                }
+
                 if (kept == min_kept)
                 {
                     break;
@@ -763,48 +1407,75 @@ namespace
         for (int size_index = 0; size_index < size_count; ++size_index)
         {
             double sum = 0.0;
+            double s1_sum = 0.0;
+            const bool size_has_s1 = want_s1 && (min_kept + size_index) <= s1_kept_limit;
             for (int start_index = 0; start_index < n; ++start_index)
             {
-                const double value = all_results[
+                const std::size_t index =
                     static_cast<std::size_t>(size_index) * static_cast<std::size_t>(n) +
-                    static_cast<std::size_t>(start_index)];
+                    static_cast<std::size_t>(start_index);
+                const double value = all_results[index];
                 if (!isfinite(value))
                 {
                     set_error("GPU entropy result contained a non-finite value.");
                     return 14;
                 }
                 sum += value;
+                if (size_has_s1)
+                {
+                    const double s1_value = all_s1[index];
+                    if (!isfinite(s1_value))
+                    {
+                        set_error("GPU von Neumann entropy result contained a "
+                                  "non-finite value.");
+                        return 15;
+                    }
+                    s1_sum += s1_value;
+                }
             }
-            host_means[size_index] = sum / static_cast<double>(n);
+            host_s2_means[size_index] = sum / static_cast<double>(n);
+            if (host_s1_means != nullptr)
+            {
+                // Sizes the caller excluded report NaN, never a zero that would
+                // be indistinguishable from a product state.
+                host_s1_means[size_index] =
+                    size_has_s1 ? (s1_sum / static_cast<double>(n)) : nan("");
+            }
         }
         return 0;
     }
 
 }
 
-extern "C" int mipt_cuda_cyclic_s2_f32(const void *device_state,
-                                         int n,
-                                         int min_kept,
-                                         int max_kept,
-                                         int fermionic_trace,
-                                         double *host_means)
+extern "C" int mipt_cuda_cyclic_entropies_f32(const void *device_state,
+                                              int n,
+                                              int min_kept,
+                                              int max_kept,
+                                              int fermionic_trace,
+                                              int max_s1_kept,
+                                              double *host_s1_means,
+                                              double *host_s2_means)
 {
-    return compute_cyclic_s2<cuFloatComplex>(device_state, n, min_kept, max_kept,
-                                             fermionic_trace, host_means);
+    return compute_cyclic_entropies<cuFloatComplex>(
+        device_state, n, min_kept, max_kept, fermionic_trace, max_s1_kept,
+        host_s1_means, host_s2_means);
 }
 
-extern "C" int mipt_cuda_cyclic_s2_f64(const void *device_state,
-                                         int n,
-                                         int min_kept,
-                                         int max_kept,
-                                         int fermionic_trace,
-                                         double *host_means)
+extern "C" int mipt_cuda_cyclic_entropies_f64(const void *device_state,
+                                              int n,
+                                              int min_kept,
+                                              int max_kept,
+                                              int fermionic_trace,
+                                              int max_s1_kept,
+                                              double *host_s1_means,
+                                              double *host_s2_means)
 {
-    return compute_cyclic_s2<cuDoubleComplex>(device_state, n, min_kept, max_kept,
-                                              fermionic_trace, host_means);
+    return compute_cyclic_entropies<cuDoubleComplex>(
+        device_state, n, min_kept, max_kept, fermionic_trace, max_s1_kept,
+        host_s1_means, host_s2_means);
 }
 
-extern "C" const char *mipt_cuda_cyclic_s2_last_error(void)
+extern "C" const char *mipt_cuda_cyclic_entropies_last_error(void)
 {
     return g_last_error;
 }
