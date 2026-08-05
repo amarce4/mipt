@@ -20,7 +20,16 @@ from .loading import (
     _parse_size,
     _resolve_files,
 )
-from .plotting import _mi_unit_spec, _show
+from .plotting import (
+    _annotate_axes,
+    _font_kwargs,
+    _inset_overlay_defaults,
+    _set_secondary_title,
+    _mi_unit_spec,
+    _paired_axes,
+    _reserve_axis_space,
+    _show,
+)
 
 
 def _load_probe_distance_curves(
@@ -122,6 +131,21 @@ def _load_probe_distance_curves(
     return curves
 
 
+def _normalize_fit_parity(fit_parity: str) -> str:
+    parity = str(fit_parity).strip().lower()
+    if parity not in {"all", "odd", "even"}:
+        raise ValueError("fit_parity must be 'all', 'odd', or 'even'.")
+    return parity
+
+
+def _distance_matches_parity(distance: int, fit_parity: str) -> bool:
+    return (
+        fit_parity == "all"
+        or (fit_parity == "odd" and distance % 2 == 1)
+        or (fit_parity == "even" and distance % 2 == 0)
+    )
+
+
 def probe_distance_collapse(
     files: Sequence[str | Path] | str | Path | None = None,
     *,
@@ -138,8 +162,10 @@ def probe_distance_collapse(
     delay_bounds: tuple[float, float] = (0.0, 4.0),
     distance_load: tuple[int, int | None] = (1, None),
     fit_distance: tuple[int, int | None] = (2, None),
+    fit_parity: str = "all",
     fit_tau: tuple[float, float | None] = (1.0, None),
     fit_x: tuple[float | None, float | None] = (None, None),
+    tau_bounds: tuple[float, float] | None = None,
     fit_value_min: float = 1e-10,
     interpolation_points: int = 250,
     minimum_pair_coverage: float = 0.8,
@@ -153,7 +179,27 @@ def probe_distance_collapse(
     errorbar_points: int = 80,
     capsize: float = 2,
     cmap: str = "viridis",
-    figsize: tuple[float, float] = (13, 5),
+    collapse_inset: bool = True,
+    inset_corner: str = "lower right",
+    inset_size: tuple[float, float] = (0.42, 0.40),
+    inset_pad: tuple[float, float] = (0.0, 0.185),
+    inset_fontsize: float = 7.5,
+    inset_facecolor: str = "white",
+    inset_alpha: float = 1.0,
+    inset_headroom: float = 0.20,
+    annotation_loc: str | None = None,
+    annotation_fontsize: float | None = None,
+    legend_loc: str | None = None,
+    legend_fontsize: float = 8,
+    legend_ncols: int | None = None,
+    raw_title: str | None = "Distance-resolved probe dynamics",
+    collapse_title: str | None = None,
+    raw_xlabel: str | None = None,
+    raw_ylabel: str | None = None,
+    collapse_xlabel: str | None = None,
+    collapse_ylabel: str | None = None,
+    suptitle: str | None = None,
+    figsize: tuple[float, float] | None = None,
     dpi: int = 130,
     show_summary: bool = True,
     show: bool = True,
@@ -182,6 +228,16 @@ def probe_distance_collapse(
     The mean fitted pairwise overlap must retain at least
     ``minimum_pair_coverage`` of the points. ``fit_distance=(2,None)`` leaves
     the microscopic ``r=1`` curve visible but excludes it from the default fit.
+    ``fit_parity`` may be ``"all"``, ``"odd"``, or ``"even"``. Odd/even
+    selection applies to the fit, bootstrap, score, and collapse panel; the raw
+    dynamics panel continues to show every separation loaded by
+    ``distance_load``.
+
+    The collapse is drawn by default as an inset in the bottom-right corner
+    of the raw panel, lifted clear of the bottom edge so both x axes stay
+    readable, and both panels share the raw panel's legend. ``inset_size``
+    and ``inset_pad`` are fractions of the parent axes;
+    ``collapse_inset=False`` restores the side-by-side layout.
     """
     ansatz_key = str(ansatz).strip().lower().replace("-", "_")
     ansatz_key = {
@@ -262,6 +318,10 @@ def probe_distance_collapse(
         raise ValueError("fit_distance minimum must be at least 1.")
     if fit_tau_min < 0:
         raise ValueError("fit_tau minimum must be non-negative.")
+    fit_parity = _normalize_fit_parity(fit_parity)
+
+    def matches_fit_parity(curve):
+        return _distance_matches_parity(curve["distance"], fit_parity)
 
     summary = pd.DataFrame(
         {
@@ -272,6 +332,9 @@ def probe_distance_collapse(
             "t_eq": [curve["t_eq"] for curve in curves],
             "tau_max": [np.max(curve["tau"]) for curve in curves],
             "points": [len(curve["tau"]) for curve in curves],
+            "fit_parity_eligible": [
+                matches_fit_parity(curve) for curve in curves
+            ],
             "file": [str(curve["path"]) for curve in curves],
         }
     )
@@ -373,12 +436,21 @@ def probe_distance_collapse(
             curve
             for curve in curve_set
             if curve["distance"] >= fit_distance_min
+            and matches_fit_parity(curve)
             and (
                 fit_distance_max is None
                 or curve["distance"] <= fit_distance_max
             )
         ]
         return selected
+
+    initially_fitted_curves = eligible_curves(curves)
+    if len(initially_fitted_curves) < 2:
+        raise ValueError(
+            f"fit_parity={fit_parity!r} and fit_distance={fit_distance!r} "
+            "retain fewer than two separation curves. Widen fit_distance, "
+            "choose another parity, or load more separations."
+        )
 
     def score_values(
         eta_value,
@@ -573,6 +645,7 @@ def probe_distance_collapse(
 
     print(f"ansatz = {ansatz_key}")
     print(f"metric = {metric_spec['key']}")
+    print(f"fit parity = {fit_parity}")
     print(
         f"eta = {best_eta:.6f}"
         + (" (fixed)" if eta_fixed else f" ± {eta_stderr:.6f}")
@@ -605,9 +678,35 @@ def probe_distance_collapse(
         color_values = np.full(len(curves), 0.5)
     colors = [plt.get_cmap(cmap)(value) for value in color_values]
     one_size = len({curve["L"] for curve in curves}) == 1
-    fig, (ax_raw, ax_collapse) = plt.subplots(
-        1, 2, figsize=figsize, dpi=dpi, constrained_layout=True
+    if figsize is None:
+        figsize = (7.6, 5.2) if collapse_inset else (13, 5)
+    fig, panels = _paired_axes(
+        inset=collapse_inset,
+        figsize=figsize,
+        dpi=dpi,
+        inset_corner=inset_corner,
+        inset_size=inset_size,
+        inset_pad=inset_pad,
+        inset_fontsize=inset_fontsize,
+        inset_facecolor=inset_facecolor,
+        inset_alpha=inset_alpha,
     )
+    ax_raw, ax_collapse = panels[0]
+    inset_font = _font_kwargs(collapse_inset, inset_fontsize)
+    auto_legend_loc, auto_annotation_loc, reserve_side = _inset_overlay_defaults(
+        inset_corner
+    )
+    if legend_loc is None:
+        legend_loc = auto_legend_loc if collapse_inset else "best"
+    if annotation_loc is None:
+        annotation_loc = auto_annotation_loc if collapse_inset else "lower right"
+    if legend_ncols is None:
+        legend_ncols = 2 if len(curves) > 8 else 1
+    legend_kwargs: dict[str, Any] = {
+        "loc": legend_loc,
+        "ncols": legend_ncols,
+        "fontsize": legend_fontsize,
+    }
     for curve, color in zip(curves, colors):
         label = (
             rf"$r={curve['distance']},\ \ell_r={curve['chord']:.3g}$"
@@ -634,6 +733,9 @@ def probe_distance_collapse(
             )
         else:
             ax_raw.plot(curve["tau"], curve["value"], **plot_kwargs)
+
+        if not matches_fit_parity(curve):
+            continue
 
         x, y, dy, mask = transformed(
             curve, best_eta, best_z, best_delay
@@ -671,12 +773,17 @@ def probe_distance_collapse(
         if metric_spec["key"] == "mi"
         else metric_spec["raw_ylabel"]
     )
-    ax_raw.set_xlabel(r"Elapsed time $\tau$")
-    ax_raw.set_ylabel(observable_label)
-    ax_raw.set_title("Distance-resolved probe dynamics")
+    ax_raw.set_xlabel(
+        raw_xlabel if raw_xlabel is not None else r"Elapsed time $\tau$"
+    )
+    ax_raw.set_ylabel(raw_ylabel if raw_ylabel is not None else observable_label)
+    if raw_title:
+        ax_raw.set_title(raw_title)
     ax_raw.set_yscale(raw_yscale)
     ax_raw.grid(alpha=0.25)
-    ax_raw.legend(fontsize=8, ncols=2 if len(curves) > 8 else 1)
+    ax_raw.legend(**legend_kwargs)
+    if (tau_bounds is not None) and len(tau_bounds) == 2:
+        ax_raw.set_xlim(tau_bounds)
 
     x_labels = {
         "lightcone": (
@@ -687,25 +794,48 @@ def probe_distance_collapse(
         ),
         "legacy_local": r"$\alpha\tau/\ell_r^z$",
     }
-    ax_collapse.set_xlabel(x_labels[ansatz_key])
+    ax_collapse.set_xlabel(
+        collapse_xlabel if collapse_xlabel is not None else x_labels[ansatz_key],
+        **inset_font,
+    )
     collapse_symbol = {
         "mi": r"I(A:B)",
         "negativity": r"\mathcal{N}(A:B)",
         "log_negativity": r"E_{\mathcal{N}}(A:B)",
     }[metric_spec["key"]]
     unit_suffix = f" [{mi_units}]" if metric_spec["key"] == "mi" else ""
-    ax_collapse.set_ylabel(
-        rf"$\ell_r^{{\eta}}{collapse_symbol}$" + unit_suffix
-    )
+    if collapse_ylabel is not None or not collapse_inset:
+        ax_collapse.set_ylabel(
+            collapse_ylabel
+            if collapse_ylabel is not None
+            else rf"$\ell_r^{{\eta}}{collapse_symbol}$" + unit_suffix,
+            **inset_font,
+        )
     collapse_titles = {
         "lightcone": "Finite-size light-cone collapse",
         "cylinder": "Finite-cylinder collapse",
         "legacy_local": "Legacy local-time collapse",
     }
-    ax_collapse.set_title(collapse_titles[ansatz_key])
+    resolved_collapse_title = (
+        collapse_title
+        if collapse_title is not None
+        else collapse_titles[ansatz_key]
+    )
+    if collapse_title is None and fit_parity != "all":
+        resolved_collapse_title = (
+            f"{fit_parity.capitalize()}-separation "
+            + resolved_collapse_title.lower()
+        )
     ax_collapse.set_yscale(collapse_yscale)
     ax_collapse.grid(alpha=0.25)
-    ax_collapse.legend(fontsize=8, ncols=2 if len(curves) > 8 else 1)
+    if not collapse_inset:
+        ax_collapse.legend(**legend_kwargs)
+    _set_secondary_title(
+        ax_collapse,
+        resolved_collapse_title,
+        inset=collapse_inset,
+        fontsize=inset_fontsize + 1.0,
+    )
     eta_text = rf"$\eta={best_eta:.4f}$" + (
         " fixed"
         if eta_fixed
@@ -714,6 +844,8 @@ def probe_distance_collapse(
         else ""
     )
     parameter_lines = [eta_text]
+    if fit_parity != "all":
+        parameter_lines.append(f"separations = {fit_parity}")
     if z_active:
         parameter_lines.append(
             rf"$z={best_z:.4f}$"
@@ -744,15 +876,17 @@ def probe_distance_collapse(
         ]
     )
     parameter_text = "\n".join(parameter_lines)
-    ax_collapse.text(
-        0.97,
-        0.03,
+    annotation_kwargs: dict[str, Any] = {}
+    if annotation_fontsize is not None:
+        annotation_kwargs["fontsize"] = annotation_fontsize
+    _annotate_axes(
+        ax_raw if collapse_inset else ax_collapse,
         parameter_text,
-        transform=ax_collapse.transAxes,
-        ha="right",
-        va="bottom",
-        bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.88},
+        annotation_loc,
+        **annotation_kwargs,
     )
+    if collapse_inset:
+        _reserve_axis_space(ax_raw, reserve_side, inset_headroom)
     ansatz_titles = {
         "lightcone": (
             r"$O(\tau,r,L)=\ell_r^{-\eta}"
@@ -766,15 +900,20 @@ def probe_distance_collapse(
             r"G(\alpha\tau/\ell_r^z)$"
         ),
     }
-    fig.suptitle(ansatz_titles[ansatz_key], fontsize=14)
+    fig.suptitle(
+        suptitle if suptitle is not None else ansatz_titles[ansatz_key],
+        fontsize=14,
+    )
     _show(fig, show)
 
     return {
         "figure": fig,
         "axes": (ax_raw, ax_collapse),
+        "collapse_inset": collapse_inset,
         "metric": metric_spec["key"],
         "mi_units": mi_units,
         "ansatz": ansatz_key,
+        "fit_parity": fit_parity,
         "eta": best_eta,
         "eta_stderr": eta_stderr,
         "eta_fixed": eta_fixed,
@@ -793,6 +932,7 @@ def probe_distance_collapse(
         "bootstrap_successes": len(estimates),
         "summary": summary,
         "curves": curves,
+        "collapsed_curves": fitted_curves,
     }
 
 

@@ -22,7 +22,17 @@ from .loading import (
     _parse_size,
     _resolve_files,
 )
-from .plotting import _color_map_by_size, _mi_unit_spec, _show
+from .plotting import (
+    _annotate_axes,
+    _color_map_by_size,
+    _font_kwargs,
+    _inset_overlay_defaults,
+    _set_secondary_title,
+    _mi_unit_spec,
+    _paired_axes,
+    _reserve_axis_space,
+    _show,
+)
 
 
 def _load_probe_anisotropy_curve(
@@ -174,7 +184,25 @@ def probe_anisotropy(
     show_errorbars: bool = True,
     errorbar_points: int = 48,
     colors: Sequence[Any] = ("tab:blue", "tab:green", "tab:red"),
-    figsize: tuple[float, float] = (13, 4.8),
+    zoom_inset: bool = True,
+    inset_corner: str = "lower right",
+    inset_size: tuple[float, float] = (0.42, 0.40),
+    inset_pad: tuple[float, float] = (0.0, 0.185),
+    inset_fontsize: float = 7.5,
+    inset_facecolor: str = "white",
+    inset_alpha: float = 1.0,
+    inset_headroom: float = 0.20,
+    annotation_loc: str | None = None,
+    annotation_fontsize: float | None = None,
+    legend_loc: str | None = None,
+    legend_fontsize: float | None = None,
+    legend_ncols: int = 1,
+    full_title: str | None = "Full evolution",
+    zoom_title: str | None = "Late-time zoom",
+    xlabel: str | None = None,
+    ylabel: str | None = None,
+    suptitle: str | None = None,
+    figsize: tuple[float, float] | None = None,
     dpi: int = 130,
     show_summary: bool = True,
     show: bool = True,
@@ -197,6 +225,12 @@ def probe_anisotropy(
     from the same trajectories are correlated. Use ``"last"`` to reproduce a
     final-readout-only estimate. ``mi_units`` changes the displayed MI units
     but leaves the crossing and anisotropy unchanged.
+
+    By default the late-time zoom is drawn as an inset in the bottom-right
+    corner of the full-evolution panel, lifted clear of the bottom edge so
+    both x axes stay readable. ``inset_size`` and ``inset_pad`` are fractions
+    of the parent axes; ``zoom_inset=False`` restores the two-panel layout.
+    The single legend lives on the full-evolution axes.
     """
     mi_units, mi_scale = _mi_unit_spec(mi_units)
     paths = _resolve_files(files, file_glob)
@@ -360,9 +394,28 @@ def probe_anisotropy(
             np.linspace(0.08, 0.92, len(ordered_curves))
         )
     )
-    fig, (ax_full, ax_zoom) = plt.subplots(
-        1, 2, figsize=figsize, dpi=dpi, constrained_layout=True
+    if figsize is None:
+        figsize = (7.6, 5.2) if zoom_inset else (13, 4.8)
+    fig, panels = _paired_axes(
+        inset=zoom_inset,
+        figsize=figsize,
+        dpi=dpi,
+        inset_corner=inset_corner,
+        inset_size=inset_size,
+        inset_pad=inset_pad,
+        inset_fontsize=inset_fontsize,
+        inset_facecolor=inset_facecolor,
+        inset_alpha=inset_alpha,
     )
+    ax_full, ax_zoom = panels[0]
+    inset_font = _font_kwargs(zoom_inset, inset_fontsize)
+    auto_legend_loc, auto_annotation_loc, reserve_side = _inset_overlay_defaults(
+        inset_corner
+    )
+    if legend_loc is None:
+        legend_loc = auto_legend_loc if zoom_inset else "best"
+    if annotation_loc is None:
+        annotation_loc = auto_annotation_loc if zoom_inset else "lower right"
     for color, curve in zip(palette, ordered_curves):
         if curve["branch"] == "spatial":
             label = r"$(\delta x,\delta t)=(L/2,0)$"
@@ -391,15 +444,24 @@ def probe_anisotropy(
                 axis.plot(
                     curve["x"], curve["I"], color=color, linewidth=1.3, label=label
                 )
-    for axis, limits, title in (
-        (ax_full, full_xlim, "Full evolution"),
-        (ax_zoom, zoom_xlim, "Late-time zoom"),
+    x_text = xlabel if xlabel is not None else r"Readout time $\tau/L$"
+    y_text = (
+        ylabel
+        if ylabel is not None
+        else rf"Mutual information $I_{{12}}$ [{mi_units}]"
+    )
+    for axis, limits, title, is_inset in (
+        (ax_full, full_xlim, full_title, False),
+        (ax_zoom, zoom_xlim, zoom_title, zoom_inset),
     ):
+        font = _font_kwargs(is_inset, inset_fontsize)
         axis.set_xlim(*limits)
-        axis.set_xlabel(r"Readout time $\tau/L$")
-        axis.set_ylabel(rf"Mutual information $I_{{12}}$ [{mi_units}]")
-        axis.set_title(title)
+        axis.set_xlabel(x_text, **font)
+        if not is_inset:
+            axis.set_ylabel(y_text)
         axis.grid(alpha=0.22)
+    if full_title:
+        ax_full.set_title(full_title)
     if full_ylim is not None:
         ax_full.set_ylim(*full_ylim)
     if zoom_ylim is None:
@@ -416,22 +478,38 @@ def probe_anisotropy(
             ax_zoom.set_ylim(lower_y - margin, upper_y + margin)
     else:
         ax_zoom.set_ylim(*zoom_ylim)
-    ax_full.legend()
+    _set_secondary_title(
+        ax_zoom,
+        zoom_title,
+        inset=zoom_inset,
+        fontsize=inset_fontsize + 1.0,
+    )
+    legend_kwargs: dict[str, Any] = {"loc": legend_loc, "ncols": legend_ncols}
+    if legend_fontsize is not None:
+        legend_kwargs["fontsize"] = legend_fontsize
+    ax_full.legend(**legend_kwargs)
     ax_zoom.axvspan(
         estimate_window[0], estimate_window[1], color="black", alpha=0.045
     )
-    ax_zoom.text(
-        0.97,
-        0.04,
+    annotation_text = (
         rf"$\delta t_*/L={delta_t_star_over_l:.4g}$" + "\n"
-        + rf"$\alpha={alpha:.4g}\pm {alpha_stderr:.2g}$ (stat.)",
-        transform=ax_zoom.transAxes,
-        ha="right",
-        va="bottom",
-        bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.88},
+        + rf"$\alpha={alpha:.4g}\pm {alpha_stderr:.2g}$ (stat.)"
     )
+    annotation_kwargs: dict[str, Any] = {}
+    if annotation_fontsize is not None:
+        annotation_kwargs["fontsize"] = annotation_fontsize
+    _annotate_axes(
+        ax_full if zoom_inset else ax_zoom,
+        annotation_text,
+        annotation_loc,
+        **annotation_kwargs,
+    )
+    if zoom_inset and full_ylim is None:
+        _reserve_axis_space(ax_full, reserve_side, inset_headroom)
     fig.suptitle(
-        rf"Two-probe anisotropy correlators ($L={size}$, $p={probabilities[0]:g}$)"
+        suptitle
+        if suptitle is not None
+        else rf"Two-probe anisotropy correlators ($L={size}$, $p={probabilities[0]:g}$)"
     )
     _show(fig, show)
     return {
@@ -464,7 +542,7 @@ _PROBE_PC_SPECS = {
     "sq": {
         "mean": ["S_Q_mean", "SQ_mean", "S_mean", "entropy_mean"],
         "stderr": ["S_Q_stderr", "SQ_stderr", "S_stderr", "entropy_stderr"],
-        "ylabel": r"Reference entropy $\overline{S_Q}$ [nats]",
+        "ylabel": r"Ancilla entropy $\overline{S_Q}$ [nats]",
         "scaled_ylabel": r"$\overline{S_Q}$",
         "title": "One-probe Gullans--Huse order parameter",
         "x_symbol": "0",
@@ -698,6 +776,22 @@ def probe_pc_collapse(
     cmap: str = "viridis",
     show_errorbars: bool = True,
     capsize: float = 2,
+    collapse_inset: bool = True,
+    inset_corner: str = "upper right",
+    inset_size: tuple[float, float] = (0.40, 0.38),
+    inset_pad: tuple[float, float] = (0.0, 0.0),
+    inset_fontsize: float = 7.5,
+    inset_facecolor: str = "white",
+    inset_alpha: float = 1.0,
+    inset_headroom: float = 0.0,
+    annotation_loc: str | None = None,
+    annotation_fontsize: float | None = None,
+    legend_loc: str | None = None,
+    legend_fontsize: float | None = None,
+    legend_ncols: int = 1,
+    raw_title: str | None = None,
+    collapse_title: str | None = "Finite-size scaling collapse",
+    suptitle: str | None = None,
     figsize: tuple[float, float] | None = None,
     dpi: int = 130,
     show: bool = True,
@@ -711,6 +805,13 @@ def probe_pc_collapse(
     and collapse pairs. Supply ``fixed_pc`` and/or ``fixed_nu`` to stabilize
     the noisier three-parameter multiprobe fits. ``mi_units`` controls all
     multiprobe information metrics independently of ``sq_units``.
+
+    Each collapse is drawn by default as an inset in the top-right corner of
+    its raw panel, with one legend per row on the raw axes. ``inset_size``
+    and ``inset_pad`` are fractions of the parent axes;
+    ``collapse_inset=False`` restores the side-by-side layout, which keeps a
+    legend on both panels. ``raw_title`` overrides the per-metric title;
+    ``None`` keeps ``"<metric title> — raw"``.
     """
     sq_units = str(sq_units).strip().lower()
     if sq_units not in {"bits", "nats"}:
@@ -794,15 +895,33 @@ def probe_pc_collapse(
 
     nrows = len(selected_metrics)
     if figsize is None:
-        figsize = (13, 4.5 * nrows)
-    fig, axes = plt.subplots(
-        nrows,
-        2,
+        figsize = (7.6, 5.2 * nrows) if collapse_inset else (13, 4.5 * nrows)
+    fig, axes = _paired_axes(
+        inset=collapse_inset,
         figsize=figsize,
         dpi=dpi,
-        squeeze=False,
-        constrained_layout=True,
+        nrows=nrows,
+        inset_corner=inset_corner,
+        inset_size=inset_size,
+        inset_pad=inset_pad,
+        inset_fontsize=inset_fontsize,
+        inset_facecolor=inset_facecolor,
+        inset_alpha=inset_alpha,
     )
+    inset_font = _font_kwargs(collapse_inset, inset_fontsize)
+    _, _, reserve_side = _inset_overlay_defaults(inset_corner)
+    # Crossing curves leave the left column free, so both overlays stack
+    # there: the parameter box in the corner, the legend centred above it.
+    if legend_loc is None:
+        legend_loc = "center left" if collapse_inset else "best"
+    if annotation_loc is None:
+        annotation_loc = "lower left" if collapse_inset else "lower right"
+    legend_kwargs: dict[str, Any] = {"loc": legend_loc, "ncols": legend_ncols}
+    if legend_fontsize is not None:
+        legend_kwargs["fontsize"] = legend_fontsize
+    annotation_kwargs: dict[str, Any] = {}
+    if annotation_fontsize is not None:
+        annotation_kwargs["fontsize"] = annotation_fontsize
     sizes = sorted({curve["L"] for curves in curves_by_metric.values() for curve in curves})
     colors = _color_map_by_size(sizes, cmap)
     for row, metric in enumerate(selected_metrics):
@@ -840,7 +959,7 @@ def probe_pc_collapse(
         ax_raw.axhline(0.0, color="black", linewidth=0.7, alpha=0.3)
         ax_raw.set_xlabel(r"Measurement rate $p$")
         ax_raw.set_ylabel(
-            r"Reference entropy $\overline{S_Q}$ [bits]"
+            r"Ancilla entropy $\overline{S_Q}$ [bits]"
             if metric == "sq" and sq_units == "bits"
             else (
                 spec["ylabel"].replace("[nats]", f"[{mi_units}]")
@@ -848,42 +967,54 @@ def probe_pc_collapse(
                 else spec["ylabel"]
             )
         )
-        ax_raw.set_title(spec["title"] + " — raw")
+        ax_raw.set_title(
+            raw_title if raw_title is not None else spec["title"] + " — raw"
+        )
         ax_raw.grid(alpha=0.25)
-        ax_raw.legend()
+        ax_raw.legend(**legend_kwargs)
 
         ax_scaled.axvline(0.0, color="black", linestyle="--", linewidth=1)
         ax_scaled.axhline(0.0, color="black", linewidth=0.7, alpha=0.3)
-        ax_scaled.set_xlabel(r"$(p-p_c)L^{1/\nu}$")
-        ax_scaled.set_ylabel(
-            spec["scaled_ylabel"] + f" [{mi_units}]"
-            if metric != "sq"
-            else spec["scaled_ylabel"]
-        )
-        ax_scaled.set_title("Finite-size scaling collapse")
+        ax_scaled.set_xlabel(r"$(p-p_c)L^{1/\nu}$", **inset_font)
+        if not collapse_inset:
+            ax_scaled.set_ylabel(
+                spec["scaled_ylabel"] + f" [{mi_units}]"
+                if metric != "sq"
+                else spec["scaled_ylabel"]
+            )
+            ax_scaled.legend(**legend_kwargs)
         ax_scaled.grid(alpha=0.25)
-        ax_scaled.legend()
+        _set_secondary_title(
+            ax_scaled,
+            collapse_title,
+            inset=collapse_inset,
+            fontsize=inset_fontsize + 1.0,
+        )
         x_text = (
             r"$x=0$ fixed"
             if metric == "sq" and abs(fit["x"]) < 1e-14
             else rf"${spec['x_symbol']}={fit['x']:.4g}\pm {fit['x_stderr']:.2g}$"
         )
-        ax_scaled.text(
-            0.97,
-            0.03,
+        _annotate_axes(
+            ax_raw if collapse_inset else ax_scaled,
             rf"$p_c={fit['pc']:.5g}\pm {fit['pc_stderr']:.2g}$" + "\n"
             + rf"$\nu={fit['nu']:.4g}\pm {fit['nu_stderr']:.2g}$" + "\n"
-            + x_text + "\n" + rf"score $={fit['score']:.3g}$",
-            transform=ax_scaled.transAxes,
-            ha="right",
-            va="bottom",
-            bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.88},
+            + rf"score $={fit['score']:.3g}$",
+            annotation_loc,
+            **annotation_kwargs,
         )
-    fig.suptitle(f"Fixed-time critical probe scaling (probes={probes}, t=4L)")
+        if collapse_inset:
+            _reserve_axis_space(ax_raw, reserve_side, inset_headroom)
+    fig.suptitle(
+        suptitle
+        if suptitle is not None
+        else f"Fixed-time critical probe scaling (probes={probes}, t=4L)"
+    )
     _show(fig, show)
     return {
         "figure": fig,
-        "axes": axes,
+        "axes": np.array(axes, dtype=object),
+        "collapse_inset": collapse_inset,
         "probes": probes,
         "metrics": selected_metrics,
         "sq_units": sq_units,
@@ -1003,7 +1134,7 @@ def probe_entropy_map(
         else:
             ax_lines.plot(curve["t"], curve["S_Q"], **kwargs)
     ax_lines.set_xlabel(r"Time $t$")
-    ax_lines.set_ylabel(r"Reference entropy $\overline{S_Q}$ [nats]")
+    ax_lines.set_ylabel(r"Ancilla entropy $\overline{S_Q}$ [nats]")
     ax_lines.set_title("Entropy dynamics at selected measurement rates")
     ax_lines.grid(alpha=0.25)
     ax_lines.legend()

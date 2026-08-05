@@ -15,13 +15,21 @@ from pathlib import Path
 import warnings
 from typing import Any, Mapping, Sequence
 
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from scipy.optimize import minimize_scalar
 
 from .loading import _find_column, resolve_metadata
-from .plotting import _color_map_by_size, _show
+from .plotting import (
+    _annotate_axes,
+    _color_map_by_size,
+    _font_kwargs,
+    _inset_overlay_defaults,
+    _set_secondary_title,
+    _paired_axes,
+    _reserve_axis_space,
+    _show,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -360,15 +368,40 @@ def bulk_exponent_collapse(
     show_errorbars: bool,
     capsize: float,
     cmap: str,
-    figsize: tuple[float, float],
+    figsize: tuple[float, float] | None,
     dpi: int,
     show_summary: bool,
     show: bool,
+    collapse_inset: bool = True,
+    show_fit_window: bool = False,
+    inset_corner: str = "lower right",
+    inset_size: tuple[float, float] = (0.42, 0.40),
+    inset_pad: tuple[float, float] = (0.0, 0.185),
+    inset_fontsize: float = 7.5,
+    inset_facecolor: str = "white",
+    inset_alpha: float = 1.0,
+    inset_headroom: float = 0.20,
+    annotation_loc: str | None = None,
+    annotation_fontsize: float | None = None,
+    legend_loc: str | None = None,
+    legend_fontsize: float | None = None,
+    legend_ncols: int = 1,
+    raw_title: str | None = None,
+    collapse_title: str | None = "Bulk-exponent scaling collapse",
+    raw_xlabel: str | None = None,
+    raw_ylabel: str | None = None,
+    collapse_xlabel: str | None = None,
+    collapse_ylabel: str | None = None,
+    suptitle: str | None = None,
 ) -> dict[str, Any]:
     """Fit and plot ``O(L,t)=L^(-eta)g((t-2L)/L)`` for a set of curves.
 
     ``curves`` come from :func:`load_scaled_time_curve` and are modified in
     place when the metric is rescaled by ``mi_scale``.
+
+    The collapse is drawn by default as an inset in the bottom-right corner
+    of the raw panel, lifted clear of the bottom edge so both x axes stay
+    readable, and the two panels share the raw panel's legend.
     """
     signed = bool(metric_spec["signed"])
     metric_spec = dict(metric_spec)
@@ -513,9 +546,28 @@ def bulk_exponent_collapse(
     print(f"collapse score = {best_score:.6g}")
 
     colors = _color_map_by_size(sizes, cmap)
-    fig, (ax_raw, ax_collapse) = plt.subplots(
-        1, 2, figsize=figsize, dpi=dpi, constrained_layout=True
+    if figsize is None:
+        figsize = (7.6, 5.2) if collapse_inset else (13, 5)
+    fig, panels = _paired_axes(
+        inset=collapse_inset,
+        figsize=figsize,
+        dpi=dpi,
+        inset_corner=inset_corner,
+        inset_size=inset_size,
+        inset_pad=inset_pad,
+        inset_fontsize=inset_fontsize,
+        inset_facecolor=inset_facecolor,
+        inset_alpha=inset_alpha,
     )
+    ax_raw, ax_collapse = panels[0]
+    inset_font = _font_kwargs(collapse_inset, inset_fontsize)
+    auto_legend_loc, auto_annotation_loc, reserve_side = _inset_overlay_defaults(
+        inset_corner
+    )
+    if legend_loc is None:
+        legend_loc = auto_legend_loc if collapse_inset else "best"
+    if annotation_loc is None:
+        annotation_loc = auto_annotation_loc if collapse_inset else "lower right"
     for curve in curves:
         size, color = curve["L"], colors[curve["L"]]
         kwargs = dict(
@@ -574,52 +626,84 @@ def bulk_exponent_collapse(
         if fit_x_max is not None
         else max(curve["x"].max() for curve in curves)
     )
-    ax_raw.axvspan(fit_x_min, fit_upper, alpha=0.08, label="fit window")
-    ax_raw.set_xlabel(r"Scaled time $x=(t-2L)/L$")
-    raw_ylabel = metric_spec["raw_ylabel"]
-    collapse_ylabel = metric_spec["collapse_ylabel"]
+    if show_fit_window:
+        ax_raw.axvspan(fit_x_min, fit_upper, alpha=0.08, label="fit window")
+    default_raw_ylabel = metric_spec["raw_ylabel"]
+    default_collapse_ylabel = metric_spec["collapse_ylabel"]
     if metric_spec["scale_with_mi_units"]:
-        raw_ylabel = raw_ylabel.replace("[nats]", f"[{mi_units}]")
-        collapse_ylabel = collapse_ylabel + f" [{mi_units}]"
-    ax_raw.set_ylabel(raw_ylabel)
-    ax_raw.set_title(metric_spec["raw_title"])
+        default_raw_ylabel = default_raw_ylabel.replace("[nats]", f"[{mi_units}]")
+        default_collapse_ylabel = default_collapse_ylabel + f" [{mi_units}]"
+    scaled_time_label = r"Scaled time $x=(t-2L)/L$"
+    ax_raw.set_xlabel(
+        raw_xlabel if raw_xlabel is not None else scaled_time_label
+    )
+    ax_raw.set_ylabel(
+        raw_ylabel if raw_ylabel is not None else default_raw_ylabel
+    )
+    ax_raw.set_title(
+        raw_title if raw_title is not None else metric_spec["raw_title"]
+    )
     ax_raw.set_yscale(raw_yscale)
     ax_raw.grid(alpha=0.25)
-    ax_raw.legend()
+    legend_kwargs: dict[str, Any] = {"loc": legend_loc, "ncols": legend_ncols}
+    if legend_fontsize is not None:
+        legend_kwargs["fontsize"] = legend_fontsize
+    ax_raw.legend(**legend_kwargs)
 
     if signed:
         ax_collapse.axhline(0.0, linewidth=1, alpha=0.35)
-    ax_collapse.set_xlabel(r"Scaled time $x=(t-2L)/L$")
-    ax_collapse.set_ylabel(collapse_ylabel)
-    ax_collapse.set_title("Bulk-exponent scaling collapse")
+    ax_collapse.set_xlabel(
+        collapse_xlabel if collapse_xlabel is not None else scaled_time_label,
+        **inset_font,
+    )
+    if collapse_ylabel is not None or not collapse_inset:
+        ax_collapse.set_ylabel(
+            collapse_ylabel
+            if collapse_ylabel is not None
+            else default_collapse_ylabel,
+            **inset_font,
+        )
     ax_collapse.set_yscale(collapse_yscale)
     ax_collapse.grid(alpha=0.25)
-    ax_collapse.legend()
+    if not collapse_inset:
+        ax_collapse.legend(**legend_kwargs)
+    _set_secondary_title(
+        ax_collapse,
+        collapse_title,
+        inset=collapse_inset,
+        fontsize=inset_fontsize + 1.0,
+    )
     symbol = metric_spec["eta_symbol"]
     eta_text = (
         rf"${symbol}={eta:.4f}\pm {eta_stderr:.4f}$"
         if np.isfinite(eta_stderr)
         else rf"${symbol}={eta:.4f}$"
     )
-    ax_collapse.text(
-        0.97,
-        0.02,
+    annotation_kwargs: dict[str, Any] = {}
+    if annotation_fontsize is not None:
+        annotation_kwargs["fontsize"] = annotation_fontsize
+    _annotate_axes(
+        ax_raw if collapse_inset else ax_collapse,
         metric_spec["ansatz"]
         + "\n"
         + eta_text
         + "\n"
         + rf"score $={best_score:.3g}$",
-        transform=ax_collapse.transAxes,
-        ha="right",
-        va="bottom",
-        bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.88},
+        annotation_loc,
+        **annotation_kwargs,
     )
-    fig.suptitle(metric_spec["suptitle"], fontsize=14)
+    if collapse_inset:
+        _reserve_axis_space(ax_raw, reserve_side, inset_headroom)
+    fig.suptitle(
+        suptitle if suptitle is not None else metric_spec["suptitle"],
+        fontsize=14,
+    )
     _show(fig, show)
 
     return {
         "figure": fig,
         "axes": (ax_raw, ax_collapse),
+        "collapse_inset": collapse_inset,
         "metric": metric_spec["key"],
         "mi_units": mi_units,
         "eta": eta,

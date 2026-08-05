@@ -4,7 +4,8 @@ Public functions
 ----------------
 gmn(...)               Plot GMN/fGMN and optional minimum bipartite negativity.
 entropy(...)           Plot Rényi-2 entropy scaling curves and weighted fits.
-dist_scaling(...)      Plot two-site MI/negativity distance scaling and power-law fits.
+dist_scaling(...)      Plot two-site (MI/negativity) or three-site (TMI/GMN)
+                       distance scaling and power-law fits.
 expvals(...)           Plot aggregate fermionic observables and Wick residuals.
 tmi_collapse(...)      Fit and plot the TMI finite-size scaling collapse.
 probe1_collapse(...)   Fit and plot the one-ancilla dynamical collapse.
@@ -17,6 +18,9 @@ free_energy_equilibration(...) Recreate Supplementary Fig. S1(a,b).
 probe4_collapse(...)   Fit and plot four-ancilla I2/I3/I4 collapses.
 probe_pc_collapse(...) Fit fixed-t p scans for one/two/four probes.
 probe_entropy_map(...) Plot the p-t S_Q heatmap and selected-p time curves.
+front_velocity(...)    Fit one-probe mode-5 classical and entanglement front velocities.
+stagger_velocity(...)  Fit two-probe mode-5 one-way velocities from insertion-delay
+                       breakpoints.
 
 All plotting functions return a dictionary containing the figure, axes, loaded
 or summarized data, and fitted parameters. They show the plot by default; pass
@@ -33,6 +37,7 @@ gmn, entropy, distance, expvals, tmi, free_energy
 probes_collapse    one-, two-, and four-probe bulk-exponent collapses
 probes_dynamics    mode-4 distance-resolved and three-probe dynamics
 probes_scans       mode-1 critical scans, mode-2 entropy maps, mode-3 anisotropy
+front, stagger     mode-5 one-probe fronts and two-probe staggered velocities
 """
 
 from __future__ import annotations
@@ -41,10 +46,12 @@ from .distance import dist_scaling
 from .entropy import entropy
 from .expvals import expvals
 from .free_energy import free_energy_ceff, free_energy_equilibration
+from .front import front_velocity
 from .gmn import gmn
 from .probes_collapse import probe1_collapse, probe2_collapse, probe4_collapse
 from .probes_dynamics import probe3_dynamics, probe_distance_collapse
 from .probes_scans import probe_anisotropy, probe_entropy_map, probe_pc_collapse
+from .stagger import stagger_velocity
 from .tmi import tmi_collapse
 
 __all__ = [
@@ -63,4 +70,6 @@ __all__ = [
     "probe4_collapse",
     "probe_pc_collapse",
     "probe_entropy_map",
+    "front_velocity",
+    "stagger_velocity",
 ]

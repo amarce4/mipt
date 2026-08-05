@@ -6,7 +6,6 @@ from pathlib import Path
 import warnings
 from typing import Any, Mapping, Sequence
 
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from scipy.optimize import differential_evolution, minimize
@@ -18,7 +17,17 @@ from .collapse import (
     load_scaled_time_curve,
 )
 from .loading import _find_column, _parse_size, _resolve_files
-from .plotting import _color_map_by_size, _mi_unit_spec, _show
+from .plotting import (
+    _annotate_axes,
+    _color_map_by_size,
+    _font_kwargs,
+    _inset_overlay_defaults,
+    _set_secondary_title,
+    _mi_unit_spec,
+    _paired_axes,
+    _reserve_axis_space,
+    _show,
+)
 
 
 def _load_probe1_curve(
@@ -83,11 +92,39 @@ def probe1_collapse(
     show_errorbars: bool = True,
     capsize: float = 2,
     cmap: str = "viridis",
-    figsize: tuple[float, float] = (13, 5),
+    collapse_inset: bool = True,
+    show_fit_window: bool = False,
+    inset_corner: str = "upper right",
+    inset_size: tuple[float, float] = (0.40, 0.38),
+    inset_pad: tuple[float, float] = (0.0, 0.0),
+    inset_fontsize: float = 7.5,
+    inset_facecolor: str = "white",
+    inset_alpha: float = 1.0,
+    inset_headroom: float = 0.20,
+    annotation_loc: str | None = None,
+    annotation_fontsize: float | None = None,
+    legend_loc: str | None = None,
+    legend_fontsize: float | None = None,
+    legend_ncols: int = 1,
+    raw_title: str | None = "Critical ancilla dynamics",
+    collapse_title: str | None = "Finite-size scaling collapse",
+    raw_xlabel: str | None = None,
+    raw_ylabel: str | None = None,
+    collapse_xlabel: str | None = None,
+    collapse_ylabel: str | None = None,
+    suptitle: str | None = None,
+    figsize: tuple[float, float] | None = None,
     dpi: int = 130,
     show: bool = True,
 ) -> dict[str, Any]:
-    """Fit S_A(L,t)=L^(-x_A)F(t/L^z) for one ancilla probe."""
+    """Fit S_A(L,t)=L^(-x_A)F(t/L^z) for one ancilla probe.
+
+    The collapse is drawn by default as an inset in the top-right corner of
+    the raw panel, sharing the raw panel's single legend. ``inset_size`` and
+    ``inset_pad`` are fractions of the parent axes. ``collapse_inset=False``
+    restores the side-by-side layout with a legend on each panel, and
+    ``show_fit_window=True`` restores the shaded fit-window band.
+    """
     paths = _resolve_files(files, file_glob)
     curves = [
         _load_probe1_curve(path, l_by_file=l_by_file, t_max=t_max)
@@ -235,20 +272,40 @@ def probe1_collapse(
     print(f"collapse score = {best_score:.6g}")
 
     colors = _color_map_by_size(sizes, cmap)
-    fig, (ax_raw, ax_collapse) = plt.subplots(
-        1, 2, figsize=figsize, dpi=dpi, constrained_layout=True
+    if figsize is None:
+        figsize = (7.6, 5.2) if collapse_inset else (13, 5)
+    fig, panels = _paired_axes(
+        inset=collapse_inset,
+        figsize=figsize,
+        dpi=dpi,
+        inset_corner=inset_corner,
+        inset_size=inset_size,
+        inset_pad=inset_pad,
+        inset_fontsize=inset_fontsize,
+        inset_facecolor=inset_facecolor,
+        inset_alpha=inset_alpha,
     )
+    ax_raw, ax_collapse = panels[0]
+    inset_font = _font_kwargs(collapse_inset, inset_fontsize)
+    auto_legend_loc, auto_annotation_loc, reserve_side = _inset_overlay_defaults(
+        inset_corner
+    )
+    if legend_loc is None:
+        legend_loc = auto_legend_loc if collapse_inset else "best"
+    if annotation_loc is None:
+        annotation_loc = auto_annotation_loc if collapse_inset else "upper right"
     loaded_t_max = max(np.max(curve["t"]) for curve in curves)
     fit_upper = min(fit_t_max, loaded_t_max) if fit_t_max is not None else loaded_t_max
-    ax_raw.axvspan(
-        fit_t_min,
-        fit_upper,
-        facecolor="lightsteelblue",
-        alpha=0.16,
-        edgecolor="none",
-        label="fit window",
-        zorder=0,
-    )
+    if show_fit_window:
+        ax_raw.axvspan(
+            fit_t_min,
+            fit_upper,
+            facecolor="lightsteelblue",
+            alpha=0.16,
+            edgecolor="none",
+            label="fit window",
+            zorder=0,
+        )
 
     for curve in curves:
         color, size = colors[curve["L"]], curve["L"]
@@ -308,35 +365,63 @@ def probe1_collapse(
                 **kwargs,
             )
 
-    ax_raw.set_xlabel(r"Time $t$")
-    ax_raw.set_ylabel(r"Ancilla entropy $\overline{S_A}$")
-    ax_raw.set_title("Critical ancilla dynamics")
+    ax_raw.set_xlabel(raw_xlabel if raw_xlabel is not None else r"Time $t$")
+    ax_raw.set_ylabel(
+        raw_ylabel
+        if raw_ylabel is not None
+        else r"Ancilla entropy $\overline{S_A}$"
+    )
+    if raw_title:
+        ax_raw.set_title(raw_title)
     ax_raw.set_xscale(raw_xscale)
     ax_raw.grid(alpha=0.25)
+    legend_kwargs: dict[str, Any] = {"loc": legend_loc, "ncols": legend_ncols}
+    if legend_fontsize is not None:
+        legend_kwargs["fontsize"] = legend_fontsize
     handles, labels = ax_raw.get_legend_handles_labels()
     order = [i for i, label in enumerate(labels) if label == "fit window"] + [
         i for i, label in enumerate(labels) if label != "fit window"
     ]
-    ax_raw.legend([handles[i] for i in order], [labels[i] for i in order])
+    ax_raw.legend(
+        [handles[i] for i in order], [labels[i] for i in order], **legend_kwargs
+    )
 
-    ax_collapse.set_xlabel(r"Scaled time $t/L^z$")
-    ax_collapse.set_ylabel(
+    ax_collapse.set_xlabel(
+        collapse_xlabel if collapse_xlabel is not None else r"Scaled time $t/L^z$",
+        **inset_font,
+    )
+    default_collapse_ylabel = (
         r"$\overline{S_A}$"
         if abs(best_x_a) < 1e-12
         else r"$L^{x_A}\overline{S_A}$"
     )
-    ax_collapse.set_title("Finite-size scaling collapse")
+    if collapse_ylabel is not None or not collapse_inset:
+        ax_collapse.set_ylabel(
+            collapse_ylabel
+            if collapse_ylabel is not None
+            else default_collapse_ylabel,
+            **inset_font,
+        )
     ax_collapse.set_xscale(collapse_xscale)
     ax_collapse.grid(alpha=0.25)
-    ax_collapse.legend()
+    if not collapse_inset:
+        ax_collapse.legend(**legend_kwargs)
+    _set_secondary_title(
+        ax_collapse,
+        collapse_title,
+        inset=collapse_inset,
+        fontsize=inset_fontsize + 1.0,
+    )
     x_a_text = (
         rf"$x_A={best_x_a:.4f}\pm {x_a_stderr:.4f}$"
         if fixed_x_a is None
         else rf"$x_A={best_x_a:.4f}$ fixed"
     )
-    ax_collapse.text(
-        0.97,
-        0.97,
+    annotation_kwargs: dict[str, Any] = {}
+    if annotation_fontsize is not None:
+        annotation_kwargs["fontsize"] = annotation_fontsize
+    _annotate_axes(
+        ax_raw if collapse_inset else ax_collapse,
         r"$\overline{S_A}=L^{-x_A}F(t/L^z)$"
         + "\n"
         + rf"$z={best_z:.4f}\pm {z_stderr:.4f}$"
@@ -344,17 +429,23 @@ def probe1_collapse(
         + x_a_text
         + "\n"
         + rf"score $={best_score:.3g}$",
-        transform=ax_collapse.transAxes,
-        ha="right",
-        va="top",
-        bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.88},
+        annotation_loc,
+        **annotation_kwargs,
     )
-    fig.suptitle("Ancilla probe at the measurement-induced critical point", fontsize=14)
+    if collapse_inset:
+        _reserve_axis_space(ax_raw, reserve_side, inset_headroom)
+    fig.suptitle(
+        suptitle
+        if suptitle is not None
+        else "Ancilla probe at the measurement-induced critical point",
+        fontsize=14,
+    )
     _show(fig, show)
 
     return {
         "figure": fig,
         "axes": (ax_raw, ax_collapse),
+        "collapse_inset": collapse_inset,
         "z": best_z,
         "z_stderr": z_stderr,
         "x_a": best_x_a,
@@ -397,7 +488,28 @@ def probe2_collapse(
     show_errorbars: bool = True,
     capsize: float = 2,
     cmap: str = "viridis",
-    figsize: tuple[float, float] = (13, 5),
+    collapse_inset: bool = True,
+    show_fit_window: bool = False,
+    inset_corner: str = "lower right",
+    inset_size: tuple[float, float] = (0.42, 0.40),
+    inset_pad: tuple[float, float] = (0.0, 0.185),
+    inset_fontsize: float = 7.5,
+    inset_facecolor: str = "white",
+    inset_alpha: float = 1.0,
+    inset_headroom: float = 0.20,
+    annotation_loc: str | None = None,
+    annotation_fontsize: float | None = None,
+    legend_loc: str | None = None,
+    legend_fontsize: float | None = None,
+    legend_ncols: int = 1,
+    raw_title: str | None = None,
+    collapse_title: str | None = "Bulk-exponent scaling collapse",
+    raw_xlabel: str | None = None,
+    raw_ylabel: str | None = None,
+    collapse_xlabel: str | None = None,
+    collapse_ylabel: str | None = None,
+    suptitle: str | None = None,
+    figsize: tuple[float, float] | None = None,
     dpi: int = 130,
     show_summary: bool = True,
     show: bool = True,
@@ -410,6 +522,11 @@ def probe2_collapse(
     retained for notebook compatibility and acts as the minimum selected
     observable value, regardless of metric. ``mi_units`` applies only when
     ``metric="mi"``.
+
+    The collapse is drawn by default as an inset in the bottom-right corner
+    of the raw panel, both panels sharing the raw panel's legend, and the
+    fit-window band is off. ``collapse_inset=False`` restores the
+    side-by-side layout; ``show_fit_window=True`` restores the band.
     """
     metric_spec = _probe2_metric_spec(metric)
     mi_units, mi_scale = _mi_unit_spec(mi_units)
@@ -445,6 +562,27 @@ def probe2_collapse(
         dpi=dpi,
         show_summary=show_summary,
         show=show,
+        collapse_inset=collapse_inset,
+        show_fit_window=show_fit_window,
+        inset_corner=inset_corner,
+        inset_size=inset_size,
+        inset_pad=inset_pad,
+        inset_fontsize=inset_fontsize,
+        inset_facecolor=inset_facecolor,
+        inset_alpha=inset_alpha,
+        inset_headroom=inset_headroom,
+        annotation_loc=annotation_loc,
+        annotation_fontsize=annotation_fontsize,
+        legend_loc=legend_loc,
+        legend_fontsize=legend_fontsize,
+        legend_ncols=legend_ncols,
+        raw_title=raw_title,
+        collapse_title=collapse_title,
+        raw_xlabel=raw_xlabel,
+        raw_ylabel=raw_ylabel,
+        collapse_xlabel=collapse_xlabel,
+        collapse_ylabel=collapse_ylabel,
+        suptitle=suptitle,
     )
 
 
@@ -470,7 +608,28 @@ def probe4_collapse(
     show_errorbars: bool = True,
     capsize: float = 2,
     cmap: str = "viridis",
-    figsize: tuple[float, float] = (13, 5),
+    collapse_inset: bool = True,
+    show_fit_window: bool = False,
+    inset_corner: str = "lower right",
+    inset_size: tuple[float, float] = (0.42, 0.40),
+    inset_pad: tuple[float, float] = (0.0, 0.185),
+    inset_fontsize: float = 7.5,
+    inset_facecolor: str = "white",
+    inset_alpha: float = 1.0,
+    inset_headroom: float = 0.20,
+    annotation_loc: str | None = None,
+    annotation_fontsize: float | None = None,
+    legend_loc: str | None = None,
+    legend_fontsize: float | None = None,
+    legend_ncols: int = 1,
+    raw_title: str | None = None,
+    collapse_title: str | None = "Bulk-exponent scaling collapse",
+    raw_xlabel: str | None = None,
+    raw_ylabel: str | None = None,
+    collapse_xlabel: str | None = None,
+    collapse_ylabel: str | None = None,
+    suptitle: str | None = None,
+    figsize: tuple[float, float] | None = None,
     dpi: int = 130,
     show_summary: bool = True,
     show: bool = True,
@@ -483,6 +642,10 @@ def probe4_collapse(
     ``I3`` and ``I4`` may be signed, the fit cutoff is applied to the absolute
     value through ``fit_abs_min`` and bootstrap samples are not clipped.
     ``mi_units`` selects ``"nats"`` or ``"bits"`` for every information metric.
+
+    The layout controls match :func:`probe2_collapse`: the collapse is an
+    inset in the bottom-right corner of the raw panel by default, the two
+    panels share one legend, and the fit-window band is off.
     """
     if fit_abs_min < 0.0:
         raise ValueError("fit_abs_min must be non-negative.")
@@ -520,4 +683,25 @@ def probe4_collapse(
         dpi=dpi,
         show_summary=show_summary,
         show=show,
+        collapse_inset=collapse_inset,
+        show_fit_window=show_fit_window,
+        inset_corner=inset_corner,
+        inset_size=inset_size,
+        inset_pad=inset_pad,
+        inset_fontsize=inset_fontsize,
+        inset_facecolor=inset_facecolor,
+        inset_alpha=inset_alpha,
+        inset_headroom=inset_headroom,
+        annotation_loc=annotation_loc,
+        annotation_fontsize=annotation_fontsize,
+        legend_loc=legend_loc,
+        legend_fontsize=legend_fontsize,
+        legend_ncols=legend_ncols,
+        raw_title=raw_title,
+        collapse_title=collapse_title,
+        raw_xlabel=raw_xlabel,
+        raw_ylabel=raw_ylabel,
+        collapse_xlabel=collapse_xlabel,
+        collapse_ylabel=collapse_ylabel,
+        suptitle=suptitle,
     )
