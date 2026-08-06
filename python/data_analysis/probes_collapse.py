@@ -15,6 +15,7 @@ from .collapse import (
     _probe4_metric_spec,
     bulk_exponent_collapse,
     load_scaled_time_curve,
+    stacked_bulk_exponent_collapse,
 )
 from .loading import _find_column, _parse_size, _resolve_files
 from .plotting import (
@@ -422,9 +423,9 @@ def probe1_collapse(
         annotation_kwargs["fontsize"] = annotation_fontsize
     _annotate_axes(
         ax_raw if collapse_inset else ax_collapse,
-        r"$\overline{S_A}=L^{-x_A}F(t/L^z)$"
-        + "\n"
-        + rf"$z={best_z:.4f}\pm {z_stderr:.4f}$"
+        # The ansatz line r"$\overline{S_A}=L^{-x_A}F(t/L^z)$" is deliberately
+        # left out of the box; do not restore the leading "+" with it.
+        rf"$z={best_z:.4f}\pm {z_stderr:.4f}$"
         + "\n"
         + x_a_text
         + "\n"
@@ -440,7 +441,9 @@ def probe1_collapse(
         else "Ancilla probe at the measurement-induced critical point",
         fontsize=14,
     )
+    ax_raw.set_ylim(-0.03, None)
     _show(fig, show)
+    
 
     return {
         "figure": fig,
@@ -472,6 +475,7 @@ def probe2_collapse(
     file_glob: str | Path | None = None,
     l_by_file: Mapping[str, int] | None = None,
     metric: str = "mi",
+    stack_metrics: bool = False,
     mi_units: str = "nats",
     x_load: tuple[float | None, float | None] = (None, None),
     fit_x: tuple[float, float | None] = (0.25, 8.0),
@@ -483,8 +487,8 @@ def probe2_collapse(
     bootstrap_samples: int = 200,
     bootstrap_seed: int = 24680,
     bootstrap_xtol: float = 1e-5,
-    raw_yscale: str = "linear",
-    collapse_yscale: str = "linear",
+    raw_yscale: str | Mapping[str, str] = "linear",
+    collapse_yscale: str | Mapping[str, str] = "linear",
     show_errorbars: bool = True,
     capsize: float = 2,
     cmap: str = "viridis",
@@ -502,12 +506,12 @@ def probe2_collapse(
     legend_loc: str | None = None,
     legend_fontsize: float | None = None,
     legend_ncols: int = 1,
-    raw_title: str | None = None,
-    collapse_title: str | None = "Bulk-exponent scaling collapse",
+    raw_title: str | Mapping[str, str] | None = None,
+    collapse_title: str | Mapping[str, str] | None = "Bulk-exponent scaling collapse",
     raw_xlabel: str | None = None,
-    raw_ylabel: str | None = None,
+    raw_ylabel: str | Mapping[str, str] | None = None,
     collapse_xlabel: str | None = None,
-    collapse_ylabel: str | None = None,
+    collapse_ylabel: str | Mapping[str, str] | None = None,
     suptitle: str | None = None,
     figsize: tuple[float, float] | None = None,
     dpi: int = 130,
@@ -523,22 +527,93 @@ def probe2_collapse(
     observable value, regardless of metric. ``mi_units`` applies only when
     ``metric="mi"``.
 
+    ``stack_metrics=True`` ignores ``metric`` and draws all three observables
+    as one figure instead: mutual information on top, negativity in the
+    middle, logarithmic negativity at the bottom, sharing a single x axis with
+    the panel frames flush against each other. Each row is still an
+    independent fit and is annotated with its own ``eta``; ``eta``,
+    ``eta_stderr``, ``score`` and ``curves`` come back keyed by metric, and
+    ``panels`` holds the full per-metric result. The overrides that name an
+    observable (``raw_title``, ``raw_ylabel``, ``collapse_title``,
+    ``collapse_ylabel``, ``raw_yscale``, ``collapse_yscale``) then also accept
+    a mapping keyed by metric.
+
     The collapse is drawn by default as an inset in the bottom-right corner
     of the raw panel, both panels sharing the raw panel's legend, and the
     fit-window band is off. ``collapse_inset=False`` restores the
     side-by-side layout; ``show_fit_window=True`` restores the band.
     """
-    metric_spec = _probe2_metric_spec(metric)
     mi_units, mi_scale = _mi_unit_spec(mi_units)
-    curves = [
-        load_scaled_time_curve(
-            path,
-            l_by_file=l_by_file,
-            x_load=x_load,
-            metric_spec=metric_spec,
+    paths = _resolve_files(files, file_glob)
+
+    def load(metric_spec: Mapping[str, Any]) -> list[dict[str, Any]]:
+        return [
+            load_scaled_time_curve(
+                path,
+                l_by_file=l_by_file,
+                x_load=x_load,
+                metric_spec=metric_spec,
+            )
+            for path in paths
+        ]
+
+    if stack_metrics:
+        metric_specs = [
+            _probe2_metric_spec(key)
+            for key in ("mi", "negativity", "log_negativity")
+        ]
+        return stacked_bulk_exponent_collapse(
+            [load(metric_spec) for metric_spec in metric_specs],
+            metric_specs,
+            mi_units=mi_units,
+            mi_scale=mi_scale,
+            fit_x=fit_x,
+            fit_min=fit_i_min,
+            eta_bounds=eta_bounds,
+            interpolation_points=interpolation_points,
+            relative_error_floor=relative_error_floor,
+            absolute_error_floor=absolute_error_floor,
+            bootstrap_samples=bootstrap_samples,
+            bootstrap_seed=bootstrap_seed,
+            bootstrap_xtol=bootstrap_xtol,
+            raw_yscale=raw_yscale,
+            collapse_yscale=collapse_yscale,
+            show_errorbars=show_errorbars,
+            capsize=capsize,
+            cmap=cmap,
+            figsize=figsize,
+            dpi=dpi,
+            show_summary=show_summary,
+            show=show,
+            collapse_inset=collapse_inset,
+            show_fit_window=show_fit_window,
+            inset_corner=inset_corner,
+            inset_size=inset_size,
+            inset_pad=inset_pad,
+            inset_fontsize=inset_fontsize,
+            inset_facecolor=inset_facecolor,
+            inset_alpha=inset_alpha,
+            inset_headroom=inset_headroom,
+            annotation_loc=annotation_loc,
+            annotation_fontsize=annotation_fontsize,
+            legend_loc=legend_loc,
+            legend_fontsize=legend_fontsize,
+            legend_ncols=legend_ncols,
+            raw_title=raw_title,
+            collapse_title=collapse_title,
+            raw_xlabel=raw_xlabel,
+            raw_ylabel=raw_ylabel,
+            collapse_xlabel=collapse_xlabel,
+            collapse_ylabel=collapse_ylabel,
+            suptitle=(
+                suptitle
+                if suptitle is not None
+                else "Bulk two-probe entanglement at fixed measurement rate"
+            ),
         )
-        for path in _resolve_files(files, file_glob)
-    ]
+
+    metric_spec = _probe2_metric_spec(metric)
+    curves = load(metric_spec)
     return bulk_exponent_collapse(
         curves,
         metric_spec,

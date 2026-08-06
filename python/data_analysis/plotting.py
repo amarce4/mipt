@@ -63,6 +63,7 @@ _ANNOTATION_POSITIONS = {
     "upper right": (0.97, 0.97, "right", "top"),
     "lower left": (0.03, 0.03, "left", "bottom"),
     "lower right": (0.97, 0.03, "right", "bottom"),
+    "center right": (0.97, 0.30, "right", "center"),
 }
 
 # Where the legend and the parameter box go once the inset owns one corner,
@@ -221,6 +222,7 @@ def _paired_axes(
     figsize: tuple[float, float],
     dpi: int,
     nrows: int = 1,
+    sharex: bool = False,
     inset_corner: str = "lower right",
     inset_size: tuple[float, float] = (0.42, 0.40),
     inset_pad: tuple[float, float] = (0.0, 0.155),
@@ -231,10 +233,13 @@ def _paired_axes(
     """Build ``nrows`` primary/secondary panel pairs, side by side or inset.
 
     Returns ``(figure, pairs)`` where each pair is ``(primary, secondary)``.
+    ``sharex`` ties the rows of each column together, which also hides the
+    x tick labels of every row but the last.
     """
     if inset:
         fig, column = plt.subplots(
             nrows, 1, figsize=figsize, dpi=dpi, squeeze=False,
+            sharex=sharex,
             constrained_layout=True,
         )
         rectangle = _inset_rectangle(inset_corner, inset_size, inset_pad)
@@ -256,9 +261,56 @@ def _paired_axes(
 
     fig, grid = plt.subplots(
         nrows, 2, figsize=figsize, dpi=dpi, squeeze=False,
+        # "col", not True: the two columns hold different observables, so only
+        # the rows within a column share an x axis.
+        sharex="col" if sharex else False,
         constrained_layout=True,
     )
     return fig, [tuple(row) for row in grid]
+
+
+# ---------------------------------------------------------------------------
+# Flush vertical stacks
+#
+# A stack of panels that share one x axis reads as a single plot only if the
+# rows actually touch. ``constrained_layout`` will not do that: its row
+# spacing is computed from each axes' tight bounding box, which includes the
+# outward tick marks, so even at hspace=0 and h_pad=0 it leaves ~4 pt between
+# frames. The fix is to let it settle the *outer* margins, freeze it, and then
+# re-lay the rows by hand. Inset axes are positioned in their parent's axes
+# fraction, so they follow without any extra work.
+# ---------------------------------------------------------------------------
+
+
+def _flush_stacked_axes(fig, rows: Sequence[Sequence[Any]]) -> None:
+    """Give every column's rows equal heights and shared horizontal edges."""
+    if len(rows) < 2:
+        return
+    fig.canvas.draw()
+    positions = [[ax.get_position() for ax in row] for row in rows]
+    fig.set_layout_engine("none")
+    top = max(position.y1 for position in positions[0])
+    bottom = min(position.y0 for position in positions[-1])
+    height = (top - bottom) / len(rows)
+    for index, row in enumerate(rows):
+        y0 = top - (index + 1) * height
+        for ax, position in zip(row, positions[index]):
+            ax.set_position([position.x0, y0, position.width, height])
+
+
+def _prune_upper_yticks(ax) -> None:
+    """Drop the top y tick label of a panel whose top edge is shared.
+
+    Without this the highest label of a lower panel and the lowest label of
+    the panel above it collide on the shared frame edge.
+    """
+    from matplotlib.ticker import MaxNLocator
+
+    if ax.get_yscale() != "linear":
+        return
+    ax.yaxis.set_major_locator(
+        MaxNLocator(nbins="auto", steps=[1, 2, 2.5, 5, 10], prune="upper")
+    )
 
 
 def _font_kwargs(inset: bool, fontsize: float) -> dict[str, Any]:

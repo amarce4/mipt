@@ -237,6 +237,11 @@ inline void run_mode3_trajectory(const ProbeRunConfig &config, probed::CircuitWo
 // Modes 0, 1, and 2: advance to each readout time and measure. Multi-probe
 // runs attach their references at t0=2N first; one-probe runs are already
 // entangled from t=0.
+//
+// A one-probe encoder needs no step of its own here: the prepared history
+// carries p=0 through the first `t_encode` layers, so the advance below runs
+// straight through it, and `t_readout_origin` puts a readout time of zero at
+// its end.
 inline void run_sampling_trajectory(const ProbeRunConfig &config, probed::CircuitWorkspace1D &workspace,
                                     cudaq::state &state, std::vector<Aggregate> &aggregates, int current_t)
 {
@@ -250,7 +255,7 @@ inline void run_sampling_trajectory(const ProbeRunConfig &config, probed::Circui
 
     for (std::size_t sample_index = 0; sample_index < config.times.size(); ++sample_index)
     {
-        const int target_t = config.times[sample_index];
+        const int target_t = config.t_readout_origin + config.times[sample_index];
         if (target_t > current_t)
         {
             workspace.advance(state, current_t, target_t - current_t);
@@ -266,7 +271,9 @@ inline void run_sampling_trajectory(const ProbeRunConfig &config, probed::Circui
         }
         else
         {
-            // At t=0 a single reference is maximally entangled by construction.
+            // Before any layer runs a single reference is maximally entangled by
+            // construction. Only an encoder-free run (MIPT_PROBED_T_ENCODE=0
+            // with t_min=0) reaches this; otherwise the encoder has already run.
             aggregates[sample_index].add({std::log(2.0), 0.0, 0.0, 0.0, 0.0, 0.0});
         }
     }
@@ -417,10 +424,13 @@ inline std::vector<OutputRow> simulate(const ProbeRunConfig &config, ProgressRep
             workspace.reserve(t_max);
         }
         std::array<std::future<void>, 2> jobs;
+        // One-probe modes 0 and 1 scramble the freshly attached ebit through a
+        // measurement-free encoder first, which is a quenched history: the
+        // first t_encode layers carry no measurement flags at all.
         auto prepare = [&](probed::CircuitWorkspace1D &workspace) {
-            if (config.mode == 1 && config.probes == 1)
+            if (config.t_encode > 0)
             {
-                workspace.prepare_quench(n, t_max, 2 * n, p, config.type);
+                workspace.prepare_quench(n, t_max, config.t_encode, p, config.type);
             }
             else
             {

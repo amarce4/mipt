@@ -594,9 +594,8 @@ enum
         std::size_t solver_work_bytes = 0;
         std::size_t solver_rwork_bytes = 0;
         std::size_t solver_info_bytes = 0;
-        // Allocated only if an fp32 eigensolve actually fails. Bounded by
-        // MIPT_ENTROPY_HEEVD_MAX_ROWS, which is why it stays outside the
-        // MIPT_ENTROPY_CUDA_MAX_MB batching budget.
+        // Allocated only if an fp32 eigensolve actually fails, but budgeted for
+        // in advance by compute_cyclic_entropies -- see f64_retry_possible.
         void *solver64 = nullptr;
         void *eigenvalues64 = nullptr;
         std::size_t solver64_bytes = 0;
@@ -1213,10 +1212,25 @@ enum
         const std::uint64_t s1_elements_max =
             want_s1 ? (std::uint64_t{1} << (2 * s1_kept_limit)) : std::uint64_t{0};
 
+        // ... and, on an fp32 state, possibly a second fp64 copy of it. The
+        // promotion is a demand-allocated retry, but it has to be budgeted for
+        // up front anyway: it is twice the width of the fp32 batch, so leaving
+        // it out lets a run size its translation batch against a limit it then
+        // blows through the first time cuSOLVER declines to converge. Only
+        // sizes the heevd cap admits can ever reach the retry.
+        const bool f64_retry_possible =
+            want_s1 && SolverTraits<ComplexT>::is_single &&
+            (1 << s1_kept_limit) <= heevd_max_rows();
+        const std::size_t s1_retry_bytes =
+            f64_retry_possible
+                ? static_cast<std::size_t>(s1_elements_max) * sizeof(cuDoubleComplex)
+                : std::size_t{0};
+
         const std::size_t bytes_per_translation =
             static_cast<std::size_t>(total_dim) * sizeof(ComplexT) +
             static_cast<std::size_t>(rho_elements_max) * sizeof(ComplexT) +
             static_cast<std::size_t>(s1_elements_max) * sizeof(ComplexT) +
+            s1_retry_bytes +
             static_cast<std::size_t>(n + 1) * sizeof(int);
         const std::size_t translations_by_memory =
             workspace_limit / max_size(std::size_t{1}, bytes_per_translation);

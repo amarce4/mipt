@@ -99,7 +99,7 @@ All one-, two-, and four-reference protocols are provided by one executable:
 
 | Mode | Arguments | Protocol |
 |---:|---|---|
-| 0 | `p t_min t_max` | Legacy time trajectory. One reference is attached at `t=0`; two/four are attached after `t0=2N`. |
+| 0 | `p t_min t_max` | Time trajectory. One reference is attached at absolute `t=0` and the Gullans--Huse encoder runs for `t_encode=2N` measurement-free timesteps; `t_min`/`t_max` are elapsed times after it, so the circuit is `2N+t_max` deep. Two/four references are attached after `t0=2N` of monitored evolution and keep absolute times. |
 | 1 | `p_min p_max p_res` | Fixed-`t=4N` critical scan. One probe uses the Gullans--Huse no-measurement encoding quench; two/four output `I2` or `I2,I3,I4`. |
 | 2 | `t_min t_max t_res p_min p_max p_res` | Rectangular `p,t` scan of the joint reference entropy `S_Q`. |
 

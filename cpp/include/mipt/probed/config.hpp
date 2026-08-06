@@ -46,6 +46,15 @@ struct ProbeRunConfig
     int delta_t = -1;
     int t0 = 0;
     int t_eq = 0;
+    // Leading timesteps evolved without any measurements. One probe in modes 0
+    // and 1 attaches its Bell pair at t=0 and then scrambles it into the system
+    // unitarily, so the monitored dynamics start from an encoded state rather
+    // than from a local ebit.
+    int t_encode = 0;
+    // Absolute circuit time that a readout time of zero refers to. Mode 0
+    // restarts its clock at the end of the encoder, so its `times` are elapsed;
+    // mode 1 reads out at the fixed absolute depth 4N and leaves it at zero.
+    int t_readout_origin = 0;
     double triangle_balance_cutoff = 0.0;
     int x_max = -1;
 
@@ -82,11 +91,17 @@ inline void print_help(const char *program)
     print_circuit_type_help(std::cout, "               ");
     std::cout << "probe_mode and args:\n"
         << "  0  Legacy time trajectory: [p] [t_min] [t_max]\n"
-              << "     One probe is attached at t=0. Two/four probes are attached at "
-                 "t0=2N;\n"
-              << "     consequently their t_min must be at least 2N. One-probe depth "
-                 "defaults\n"
-        << "     to d=1 and can be set with MIPT_PROBED_DISTANCE.\n"
+              << "     One probe is attached at absolute t=0, evolved without "
+                 "measurements\n"
+              << "     for t_encode=2N timesteps, and only then measured: t_min and "
+                 "t_max are\n"
+              << "     elapsed times after that encoder, so the deepest circuit is "
+                 "2N+t_max.\n"
+              << "     Its depth defaults to d=1 and can be set with "
+                 "MIPT_PROBED_DISTANCE.\n"
+              << "     Two/four probes are attached at t0=2N; consequently their t_min "
+                 "must\n"
+        << "     be at least 2N.\n"
         << "  1  Critical-point scan: [p_min] [p_max] [p_res]\n"
         << "     One probe follows Gullans--Huse: attach at t=0, evolve without\n"
               << "     measurements to 2N, then at p to 4N. Two/four probes evolve at "
@@ -185,6 +200,10 @@ inline void print_help(const char *program)
         << "  MIPT_PROBED_PROGRESS_MS=500  Progress-update interval.\n"
               << "  MIPT_PROBED_T_EQ=2N          Mode-4 equilibration timesteps "
                  "(one-probe mode 5: 4N).\n"
+              << "  MIPT_PROBED_T_ENCODE=2N      One-probe mode-0 measurement-free "
+                 "encoder\n"
+              << "                               timesteps; 0 measures from the "
+                 "attachment on.\n"
               << "  MIPT_PROBED_RECEIVER_WIDTHS=1,2,3  One-probe mode-5 receiver-block "
                  "widths.\n"
               << "  MIPT_PROBED_R_MIN=1          Two-probe mode-5 smallest probe "
@@ -253,6 +272,13 @@ inline void parse_common_arguments(int argc, char *argv[], ProbeRunConfig &confi
 }
 
 // Mode 0: one p, a contiguous band of readout times.
+//
+// One probe follows the Gullans--Huse encoding schedule: the Bell pair is
+// created at absolute t=0, evolved without measurements for t_encode=2N
+// timesteps, and only then are measurements switched on. The readout clock is
+// reset at that point, so [t_min, t_max] are elapsed times after the encoder
+// and the deepest circuit is t_encode+t_max. Two/four probes are unaffected --
+// they attach after t0=2N of monitored evolution and their times stay absolute.
 inline void parse_mode0(int argc, char *argv[], ProbeRunConfig &config)
 {
     if (argc != 9)
@@ -269,6 +295,12 @@ inline void parse_mode0(int argc, char *argv[], ProbeRunConfig &config)
     if (config.probes > 1 && t_min < config.t0)
     {
         throw std::invalid_argument("Two/four-probe legacy mode requires t_min >= t0=2N.");
+    }
+    if (config.probes == 1)
+    {
+        config.t_encode = static_cast<int>(
+            env::integer("MIPT_PROBED_T_ENCODE", 2 * config.n, 0, std::numeric_limits<int>::max() - t_max));
+        config.t_readout_origin = config.t_encode;
     }
     config.p_values = {p};
     config.times.reserve(static_cast<std::size_t>(t_max - t_min + 1));
@@ -295,6 +327,12 @@ inline void parse_mode1(int argc, char *argv[], ProbeRunConfig &config)
     config.p_values = checked_linspace(p_min, p_max, p_res);
     config.times = {4 * config.n};
     config.t0 = 2 * config.n;
+    if (config.probes == 1)
+    {
+        // Gullans--Huse: encode to 2N without measurements, then measure to the
+        // fixed readout depth 4N. The readout time stays absolute.
+        config.t_encode = 2 * config.n;
+    }
 }
 
 // Mode 2: a rectangular (p, t) grid of the joint reference entropy.
@@ -499,7 +537,7 @@ inline void resolve_derived_settings(ProbeRunConfig &config)
     config.t_max = config.mode == 3 ? 12 * n + config.delta_t
                    : stagger        ? config.t_eq + config.staggers.delta_max + config.times.back()
                    : random_origin  ? config.t_eq + config.times.back()
-                                    : config.times.back();
+                                    : config.t_readout_origin + config.times.back();
 
     const std::string generated_output = default_output_name(
         config.probes, n, config.realizations, config.type, config.mode, config.p_values, config.times, config.delta_x,
@@ -612,6 +650,11 @@ inline std::string describe_run(const ProbeRunConfig &config)
         text += ", t=" + std::to_string(config.times.front()) + ".." + std::to_string(config.times.back());
     }
 
+    if (mode == 0 && config.probes == 1)
+    {
+        text += ", t_encode=" + std::to_string(config.t_encode) +
+                " (unitary), max_depth=" + std::to_string(config.t_max);
+    }
     if (mode == 3)
     {
         text += ", delta_x=" + std::to_string(config.delta_x) + ", delta_t=" + std::to_string(config.delta_t) +

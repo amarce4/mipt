@@ -245,7 +245,7 @@ MIPT_HEADERS := $(shell find include -name '*.hpp' 2>/dev/null)
 MIPT_CUDA_HEADERS := $(shell find include -name '*.cuh' 2>/dev/null) $(MIPT_HEADERS)
 
 .PHONY: all simulation analysis clean cpu gpu print-config format test-core test-dist test-front \
-  test-spectral test-rdm-gram test-cusv test-cusv-gates bench-cusv \
+  test-spectral test-rdm-gram test-cusv test-cusv-gates test-mode3 bench-cusv \
   mipt.exe mipt_probed.exe free_energy.exe sim_tmi.exe dist_scaling.exe \
   entropy.exe gmn.exe fgmn.exe ring_inflation.exe exp_vals.exe
 
@@ -349,6 +349,7 @@ CUDAQ_INC ?= $(HOME)/.cudaq/include
 CUSV_GATE_TEST_BIN := $(HOST_BUILD)/cusv_gate_tests
 DUMP_BOND_BIN := $(BUILD)/dump_bond
 CUSV_EQUIV_BIN := $(BUILD)/cusv_equiv
+MODE3_EQUIV_BIN := $(BUILD)/mode3_equiv
 CUSV_BENCH_BIN := $(BUILD)/cusv_bench
 CUSV_GROUND_TRUTH := $(BUILD)/cusv_ground_truth.txt
 CUSV_TEST_SEED ?= 12345
@@ -361,6 +362,10 @@ $(DUMP_BOND_BIN): tests/dump_bond.cpp $(MIPT_HEADERS) | $(BUILD)
 	  -DNDEBUG -DMIPT_CUDAQ_BACKEND_NAME=\"nvidia\" -DMIPT_CUDAQ_PRECISION=64 $< -o $@
 
 $(CUSV_EQUIV_BIN): tests/cusv_equiv.cpp $(BUILD)/cusv_diag.o $(MIPT_HEADERS) | $(BUILD)
+	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $(NVQXXFLAGS_COMMON) $< $(BUILD)/cusv_diag.o \
+	  $(MIPT_CUDA_LIBS) $(CUSV_LIBS) $(DL_LIBS) -o $@
+
+$(MODE3_EQUIV_BIN): tests/mode3_equiv.cpp $(BUILD)/cusv_diag.o $(MIPT_HEADERS) | $(BUILD)
 	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $(NVQXXFLAGS_COMMON) $< $(BUILD)/cusv_diag.o \
 	  $(MIPT_CUDA_LIBS) $(CUSV_LIBS) $(DL_LIBS) -o $@
 
@@ -378,6 +383,12 @@ test-cusv-gates: $(CUSV_GATE_TEST_BIN) $(CUSV_GROUND_TRUTH)
 test-cusv: test-cusv-gates $(CUSV_EQUIV_BIN)
 	$(CUSV_EQUIV_BIN) 12 6 2024
 	$(CUSV_EQUIV_BIN) 14 8 31337
+
+# The mode-3 pattern cusv_equiv cannot reach: a register two qubits wider than
+# the circuit, with references attached mid-trajectory.
+test-mode3: $(MODE3_EQUIV_BIN)
+	$(MODE3_EQUIV_BIN) 10 2024
+	$(MODE3_EQUIV_BIN) 12 31337
 
 bench-cusv: $(CUSV_BENCH_BIN)
 	$(CUSV_BENCH_BIN) 20 16 0.15 2

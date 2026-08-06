@@ -3,13 +3,16 @@
 Public functions
 ----------------
 gmn(...)               Plot GMN/fGMN and optional minimum bipartite negativity.
-entropy(...)           Plot Rényi-2 entropy scaling curves and weighted fits.
+entropy(...)           Plot entropy scaling curves and weighted fits; ``order=1``
+                       selects von Neumann, ``order=2`` (default) Rényi-2.
 dist_scaling(...)      Plot two-site (MI/negativity) or three-site (TMI/GMN)
                        distance scaling and power-law fits.
 expvals(...)           Plot aggregate fermionic observables and Wick residuals.
 tmi_collapse(...)      Fit and plot the TMI finite-size scaling collapse.
 probe1_collapse(...)   Fit and plot the one-ancilla dynamical collapse.
-probe2_collapse(...)   Fit and plot the two-ancilla bulk-exponent collapse.
+probe2_collapse(...)   Fit and plot the two-ancilla bulk-exponent collapse, one
+                       observable or, with ``stack_metrics=True``, all three
+                       stacked flush on a shared x axis.
 probe_distance_collapse(...) Plot and collapse mode-4 distance-resolved probes.
 probe3_dynamics(...)   Plot three-probe mode-4 multipartite metrics and purity.
 probe_anisotropy(...)  Plot mode-3 space/time correlators and estimate alpha.

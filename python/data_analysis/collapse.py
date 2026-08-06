@@ -11,6 +11,7 @@ metric specs below; the loader and the fit itself are shared.
 
 from __future__ import annotations
 
+from collections import abc
 from pathlib import Path
 import warnings
 from typing import Any, Mapping, Sequence
@@ -23,8 +24,10 @@ from .loading import _find_column, resolve_metadata
 from .plotting import (
     _annotate_axes,
     _color_map_by_size,
+    _flush_stacked_axes,
     _font_kwargs,
     _inset_overlay_defaults,
+    _prune_upper_yticks,
     _set_secondary_title,
     _paired_axes,
     _reserve_axis_space,
@@ -348,11 +351,10 @@ def _collapse_summary(
     )
 
 
-def bulk_exponent_collapse(
+def _fit_bulk_exponent(
     curves: list[dict[str, Any]],
     metric_spec: Mapping[str, Any],
     *,
-    mi_units: str,
     mi_scale: float,
     fit_x: tuple[float, float | None],
     fit_min: float,
@@ -363,45 +365,15 @@ def bulk_exponent_collapse(
     bootstrap_samples: int,
     bootstrap_seed: int,
     bootstrap_xtol: float,
-    raw_yscale: str,
-    collapse_yscale: str,
-    show_errorbars: bool,
-    capsize: float,
-    cmap: str,
-    figsize: tuple[float, float] | None,
-    dpi: int,
     show_summary: bool,
-    show: bool,
-    collapse_inset: bool = True,
-    show_fit_window: bool = False,
-    inset_corner: str = "lower right",
-    inset_size: tuple[float, float] = (0.42, 0.40),
-    inset_pad: tuple[float, float] = (0.0, 0.185),
-    inset_fontsize: float = 7.5,
-    inset_facecolor: str = "white",
-    inset_alpha: float = 1.0,
-    inset_headroom: float = 0.20,
-    annotation_loc: str | None = None,
-    annotation_fontsize: float | None = None,
-    legend_loc: str | None = None,
-    legend_fontsize: float | None = None,
-    legend_ncols: int = 1,
-    raw_title: str | None = None,
-    collapse_title: str | None = "Bulk-exponent scaling collapse",
-    raw_xlabel: str | None = None,
-    raw_ylabel: str | None = None,
-    collapse_xlabel: str | None = None,
-    collapse_ylabel: str | None = None,
-    suptitle: str | None = None,
+    progress_label: str | None = None,
 ) -> dict[str, Any]:
-    """Fit and plot ``O(L,t)=L^(-eta)g((t-2L)/L)`` for a set of curves.
+    """Fit ``eta`` in ``O(L,t)=L^(-eta)g((t-2L)/L)`` for one observable.
 
-    ``curves`` come from :func:`load_scaled_time_curve` and are modified in
-    place when the metric is rescaled by ``mi_scale``.
-
-    The collapse is drawn by default as an inset in the bottom-right corner
-    of the raw panel, lifted clear of the bottom edge so both x axes stay
-    readable, and the two panels share the raw panel's legend.
+    ``curves`` come from :func:`load_scaled_time_curve` and are sorted and, for
+    an information measure, rescaled by ``mi_scale`` in place. The returned
+    dictionary carries everything the drawing stage needs, including the
+    ``fit_mask`` closure that selects the fitted points.
     """
     signed = bool(metric_spec["signed"])
     metric_spec = dict(metric_spec)
@@ -432,6 +404,7 @@ def bulk_exponent_collapse(
         except ImportError:
             print(summary.to_string(index=False))
 
+    prefix = f"[{progress_label}] " if progress_label else ""
     fit_x_min, fit_x_max = fit_x
 
     def fit_mask(curve):
@@ -528,7 +501,7 @@ def bulk_exponent_collapse(
             if result.success and np.isfinite(result.x) and np.isfinite(result.fun):
                 estimates.append(float(result.x))
             if (index + 1) % 25 == 0 or index + 1 == bootstrap_samples:
-                print(f"Bootstrap fits: {index + 1}/{bootstrap_samples}")
+                print(f"{prefix}Bootstrap fits: {index + 1}/{bootstrap_samples}")
 
     if len(estimates) >= 2:
         estimate_array = np.asarray(estimates)
@@ -539,35 +512,71 @@ def bulk_exponent_collapse(
         if bootstrap_samples >= 2:
             warnings.warn("Too few successful bootstrap fits to estimate eta uncertainty.")
 
-    print(f"metric = {metric_spec['key']}")
-    print(f"eta = {eta:.6f} ± {eta_stderr:.6f}")
+    print(f"{prefix}metric = {metric_spec['key']}")
+    print(f"{prefix}eta = {eta:.6f} ± {eta_stderr:.6f}")
     if np.isfinite(eta_p16):
-        print(f"bootstrap 68% interval = [{eta_p16:.6f}, {eta_p84:.6f}]")
-    print(f"collapse score = {best_score:.6g}")
+        print(f"{prefix}bootstrap 68% interval = [{eta_p16:.6f}, {eta_p84:.6f}]")
+    print(f"{prefix}collapse score = {best_score:.6g}")
 
-    colors = _color_map_by_size(sizes, cmap)
-    if figsize is None:
-        figsize = (7.6, 5.2) if collapse_inset else (13, 5)
-    fig, panels = _paired_axes(
-        inset=collapse_inset,
-        figsize=figsize,
-        dpi=dpi,
-        inset_corner=inset_corner,
-        inset_size=inset_size,
-        inset_pad=inset_pad,
-        inset_fontsize=inset_fontsize,
-        inset_facecolor=inset_facecolor,
-        inset_alpha=inset_alpha,
-    )
-    ax_raw, ax_collapse = panels[0]
+    return {
+        "metric_spec": metric_spec,
+        "curves": curves,
+        "sizes": sizes,
+        "signed": signed,
+        "fit_mask": fit_mask,
+        "summary": summary,
+        "eta": eta,
+        "eta_stderr": eta_stderr,
+        "eta_p16": eta_p16,
+        "eta_p84": eta_p84,
+        "score": best_score,
+        "bootstrap_successes": len(estimates),
+        "fit_result": fit_result,
+    }
+
+
+def _draw_bulk_exponent_panel(
+    ax_raw,
+    ax_collapse,
+    fit: Mapping[str, Any],
+    *,
+    colors: Mapping[int, Any],
+    mi_units: str,
+    fit_x: tuple[float, float | None],
+    show_errorbars: bool,
+    capsize: float,
+    raw_yscale: str,
+    collapse_yscale: str,
+    collapse_inset: bool,
+    show_fit_window: bool,
+    inset_fontsize: float,
+    inset_headroom: float,
+    reserve_side: str,
+    annotation_loc: str,
+    annotation_fontsize: float | None,
+    legend_loc: str,
+    legend_fontsize: float | None,
+    legend_ncols: int,
+    draw_legend: bool,
+    raw_title: str | None,
+    collapse_title: str | None,
+    raw_xlabel: str | None,
+    raw_ylabel: str | None,
+    collapse_xlabel: str | None,
+    collapse_ylabel: str | None,
+) -> None:
+    """Draw one raw/collapse panel pair from a :func:`_fit_bulk_exponent` result.
+
+    ``draw_legend=False`` leaves the panel bare so that a stack of them can
+    share one legend; everything else is per panel, including the annotated
+    exponent.
+    """
+    metric_spec = fit["metric_spec"]
+    curves, signed = fit["curves"], fit["signed"]
+    fit_mask, eta = fit["fit_mask"], fit["eta"]
+    eta_stderr, best_score = fit["eta_stderr"], fit["score"]
+    fit_x_min, fit_x_max = fit_x
     inset_font = _font_kwargs(collapse_inset, inset_fontsize)
-    auto_legend_loc, auto_annotation_loc, reserve_side = _inset_overlay_defaults(
-        inset_corner
-    )
-    if legend_loc is None:
-        legend_loc = auto_legend_loc if collapse_inset else "best"
-    if annotation_loc is None:
-        annotation_loc = auto_annotation_loc if collapse_inset else "lower right"
     for curve in curves:
         size, color = curve["L"], colors[curve["L"]]
         kwargs = dict(
@@ -634,28 +643,34 @@ def bulk_exponent_collapse(
         default_raw_ylabel = default_raw_ylabel.replace("[nats]", f"[{mi_units}]")
         default_collapse_ylabel = default_collapse_ylabel + f" [{mi_units}]"
     scaled_time_label = r"Scaled time $x=(t-2L)/L$"
-    ax_raw.set_xlabel(
-        raw_xlabel if raw_xlabel is not None else scaled_time_label
-    )
+    if raw_xlabel != "":
+        ax_raw.set_xlabel(
+            raw_xlabel if raw_xlabel is not None else scaled_time_label
+        )
     ax_raw.set_ylabel(
         raw_ylabel if raw_ylabel is not None else default_raw_ylabel
     )
-    ax_raw.set_title(
-        raw_title if raw_title is not None else metric_spec["raw_title"]
-    )
+    # An empty title is a request for no title at all, not for a blank one:
+    # a stacked figure names its metrics on the y axes and cannot afford the
+    # vertical space a per-panel title would take.
+    panel_title = raw_title if raw_title is not None else metric_spec["raw_title"]
+    if panel_title:
+        ax_raw.set_title(panel_title)
     ax_raw.set_yscale(raw_yscale)
     ax_raw.grid(alpha=0.25)
     legend_kwargs: dict[str, Any] = {"loc": legend_loc, "ncols": legend_ncols}
     if legend_fontsize is not None:
         legend_kwargs["fontsize"] = legend_fontsize
-    ax_raw.legend(**legend_kwargs)
+    if draw_legend:
+        ax_raw.legend(**legend_kwargs)
 
     if signed:
         ax_collapse.axhline(0.0, linewidth=1, alpha=0.35)
-    ax_collapse.set_xlabel(
-        collapse_xlabel if collapse_xlabel is not None else scaled_time_label,
-        **inset_font,
-    )
+    if collapse_xlabel != "":
+        ax_collapse.set_xlabel(
+            collapse_xlabel if collapse_xlabel is not None else scaled_time_label,
+            **inset_font,
+        )
     if collapse_ylabel is not None or not collapse_inset:
         ax_collapse.set_ylabel(
             collapse_ylabel
@@ -665,7 +680,7 @@ def bulk_exponent_collapse(
         )
     ax_collapse.set_yscale(collapse_yscale)
     ax_collapse.grid(alpha=0.25)
-    if not collapse_inset:
+    if not collapse_inset and draw_legend:
         ax_collapse.legend(**legend_kwargs)
     _set_secondary_title(
         ax_collapse,
@@ -694,8 +709,147 @@ def bulk_exponent_collapse(
     )
     if collapse_inset:
         _reserve_axis_space(ax_raw, reserve_side, inset_headroom)
+
+
+def _panel_result(fit: Mapping[str, Any], mi_units: str) -> dict[str, Any]:
+    """The public per-observable half of a collapse result."""
+    return {
+        "metric": fit["metric_spec"]["key"],
+        "mi_units": mi_units,
+        "eta": fit["eta"],
+        "eta_stderr": fit["eta_stderr"],
+        "eta_p16": fit["eta_p16"],
+        "eta_p84": fit["eta_p84"],
+        "score": fit["score"],
+        "bootstrap_successes": fit["bootstrap_successes"],
+        "summary": fit["summary"],
+        "curves": fit["curves"],
+        "fit_result": fit["fit_result"],
+    }
+
+
+def bulk_exponent_collapse(
+    curves: list[dict[str, Any]],
+    metric_spec: Mapping[str, Any],
+    *,
+    mi_units: str,
+    mi_scale: float,
+    fit_x: tuple[float, float | None],
+    fit_min: float,
+    eta_bounds: tuple[float, float],
+    interpolation_points: int,
+    relative_error_floor: float,
+    absolute_error_floor: float,
+    bootstrap_samples: int,
+    bootstrap_seed: int,
+    bootstrap_xtol: float,
+    raw_yscale: str,
+    collapse_yscale: str,
+    show_errorbars: bool,
+    capsize: float,
+    cmap: str,
+    figsize: tuple[float, float] | None,
+    dpi: int,
+    show_summary: bool,
+    show: bool,
+    collapse_inset: bool = True,
+    show_fit_window: bool = False,
+    inset_corner: str = "lower right",
+    inset_size: tuple[float, float] = (0.42, 0.40),
+    inset_pad: tuple[float, float] = (0.0, 0.185),
+    inset_fontsize: float = 7.5,
+    inset_facecolor: str = "white",
+    inset_alpha: float = 1.0,
+    inset_headroom: float = 0.20,
+    annotation_loc: str | None = None,
+    annotation_fontsize: float | None = None,
+    legend_loc: str | None = None,
+    legend_fontsize: float | None = None,
+    legend_ncols: int = 1,
+    raw_title: str | None = None,
+    collapse_title: str | None = "Bulk-exponent scaling collapse",
+    raw_xlabel: str | None = None,
+    raw_ylabel: str | None = None,
+    collapse_xlabel: str | None = None,
+    collapse_ylabel: str | None = None,
+    suptitle: str | None = None,
+) -> dict[str, Any]:
+    """Fit and plot ``O(L,t)=L^(-eta)g((t-2L)/L)`` for a set of curves.
+
+    ``curves`` come from :func:`load_scaled_time_curve` and are modified in
+    place when the metric is rescaled by ``mi_scale``.
+
+    The collapse is drawn by default as an inset in the bottom-right corner
+    of the raw panel, lifted clear of the bottom edge so both x axes stay
+    readable, and the two panels share the raw panel's legend.
+    """
+    fit = _fit_bulk_exponent(
+        curves,
+        metric_spec,
+        mi_scale=mi_scale,
+        fit_x=fit_x,
+        fit_min=fit_min,
+        eta_bounds=eta_bounds,
+        interpolation_points=interpolation_points,
+        relative_error_floor=relative_error_floor,
+        absolute_error_floor=absolute_error_floor,
+        bootstrap_samples=bootstrap_samples,
+        bootstrap_seed=bootstrap_seed,
+        bootstrap_xtol=bootstrap_xtol,
+        show_summary=show_summary,
+    )
+    if figsize is None:
+        figsize = (7.6, 5.2) if collapse_inset else (13, 5)
+    fig, panels = _paired_axes(
+        inset=collapse_inset,
+        figsize=figsize,
+        dpi=dpi,
+        inset_corner=inset_corner,
+        inset_size=inset_size,
+        inset_pad=inset_pad,
+        inset_fontsize=inset_fontsize,
+        inset_facecolor=inset_facecolor,
+        inset_alpha=inset_alpha,
+    )
+    ax_raw, ax_collapse = panels[0]
+    auto_legend_loc, auto_annotation_loc, reserve_side = _inset_overlay_defaults(
+        inset_corner
+    )
+    if legend_loc is None:
+        legend_loc = auto_legend_loc if collapse_inset else "best"
+    if annotation_loc is None:
+        annotation_loc = auto_annotation_loc if collapse_inset else "lower right"
+    _draw_bulk_exponent_panel(
+        ax_raw,
+        ax_collapse,
+        fit,
+        colors=_color_map_by_size(fit["sizes"], cmap),
+        mi_units=mi_units,
+        fit_x=fit_x,
+        show_errorbars=show_errorbars,
+        capsize=capsize,
+        raw_yscale=raw_yscale,
+        collapse_yscale=collapse_yscale,
+        collapse_inset=collapse_inset,
+        show_fit_window=show_fit_window,
+        inset_fontsize=inset_fontsize,
+        inset_headroom=inset_headroom,
+        reserve_side=reserve_side,
+        annotation_loc=annotation_loc,
+        annotation_fontsize=annotation_fontsize,
+        legend_loc=legend_loc,
+        legend_fontsize=legend_fontsize,
+        legend_ncols=legend_ncols,
+        draw_legend=True,
+        raw_title=raw_title,
+        collapse_title=collapse_title,
+        raw_xlabel=raw_xlabel,
+        raw_ylabel=raw_ylabel,
+        collapse_xlabel=collapse_xlabel,
+        collapse_ylabel=collapse_ylabel,
+    )
     fig.suptitle(
-        suptitle if suptitle is not None else metric_spec["suptitle"],
+        suptitle if suptitle is not None else fit["metric_spec"]["suptitle"],
         fontsize=14,
     )
     _show(fig, show)
@@ -704,15 +858,218 @@ def bulk_exponent_collapse(
         "figure": fig,
         "axes": (ax_raw, ax_collapse),
         "collapse_inset": collapse_inset,
-        "metric": metric_spec["key"],
+        **_panel_result(fit, mi_units),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Stacked variant
+#
+# Several observables of the same run, one per row, sharing a single x axis
+# with the row frames flush against each other. Every row is an independent
+# one-parameter fit; only the layout and the legend are shared.
+# ---------------------------------------------------------------------------
+
+
+def _per_metric(value: Any, key: str) -> Any:
+    """Resolve a style override that may be given per metric key."""
+    if isinstance(value, abc.Mapping):
+        return value.get(key)
+    return value
+
+
+def stacked_bulk_exponent_collapse(
+    curve_sets: Sequence[list[dict[str, Any]]],
+    metric_specs: Sequence[Mapping[str, Any]],
+    *,
+    mi_units: str,
+    mi_scale: float,
+    fit_x: tuple[float, float | None],
+    fit_min: float,
+    eta_bounds: tuple[float, float],
+    interpolation_points: int,
+    relative_error_floor: float,
+    absolute_error_floor: float,
+    bootstrap_samples: int,
+    bootstrap_seed: int,
+    bootstrap_xtol: float,
+    raw_yscale: str | Mapping[str, str],
+    collapse_yscale: str | Mapping[str, str],
+    show_errorbars: bool,
+    capsize: float,
+    cmap: str,
+    figsize: tuple[float, float] | None,
+    dpi: int,
+    show_summary: bool,
+    show: bool,
+    collapse_inset: bool = True,
+    show_fit_window: bool = False,
+    inset_corner: str = "lower right",
+    inset_size: tuple[float, float] = (0.42, 0.40),
+    inset_pad: tuple[float, float] = (0.0, 0.185),
+    inset_fontsize: float = 7.5,
+    inset_facecolor: str = "white",
+    inset_alpha: float = 1.0,
+    inset_headroom: float = 0.20,
+    annotation_loc: str | None = None,
+    annotation_fontsize: float | None = None,
+    legend_loc: str | None = None,
+    legend_fontsize: float | None = None,
+    legend_ncols: int = 1,
+    raw_title: str | Mapping[str, str] | None = None,
+    collapse_title: str | Mapping[str, str] | None = "Bulk-exponent scaling collapse",
+    raw_xlabel: str | None = None,
+    raw_ylabel: str | Mapping[str, str] | None = None,
+    collapse_xlabel: str | None = None,
+    collapse_ylabel: str | Mapping[str, str] | None = None,
+    suptitle: str | None = None,
+    prune_shared_yticks: bool = True,
+) -> dict[str, Any]:
+    """Stack one bulk-exponent panel per observable, flush on a shared x axis.
+
+    ``curve_sets[i]`` are the curves for ``metric_specs[i]``, in top-to-bottom
+    row order. Each row is fitted independently and annotated with its own
+    exponent; the rows share one x axis, one legend on the top row, and their
+    frames touch, so the stack reads as a single plot.
+
+    The overrides that name an observable — ``raw_title``, ``raw_ylabel``,
+    ``collapse_title``, ``collapse_ylabel``, ``raw_yscale``, ``collapse_yscale``
+    — accept either one value for every row or a mapping keyed by metric.
+    ``raw_title`` defaults to no per-row title (the y labels carry the metric
+    names, and a title between two flush rows would break the stack); when
+    given it goes on the top row only.
+    """
+    if len(curve_sets) != len(metric_specs):
+        raise ValueError("curve_sets and metric_specs must have the same length.")
+    if not metric_specs:
+        raise ValueError("At least one metric is required.")
+    rows = len(metric_specs)
+
+    fits = [
+        _fit_bulk_exponent(
+            curves,
+            metric_spec,
+            mi_scale=mi_scale,
+            fit_x=fit_x,
+            fit_min=fit_min,
+            eta_bounds=eta_bounds,
+            interpolation_points=interpolation_points,
+            relative_error_floor=relative_error_floor,
+            absolute_error_floor=absolute_error_floor,
+            bootstrap_samples=bootstrap_samples,
+            bootstrap_seed=bootstrap_seed,
+            bootstrap_xtol=bootstrap_xtol,
+            show_summary=show_summary,
+            progress_label=metric_spec["key"],
+        )
+        for curves, metric_spec in zip(curve_sets, metric_specs)
+    ]
+    sizes = [fit["sizes"] for fit in fits]
+    if any(row != sizes[0] for row in sizes[1:]):
+        warnings.warn(f"The stacked panels cover different system sizes: {sizes}")
+
+    if figsize is None:
+        figsize = (7.6, 3.6 * rows) if collapse_inset else (13, 4.4 * rows)
+    fig, panels = _paired_axes(
+        inset=collapse_inset,
+        figsize=figsize,
+        dpi=dpi,
+        nrows=rows,
+        sharex=True,
+        inset_corner=inset_corner,
+        inset_size=inset_size,
+        inset_pad=inset_pad,
+        inset_fontsize=inset_fontsize,
+        inset_facecolor=inset_facecolor,
+        inset_alpha=inset_alpha,
+    )
+    auto_legend_loc, auto_annotation_loc, reserve_side = _inset_overlay_defaults(
+        inset_corner
+    )
+    if legend_loc is None:
+        legend_loc = auto_legend_loc if collapse_inset else "best"
+    if annotation_loc is None:
+        annotation_loc = auto_annotation_loc if collapse_inset else "lower right"
+
+    colors = _color_map_by_size(sizes[0], cmap)
+    for index, (fit, (ax_raw, ax_collapse)) in enumerate(zip(fits, panels)):
+        key = fit["metric_spec"]["key"]
+        last = index == rows - 1
+        # An inset titles and labels itself from the inside, so every row can
+        # carry both. A side-by-side collapse panel is a stacked row like the
+        # raw one: its title sits above its frame and its x label below, which
+        # on any row but the first and last lands in the neighbouring row.
+        second_column_stacked = not collapse_inset
+        _draw_bulk_exponent_panel(
+            ax_raw,
+            ax_collapse,
+            fit,
+            colors=colors,
+            mi_units=mi_units,
+            fit_x=fit_x,
+            show_errorbars=show_errorbars,
+            capsize=capsize,
+            raw_yscale=_per_metric(raw_yscale, key) or "linear",
+            collapse_yscale=_per_metric(collapse_yscale, key) or "linear",
+            collapse_inset=collapse_inset,
+            show_fit_window=show_fit_window,
+            inset_fontsize=inset_fontsize,
+            inset_headroom=inset_headroom,
+            reserve_side=reserve_side,
+            annotation_loc=annotation_loc,
+            annotation_fontsize=annotation_fontsize,
+            legend_loc=legend_loc,
+            legend_fontsize=legend_fontsize,
+            legend_ncols=legend_ncols,
+            draw_legend=index == 0,
+            # Only the bottom row carries the shared x label, and only the top
+            # row can carry a title without splitting the stack. The per-metric
+            # default title is suppressed: it would name one row's observable
+            # over a figure that holds several.
+            raw_title=("" if raw_title is None else _per_metric(raw_title, key))
+            if index == 0
+            else "",
+            collapse_title=(
+                ""
+                if second_column_stacked and index > 0
+                else _per_metric(collapse_title, key)
+            ),
+            raw_xlabel=raw_xlabel if last else "",
+            raw_ylabel=_per_metric(raw_ylabel, key),
+            collapse_xlabel=(
+                "" if second_column_stacked and not last else collapse_xlabel
+            ),
+            collapse_ylabel=_per_metric(collapse_ylabel, key),
+        )
+        if prune_shared_yticks and index > 0:
+            _prune_upper_yticks(ax_raw)
+            if second_column_stacked:
+                _prune_upper_yticks(ax_collapse)
+    fig.suptitle(
+        suptitle if suptitle is not None else metric_specs[0]["suptitle"],
+        fontsize=14,
+    )
+    # An inset is positioned in its parent's axes fraction and follows it, so
+    # only the gridspec axes of each row are re-laid.
+    _flush_stacked_axes(
+        fig, [list(pair[:1] if collapse_inset else pair) for pair in panels]
+    )
+    _show(fig, show)
+
+    results = {fit["metric_spec"]["key"]: _panel_result(fit, mi_units) for fit in fits}
+    return {
+        "figure": fig,
+        "axes": tuple(panels),
+        "collapse_inset": collapse_inset,
+        "stacked": True,
+        "metrics": list(results),
         "mi_units": mi_units,
-        "eta": eta,
-        "eta_stderr": eta_stderr,
-        "eta_p16": eta_p16,
-        "eta_p84": eta_p84,
-        "score": best_score,
-        "bootstrap_successes": len(estimates),
-        "summary": summary,
-        "curves": curves,
-        "fit_result": fit_result,
+        "panels": results,
+        "eta": {key: panel["eta"] for key, panel in results.items()},
+        "eta_stderr": {key: panel["eta_stderr"] for key, panel in results.items()},
+        "score": {key: panel["score"] for key, panel in results.items()},
+        "summary": pd.concat(
+            [panel["summary"] for panel in results.values()], ignore_index=True
+        ),
+        "curves": {key: panel["curves"] for key, panel in results.items()},
     }
