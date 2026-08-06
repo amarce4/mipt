@@ -658,7 +658,7 @@ def _draw_bulk_exponent_panel(
         ax_raw.set_title(panel_title)
     ax_raw.set_yscale(raw_yscale)
     ax_raw.grid(alpha=0.25)
-    legend_kwargs: dict[str, Any] = {"loc": legend_loc, "ncols": legend_ncols}
+    legend_kwargs: dict[str, Any] = {"loc": legend_loc, "ncols": legend_ncols, "bbox_to_anchor": (0.45, 0.0)}
     if legend_fontsize is not None:
         legend_kwargs["fontsize"] = legend_fontsize
     if draw_legend:

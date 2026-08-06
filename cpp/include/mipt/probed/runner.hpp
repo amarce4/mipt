@@ -57,8 +57,11 @@ struct SdpSettings
         settings.zero_tolerance = env::real("MIPT_PROBED_GMN_ZERO_TOL", 1.0e-10, 0.0, 1.0);
         settings.batch_size =
             static_cast<std::size_t>(env::integer("MIPT_PROBED_GMN_BATCH_RECORDS", 64, 1, 1000000));
-        settings.pending_batches =
-            static_cast<std::size_t>(env::integer("MIPT_PROBED_GMN_PENDING_BATCHES", 2, 1, 64));
+        // Must not sit below the solver concurrency limit or it, rather than
+        // the limiter, becomes the binding throttle and the extra workers never
+        // get a batch to work on.
+        settings.pending_batches = static_cast<std::size_t>(env::integer(
+            "MIPT_PROBED_GMN_PENDING_BATCHES", 2 * analysis::default_sdp_worker_count(), 1, 64));
         return settings;
     }
 };
@@ -410,9 +413,12 @@ inline std::vector<OutputRow> simulate(const ProbeRunConfig &config, ProgressRep
         if (config.mode == 4 && config.probes == 3)
         {
             // The SDP workers are what use the cores here, so keep MOSEK
-            // single-threaded and bound how many solve at once.
+            // single-threaded and bound how many solve at once. The bound
+            // scales with the machine; see default_sdp_worker_count.
             env::set_if_unset("GMN_MOSEK_NUM_THREADS", "1");
-            env::set_if_unset("FGMN_MAX_CONCURRENT_MOSEK", "2");
+            env::set_if_unset("FGMN_MAX_CONCURRENT_MOSEK",
+                              analysis::default_sdp_worker_count_text().c_str());
+            env::set_if_unset("GMN_MOSEK_TOL", analysis::DEFAULT_SDP_TOLERANCE_TEXT);
             gmn_selected = detail::select_gmn_samples(config, sdp, origin_rng);
             sdp_queue = std::make_unique<SdpBatchQueue>(aggregates, uses_fermionic_trace(config.type), sdp.batch_size,
                                                         sdp.pending_batches);

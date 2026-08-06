@@ -797,8 +797,10 @@ struct SdpSettings
         settings.zero_tolerance = env::real("MIPT_DIST_GMN_ZERO_TOL", 1.0e-10, 0.0, 1.0);
         settings.batch_size =
             static_cast<std::size_t>(env::integer("MIPT_DIST_GMN_BATCH_RECORDS", 64, 1, 1000000));
-        settings.pending_batches =
-            static_cast<std::size_t>(env::integer("MIPT_DIST_GMN_PENDING_BATCHES", 2, 1, 64));
+        // Must not sit below the solver concurrency limit or it, rather than
+        // the limiter, becomes the binding throttle.
+        settings.pending_batches = static_cast<std::size_t>(env::integer(
+            "MIPT_DIST_GMN_PENDING_BATCHES", 2 * analysis::default_sdp_worker_count(), 1, 64));
         return settings;
     }
 
@@ -1491,9 +1493,12 @@ inline void run_triples(const RunConfig &config)
                   << ", pending_batches=" << sdp.pending_batches
                   << ", measures=" << (include_fermionic ? "GMN+fGMN" : "GMN") << '\n';
         // The SDP workers are what use the cores here, so keep MOSEK
-        // single-threaded and bound how many solve at once.
+        // single-threaded and bound how many solve at once. The bound scales
+        // with the machine; see default_sdp_worker_count.
         env::set_if_unset("GMN_MOSEK_NUM_THREADS", "1");
-        env::set_if_unset("FGMN_MAX_CONCURRENT_MOSEK", "2");
+        env::set_if_unset("FGMN_MAX_CONCURRENT_MOSEK",
+                          analysis::default_sdp_worker_count_text().c_str());
+        env::set_if_unset("GMN_MOSEK_TOL", analysis::DEFAULT_SDP_TOLERANCE_TEXT);
     }
     else
     {
@@ -1710,6 +1715,11 @@ inline void print_usage(const char *argv0)
         << "  MIPT_DIST_GMN_ZERO_TOL=1e-10 minimum bipartite negativity below which\n"
         << "    GMN is taken to be exactly zero.\n"
         << "  MIPT_DIST_GMN_BATCH_RECORDS=64 solves per background batch.\n"
-        << "  MIPT_DIST_GMN_PENDING_BATCHES=2 batches allowed in flight.\n";
+        << "  MIPT_DIST_GMN_PENDING_BATCHES batches allowed in flight (default: twice\n"
+        << "    the solver concurrency below).\n"
+        << "  FGMN_MAX_CONCURRENT_MOSEK concurrent GMN/fGMN solves (default: cores/3,\n"
+        << "    clamped to [2,8]). The SDP dominates k=3, so this is the main speed knob.\n"
+        << "  GMN_MOSEK_TOL=1e-5 interior-point tolerance for the SDP. 1e-5 is 1.3x faster\n"
+        << "    than MOSEK's default at the same accuracy; 1e-4 loses three digits.\n";
 }
 } // namespace mipt::dist

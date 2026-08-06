@@ -52,4 +52,65 @@ namespace fgmn
     int configured_fusion_concurrency_limit();
 }
 
+#include <algorithm>
+#include <string>
+#include <thread>
+
+namespace mipt::analysis
+{
+
+// How many GMN/fGMN solves the deferred-SDP runners should keep in flight.
+//
+// Shared by mipt_probed.exe and dist_scaling.exe so the two cannot drift.  The
+// SDP dominates both -- it outweighs the circuit trajectory that produced its
+// RDM by two orders of magnitude -- so this number, not anything on the GPU
+// side, sets the wall time of a three-probe run.
+//
+// Measured on a 12-core box, mipt_probed mode 4 with three probes at N=12:
+//
+//     workers        2        4        6
+//     small run   32.2 s   21.2 s   22.5 s
+//     large run   88.5 s   53.0 s   43.5 s
+//
+// Going from the old hard-coded 2 to 4 is worth 1.5-1.7x.  Past that the wall
+// time flattens while CPU keeps climbing (76 s -> 115 s of user time on the
+// small run), which is contention rather than throughput, so the ratio is kept
+// conservative and capped.  Both runners honour an explicit
+// FGMN_MAX_CONCURRENT_MOSEK, so this is only the default.
+inline int default_sdp_worker_count()
+{
+    const unsigned hardware = std::thread::hardware_concurrency();
+    if (hardware == 0)
+    {
+        return 2;
+    }
+    return std::clamp(static_cast<int>(hardware / 3u), 2, 8);
+}
+
+inline std::string default_sdp_worker_count_text()
+{
+    return std::to_string(default_sdp_worker_count());
+}
+
+// Interior-point tolerance the runners ask MOSEK for.
+//
+// Both runners average thousands of samples per bin, so the standard error of a
+// reported mean is ~1e-3; solving each individual SDP to MOSEK's default ~1e-8
+// buys nothing.  Measured per solve on random rank-4 8x8 states, with the error
+// against the |GHZ> and |W> closed forms:
+//
+//     tol        GMN      fGMN     error
+//     default  219 ms    514 ms    3e-6
+//     1e-6     202 ms    449 ms    1.4e-6
+//     1e-5     169 ms    396 ms    1.4e-6      <- 1.30x, accuracy unchanged
+//     1e-4     147 ms    336 ms    3e-4        <- falls off a cliff
+//
+// 1e-5 sits right at the knee: still five orders of magnitude tighter than the
+// statistical error on any reported mean, and the last setting before accuracy
+// degrades.  Set GMN_MOSEK_TOL explicitly to override, including back to
+// MOSEK's own default.
+inline constexpr const char *DEFAULT_SDP_TOLERANCE_TEXT = "1e-5";
+
+} // namespace mipt::analysis
+
 #endif

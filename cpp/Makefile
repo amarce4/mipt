@@ -188,6 +188,7 @@ CORE_TEST_BIN := $(HOST_BUILD)/core_tests
 DIST_TEST_BIN := $(HOST_BUILD)/dist_metrics_tests
 SPECTRAL_TEST_BIN := $(HOST_BUILD)/spectral_tests
 FRONT_TEST_BIN := $(HOST_BUILD)/front_metrics_tests
+GMN_SOLVER_TEST_BIN := $(HOST_BUILD)/gmn_solver_tests
 
 MIPT_OBJS := $(BUILD)/mipt.o
 MIPT_PROBED_OBJS := $(BUILD)/mipt_probed.o
@@ -205,6 +206,9 @@ CORE_TEST_OBJS := $(HOST_BUILD)/core_tests.o
 DIST_TEST_OBJS := $(HOST_BUILD)/dist_metrics_tests.o
 SPECTRAL_TEST_OBJS := $(HOST_BUILD)/spectral_tests.o
 FRONT_TEST_OBJS := $(HOST_BUILD)/front_metrics_tests.o
+# Exercises both GMN back ends, so it links the C API and the Fusion object.
+GMN_SOLVER_TEST_OBJS := $(HOST_BUILD)/gmn_solver_tests.o $(HOST_BUILD)/gmn_mosek.o \
+  $(HOST_BUILD)/fgmn.o
 
 # Every executable that builds circuit states now goes through mipt/cusv.
 ifeq ($(CUSV),1)
@@ -229,7 +233,7 @@ endif
 ALL_OBJS := $(MIPT_OBJS) $(MIPT_PROBED_OBJS) $(FREE_ENERGY_OBJS) \
   $(SIM_TMI_OBJS) $(DIST_SCALING_OBJS) $(ENTROPY_OBJS) $(GMN_OBJS) $(FGMN_OBJS) \
   $(RING_OBJS) $(EXP_VALS_OBJS) $(CORE_TEST_OBJS) $(DIST_TEST_OBJS) \
-  $(SPECTRAL_TEST_OBJS) $(FRONT_TEST_OBJS) \
+  $(SPECTRAL_TEST_OBJS) $(FRONT_TEST_OBJS) $(GMN_SOLVER_TEST_OBJS) \
   $(MIPT_PROBED_FGMN_PIC_OBJ)
 DEPS := $(ALL_OBJS:.o=.d)
 
@@ -245,7 +249,7 @@ MIPT_HEADERS := $(shell find include -name '*.hpp' 2>/dev/null)
 MIPT_CUDA_HEADERS := $(shell find include -name '*.cuh' 2>/dev/null) $(MIPT_HEADERS)
 
 .PHONY: all simulation analysis clean cpu gpu print-config format test-core test-dist test-front \
-  test-spectral test-rdm-gram test-cusv test-cusv-gates test-mode3 bench-cusv \
+  test-spectral test-gmn test-rdm-gram test-cusv test-cusv-gates test-mode3 bench-cusv \
   mipt.exe mipt_probed.exe free_energy.exe sim_tmi.exe dist_scaling.exe \
   entropy.exe gmn.exe fgmn.exe ring_inflation.exe exp_vals.exe
 
@@ -317,6 +321,8 @@ $(SPECTRAL_TEST_BIN): $(SPECTRAL_TEST_OBJS)
 	$(HOSTCXX) $^ -o $@
 $(FRONT_TEST_BIN): $(FRONT_TEST_OBJS)
 	$(HOSTCXX) $^ -o $@
+$(GMN_SOLVER_TEST_BIN): $(GMN_SOLVER_TEST_OBJS)
+	$(HOSTCXX) $(HOST_LDFLAGS) $^ $(MOSEK_LDFLAGS) $(MOSEK_LIBS) -o $@
 
 test-core: $(CORE_TEST_BIN)
 	$(CORE_TEST_BIN)
@@ -326,6 +332,11 @@ test-spectral: $(SPECTRAL_TEST_BIN)
 	$(SPECTRAL_TEST_BIN)
 test-front: $(FRONT_TEST_BIN)
 	$(FRONT_TEST_BIN)
+# Needs MOSEK, no GPU. Pins both GMN back ends and fGMN to closed forms; see the
+# header comment in tests/gmn_solver_tests.cpp for why |W> is the load-bearing
+# case. Single-threaded so the check is deterministic.
+test-gmn: $(GMN_SOLVER_TEST_BIN)
+	GMN_MOSEK_NUM_THREADS=1 $(GMN_SOLVER_TEST_BIN)
 
 # --- reduction-kernel equivalence -------------------------------------------
 #
@@ -452,6 +463,8 @@ $(HOST_BUILD)/spectral_tests.o: tests/spectral_tests.cpp | $(HOST_BUILD)
 	$(HOSTCXX) $(CPPFLAGS_COMMON) -std=c++20 -O2 -MMD -MP -c $< -o $@
 $(HOST_BUILD)/front_metrics_tests.o: tests/front_metrics_tests.cpp | $(HOST_BUILD)
 	$(HOSTCXX) $(CPPFLAGS_COMMON) -std=c++20 -O2 -MMD -MP -c $< -o $@
+$(HOST_BUILD)/gmn_solver_tests.o: tests/gmn_solver_tests.cpp | $(HOST_BUILD)
+	$(HOSTCXX) $(CPPFLAGS_COMMON) $(MOSEK_CPPFLAGS) -std=c++20 -O2 -MMD -MP -c $< -o $@
 
 print-config:
 	@echo "CONFIG=$(CONFIG)"

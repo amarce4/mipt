@@ -1039,9 +1039,14 @@ namespace fgmn
                         Expression::t BigQ = Expr::vstack(Expr::hstack(double_identity_expr(), Qshift), Expr::hstack(Expr::transpose(Qshift), double_identity_expr())); //The transpose here is actually the full realified conjugate transpose, since Qshift is symmetric in the real part and antisymmetric in the imaginary part.
 
                         M->constraint(P_complex,Domain::inPSDCone(2*D)); //Real part is automatically taken by the constraint
-                        // M->constraint(
-                        //     Expr::sub(double_identity(), Expr::mul(0.1,P_complex)),
-                        //     Domain::inPSDCone(2*D)); //Extremely weak upper bound on P, re-enable if Mosek complains about dual infeasibile/unbounded problem
+                        // P <= I. This is part of the JMG normalization, not an
+                        // optional safeguard: without it the witness is only
+                        // bounded through Q and the SDP relaxes to the minimum
+                        // bipartite negativity. |W> is the cheap regression --
+                        // it must give 0.443, not its bipartite value 0.4714.
+                        M->constraint(
+                            Expr::sub(double_identity(), P_complex),
+                            Domain::inPSDCone(2*D));
                         M->constraint(BigQ,Domain::inPSDCone(4*D));
                     }
                     else{
@@ -1050,9 +1055,12 @@ namespace fgmn
                         M->constraint(
                             Expr::sub(double_identity(), Q_complex),
                             Domain::inPSDCone(2*D));
-                        // M->constraint(
-                        //     Expr::sub(double_identity(), P_complex),
-                        //     Domain::inPSDCone(2*D)); //Going to just use the renormalized version here (no P < I constraint)
+                        // See the fermionic branch above: P <= I is required,
+                        // not optional. Bounding Q alone leaves the witness free
+                        // to saturate a single bipartition.
+                        M->constraint(
+                            Expr::sub(double_identity(), P_complex),
+                            Domain::inPSDCone(2*D));
                     }
                 }
             }
@@ -1066,6 +1074,7 @@ namespace fgmn
                     Q[subsystem] = psd_slice(X, psds_per_subsystem * subsystem + 1);
                     //P[subsystem] = psd_slice(XP, subsystem);
                     //Q[subsystem] = psd_slice(XQ, subsystem);
+                    add_psd_upper_bound(M, P[subsystem]);
                     add_psd_upper_bound(M, Q[subsystem]);
                 }
             }
