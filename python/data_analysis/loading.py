@@ -23,15 +23,52 @@ def _as_paths(files: Sequence[str | Path] | str | Path | None) -> list[Path]:
     return [Path(path) for path in files]
 
 
+_GLOB_METACHARACTERS = re.compile(r"[*?\[]")
+
+
+def _expand_patterns(paths: Sequence[Path]) -> tuple[list[Path], list[str]]:
+    """Expand the entries of ``paths`` that look like glob patterns.
+
+    An entry that names an existing file, or that carries no glob
+    metacharacter, is taken literally -- so a real path containing ``[`` still
+    resolves, and a plain path that does not exist still reaches the reader
+    and fails there with its own name in the message. Returns the expanded
+    paths (deduplicated, first occurrence wins) and the patterns that matched
+    nothing, which the caller reports only if it ends up with no files at all.
+    """
+    expanded: list[Path] = []
+    unmatched: list[str] = []
+    for path in paths:
+        text = str(path)
+        if path.exists() or not _GLOB_METACHARACTERS.search(text):
+            expanded.append(path)
+            continue
+        matches = sorted(glob(text))
+        if not matches:
+            unmatched.append(text)
+        expanded.extend(Path(match) for match in matches)
+    deduplicated = list(dict.fromkeys(expanded))
+    return deduplicated, unmatched
+
+
 def _resolve_files(
     files: Sequence[str | Path] | str | Path | None,
     file_glob: str | Path | None,
+    *,
+    description: str = "input files",
 ) -> list[Path]:
-    paths = _as_paths(files)
+    paths, unmatched = _expand_patterns(_as_paths(files))
     if not paths and file_glob is not None:
-        paths = [Path(path) for path in sorted(glob(str(file_glob)))]
+        pattern = str(file_glob)
+        paths = [Path(path) for path in sorted(glob(pattern))]
+        if not paths:
+            unmatched.append(pattern)
     if not paths:
-        raise FileNotFoundError("No input files were found.")
+        if unmatched:
+            raise FileNotFoundError(
+                f"No {description} matched: {unmatched}."
+            )
+        raise FileNotFoundError(f"No {description} were found.")
     return paths
 
 

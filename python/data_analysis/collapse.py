@@ -20,6 +20,7 @@ import numpy as np
 import pandas as pd
 from scipy.optimize import minimize_scalar
 
+from .fitting import _format_with_uncertainty
 from .loading import _find_column, resolve_metadata
 from .plotting import (
     _annotate_axes,
@@ -689,19 +690,22 @@ def _draw_bulk_exponent_panel(
         fontsize=inset_fontsize + 1.0,
     )
     symbol = metric_spec["eta_symbol"]
+    # The error bar is quoted to one significant figure and eta is quoted to
+    # that same decimal place, rather than both to a fixed number of decimals.
+    eta_str, eta_stderr_str = _format_with_uncertainty(eta, eta_stderr)
     eta_text = (
-        rf"${symbol}={eta:.4f}\pm {eta_stderr:.4f}$"
+        rf"${symbol}={eta_str}\pm {eta_stderr_str}$"
         if np.isfinite(eta_stderr)
-        else rf"${symbol}={eta:.4f}$"
+        else rf"${symbol}={eta_str}$"
     )
     annotation_kwargs: dict[str, Any] = {}
     if annotation_fontsize is not None:
         annotation_kwargs["fontsize"] = annotation_fontsize
     _annotate_axes(
         ax_raw if collapse_inset else ax_collapse,
-        metric_spec["ansatz"]
-        + "\n"
-        + eta_text
+        # metric_spec["ansatz"]
+        # + "\n"
+        eta_text
         + "\n"
         + rf"score $={best_score:.3g}$",
         annotation_loc,

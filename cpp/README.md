@@ -83,6 +83,29 @@ or more kept sites (starting at `N=14`) to cuSOLVER by default; override this
 free-energy-specific threshold with
 `MIPT_FREE_ENERGY_CUDA_ENTROPY_MIN_KEPT`.
 
+### Resuming an interrupted run
+
+Re-issuing the identical command continues an interrupted run instead of
+overwriting it. The two CSVs are themselves the checkpoint: the samples file
+supplies the finished trajectories and, through the invertibility of the
+splitmix64 seed derivation, the master seed, while the time series supplies the
+per-timestep Welford accumulators (`m2` is recovered from the stored sample
+standard deviation). A resumed run therefore continues the same seed stream and
+reproduces what an uninterrupted run would have written, to a few ulp on the
+standard-deviation columns. Runs interrupted by a binary that predates this
+support resume fine, since nothing beyond the two CSVs is consulted.
+
+A resume refuses rather than guesses when the files on disk describe a different
+run: a mismatched `N`, `p`, `CIRC_TYPE`, `INIT_STATE` or `REALIZATIONS`, a
+different CSV schema, a different half-chain entropy schedule, non-contiguous
+trajectory indices, or only one of the two files present. An unterminated final
+samples row — a kill during the flush — is dropped; every complete row is kept.
+Because the samples row is appended before the time series is rewritten, an
+interrupt between the two leaves the samples file one row ahead; that row is
+kept and `completed_realizations` reports the aggregate's own count, so the two
+files stay individually truthful. `MIPT_FREE_ENERGY_RESUME=0` discards the
+existing files and starts over.
+
 The sample column `free_energy_density_tilde` is the production-window slope
 divided by `N`, in natural-log units, before the spacetime anisotropy is
 applied. In the extracted root-level `data_analysis.py`, use

@@ -1,6 +1,7 @@
 #include "mipt/backend.hpp"
 #include "mipt/env.hpp"
 #include "mipt/free_energy.hpp"
+#include "mipt/free_energy_resume.hpp"
 #include "mipt/probed.hpp"
 #include "mipt/types.hpp"
 #include "mipt/util/pause.hpp"
@@ -12,6 +13,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -69,20 +71,11 @@ struct LinearAccumulator
     double sum_xy = 0.0;
 };
 
-struct TimeStats
-{
-    RunningStats cumulative_f;
-    RunningStats f_over_tl;
-    RunningStats half_entropy;
-};
-
-std::uint64_t splitmix64(std::uint64_t value)
-{
-    value += 0x9e3779b97f4a7c15ULL;
-    value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ULL;
-    value = (value ^ (value >> 27)) * 0x94d049bb133111ebULL;
-    return value ^ (value >> 31);
-}
+namespace resume = mipt::free_energy::resume;
+using resume::kSamplesHeader;
+using resume::kTimeseriesHeader;
+using resume::splitmix64;
+using resume::TimeStats;
 
 std::uint64_t default_seed()
 {
@@ -113,10 +106,16 @@ void write_timeseries(
     CircuitType type,
     int init_state,
     int requested_realizations,
-    int completed_realizations,
     int equilibration_timesteps,
     const std::vector<TimeStats> &stats)
 {
+    // Taken from the accumulator, not from the trajectory counter: a resume
+    // keeps a samples row the previous checkpoint never saw, so the two can
+    // legitimately differ by one and this column must report what the
+    // aggregates actually contain.
+    const std::uint64_t completed_realizations =
+        stats.empty() ? 0 : stats.front().cumulative_f.count;
+
     const std::string temporary = path + ".tmp";
     std::ofstream csv(temporary, std::ios::out | std::ios::trunc);
     if (!csv)
@@ -124,10 +123,7 @@ void write_timeseries(
         throw std::runtime_error("Could not open time-series CSV: " + temporary);
     }
     csv << std::setprecision(17);
-    csv << "N,p,circ_type,circuit_name,init_state,requested_realizations,"
-           "completed_realizations,t,t_over_L,phase,F_mean,F_stddev,F_stderr,"
-           "F_over_tL_mean,F_over_tL_stddev,F_over_tL_stderr,S_half_mean,"
-           "S_half_stddev,S_half_stderr,S_half_count\n";
+    csv << kTimeseriesHeader << '\n';
 
     for (std::size_t index = 0; index < stats.size(); ++index)
     {
@@ -183,7 +179,12 @@ void print_usage(const char *argv0)
         << "or odd unitary brickwork layer followed by its measurement layer.\n"
         << "For circ_type 2, 3, or 4, every initial state has a definite randomly\n"
         << "selected global parity.\n\n"
+        << "An interrupted run is resumed by re-issuing the identical command: the\n"
+        << "two CSVs it already wrote are the checkpoint, so trajectories, the\n"
+        << "per-timestep aggregates and the seed stream all continue where they\n"
+        << "stopped. MIPT_FREE_ENERGY_RESUME=0 discards them and starts over.\n\n"
         << "Environment controls:\n"
+        << "  MIPT_FREE_ENERGY_RESUME=1\n"
         << "  MIPT_FREE_ENERGY_SEED=<integer>\n"
         << "  MIPT_FREE_ENERGY_PROGRESS_MS=1000\n"
         << "  MIPT_FREE_ENERGY_HALF_ENTROPY=1\n"
@@ -256,9 +257,8 @@ int main(int argc, char *argv[])
             "MIPT_FREE_ENERGY_ENTROPY_STRIDE", 1, 1, total_timesteps));
         const long configured_seed = env::integer(
             "MIPT_FREE_ENERGY_SEED", -1, -1, std::numeric_limits<long>::max());
-        const std::uint64_t master_seed = configured_seed >= 0
-                                              ? static_cast<std::uint64_t>(configured_seed)
-                                              : default_seed();
+        const bool resume_enabled =
+            env::boolean("MIPT_FREE_ENERGY_RESUME", true);
 
         const std::string prefix =
             "free_energy_" + std::string(circuit_type_tag(type)) +
@@ -270,17 +270,154 @@ int main(int argc, char *argv[])
         const std::string samples_path = prefix + "_samples.csv";
         const std::string timeseries_path = prefix + "_timeseries.csv";
 
-        std::ofstream samples(samples_path, std::ios::out | std::ios::trunc);
+        // --- resume ---------------------------------------------------------
+        //
+        // The two CSVs are the checkpoint. Read them before opening anything
+        // for writing, so a refusal cannot have destroyed the run it refused.
+        resume::RunIdentity identity;
+        identity.n = n;
+        identity.p = p;
+        identity.circ_type = static_cast<int>(type);
+        identity.init_state = init_state;
+        identity.requested_realizations = realizations;
+
+        const bool samples_exists = std::filesystem::exists(samples_path);
+        const bool timeseries_exists = std::filesystem::exists(timeseries_path);
+        resume::SamplesCheckpoint samples_checkpoint;
+        resume::TimeseriesCheckpoint timeseries_checkpoint;
+        bool resuming = false;
+
+        if (resume_enabled && (samples_exists || timeseries_exists))
+        {
+            if (samples_exists)
+            {
+                samples_checkpoint =
+                    resume::scan_samples(samples_path, kSamplesHeader, identity);
+            }
+
+            if (!timeseries_exists && samples_checkpoint.completed == 0)
+            {
+                // The time series appears only once a trajectory has finished,
+                // so this is a run killed inside its first one (at large N that
+                // is minutes). Nothing was completed, so nothing is lost by
+                // starting over.
+            }
+            else if (!samples_exists || !timeseries_exists)
+            {
+                throw std::runtime_error(
+                    std::string("Resume refused: only ") +
+                    (samples_exists ? samples_path : timeseries_path) +
+                    " is present. Both CSVs are needed to continue a run -- the "
+                    "samples file carries the trajectories and the seed stream, "
+                    "the time series carries the per-timestep aggregates, and "
+                    "neither can be rebuilt from the other. Move it aside, or "
+                    "set MIPT_FREE_ENERGY_RESUME=0 to start over.");
+            }
+            else
+            {
+                timeseries_checkpoint = resume::load_timeseries(
+                    timeseries_path,
+                    kTimeseriesHeader,
+                    identity,
+                    total_timesteps,
+                    record_half_entropy,
+                    entropy_max_t,
+                    entropy_stride);
+                // The aggregate is written after the samples row, and a resume
+                // may leave it permanently one trajectory behind, so it can lag
+                // but can never lead. If it does, the samples file lost rows and
+                // continuing would double-count them in the aggregate.
+                if (timeseries_checkpoint.completed > samples_checkpoint.completed)
+                {
+                    throw std::runtime_error(
+                        "Resume refused: " + timeseries_path + " aggregates " +
+                        std::to_string(timeseries_checkpoint.completed) +
+                        " trajectories but " + samples_path + " holds only " +
+                        std::to_string(samples_checkpoint.completed) +
+                        " rows. The samples file has been truncated or edited; "
+                        "resuming would count those trajectories twice.");
+                }
+                resuming = samples_checkpoint.completed > 0 ||
+                           timeseries_checkpoint.completed > 0;
+            }
+        }
+
+        const std::uint64_t master_seed =
+            resuming && samples_checkpoint.has_master_seed
+                ? samples_checkpoint.master_seed
+                : (configured_seed >= 0
+                       ? static_cast<std::uint64_t>(configured_seed)
+                       : default_seed());
+        const int start_trajectory =
+            resuming ? static_cast<int>(samples_checkpoint.next_trajectory) : 0;
+
+        if (resuming)
+        {
+            std::cout << "Resuming from " << samples_path << ": "
+                      << samples_checkpoint.completed << '/' << realizations
+                      << " trajectories already recorded";
+            if (samples_checkpoint.has_master_seed)
+            {
+                std::cout << ", seed stream recovered";
+            }
+            std::cout << ".\n";
+            if (resume::has_partial_tail(samples_checkpoint))
+            {
+                std::cout
+                    << "  Dropping "
+                    << (samples_checkpoint.file_bytes -
+                        samples_checkpoint.valid_bytes)
+                    << " bytes of an unterminated trailing row (killed "
+                       "mid-flush); every complete row is kept.\n";
+            }
+            if (timeseries_checkpoint.completed != samples_checkpoint.completed)
+            {
+                std::cout
+                    << "  The time-series aggregate holds "
+                    << timeseries_checkpoint.completed
+                    << " trajectories against the samples file's "
+                    << samples_checkpoint.completed
+                    << "; the run stopped between the two writes. Every sample "
+                       "row is kept and completed_realizations reports the "
+                       "aggregate's own count.\n";
+            }
+            if (configured_seed >= 0 &&
+                samples_checkpoint.has_master_seed &&
+                static_cast<std::uint64_t>(configured_seed) !=
+                    samples_checkpoint.master_seed)
+            {
+                std::cout
+                    << "  Ignoring MIPT_FREE_ENERGY_SEED=" << configured_seed
+                    << "; continuing the recovered stream " << master_seed
+                    << " so no trajectory is simulated twice.\n";
+            }
+            if (start_trajectory >= realizations)
+            {
+                std::cout << samples_path << " is already complete ("
+                          << samples_checkpoint.completed << '/' << realizations
+                          << " trajectories). Nothing to do.\n";
+                return 0;
+            }
+        }
+
+        if (resuming)
+        {
+            resume::trim_partial_tail(samples_path, samples_checkpoint);
+        }
+
+        std::ofstream samples(
+            samples_path,
+            resuming ? (std::ios::out | std::ios::app)
+                     : (std::ios::out | std::ios::trunc));
         if (!samples)
         {
             throw std::runtime_error("Could not open sample CSV: " + samples_path);
         }
         samples << std::setprecision(17);
-        samples
-            << "N,p,circ_type,circuit_name,init_state,trajectory,parity_sector,"
-               "trajectory_seed,equil_timesteps,production_timesteps,total_timesteps,"
-               "measurements_total,measurements_production,F_total,F_production,"
-               "production_rate_endpoint,production_slope,free_energy_density_tilde\n";
+        if (!resuming)
+        {
+            samples << kSamplesHeader << '\n';
+        }
 
         std::cout
             << "Measurement-record free energy: N=" << n
@@ -291,6 +428,11 @@ int main(int argc, char *argv[])
             << (init_state == 0 ? " (product)" : " (Haar)")
             << ", realizations=" << realizations
             << ", seed=" << master_seed << '\n'
+            << (resuming
+                    ? "trajectories " + std::to_string(start_trajectory) +
+                          ".." + std::to_string(realizations - 1) +
+                          " remaining\n"
+                    : std::string())
             << "t_eq=" << equilibration_timesteps
             << ", t_production=" << production_timesteps
             << ", t_total=" << total_timesteps << '\n';
@@ -304,8 +446,10 @@ int main(int argc, char *argv[])
         workspace.reserve(total_timesteps);
         free_energy::HalfEntropyWorkspace entropy_workspace;
         const bool fermion_trace = uses_fermionic_trace(type);
-        std::vector<TimeStats> time_stats(
-            static_cast<std::size_t>(total_timesteps + 1));
+        std::vector<TimeStats> time_stats =
+            resuming ? std::move(timeseries_checkpoint.stats)
+                     : std::vector<TimeStats>(
+                           static_cast<std::size_t>(total_timesteps + 1));
 
         const auto run_start = std::chrono::steady_clock::now();
         auto last_progress = run_start;
@@ -313,7 +457,8 @@ int main(int argc, char *argv[])
 
         mipt::util::PauseSentinel pause_sentinel;
 
-        for (int trajectory = 0; trajectory < realizations; ++trajectory)
+        for (int trajectory = start_trajectory; trajectory < realizations;
+             ++trajectory)
         {
             // Safe checkpoint: per-trajectory samples are already flushed.
             pause_sentinel.wait([&]() { samples.flush(); });
@@ -339,7 +484,8 @@ int main(int argc, char *argv[])
             LinearAccumulator production_fit;
 
             time_stats[0].cumulative_f.add(0.0);
-            if (record_half_entropy && entropy_max_t >= 0)
+            if (resume::records_half_entropy(
+                    0, record_half_entropy, entropy_max_t, entropy_stride))
             {
                 time_stats[0].half_entropy.add(
                     free_energy::half_chain_entropy_bits(
@@ -378,8 +524,8 @@ int main(int argc, char *argv[])
                     cumulative_f /
                     (static_cast<double>(t) * static_cast<double>(n)));
 
-                if (record_half_entropy && t <= entropy_max_t &&
-                    (t % entropy_stride == 0 || t == entropy_max_t))
+                if (resume::records_half_entropy(
+                        t, record_half_entropy, entropy_max_t, entropy_stride))
                 {
                     time_stats[static_cast<std::size_t>(t)].half_entropy.add(
                         free_energy::half_chain_entropy_bits(
@@ -433,7 +579,6 @@ int main(int argc, char *argv[])
                 type,
                 init_state,
                 realizations,
-                trajectory + 1,
                 equilibration_timesteps,
                 time_stats);
 
@@ -450,8 +595,12 @@ int main(int argc, char *argv[])
             {
                 const double elapsed =
                     std::chrono::duration<double>(now - run_start).count();
+                // Rate and ETA describe this session, so they count from the
+                // resume point rather than from trajectory 0.
+                const double done_here =
+                    static_cast<double>(trajectory + 1 - start_trajectory);
                 const double average_rate =
-                    elapsed > 0.0 ? static_cast<double>(trajectory + 1) / elapsed : 0.0;
+                    elapsed > 0.0 ? done_here / elapsed : 0.0;
                 const double remaining = average_rate > 0.0
                                              ? static_cast<double>(
                                                    realizations - trajectory - 1) /

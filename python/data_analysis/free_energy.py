@@ -322,8 +322,8 @@ def free_energy_ceff(
         [rf"$1/{int(size)}^2$" for size in sizes[tick_order]]
     )
     ax.set_xlabel(r"$1/L^2$")
-    ax.set_ylabel(r"$\widetilde{f}(L)=F/(L t)$")
-    ax.set_title("Measurement-record free-energy density")
+    ax.set_ylabel(r"$f(L)$")
+    # ax.set_title("Measurement-record free-energy density")
     ax.grid(alpha=0.25)
     information = ax.text(
         0.025,

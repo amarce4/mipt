@@ -493,7 +493,7 @@ def probe_anisotropy(
     )
     annotation_text = (
         rf"$\delta t_*/L={delta_t_star_over_l:.4g}$" + "\n"
-        + rf"$\alpha={alpha:.4g}\pm {alpha_stderr:.2g}$ (stat.)"
+        + rf"$a={alpha:.2g}\pm {alpha_stderr:.1g}$"
     )
     annotation_kwargs: dict[str, Any] = {}
     if annotation_fontsize is not None:
