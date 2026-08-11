@@ -2,6 +2,7 @@
 
 #include "mipt/backend.hpp"
 #include "mipt/circuit.hpp"
+#include "mipt/entropy_resume.hpp"
 #include "mipt/native_mps.hpp"
 #include "mipt/rdm.hpp"
 // The host von Neumann path reuses sim_tmi's Hermitian eigen-entropy: a
@@ -591,10 +592,7 @@ inline void write_results(const std::string &path,
         throw std::runtime_error("Could not open output CSV: " + path);
     }
     csv << std::setprecision(17);
-    csv << "N,periods,p,requested_realizations,completed_realizations,circ_type,"
-           "circuit_name,fermionic_trace,L_A,x,ln_x,"
-           "S1_mean,S1_stddev,S1_stderr,S2_mean,S2_stddev,S2_stderr,"
-           "subsystems_per_realization,total_subsystems\n";
+    csv << resume::kResultsHeader << '\n';
 
     constexpr double pi = 3.141592653589793238462643383279502884;
     const bool fermionic_trace = uses_fermionic_trace(circ_type);
@@ -662,6 +660,11 @@ inline void print_usage(const char *argv0)
         << "report NaN in the S1 columns, never 0.\n"
         << "  MIPT_ENTROPY_S1=0            report S2 only\n"
         << "  MIPT_ENTROPY_S1_MAX_LA=k     compute S1 only for L_A<=k (0 = no cap)\n\n"
+        << "An interrupted run is resumed by re-issuing the identical command with\n"
+        << "the same output_csv: that file is the checkpoint, so the averages carry\n"
+        << "on rather than restarting. Trajectories are i.i.d. draws, so a resumed\n"
+        << "run is statistically identical to an uninterrupted one.\n"
+        << "  MIPT_ENTROPY_RESUME=0        discard the existing CSV and start over\n\n"
         << "GPU controls (GPU=1 CUDA_RHO=1 builds):\n"
         << "  MIPT_ENTROPY_CUDA=0          disable CUDA entropy evaluation\n"
         << "  MIPT_ENTROPY_CUDA_MAX_MB=512 cap temporary CUDA workspace in MiB\n"

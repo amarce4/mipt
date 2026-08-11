@@ -85,6 +85,14 @@ free-energy-specific threshold with
 
 ### Resuming an interrupted run
 
+`free_energy.exe`, `entropy.exe` and `dist_scaling.exe` all resume; the shared
+CSV-reading and Welford-reconstruction machinery is in
+`include/mipt/util/resume_csv.hpp`, with one small per-application header on
+top. In every case the run's own output file *is* the checkpoint — there is no
+side-car state — which is what lets a run interrupted by a binary that predates
+the feature be picked up by one that has it. See "Resuming entropy.exe and
+dist_scaling.exe" below for those two.
+
 Re-issuing the identical command continues an interrupted run instead of
 overwriting it. The two CSVs are themselves the checkpoint: the samples file
 supplies the finished trajectories and, through the invertibility of the
@@ -111,6 +119,57 @@ divided by `N`, in natural-log units, before the spacetime anisotropy is
 applied. In the extracted root-level `data_analysis.py`, use
 `free_energy_ceff(..., alpha=...)` for the Fig. 1(b) double fit and
 `free_energy_equilibration(...)` for Supplementary Fig. S1(a,b).
+
+## Resuming entropy.exe and dist_scaling.exe
+
+Both write a single aggregated CSV and rewrite it as the run proceeds, so that
+file is the whole checkpoint. Re-issuing the identical command — same arguments,
+same output path — continues the averages rather than restarting them.
+`MIPT_ENTROPY_RESUME=0` and `MIPT_DIST_RESUME=0` restore the old
+overwrite-and-restart behaviour.
+
+Neither executable seeds its circuits (`CircuitWorkspace1D::seed` is never
+called, so trajectories come from `std::random_device`), so unlike
+`free_energy.exe` there is no seed stream to continue and none is needed: the
+trajectories are i.i.d. draws and a resumed run simply takes more of them. The
+consequence is that a resumed run is statistically identical to an uninterrupted
+one but not comparable trajectory by trajectory.
+
+**`entropy.exe`.** The completed count is the `completed_realizations` column;
+the accumulators come back through `m2 = stddev² · (count − 1)`. A block whose
+von Neumann entropy was skipped is written as NaN and must return as an *empty*
+accumulator rather than a zero sample, so the S1 schedule is read off the file's
+own NaNs and then held against the current settings — resuming under a different
+`MIPT_ENTROPY_S1`/`MIPT_ENTROPY_S1_MAX_LA` is refused, since it would leave the
+S1 columns averaged over a different number of trajectories than the S2 ones.
+Pre-2026-08-05 S2-only files resume as S2-only scans (`MIPT_ENTROPY_S1=0`) and
+are refused otherwise. Because `stderr = stddev / sqrt(count)`, the two spread
+columns cross-check the count for free; a file whose columns disagree is refused
+as edited or concatenated.
+
+**`dist_scaling.exe`.** Every bin field is a column or implied by one, so the
+CSV is an invertible projection of the aggregation bins; `make test-dist` pins
+that. The completed count is a bin's sample count divided by the records one
+trajectory contributes to it — `embedding_count` for k=2, and
+`min(MIPT_DIST_EMBEDDINGS_PER_GEOMETRY, embeddings)` for k=3 — and every bin
+must agree. For k=3 the SDP schedule also has to resume in position:
+`SdpSettings::selects` is a pure function of `bin.records` and
+`bin.gmn.requested`, and both come back (the former as `tmi_samples`, since
+every record feeds the TMI; the latter as `gmn_requested_count`).
+
+> **GMN solves in flight at the interrupt are lost, and their loss is not
+> neutral.** A record is counted in `gmn_requested_count` when it is submitted
+> but contributes its value only when its batch is collected, so a kill leaves
+> `requested > value.count + solver_failures`. The resume detects that from the
+> queue's own invariant and rolls `requested` back, which returns those schedule
+> slots so everything sampled from here on is unbiased. It cannot recover the
+> lost values — the density matrices are long gone — and those records are
+> exactly the ones the zero prefilter did *not* settle, so the surviving average
+> over-weights `GMN = 0`. A resume prints the reclaimed count and warns when any
+> geometry lost more than 2% of its requested records. This skew is a property
+> of the interrupted file itself, not of resuming it: it is equally present in
+> the partial CSV a killed run has always left behind. Folding the prefiltered
+> zeros through the same queue as the solves would remove it at the source.
 
 ## Unified probe simulator
 

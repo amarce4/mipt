@@ -329,7 +329,7 @@ def free_energy_ceff(
         0.025,
         0.025,
         rf"$\alpha={alpha:.5g}$" + "\n" +
-        rf"$c_{{\mathrm{{eff}}}}={c_eff:.5f}\pm{c_eff_stderr:.5f}$",
+        rf"$c_{{\mathrm{{eff}}}}={c_eff:.2g}\pm{c_eff_stderr:.1g}$",
         transform=ax.transAxes,
         ha="left",
         va="bottom",

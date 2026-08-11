@@ -34,8 +34,10 @@
 //     itself rather than from the loop counter, so the column stays truthful.
 //
 // Nothing here depends on CUDA-Q, MOSEK, or a GPU, so it is exercised by
-// `make test-core`.
+// `make test-core`. The CSV parsing and Welford reconstruction it shares with
+// entropy.exe and dist_scaling.exe live in util/resume_csv.hpp.
 
+#include "mipt/util/resume_csv.hpp"
 #include "mipt/util/stats.hpp"
 
 #include <cmath>
@@ -52,6 +54,14 @@
 namespace mipt::free_energy::resume
 {
 using util::RunningStats;
+
+// Re-exported so this header stays the single import for the free-energy app
+// and its tests.
+using util::resume::parse_double_field;
+using util::resume::parse_long_field;
+using util::resume::parse_uint64_field;
+using util::resume::read_whole_file;
+using util::resume::split_csv_row;
 
 // The live per-timestep accumulator, shared with the checkpoint reader so the
 // two cannot drift apart.
@@ -154,125 +164,6 @@ inline bool records_half_entropy(int t, bool enabled, int entropy_max_t, int ent
         return false;
     }
     return t % entropy_stride == 0 || t == entropy_max_t;
-}
-
-// --- CSV reading -----------------------------------------------------------
-
-// Splits one CSV row, honouring the double-quoted circuit-name field written
-// by util::csv_quote (doubled quotes escape a literal quote).
-inline std::vector<std::string> split_csv_row(std::string_view row)
-{
-    std::vector<std::string> fields;
-    std::string field;
-    bool quoted = false;
-    for (std::size_t i = 0; i < row.size(); ++i)
-    {
-        const char c = row[i];
-        if (quoted)
-        {
-            if (c != '"')
-            {
-                field.push_back(c);
-            }
-            else if (i + 1 < row.size() && row[i + 1] == '"')
-            {
-                field.push_back('"');
-                ++i;
-            }
-            else
-            {
-                quoted = false;
-            }
-            continue;
-        }
-        if (c == '"')
-        {
-            quoted = true;
-        }
-        else if (c == ',')
-        {
-            fields.push_back(std::move(field));
-            field.clear();
-        }
-        else
-        {
-            field.push_back(c);
-        }
-    }
-    fields.push_back(std::move(field));
-    return fields;
-}
-
-inline std::string read_whole_file(const std::filesystem::path &path)
-{
-    std::ifstream input(path, std::ios::in | std::ios::binary);
-    if (!input)
-    {
-        throw std::runtime_error("Could not open for resume: " + path.string());
-    }
-    std::ostringstream buffer;
-    buffer << input.rdbuf();
-    return buffer.str();
-}
-
-inline double parse_double_field(
-    const std::string &text, const std::string &context)
-{
-    try
-    {
-        std::size_t consumed = 0;
-        const double value = std::stod(text, &consumed);
-        if (consumed != text.size())
-        {
-            throw std::invalid_argument("trailing characters");
-        }
-        return value;
-    }
-    catch (const std::exception &)
-    {
-        throw std::runtime_error(
-            "Resume: could not parse '" + text + "' as a number in " + context);
-    }
-}
-
-inline long parse_long_field(const std::string &text, const std::string &context)
-{
-    try
-    {
-        std::size_t consumed = 0;
-        const long value = std::stol(text, &consumed);
-        if (consumed != text.size())
-        {
-            throw std::invalid_argument("trailing characters");
-        }
-        return value;
-    }
-    catch (const std::exception &)
-    {
-        throw std::runtime_error(
-            "Resume: could not parse '" + text + "' as an integer in " + context);
-    }
-}
-
-inline std::uint64_t parse_uint64_field(
-    const std::string &text, const std::string &context)
-{
-    try
-    {
-        std::size_t consumed = 0;
-        const unsigned long long value = std::stoull(text, &consumed);
-        if (consumed != text.size())
-        {
-            throw std::invalid_argument("trailing characters");
-        }
-        return static_cast<std::uint64_t>(value);
-    }
-    catch (const std::exception &)
-    {
-        throw std::runtime_error(
-            "Resume: could not parse '" + text + "' as an unsigned integer in " +
-            context);
-    }
 }
 
 // --- run identity ----------------------------------------------------------
@@ -495,17 +386,7 @@ constexpr std::size_t kTsColumnSHalfCount = 19;
 // one whose samples all happened to be zero.
 inline RunningStats rebuild_stats(double mean, double stddev, std::uint64_t count)
 {
-    RunningStats stats;
-    if (count == 0 || std::isnan(mean))
-    {
-        return stats;
-    }
-    stats.count = count;
-    stats.mean = mean;
-    stats.m2 = count > 1
-                   ? stddev * stddev * static_cast<double>(count - 1)
-                   : 0.0;
-    return stats;
+    return util::resume::stats_from_stddev(mean, stddev, count);
 }
 
 inline TimeseriesCheckpoint load_timeseries(

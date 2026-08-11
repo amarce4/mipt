@@ -5,8 +5,10 @@
 
 #include <cstring>
 #include <exception>
+#include <filesystem>
 #include <iostream>
 #include <string>
+#include <utility>
 
 using namespace mipt;
 using namespace mipt::entropy;
@@ -73,8 +75,45 @@ int main(int argc, char *argv[])
         // L_A whose spectrum is computed.
         const int max_s1_block =
             von_neumann_enabled() ? von_neumann_max_block(max_small_block) : 0;
-        std::vector<RunningStats> s1_stats(static_cast<std::size_t>(n + 1));
-        std::vector<RunningStats> s2_stats(static_cast<std::size_t>(n + 1));
+
+        // --- resume ---------------------------------------------------------
+        //
+        // The output CSV is the checkpoint. Read it before anything is opened
+        // for writing, so a refusal cannot have destroyed what it refused.
+        resume::RunIdentity identity;
+        identity.n = n;
+        identity.periods = periods;
+        identity.p = p;
+        identity.requested_realizations = realizations;
+        identity.circ_type = static_cast<int>(circ_type);
+
+        resume::Checkpoint checkpoint;
+        const bool resume_enabled = mipt::env::boolean("MIPT_ENTROPY_RESUME", true);
+        if (resume_enabled && std::filesystem::exists(output_csv))
+        {
+            checkpoint = resume::load(output_csv, identity, max_s1_block);
+        }
+        const int start_realization = static_cast<int>(checkpoint.completed);
+        std::vector<RunningStats> s1_stats =
+            checkpoint.completed > 0
+                ? std::move(checkpoint.s1)
+                : std::vector<RunningStats>(static_cast<std::size_t>(n + 1));
+        std::vector<RunningStats> s2_stats =
+            checkpoint.completed > 0
+                ? std::move(checkpoint.s2)
+                : std::vector<RunningStats>(static_cast<std::size_t>(n + 1));
+        if (start_realization > 0)
+        {
+            std::cout << "Resuming from " << output_csv << ": "
+                      << start_realization << '/' << realizations
+                      << " trajectories already averaged in.\n";
+            if (start_realization >= realizations)
+            {
+                std::cout << output_csv << " is already complete. Nothing to do.\n";
+                return 0;
+            }
+        }
+
         CircuitWorkspace1D workspace;
         workspace.reserve(periods);
 
@@ -113,7 +152,7 @@ int main(int argc, char *argv[])
 
         mipt::util::PauseSentinel pause_sentinel;
 
-        for (int r = 0; r < realizations; ++r)
+        for (int r = start_realization; r < realizations; ++r)
         {
             // Safe checkpoint: the CSV is rewritten after every trajectory.
             pause_sentinel.wait();
@@ -147,7 +186,7 @@ int main(int argc, char *argv[])
                 }
             }
 
-            if (r == 0)
+            if (r == start_realization)
             {
                 const double circuit_seconds =
                     std::chrono::duration<double>(circuit_end - circuit_start).count();
@@ -170,11 +209,14 @@ int main(int argc, char *argv[])
             const auto trajectory_end = std::chrono::steady_clock::now();
             const double elapsed =
                 std::chrono::duration<double>(trajectory_end - trajectory_start).count();
+            // Rates and the ETA describe this session, so they average over the
+            // trajectories run since the resume point rather than since zero.
+            const int done_here = r - start_realization;
             seconds_per_trajectory =
-                (r == 0)
+                (done_here == 0)
                     ? elapsed
-                    : (seconds_per_trajectory * static_cast<double>(r) + elapsed) /
-                          static_cast<double>(r + 1);
+                    : (seconds_per_trajectory * static_cast<double>(done_here) + elapsed) /
+                          static_cast<double>(done_here + 1);
 
             recent_trajectory_seconds.push_back(elapsed);
             recent_seconds_sum += elapsed;

@@ -77,7 +77,7 @@ def probe1_collapse(
     file_glob: str | Path | None = None,
     l_by_file: Mapping[str, int] | None = None,
     t_max: float | None = 150,
-    fit_t: tuple[float, float | None] = (2.0, None),
+    fit_t: tuple[float, float | None] = (0.25, None),
     fit_s_min: float = 1e-6,
     z_bounds: tuple[float, float] = (0.4, 2.5),
     x_a_bounds: tuple[float, float] = (0.0, 1.0),
@@ -120,11 +120,19 @@ def probe1_collapse(
 ) -> dict[str, Any]:
     """Fit S_A(L,t)=L^(-x_A)F(t/L^z) for one ancilla probe.
 
+    ``fit_t`` is in units of ``L``, not in timesteps: ``fit_t=(0.25, None)``
+    fits ``t >= L/4`` to the end of each curve, so every size is cut at the
+    same point of its own scaling window. This mirrors ``probe2_collapse``'s
+    ``fit_x``, whose bounds are likewise per-size (there through the scaled
+    time ``x=(t-2L)/L``). ``t_max``, which is a load cutoff rather than a fit
+    window, stays in absolute timesteps.
+
     The collapse is drawn by default as an inset in the top-right corner of
     the raw panel, sharing the raw panel's single legend. ``inset_size`` and
     ``inset_pad`` are fractions of the parent axes. ``collapse_inset=False``
     restores the side-by-side layout with a legend on each panel, and
-    ``show_fit_window=True`` restores the shaded fit-window band.
+    ``show_fit_window=True`` restores the shaded fit-window bands, one per
+    size.
     """
     paths = _resolve_files(files, file_glob)
     curves = [
@@ -139,17 +147,28 @@ def probe1_collapse(
         warnings.warn("A collapse with fewer than three sizes is weakly constrained.")
 
     fit_t_min, fit_t_max = fit_t
+    if fit_t_min < 0:
+        raise ValueError("fit_t minimum must be non-negative.")
+    if fit_t_max is not None and fit_t_max <= fit_t_min:
+        raise ValueError("fit_t maximum must exceed its minimum.")
+
+    def fit_window(size):
+        """The fit window in absolute time for one system size."""
+        lower = fit_t_min * float(size)
+        upper = None if fit_t_max is None else fit_t_max * float(size)
+        return lower, upper
 
     def fit_mask(curve):
+        lower, upper = fit_window(curve["L"])
         mask = (
             np.isfinite(curve["t"])
             & np.isfinite(curve["S"])
             & np.isfinite(curve["dS"])
-            & (curve["t"] >= fit_t_min)
+            & (curve["t"] >= lower)
             & (curve["S"] >= fit_s_min)
         )
-        if fit_t_max is not None:
-            mask &= curve["t"] <= fit_t_max
+        if upper is not None:
+            mask &= curve["t"] <= upper
         return mask
 
     def transformed(curve, z, x_a):
@@ -295,18 +314,21 @@ def probe1_collapse(
         legend_loc = auto_legend_loc if collapse_inset else "best"
     if annotation_loc is None:
         annotation_loc = auto_annotation_loc if collapse_inset else "upper right"
-    loaded_t_max = max(np.max(curve["t"]) for curve in curves)
-    fit_upper = min(fit_t_max, loaded_t_max) if fit_t_max is not None else loaded_t_max
     if show_fit_window:
-        ax_raw.axvspan(
-            fit_t_min,
-            fit_upper,
-            facecolor="lightsteelblue",
-            alpha=0.16,
-            edgecolor="none",
-            label="fit window",
-            zorder=0,
-        )
+        # One band per size: the window edges scale with L, so a single shared
+        # span would misstate every curve but one.
+        for index, curve in enumerate(curves):
+            lower, upper = fit_window(curve["L"])
+            loaded_t_max = float(np.max(curve["t"]))
+            ax_raw.axvspan(
+                lower,
+                min(upper, loaded_t_max) if upper is not None else loaded_t_max,
+                facecolor=colors[curve["L"]],
+                alpha=0.12,
+                edgecolor="none",
+                label="fit window" if index == 0 else "_nolegend_",
+                zorder=0,
+            )
 
     for curve in curves:
         color, size = colors[curve["L"]], curve["L"]
@@ -427,8 +449,8 @@ def probe1_collapse(
         # left out of the box; do not restore the leading "+" with it.
         rf"$z={best_z:.4f}\pm {z_stderr:.4f}$"
         + "\n"
-        + x_a_text
-        + "\n"
+        # + x_a_text
+        # + "\n"
         + rf"score $={best_score:.3g}$",
         annotation_loc,
         **annotation_kwargs,

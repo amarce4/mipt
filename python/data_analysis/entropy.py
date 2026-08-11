@@ -3,6 +3,10 @@
 ``entropy.exe`` reports both the von Neumann entropy S1 = -Tr(rho ln rho) and the
 second Renyi entropy S2 = -ln Tr(rho^2) for every block, so ``order`` selects
 which one is plotted and fitted.
+
+A size scan at fixed measurement rate also gets a secondary panel -- an inset
+by default -- carrying the fitted log coefficient against system size and its
+``alpha(L) = alpha(inf) + a L^-2`` extrapolation.
 """
 
 from __future__ import annotations
@@ -14,9 +18,17 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from .fitting import _weighted_linear_fit
+from .fitting import _format_with_uncertainty, _weighted_linear_fit
 from .loading import _resolve_files
-from .plotting import _show
+from .plotting import (
+    _annotate_axes,
+    _font_kwargs,
+    _inset_overlay_defaults,
+    _paired_axes,
+    _reserve_axis_space,
+    _set_secondary_title,
+    _show,
+)
 
 # Renyi index -> (name, label for the y axis).
 _ORDERS = {
@@ -81,6 +93,113 @@ def _resolve_uncertainty(uncertainty: str, order: int) -> str:
     return uncertainty
 
 
+def _extrapolate_log_coefficient(
+    sizes: Sequence[float],
+    alphas: Sequence[float],
+    alpha_errors: Sequence[float],
+) -> dict[str, float]:
+    """Fit ``alpha(L) = alpha(inf) + a L^-2`` to the per-size log coefficients.
+
+    Leading finite-size corrections to the conformal log coefficient are taken
+    to be ``L^-2``, so the fit is linear in ``L^-2`` and the extrapolated
+    coefficient is its intercept. ``_weighted_linear_fit`` needs three valid
+    points, which is also the minimum that leaves the fit any residual.
+    """
+    fit = _weighted_linear_fit(
+        np.asarray(sizes, dtype=float) ** -2.0, alphas, alpha_errors
+    )
+    return {
+        "alpha_inf": fit["intercept"],
+        "alpha_inf_stderr": fit["intercept_stderr"],
+        "a": fit["slope"],
+        "a_stderr": fit["slope_stderr"],
+        "reduced_chi2": fit["reduced_chi2"],
+        "points": int(np.size(sizes)),
+    }
+
+
+def _draw_extrapolation_panel(
+    ax,
+    points: Sequence[dict[str, Any]],
+    fit: dict[str, float] | None,
+    *,
+    inset: bool,
+    fontsize: float,
+    facecolor: str,
+    alpha: float,
+    annotation_text: str,
+    annotation_loc: str,
+    annotation_fontsize: float | None,
+    annotation_headroom: float,
+    title: str | None,
+    xlabel: str | None,
+    ylabel: str | None,
+    capsize: float,
+) -> None:
+    """Draw ``alpha`` against ``L`` with its ``L^-2`` extrapolation.
+
+    The markers reuse each curve's colour from the primary panel, and the fit
+    is a thin black dashed line drawn over the measured range.
+    """
+    font = _font_kwargs(inset, fontsize)
+    for point in points:
+        ax.errorbar(
+            point["L"],
+            point["alpha"],
+            yerr=point["alpha_stderr"],
+            fmt="o",
+            markersize=3.6,
+            color=point["color"],
+            ecolor=point["color"],
+            elinewidth=0.9,
+            capsize=capsize,
+        )
+    if fit is not None:
+        sizes = np.asarray([point["L"] for point in points], dtype=float)
+        grid = np.linspace(sizes.min(), sizes.max(), 200)
+        ax.plot(
+            grid,
+            fit["alpha_inf"] + fit["a"] * grid**-2.0,
+            linestyle="--",
+            linewidth=0.9,
+            color="black",
+        )
+    ax.set_xlabel(xlabel if xlabel is not None else r"$L$", **font)
+    ax.set_ylabel(ylabel if ylabel is not None else r"$\alpha(L)$", **font)
+    if inset:
+        # The x label has the gap below the inset to live in; the y label sits
+        # outside the left spine, which for a right-flush inset is over the
+        # parent's data. The parent's curves rise diagonally, so they cross
+        # that edge somewhere in the inset's y span whatever the headroom --
+        # give the label the inset's own face to read against.
+        ax.yaxis.label.set_bbox(
+            {
+                "boxstyle": "square,pad=0.15",
+                "facecolor": facecolor,
+                "edgecolor": "none",
+                "alpha": alpha,
+            }
+        )
+    ax.grid(alpha=0.25)
+    # A handful of widely spaced sizes otherwise put the end markers on the
+    # spines, where half of each error bar is clipped.
+    ax.margins(x=0.12)
+    # Room at the bottom for the annotation box, which sits over the corner
+    # the smallest sizes leave empty.
+    _reserve_axis_space(ax, "bottom", annotation_headroom)
+    annotation_kwargs: dict[str, Any] = {}
+    if annotation_fontsize is not None:
+        annotation_kwargs["fontsize"] = annotation_fontsize
+    elif inset:
+        annotation_kwargs["fontsize"] = fontsize
+    _annotate_axes(ax, annotation_text, annotation_loc, **annotation_kwargs)
+    # After _set_secondary_title, which reinstalls the inset tick locators:
+    # the x axis is a handful of measured sizes, not a continuum, so a
+    # general-purpose locator lands ticks on sizes that were never simulated.
+    _set_secondary_title(ax, title, inset=inset, fontsize=fontsize + 1.0)
+    ax.set_xticks([point["L"] for point in points])
+
+
 def entropy(
     files: Sequence[str | Path] | str | Path | None = None,
     *,
@@ -93,7 +212,29 @@ def entropy(
     xlim: tuple[float, float] | None = (0.5, 2.05),
     ylim: tuple[float, float] | None = None,
     cmap: str = "viridis",
-    figsize: tuple[float, float] = (10, 6),
+    extrapolate: bool = True,
+    extrapolation_inset: bool = True,
+    inset_corner: str = "lower right",
+    inset_size: tuple[float, float] = (0.42, 0.40),
+    inset_pad: tuple[float, float] = (0.0, 0.155),
+    inset_fontsize: float = 7.5,
+    inset_facecolor: str = "white",
+    inset_alpha: float = 1.0,
+    # Larger than the probe figures use: this panel's curves are straight
+    # lines rising into the bottom-right corner, so they need more room than
+    # a saturating one to clear the inset.
+    inset_headroom: float = 0.38,
+    inset_title: str | None = None,
+    inset_xlabel: str | None = None,
+    inset_ylabel: str | None = None,
+    inset_capsize: float = 2.0,
+    annotation_loc: str = "lower right",
+    annotation_fontsize: float | None = None,
+    annotation_headroom: float = 0.30,
+    legend_loc: str | None = None,
+    legend_fontsize: float = 8.0,
+    figsize: tuple[float, float] | None = None,
+    dpi: int | None = None,
     show: bool = True,
 ) -> dict[str, Any]:
     """Plot entropy versus conformal distance and fit selected curves.
@@ -120,6 +261,23 @@ def entropy(
     uncertainty:
         ``"stderr"`` or ``"stddev"``, which follow ``order``, or an explicit
         column name.
+    extrapolate:
+        Draw a secondary panel of the fitted log coefficient against system
+        size and extrapolate it with ``alpha(L) = alpha(inf) + a L^-2``. It
+        needs a size scan at fixed ``p`` (``vary="L"``) with at least three
+        fitted curves, and is skipped silently otherwise.
+    extrapolation_inset:
+        Draw that panel as an inset in the bottom-right corner of the main
+        axes, lifted clear of the bottom edge so both x axes stay readable.
+        ``False`` puts it beside the main panel instead. ``inset_size`` and
+        ``inset_pad`` are fractions of the parent axes.
+    annotation_loc, annotation_headroom:
+        Where the parameter box -- the fixed measurement rate and the
+        extrapolated ``alpha(inf)`` -- sits inside the extrapolation panel,
+        and how much of that panel's y range is reserved for it. Without an
+        extrapolation panel the box keeps its historical place in the
+        bottom-right corner of the main axes and carries the fixed parameter
+        only.
     """
     if order not in _ORDERS:
         raise ValueError(f"order must be one of {sorted(_ORDERS)}, got {order!r}.")
@@ -203,9 +361,40 @@ def entropy(
     _, fixed_label = _VARY_KEYS[fixed_key]
     fixed_value = curves[0][fixed_key]
 
-    fig, ax = plt.subplots(figsize=figsize)
+    # The extrapolation needs one alpha per size, so it is only defined for a
+    # size scan. Whether it survives is decided after the fits are in hand --
+    # a curve can still fail its own fit -- but the axes have to exist first.
+    want_extrapolation = extrapolate and vary == "L" and len(curves) >= 3
+    if figsize is None:
+        figsize = (10, 6) if extrapolation_inset or not want_extrapolation else (15, 6)
+    if dpi is None:
+        dpi = plt.rcParams["figure.dpi"]
+    auto_legend_loc, _, reserve_side = _inset_overlay_defaults(inset_corner)
+    if want_extrapolation:
+        fig, panels = _paired_axes(
+            inset=extrapolation_inset,
+            figsize=figsize,
+            dpi=dpi,
+            inset_corner=inset_corner,
+            inset_size=inset_size,
+            inset_pad=inset_pad,
+            inset_fontsize=inset_fontsize,
+            inset_facecolor=inset_facecolor,
+            inset_alpha=inset_alpha,
+        )
+        ax, ax_extrapolation = panels[0]
+    else:
+        fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
+        ax_extrapolation = None
+    if legend_loc is None:
+        legend_loc = (
+            auto_legend_loc
+            if want_extrapolation and extrapolation_inset
+            else "upper left"
+        )
     colors = plt.get_cmap(cmap)(np.linspace(0.1, 0.9, len(curves)))
     fit_rows: list[dict[str, Any]] = []
+    extrapolation_points: list[dict[str, Any]] = []
 
     for color, curve in zip(colors, curves):
         x, y, dy, p = curve["x"], curve["y"], curve["dy"], curve["p"]
@@ -258,6 +447,14 @@ def entropy(
                     ),
                 )
                 fit_record.update(fit)
+                extrapolation_points.append(
+                    {
+                        "L": float(curve["L"]),
+                        "alpha": fit["slope"],
+                        "alpha_stderr": slope_error,
+                        "color": color,
+                    }
+                )
             except ValueError as exc:
                 data_line.set_label(rf"{curve_label}: fit unavailable ({exc})")
                 fit_record["error"] = str(exc)
@@ -265,27 +462,77 @@ def entropy(
             data_line.set_label(curve_label)
         fit_rows.append(fit_record)
 
-    ax.text(
-        0.99,
-        0.02,
-        fixed_label(fixed_value),# + "\n" + order_name,
-        transform=ax.transAxes,
-        fontsize=12,
-        ha="right",
-        va="bottom",
-        bbox={"boxstyle": "square", "facecolor": "white", "alpha": 0.7},
-    )
+    extrapolation_points.sort(key=lambda point: point["L"])
+    extrapolation: dict[str, float] | None = None
+    if ax_extrapolation is not None and len(extrapolation_points) >= 3:
+        try:
+            extrapolation = _extrapolate_log_coefficient(
+                [point["L"] for point in extrapolation_points],
+                [point["alpha"] for point in extrapolation_points],
+                [point["alpha_stderr"] for point in extrapolation_points],
+            )
+        except ValueError:
+            extrapolation = None
+    elif ax_extrapolation is not None:
+        # Too few fitted curves to extrapolate: drop the panel rather than
+        # leave an empty frame over the data.
+        ax_extrapolation.remove()
+        ax_extrapolation = None
+
+    annotation_text = fixed_label(fixed_value)  # + "\n" + order_name
+    if extrapolation is not None:
+        alpha_str, alpha_stderr_str = _format_with_uncertainty(
+            extrapolation["alpha_inf"], extrapolation["alpha_inf_stderr"]
+        )
+        annotation_text += (
+            "\n" + rf"$\alpha(\infty)={alpha_str}\pm {alpha_stderr_str}$"
+        )
+    if ax_extrapolation is None:
+        ax.text(
+            0.99,
+            0.02,
+            annotation_text,
+            transform=ax.transAxes,
+            fontsize=12,
+            ha="right",
+            va="bottom",
+            bbox={"boxstyle": "square", "facecolor": "white", "alpha": 0.7},
+        )
     ax.set_xlabel(
         r"$\ln x$, $x=\frac{L}{\pi}\sin\left(\frac{\pi L_A}{L}\right)$"
     )
     ax.set_ylabel(order_label)
-    ax.legend(fontsize=8, framealpha=0.9, loc="upper left")
+    ax.legend(fontsize=legend_fontsize, framealpha=0.9, loc=legend_loc)
     ax.grid(alpha=0.25)
     if xlim is not None:
         ax.set_xlim(*xlim)
     if ylim is not None:
         ax.set_ylim(*ylim)
-    fig.tight_layout()
+
+    if ax_extrapolation is not None:
+        if extrapolation_inset and ylim is None:
+            _reserve_axis_space(ax, reserve_side, inset_headroom)
+        _draw_extrapolation_panel(
+            ax_extrapolation,
+            extrapolation_points,
+            extrapolation,
+            inset=extrapolation_inset,
+            fontsize=inset_fontsize,
+            facecolor=inset_facecolor,
+            alpha=inset_alpha,
+            annotation_text=annotation_text,
+            annotation_loc=annotation_loc,
+            annotation_fontsize=annotation_fontsize,
+            annotation_headroom=annotation_headroom,
+            title=inset_title,
+            xlabel=inset_xlabel,
+            ylabel=inset_ylabel,
+            capsize=inset_capsize,
+        )
+    elif not want_extrapolation:
+        # _paired_axes lays its figures out with constrained_layout, which
+        # tight_layout would fight even after the panel has been removed.
+        fig.tight_layout()
     _show(fig, show)
 
     metadata = pd.DataFrame(
@@ -307,6 +554,8 @@ def entropy(
     return {
         "figure": fig,
         "axis": ax,
+        "extrapolation_axis": ax_extrapolation,
+        "extrapolation": extrapolation,
         "vary": vary,
         "fixed": {fixed_key: fixed_value},
         "order": order,

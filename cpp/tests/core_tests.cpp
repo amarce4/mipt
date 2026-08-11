@@ -1,6 +1,7 @@
 #include "mipt/density.hpp"
 #include "mipt/env.hpp"
 #include "mipt/free_energy_measure.hpp"
+#include "mipt/entropy_resume.hpp"
 #include "mipt/free_energy_resume.hpp"
 #include "mipt/types.hpp"
 
@@ -479,6 +480,251 @@ void test_resume_checkpoint_scanning()
 
     std::filesystem::remove_all(directory);
 }
+
+// --- entropy.exe resume -----------------------------------------------------
+//
+// entropy.exe's aggregated CSV is its only output and its whole checkpoint, so
+// these tests render it exactly as write_results does and read it back.
+
+namespace entropy_resume = mipt::entropy::resume;
+
+// The projection write_results performs, minus the CUDA-Q dependency that
+// pulling in entropy.hpp would add. Kept in step with it by the shared
+// kResultsHeader constant, which is what a schema drift would break first.
+std::string render_entropy_csv(
+    int n,
+    int periods,
+    double p,
+    int requested_realizations,
+    int circ_type,
+    const std::vector<mipt::util::RunningStats> &s1,
+    const std::vector<mipt::util::RunningStats> &s2)
+{
+    std::ostringstream csv;
+    csv << std::setprecision(17) << entropy_resume::kResultsHeader << '\n';
+    constexpr double pi = 3.141592653589793238462643383279502884;
+    const int max_kept = n / 2;
+    for (int kept = 2; kept <= max_kept; ++kept)
+    {
+        const double x = (static_cast<double>(n) / pi) *
+                         std::sin(pi * static_cast<double>(kept) / static_cast<double>(n));
+        const auto &a = s1[static_cast<std::size_t>(kept)];
+        const auto &b = s2[static_cast<std::size_t>(kept)];
+        const bool has_s1 = a.count > 0;
+        const double nan_value = std::numeric_limits<double>::quiet_NaN();
+        csv << n << ',' << periods << ',' << p << ',' << requested_realizations << ','
+            << b.count << ',' << circ_type << ',' << "\"Test Circuit\"" << ',' << 0 << ','
+            << kept << ',' << x << ',' << std::log(x) << ','
+            << (has_s1 ? a.mean : nan_value) << ','
+            << (has_s1 ? a.sample_stddev() : nan_value) << ','
+            << (has_s1 ? a.standard_error() : nan_value) << ','
+            << b.mean << ',' << b.sample_stddev() << ',' << b.standard_error() << ','
+            << n << ',' << static_cast<std::uint64_t>(n) * b.count << '\n';
+    }
+    return csv.str();
+}
+
+void test_entropy_resume()
+{
+    const auto directory =
+        std::filesystem::temp_directory_path() / "mipt_entropy_resume_tests";
+    std::filesystem::remove_all(directory);
+    std::filesystem::create_directories(directory);
+    const std::string path = (directory / "scan.csv").string();
+
+    constexpr int n = 16;
+    constexpr int periods = 12;
+    constexpr double p = 0.25;
+    constexpr int requested = 40;
+    constexpr int circ_type = 1;
+    const int max_kept = n / 2;
+    const int max_s1_block = 5;  // S1 capped below N/2, so the tail is NaN
+
+    std::vector<mipt::util::RunningStats> s1(static_cast<std::size_t>(n + 1));
+    std::vector<mipt::util::RunningStats> s2(static_cast<std::size_t>(n + 1));
+    std::vector<mipt::util::RunningStats> reference_s1 = s1;
+    std::vector<mipt::util::RunningStats> reference_s2 = s2;
+
+    const auto add_trajectory = [&](std::vector<mipt::util::RunningStats> &a,
+                                    std::vector<mipt::util::RunningStats> &b,
+                                    int trajectory) {
+        for (int kept = 2; kept <= max_kept; ++kept)
+        {
+            const double value =
+                0.3 * kept + 0.05 * std::sin(0.7 * trajectory + kept);
+            b[static_cast<std::size_t>(kept)].add(value);
+            if (kept <= max_s1_block)
+            {
+                a[static_cast<std::size_t>(kept)].add(value * 1.4 + 0.01 * trajectory);
+            }
+        }
+    };
+
+    constexpr int before_break = 17;
+    for (int t = 0; t < before_break; ++t)
+    {
+        add_trajectory(s1, s2, t);
+        add_trajectory(reference_s1, reference_s2, t);
+    }
+    {
+        std::ofstream out(path, std::ios::out | std::ios::trunc);
+        out << render_entropy_csv(n, periods, p, requested, circ_type, s1, s2);
+    }
+
+    entropy_resume::RunIdentity identity;
+    identity.n = n;
+    identity.periods = periods;
+    identity.p = p;
+    identity.requested_realizations = requested;
+    identity.circ_type = circ_type;
+
+    auto checkpoint = entropy_resume::load(path, identity, max_s1_block);
+    assert(checkpoint.completed == before_break);
+    for (int kept = 2; kept <= max_kept; ++kept)
+    {
+        const auto &restored = checkpoint.s2[static_cast<std::size_t>(kept)];
+        const auto &expected = s2[static_cast<std::size_t>(kept)];
+        assert(restored.count == expected.count);
+        assert(std::abs(restored.mean - expected.mean) < 1.0e-12);
+        assert(std::abs(restored.sample_stddev() - expected.sample_stddev()) <
+               1.0e-10 * std::max(1.0e-300, expected.sample_stddev()));
+
+        // A block whose S1 was skipped must come back empty, not as a zero
+        // sample -- the CSV writes NaN there precisely to keep them distinct.
+        const auto &restored_s1 = checkpoint.s1[static_cast<std::size_t>(kept)];
+        if (kept <= max_s1_block)
+        {
+            assert(restored_s1.count == static_cast<std::uint64_t>(before_break));
+        }
+        else
+        {
+            assert(restored_s1.count == 0);
+            assert(restored_s1.mean == 0.0);
+        }
+    }
+
+    // Continuing from the checkpoint must land where an uninterrupted run would.
+    for (int t = before_break; t < requested; ++t)
+    {
+        add_trajectory(checkpoint.s1, checkpoint.s2, t);
+        add_trajectory(reference_s1, reference_s2, t);
+    }
+    for (int kept = 2; kept <= max_kept; ++kept)
+    {
+        const auto &got2 = checkpoint.s2[static_cast<std::size_t>(kept)];
+        const auto &want2 = reference_s2[static_cast<std::size_t>(kept)];
+        assert(got2.count == want2.count);
+        assert(std::abs(got2.mean - want2.mean) < 1.0e-12);
+        assert(std::abs(got2.sample_stddev() - want2.sample_stddev()) <
+               1.0e-10 * std::max(1.0e-300, want2.sample_stddev()));
+        const auto &got1 = checkpoint.s1[static_cast<std::size_t>(kept)];
+        const auto &want1 = reference_s1[static_cast<std::size_t>(kept)];
+        assert(got1.count == want1.count);
+        assert(std::abs(got1.mean - want1.mean) < 1.0e-12);
+    }
+
+    const auto refuses = [](auto &&action) {
+        bool threw = false;
+        try
+        {
+            action();
+        }
+        catch (const std::runtime_error &)
+        {
+            threw = true;
+        }
+        assert(threw);
+    };
+
+    // A different run that happens to share the output path.
+    refuses([&]() {
+        auto other = identity;
+        other.p = 0.3;
+        (void)entropy_resume::load(path, other, max_s1_block);
+    });
+    refuses([&]() {
+        auto other = identity;
+        other.periods = 13;
+        (void)entropy_resume::load(path, other, max_s1_block);
+    });
+    refuses([&]() {
+        auto other = identity;
+        other.requested_realizations = 41;
+        (void)entropy_resume::load(path, other, max_s1_block);
+    });
+    refuses([&]() {
+        auto other = identity;
+        other.n = 14;  // wrong number of block rows
+        (void)entropy_resume::load(path, other, max_s1_block);
+    });
+    // Resuming under a different S1 cap would leave the S1 columns averaged
+    // over a different number of trajectories than the S2 ones.
+    refuses([&]() { (void)entropy_resume::load(path, identity, max_s1_block + 1); });
+    refuses([&]() { (void)entropy_resume::load(path, identity, 0); });
+
+    // An S2-only file from before 2026-08-05 resumes as an S2-only scan, and is
+    // refused when the run would compute S1.
+    std::string legacy(entropy_resume::kLegacyS2OnlyHeader);
+    legacy += '\n';
+    for (int kept = 2; kept <= max_kept; ++kept)
+    {
+        const auto &b = s2[static_cast<std::size_t>(kept)];
+        std::ostringstream row;
+        row << std::setprecision(17) << n << ',' << periods << ',' << p << ','
+            << requested << ',' << b.count << ',' << circ_type << ",\"Test Circuit\",0,"
+            << kept << ",1,0," << b.mean << ',' << b.sample_stddev() << ','
+            << b.standard_error() << ',' << n << ','
+            << static_cast<std::uint64_t>(n) * b.count << '\n';
+        legacy += row.str();
+    }
+    const std::string legacy_path = (directory / "legacy.csv").string();
+    {
+        std::ofstream out(legacy_path, std::ios::out | std::ios::trunc);
+        out << legacy;
+    }
+    refuses([&]() { (void)entropy_resume::load(legacy_path, identity, max_s1_block); });
+    const auto legacy_checkpoint = entropy_resume::load(legacy_path, identity, 0);
+    assert(legacy_checkpoint.completed == before_break);
+    assert(legacy_checkpoint.s2[2].count == static_cast<std::uint64_t>(before_break));
+    assert(legacy_checkpoint.s1[2].count == 0);
+
+    // stderr = stddev / sqrt(count) ties the two spread columns to the count,
+    // so an edited or concatenated file gives itself away for free. Here the
+    // count is doubled while the spreads are left alone.
+    refuses([&]() {
+        // Rewrite only the completed_realizations field (index 4), leaving the
+        // spreads as they were -- a hand edit, not a re-render.
+        const std::string original =
+            render_entropy_csv(n, periods, p, requested, circ_type, s1, s2);
+        std::string edited;
+        std::size_t cursor = 0;
+        bool first_line = true;
+        while (cursor < original.size())
+        {
+            const std::size_t newline = original.find('\n', cursor);
+            const std::string line = original.substr(cursor, newline - cursor);
+            cursor = newline + 1;
+            if (first_line)
+            {
+                first_line = false;
+                edited += line + '\n';
+                continue;
+            }
+            auto fields = mipt::util::resume::split_csv_row(line);
+            fields[4] = std::to_string(before_break * 2);
+            for (std::size_t i = 0; i < fields.size(); ++i)
+            {
+                edited += (i == 6 ? '"' + fields[i] + '"' : fields[i]);
+                edited += (i + 1 == fields.size()) ? '\n' : ',';
+            }
+        }
+        const std::string edited_path = (directory / "edited.csv").string();
+        std::ofstream(edited_path, std::ios::out | std::ios::trunc) << edited;
+        (void)entropy_resume::load(edited_path, identity, max_s1_block);
+    });
+
+    std::filesystem::remove_all(directory);
+}
 } // namespace
 
 int main()
@@ -493,5 +739,6 @@ int main()
     test_resume_half_entropy_schedule();
     test_resume_running_stats_round_trip();
     test_resume_checkpoint_scanning();
+    test_entropy_resume();
     std::cout << "core tests passed\n";
 }
