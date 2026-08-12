@@ -172,7 +172,7 @@ def probe_anisotropy(
     *,
     file_glob: str | Path | None = None,
     l_by_file: Mapping[str, int] | None = None,
-    mi_units: str = "nats",
+    mi_units: str = "bits",
     estimate_window: tuple[float, float] = (7.0, 8.0),
     estimate_method: str = "mean",
     full_xlim: tuple[float, float] = (0.0, 8.0),
@@ -768,7 +768,7 @@ def probe_pc_collapse(
     fixed_nu: float | None = None,
     fixed_x: float | Mapping[str, float] | None = None,
     sq_units: str = "bits",
-    mi_units: str = "nats",
+    mi_units: str = "bits",
     interpolation_points: int = 250,
     relative_error_floor: float = 0.02,
     absolute_error_floor: float = 1e-10,
@@ -813,9 +813,10 @@ def probe_pc_collapse(
     legend on both panels. ``raw_title`` overrides the per-metric title;
     ``None`` keeps ``"<metric title> — raw"``.
     """
-    sq_units = str(sq_units).strip().lower()
-    if sq_units not in {"bits", "nats"}:
-        raise ValueError("sq_units must be 'bits' or 'nats'.")
+    # S_Q keeps its own knob because it is the order parameter and was quoted in
+    # bits long before the information metrics were; both go through the one
+    # unit helper so the aliases and the conversion factor agree.
+    sq_units, sq_scale = _mi_unit_spec(sq_units, name="sq_units")
     mi_units, mi_scale = _mi_unit_spec(mi_units)
     paths = _resolve_files(files, file_glob)
     first_df = pd.read_csv(paths[0], nrows=2)
@@ -842,14 +843,10 @@ def probe_pc_collapse(
             for path in paths
         ]
         curves.sort(key=lambda curve: curve["L"])
-        if metric == "sq" and sq_units == "bits":
-            for curve in curves:
-                curve["value"] = curve["value"] / np.log(2.0)
-                curve["dvalue"] = curve["dvalue"] / np.log(2.0)
-        elif metric != "sq":
-            for curve in curves:
-                curve["value"] *= mi_scale
-                curve["dvalue"] *= mi_scale
+        scale = sq_scale if metric == "sq" else mi_scale
+        for curve in curves:
+            curve["value"] *= scale
+            curve["dvalue"] *= scale
         sizes = [curve["L"] for curve in curves]
         if len(set(sizes)) != len(sizes):
             raise ValueError(f"Duplicate system sizes found: {sizes}")
@@ -958,15 +955,8 @@ def probe_pc_collapse(
         ax_raw.axvline(fit["pc"], color="black", linestyle="--", linewidth=1)
         ax_raw.axhline(0.0, color="black", linewidth=0.7, alpha=0.3)
         ax_raw.set_xlabel(r"Measurement rate $p$")
-        ax_raw.set_ylabel(
-            r"Ancilla entropy $\overline{S_Q}$ [bits]"
-            if metric == "sq" and sq_units == "bits"
-            else (
-                spec["ylabel"].replace("[nats]", f"[{mi_units}]")
-                if metric != "sq"
-                else spec["ylabel"]
-            )
-        )
+        metric_units = sq_units if metric == "sq" else mi_units
+        ax_raw.set_ylabel(spec["ylabel"].replace("[nats]", f"[{metric_units}]"))
         ax_raw.set_title(
             raw_title if raw_title is not None else spec["title"] + " — raw"
         )
@@ -977,11 +967,7 @@ def probe_pc_collapse(
         ax_scaled.axhline(0.0, color="black", linewidth=0.7, alpha=0.3)
         ax_scaled.set_xlabel(r"$(p-p_c)L^{1/\nu}$", **inset_font)
         if not collapse_inset:
-            ax_scaled.set_ylabel(
-                spec["scaled_ylabel"] + f" [{mi_units}]"
-                if metric != "sq"
-                else spec["scaled_ylabel"]
-            )
+            ax_scaled.set_ylabel(spec["scaled_ylabel"] + f" [{metric_units}]")
             ax_scaled.legend(**legend_kwargs)
         ax_scaled.grid(alpha=0.25)
         _set_secondary_title(
@@ -1034,6 +1020,7 @@ def probe_entropy_map(
     *,
     p_values: Sequence[float] | None = None,
     line_count: int = 5,
+    entropy_units: str = "bits",
     cmap: str = "magma",
     capsize: float = 2,
     show_errorbars: bool = True,
@@ -1047,7 +1034,10 @@ def probe_entropy_map(
 
     ``p_values`` is the user control for the right-hand plot. Requested values
     are matched to the nearest simulated p value and duplicates are removed.
+    ``entropy_units`` selects ``"bits"`` (the default) or ``"nats"``; the probe
+    CSVs store nats.
     """
+    entropy_units, entropy_scale = _mi_unit_spec(entropy_units, name="entropy_units")
     path = Path(file)
     df = pd.read_csv(path)
     probes = _infer_probe_count(path, df)
@@ -1066,6 +1056,7 @@ def probe_entropy_map(
     if clean.empty:
         raise ValueError(f"No valid p-t entropy rows were loaded from {path}.")
     clean = clean.sort_values(["p", "t"]).drop_duplicates(["p", "t"], keep="last")
+    clean[["S_Q", "dS_Q"]] *= entropy_scale
     simulated_p = np.sort(clean["p"].unique())
     simulated_t = np.sort(clean["t"].unique())
     expected = len(simulated_p) * len(simulated_t)
@@ -1109,7 +1100,7 @@ def probe_entropy_map(
         vmax=vmax,
     )
     colorbar = fig.colorbar(mesh, ax=ax_map)
-    colorbar.set_label(r"$\overline{S_Q}$ [nats]")
+    colorbar.set_label(rf"$\overline{{S_Q}}$ [{entropy_units}]")
     ax_map.set_xlabel(r"Measurement rate $p$")
     ax_map.set_ylabel(r"Time $t$")
     ax_map.set_title(r"Joint-reference entropy $\overline{S_Q}(p,t)$")
@@ -1134,7 +1125,7 @@ def probe_entropy_map(
         else:
             ax_lines.plot(curve["t"], curve["S_Q"], **kwargs)
     ax_lines.set_xlabel(r"Time $t$")
-    ax_lines.set_ylabel(r"Ancilla entropy $\overline{S_Q}$ [nats]")
+    ax_lines.set_ylabel(rf"Ancilla entropy $\overline{{S_Q}}$ [{entropy_units}]")
     ax_lines.set_title("Entropy dynamics at selected measurement rates")
     ax_lines.grid(alpha=0.25)
     ax_lines.legend()
@@ -1144,6 +1135,7 @@ def probe_entropy_map(
         "figure": fig,
         "axes": (ax_map, ax_lines),
         "colorbar": colorbar,
+        "entropy_units": entropy_units,
         "probes": probes,
         "selected_p": selected_p,
         "p": simulated_p,

@@ -118,6 +118,7 @@ def _probe2_metric_spec(metric: str) -> dict[str, Any]:
             "ansatz": r"$\mathcal{N}(A:B)=L^{-\eta}g((t-2L)/L)$",
             "suptitle": "Bulk two-probe negativity at fixed measurement rate",
             "bootstrap_upper": 0.5,
+            # (||rho^T||_1 - 1)/2 is not a logarithm; it has no entropy unit.
             "scale_with_mi_units": False,
         },
         "log_negativity": {
@@ -149,7 +150,9 @@ def _probe2_metric_spec(metric: str) -> dict[str, Any]:
                 "Bulk two-probe logarithmic negativity at fixed measurement rate"
             ),
             "bootstrap_upper": np.log(2.0),
-            "scale_with_mi_units": False,
+            # E_N = ln||rho^T||_1 is a logarithm, so unlike the bare negativity
+            # below it carries entropy units and follows mi_units.
+            "scale_with_mi_units": True,
         },
     }
     if key not in specs:

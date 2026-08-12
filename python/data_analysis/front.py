@@ -359,7 +359,7 @@ def front_velocity(
     drop_wrapped: bool = True,
     persistence: int = 2,
     heatmap_file: str | Path | None = None,
-    mi_units: str = "nats",
+    mi_units: str = "bits",
     cmap: str = "magma",
     l_by_file: Mapping[str, int] | None = None,
     figsize: tuple[float, float] = (13.0, 9.5),

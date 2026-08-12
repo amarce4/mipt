@@ -13,12 +13,23 @@ def _show(fig, show: bool) -> None:
         plt.show()
 
 
-def _mi_unit_spec(mi_units: str) -> tuple[str, float]:
-    """Return the canonical MI unit and the nats-to-unit scale factor."""
+def _mi_unit_spec(mi_units: str, name: str = "mi_units") -> tuple[str, float]:
+    """Return the canonical entropy unit and the nats-to-unit scale factor.
+
+    Every entropy-valued observable in this package -- entropies, mutual
+    informations, tripartite informations and the *logarithmic* negativity --
+    goes through this one helper, so ``[bits]``/``[nats]`` means the same thing
+    and converts by the same factor everywhere. ``name`` only shapes the error
+    message, since the callers spell the argument ``units``, ``mi_units`` or
+    ``entropy_units`` depending on what they plot.
+
+    Bare negativities (``\\mathcal{N} = (||rho^T||_1 - 1)/2``) are *not*
+    entropy-valued and must not be passed through it.
+    """
     key = str(mi_units).strip().lower()
     key = {"nat": "nats", "bit": "bits"}.get(key, key)
     if key not in {"nats", "bits"}:
-        raise ValueError("mi_units must be 'nats' or 'bits'.")
+        raise ValueError(f"{name} must be 'nats' or 'bits'.")
     return key, 1.0 if key == "nats" else 1.0 / np.log(2.0)
 
 

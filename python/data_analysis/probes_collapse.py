@@ -77,6 +77,7 @@ def probe1_collapse(
     file_glob: str | Path | None = None,
     l_by_file: Mapping[str, int] | None = None,
     t_max: float | None = 150,
+    entropy_units: str = "bits",
     fit_t: tuple[float, float | None] = (0.25, None),
     fit_s_min: float = 1e-6,
     z_bounds: tuple[float, float] = (0.4, 2.5),
@@ -127,6 +128,10 @@ def probe1_collapse(
     time ``x=(t-2L)/L``). ``t_max``, which is a load cutoff rather than a fit
     window, stays in absolute timesteps.
 
+    ``entropy_units`` selects ``"bits"`` (the default) or ``"nats"``; the probe
+    CSVs store nats. Only the plotted scale moves -- ``z`` and ``x_A`` are
+    dimensionless and come out identical either way.
+
     The collapse is drawn by default as an inset in the top-right corner of
     the raw panel, sharing the raw panel's single legend. ``inset_size`` and
     ``inset_pad`` are fractions of the parent axes. ``collapse_inset=False``
@@ -134,11 +139,22 @@ def probe1_collapse(
     ``show_fit_window=True`` restores the shaded fit-window bands, one per
     size.
     """
+    entropy_units, entropy_scale = _mi_unit_spec(
+        entropy_units, name="entropy_units"
+    )
     paths = _resolve_files(files, file_glob)
     curves = [
         _load_probe1_curve(path, l_by_file=l_by_file, t_max=t_max)
         for path in paths
     ]
+    # The probe CSVs store nats. The two absolute guards below are thresholds on
+    # S itself, so they move with it and the fitted (z, x_A) stay exactly
+    # unit-independent; relative_error_floor is a ratio and needs no scaling.
+    for curve in curves:
+        curve["S"] = curve["S"] * entropy_scale
+        curve["dS"] = curve["dS"] * entropy_scale
+    fit_s_min *= entropy_scale
+    absolute_error_floor *= entropy_scale
     curves.sort(key=lambda curve: curve["L"])
     sizes = [curve["L"] for curve in curves]
     if len(set(sizes)) != len(sizes):
@@ -251,7 +267,8 @@ def probe1_collapse(
                 synthetic["S"] = np.clip(
                     rng.normal(curve["S"], np.maximum(curve["dS"], 0.0)),
                     0.0,
-                    np.log(2.0),
+                    # One ebit: ln 2 nats, or exactly 1 bit.
+                    np.log(2.0) * entropy_scale,
                 )
                 synthetic_curves.append(synthetic)
             result = minimize(
@@ -392,7 +409,7 @@ def probe1_collapse(
     ax_raw.set_ylabel(
         raw_ylabel
         if raw_ylabel is not None
-        else r"Ancilla entropy $\overline{S_A}$"
+        else rf"Ancilla entropy $\overline{{S_A}}$ [{entropy_units}]"
     )
     if raw_title:
         ax_raw.set_title(raw_title)
@@ -414,9 +431,9 @@ def probe1_collapse(
         **inset_font,
     )
     default_collapse_ylabel = (
-        r"$\overline{S_A}$"
+        rf"$\overline{{S_A}}$ [{entropy_units}]"
         if abs(best_x_a) < 1e-12
-        else r"$L^{x_A}\overline{S_A}$"
+        else rf"$L^{{x_A}}\overline{{S_A}}$ [{entropy_units}]"
     )
     if collapse_ylabel is not None or not collapse_inset:
         ax_collapse.set_ylabel(
@@ -471,6 +488,7 @@ def probe1_collapse(
         "figure": fig,
         "axes": (ax_raw, ax_collapse),
         "collapse_inset": collapse_inset,
+        "entropy_units": entropy_units,
         "z": best_z,
         "z_stderr": z_stderr,
         "x_a": best_x_a,
@@ -498,7 +516,7 @@ def probe2_collapse(
     l_by_file: Mapping[str, int] | None = None,
     metric: str = "mi",
     stack_metrics: bool = False,
-    mi_units: str = "nats",
+    mi_units: str = "bits",
     x_load: tuple[float | None, float | None] = (None, None),
     fit_x: tuple[float, float | None] = (0.25, 8.0),
     fit_i_min: float = 1e-8,
@@ -689,7 +707,7 @@ def probe4_collapse(
     file_glob: str | Path | None = None,
     l_by_file: Mapping[str, int] | None = None,
     metric: str = "i2",
-    mi_units: str = "nats",
+    mi_units: str = "bits",
     x_load: tuple[float | None, float | None] = (None, None),
     fit_x: tuple[float, float | None] = (0.25, 8.0),
     fit_abs_min: float = 1e-8,
@@ -738,7 +756,8 @@ def probe4_collapse(
     four probe triplets, and ``I4`` is the four-party information. Because
     ``I3`` and ``I4`` may be signed, the fit cutoff is applied to the absolute
     value through ``fit_abs_min`` and bootstrap samples are not clipped.
-    ``mi_units`` selects ``"nats"`` or ``"bits"`` for every information metric.
+    ``mi_units`` selects ``"bits"`` (the default) or ``"nats"`` for every
+    information metric.
 
     The layout controls match :func:`probe2_collapse`: the collapse is an
     inset in the bottom-right corner of the raw panel by default, the two

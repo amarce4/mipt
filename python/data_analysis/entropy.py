@@ -7,6 +7,9 @@ which one is plotted and fitted.
 A size scan at fixed measurement rate also gets a secondary panel -- an inset
 by default -- carrying the fitted log coefficient against system size and its
 ``alpha(L) = alpha(inf) + a L^-2`` extrapolation.
+
+``entropy.exe`` writes both entropies in nats; ``units`` converts them, and
+defaults to bits.
 """
 
 from __future__ import annotations
@@ -24,6 +27,7 @@ from .plotting import (
     _annotate_axes,
     _font_kwargs,
     _inset_overlay_defaults,
+    _mi_unit_spec,
     _paired_axes,
     _reserve_axis_space,
     _set_secondary_title,
@@ -134,6 +138,7 @@ def _draw_extrapolation_panel(
     title: str | None,
     xlabel: str | None,
     ylabel: str | None,
+    units: str,
     capsize: float,
 ) -> None:
     """Draw ``alpha`` against ``L`` with its ``L^-2`` extrapolation.
@@ -165,7 +170,11 @@ def _draw_extrapolation_panel(
             color="black",
         )
     ax.set_xlabel(xlabel if xlabel is not None else r"$L$", **font)
-    ax.set_ylabel(ylabel if ylabel is not None else r"$\alpha(L)$", **font)
+    # alpha is the coefficient of a plain logarithm, so it carries the entropy's
+    # units: alpha[bits] = alpha[nats]/ln 2.
+    ax.set_ylabel(
+        ylabel if ylabel is not None else rf"$\alpha(L)$ [{units}]", **font
+    )
     if inset:
         # The x label has the gap below the inset to live in; the y label sits
         # outside the left spine, which for a right-flush inset is over the
@@ -206,6 +215,7 @@ def entropy(
     file_glob: str | Path | None = None,
     vary: str | None = None,
     order: int = 2,
+    units: str = "bits",
     fit_above_p: float = 0.3,
     exclude_first: int = 1,
     uncertainty: str = "stderr",
@@ -258,6 +268,14 @@ def entropy(
     order:
         Renyi index to plot: ``1`` for the von Neumann entropy, ``2`` for the
         second Renyi entropy (the default, and the only one older CSVs carry).
+    units:
+        ``"bits"`` (the default) or ``"nats"``. ``entropy.exe`` writes nats, so
+        bits divides through by ``ln 2``. The unit is appended to the y label,
+        and the fitted log coefficient ``alpha`` -- being the coefficient of a
+        plain logarithm -- is quoted in it too, in the legend, in the
+        extrapolation panel and in ``fits``. Note that
+        :func:`free_energy_ceff` reads ``alpha`` in **nats** unless told
+        otherwise; ``fits`` also carries ``slope_nats`` for that.
     uncertainty:
         ``"stderr"`` or ``"stddev"``, which follow ``order``, or an explicit
         column name.
@@ -283,6 +301,7 @@ def entropy(
         raise ValueError(f"order must be one of {sorted(_ORDERS)}, got {order!r}.")
     if vary is not None and vary not in _VARY_KEYS:
         raise ValueError(f"vary must be one of {sorted(_VARY_KEYS)} or None, got {vary!r}.")
+    units, unit_scale = _mi_unit_spec(units, name="units")
     paths = _resolve_files(files, file_glob, description="entropy CSVs")
     if exclude_first < 0:
         raise ValueError("exclude_first must be non-negative.")
@@ -318,8 +337,10 @@ def entropy(
         df = df.sort_values("L_A").reset_index(drop=True)
 
         x = df["ln_x"].to_numpy(dtype=float)
-        y = df[mean_column].to_numpy(dtype=float)
-        dy = df[uncertainty_column].to_numpy(dtype=float)
+        # The stored entropies are nats. Both the mean and its spread scale
+        # linearly, so the fit and its chi^2 are unchanged by the conversion.
+        y = df[mean_column].to_numpy(dtype=float) * unit_scale
+        dy = df[uncertainty_column].to_numpy(dtype=float) * unit_scale
         # Blocks excluded by MIPT_ENTROPY_S1_MAX_LA report NaN, never 0. Drop
         # them so a capped run still plots and fits over the range it covered.
         keep = np.isfinite(x) & np.isfinite(y) & np.isfinite(dy)
@@ -447,6 +468,10 @@ def entropy(
                     ),
                 )
                 fit_record.update(fit)
+                # free_energy_ceff's c_eff formula is written in nats; keep the
+                # unconverted slope so a bits figure can still feed it.
+                fit_record["slope_nats"] = fit["slope"] / unit_scale
+                fit_record["slope_nats_stderr"] = slope_error / unit_scale
                 extrapolation_points.append(
                     {
                         "L": float(curve["L"]),
@@ -501,7 +526,7 @@ def entropy(
     ax.set_xlabel(
         r"$\ln x$, $x=\frac{L}{\pi}\sin\left(\frac{\pi L_A}{L}\right)$"
     )
-    ax.set_ylabel(order_label)
+    ax.set_ylabel(rf"{order_label} [{units}]")
     ax.legend(fontsize=legend_fontsize, framealpha=0.9, loc=legend_loc)
     ax.grid(alpha=0.25)
     if xlim is not None:
@@ -527,6 +552,7 @@ def entropy(
             title=inset_title,
             xlabel=inset_xlabel,
             ylabel=inset_ylabel,
+            units=units,
             capsize=inset_capsize,
         )
     elif not want_extrapolation:
@@ -559,6 +585,7 @@ def entropy(
         "vary": vary,
         "fixed": {fixed_key: fixed_value},
         "order": order,
+        "units": units,
         "mean_column": mean_column,
         "uncertainty_column": uncertainty_column,
         "fits": pd.DataFrame(fit_rows),

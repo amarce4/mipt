@@ -151,7 +151,7 @@ def probe_distance_collapse(
     *,
     file_glob: str | Path | None = None,
     metric: str = "mi",
-    mi_units: str = "nats",
+    mi_units: str = "bits",
     ansatz: str = "lightcone",
     eta: float | None = None,
     z: float | None = 1.0,
@@ -292,7 +292,9 @@ def probe_distance_collapse(
             distance_load=distance_load,
         )
     ]
-    if metric_spec["key"] == "mi":
+    # Both the MI and the logarithmic negativity carry entropy units; the bare
+    # negativity does not. The spec is the single place that records which.
+    if metric_spec["scale_with_mi_units"]:
         metric_spec = dict(metric_spec)
         metric_spec["bootstrap_upper"] *= mi_scale
         for curve in curves:
@@ -769,8 +771,8 @@ def probe_distance_collapse(
             ax_collapse.plot(x, y, **collapse_kwargs)
 
     observable_label = (
-        rf"Mutual information $I(A:B)$ [{mi_units}]"
-        if metric_spec["key"] == "mi"
+        metric_spec["raw_ylabel"].replace("[nats]", f"[{mi_units}]")
+        if metric_spec["scale_with_mi_units"]
         else metric_spec["raw_ylabel"]
     )
     ax_raw.set_xlabel(
@@ -803,7 +805,7 @@ def probe_distance_collapse(
         "negativity": r"\mathcal{N}(A:B)",
         "log_negativity": r"E_{\mathcal{N}}(A:B)",
     }[metric_spec["key"]]
-    unit_suffix = f" [{mi_units}]" if metric_spec["key"] == "mi" else ""
+    unit_suffix = f" [{mi_units}]" if metric_spec["scale_with_mi_units"] else ""
     if collapse_ylabel is not None or not collapse_inset:
         ax_collapse.set_ylabel(
             collapse_ylabel
@@ -948,7 +950,7 @@ def probe3_dynamics(
         "joint_purity",
         "mean_single_purity",
     ),
-    mi_units: str = "nats",
+    mi_units: str = "bits",
     geometry_ids: Sequence[int] | None = None,
     tau_range: tuple[float | None, float | None] = (None, None),
     time_axis: str = "tau",
@@ -1188,7 +1190,9 @@ def probe3_dynamics(
         axis.set_xlabel(x_label)
         axis.grid(alpha=0.25)
         if metric in {"tmi", "average_mi"}:
-            axis.set_ylabel(mi_units)
+            # The panel title names the quantity; the label carries only its
+            # unit, in the same [bits]/[nats] form the rest of the package uses.
+            axis.set_ylabel(f"[{mi_units}]")
         elif metric in {"joint_purity", "mean_single_purity"}:
             axis.set_ylim(0.0, 1.02)
     for axis in axes[n_metrics:]:

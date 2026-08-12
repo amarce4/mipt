@@ -571,7 +571,7 @@ def dist_scaling(
     min_relative_error: float = 0.03,
     chunksize: int = 1_000_000,
     distance_round: int = 12,
-    mi_units: str = "nats",
+    mi_units: str = "bits",
     legacy_entropy_units: str = "bits",
     show_errorbars: bool = True,
     capsize: float = 2.0,

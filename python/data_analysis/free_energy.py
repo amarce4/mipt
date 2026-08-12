@@ -11,7 +11,7 @@ import numpy as np
 import pandas as pd
 
 from .loading import _resolve_files
-from .plotting import _show
+from .plotting import _mi_unit_spec, _show
 
 
 def _free_energy_linear_fit(
@@ -105,12 +105,14 @@ def free_energy_ceff(
     file_glob: str | Path | None = None,
     alpha: float,
     alpha_stderr: float = 0.0,
+    alpha_units: str = "nats",
     fit_sizes: Sequence[int] | None = None,
     l_min_values: Sequence[int] | None = None,
     require_both_initial_states: bool = True,
     bootstrap_samples: int = 2_000,
     bootstrap_seed: int = 24_680,
     cmap: str = "Blues",
+    inset_quantity: str = "m0",
     figsize: tuple[float, float] = (11.5, 5.3),
     show: bool = True,
 ) -> dict[str, Any]:
@@ -123,11 +125,33 @@ def free_energy_ceff(
     slope.  As in the paper, the plotted and fitted quantity is
     ``f_tilde(L)=F/(L*t)``; ``alpha`` is applied when converting its asymptotic
     slope to ``c_eff``.
+
+    ``alpha_units`` declares the unit of the supplied ``alpha``.  The record
+    free energy is a natural logarithm, so ``c_eff = -6*m0/(pi*alpha)`` needs
+    ``alpha`` in nats; ``alpha_units="bits"`` converts a coefficient read off a
+    bits entropy figure (``da.entropy`` now defaults to bits) instead of
+    quietly inflating ``c_eff`` by ``1/ln 2``.
+
+    ``inset_quantity`` selects what the inset shows against ``L_min``: the
+    Casimir slope ``m0`` (the default, and the quantity the fit is done in) or
+    ``c_eff``, which is the same numbers through the fixed linear map
+    ``c_eff = -6*m0/(pi*alpha)``.  Both are extrapolated with the same
+    ``y(L_min) = y(inf) + b*L_min^-2`` correction-to-scaling fit; since the map
+    is linear the two extrapolations are equivalent, and the ``c_eff`` view is
+    just the physical reading of it.
     """
     if not np.isfinite(alpha) or alpha <= 0.0:
         raise ValueError("alpha must be finite and positive.")
     if not np.isfinite(alpha_stderr) or alpha_stderr < 0.0:
         raise ValueError("alpha_stderr must be finite and non-negative.")
+    if inset_quantity not in {"m0", "c_eff"}:
+        raise ValueError("inset_quantity must be 'm0' or 'c_eff'.")
+    alpha_units, alpha_scale = _mi_unit_spec(alpha_units, name="alpha_units")
+    # Everything downstream -- f/alpha, c_eff, the information box -- works in
+    # nats, so normalise once here rather than at each use.
+    alpha_in_units, alpha_stderr_in_units = alpha, alpha_stderr
+    alpha = alpha / alpha_scale
+    alpha_stderr = alpha_stderr / alpha_scale
 
     paths = _resolve_files(files, file_glob)
     data, samples = _load_free_energy_samples(paths)
@@ -328,7 +352,7 @@ def free_energy_ceff(
     information = ax.text(
         0.025,
         0.025,
-        rf"$\alpha={alpha:.5g}$" + "\n" +
+        rf"$a={alpha_in_units:.5g}$ [{alpha_units}]" + "\n" +
         rf"$c_{{\mathrm{{eff}}}}={c_eff:.2g}\pm{c_eff_stderr:.1g}$",
         transform=ax.transAxes,
         ha="left",
@@ -360,8 +384,26 @@ def free_energy_ceff(
         [int(row["L_min"]) for row in fits],
         dtype=int,
     )
-    inset_y = np.asarray([float(row["slope"]) for row in fits])
-    inset_error = np.asarray([float(row["slope_stderr"]) for row in fits])
+    slopes = np.asarray([float(row["slope"]) for row in fits])
+    slope_errors = np.asarray([float(row["slope_stderr"]) for row in fits])
+    if inset_quantity == "m0":
+        inset_y = slopes
+        inset_error = slope_errors
+        inset_intercept = m_tilde_infinite
+        inset_curvature = correction_fit["slope"]
+        inset_ylabel = r"$m_0(L_{\min})$"
+    else:
+        # c_eff is m_0 through a fixed linear map, so the extrapolation is the
+        # same fit rescaled: intercept -> c_eff(inf), curvature -> b/L_min^2.
+        # alpha's own uncertainty is a common factor across every L_min rather
+        # than scatter between them, so it stays out of these error bars and
+        # enters only the quoted c_eff in the information box.
+        scale = -6.0 / (np.pi * alpha)
+        inset_y = scale * slopes
+        inset_error = abs(scale) * slope_errors
+        inset_intercept = scale * m_tilde_infinite
+        inset_curvature = scale * correction_fit["slope"]
+        inset_ylabel = r"$c_{\mathrm{eff}}(L_{\min})$"
     inset.errorbar(
         inset_x,
         inset_y,
@@ -383,12 +425,12 @@ def free_energy_ceff(
         )
         inset.plot(
             inset_line_x,
-            correction_fit["slope"] / inset_line_x**2 + m_tilde_infinite,
+            inset_curvature / inset_line_x**2 + inset_intercept,
             linestyle=":",
             color="tab:blue",
         )
     inset.set_xlabel(r"$L_{\min}$", fontsize=8)
-    inset.set_ylabel(r"$m_0(L_{\min})$", fontsize=8)
+    inset.set_ylabel(inset_ylabel, fontsize=8)
     inset.set_xticks(inset_x)
     inset.set_xticklabels([str(value) for value in inset_x])
     if len(inset_x) == 1:
@@ -403,15 +445,27 @@ def free_energy_ceff(
     inset.grid(alpha=0.2)
     _show(fig, show)
 
+    fits_frame = pd.DataFrame(fits)
+    # The per-L_min c_eff the inset can plot, kept alongside the slope it is
+    # rescaled from so callers do not have to redo the conversion.
+    fits_frame["c_eff"] = -6.0 * fits_frame["slope"] / (np.pi * alpha)
+    fits_frame["c_eff_stderr"] = (
+        6.0 * fits_frame["slope_stderr"] / (np.pi * alpha)
+    )
+
     return {
         "figure": fig,
         "axis": ax,
         "inset": inset,
+        "inset_quantity": inset_quantity,
         "summary": summary,
-        "fits": pd.DataFrame(fits),
+        "fits": fits_frame,
         "correction_fit": correction_fit,
         "alpha": alpha,
         "alpha_stderr": alpha_stderr,
+        "alpha_units": alpha_units,
+        "alpha_as_given": float(alpha_in_units),
+        "alpha_stderr_as_given": float(alpha_stderr_in_units),
         "c_eff": float(c_eff),
         "c_eff_stderr": float(c_eff_stderr),
         "c_eff_p16": float(c_eff_p16),
@@ -427,6 +481,7 @@ def free_energy_equilibration(
     file_glob: str | Path | None = None,
     t_over_l_range: tuple[float, float] = (0.0, 10.0),
     fit_t_over_l_min: float = 2.0,
+    entropy_units: str = "bits",
     colors: tuple[Any, Any, Any] = ("tab:blue", "tab:orange", "tab:green"),
     figsize: tuple[float, float] = (11.5, 4.5),
     show: bool = True,
@@ -436,8 +491,18 @@ def free_energy_equilibration(
     Unlike the production-only estimator used by :func:`free_energy_ceff`,
     these curves use the cumulative measurement-record entropy from the first
     timestep.  ``init_state=0`` is the product ensemble and ``init_state=1`` is
-    the Haar ensemble.  The half-chain von Neumann entropy inset is in bits.
+    the Haar ensemble.
+
+    ``free_energy.exe`` writes the half-chain von Neumann entropy in bits
+    (``half_chain_entropy_bits``), so ``entropy_units`` governs the inset only
+    and only ``"nats"`` converts anything.  The free-energy panels are record
+    surprisals in nats and are deliberately left alone.
     """
+    entropy_units, entropy_scale = _mi_unit_spec(
+        entropy_units, name="entropy_units"
+    )
+    # _mi_unit_spec scales *from nats*; this column is already bits.
+    entropy_scale *= np.log(2.0)
     paths = _resolve_files(files, file_glob)
     frames = []
     for path in paths:
@@ -591,13 +656,13 @@ def free_energy_equilibration(
     # equilibration; the lower-right corner keeps the entropy inset clear.
     inset = ax_density.inset_axes([0.50, 0.06, 0.47, 0.38])
     for key, label, color in curve_specs:
-        y = aligned[f"S_half_mean_{key}"].to_numpy(dtype=float)
+        y = aligned[f"S_half_mean_{key}"].to_numpy(dtype=float) * entropy_scale
         x = aligned["t_over_L"].to_numpy(dtype=float)
         mask = np.isfinite(x) & np.isfinite(y)
         if np.any(mask):
             inset.plot(x[mask], y[mask], color=color, label=label)
     inset.set_xlabel(r"$t/L$", fontsize=8)
-    inset.set_ylabel(r"$S_1(t)$ [bits]", fontsize=8)
+    inset.set_ylabel(rf"$S_1(t)$ [{entropy_units}]", fontsize=8)
     inset.tick_params(labelsize=8)
     inset.grid(alpha=0.2)
 
@@ -625,6 +690,7 @@ def free_energy_equilibration(
         "figure": fig,
         "axes": (ax_density, ax_delta),
         "entropy_inset": inset,
+        "entropy_units": entropy_units,
         "data": aligned,
         "boundary_fits": boundary_fits,
         "N": size,

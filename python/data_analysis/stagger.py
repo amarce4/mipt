@@ -497,7 +497,7 @@ def stagger_velocity(
     heatmap_file: str | Path | None = None,
     heatmap_delta: int = 0,
     heatmap_r: int | None = None,
-    mi_units: str = "nats",
+    mi_units: str = "bits",
     cmap: str = "magma",
     l_by_file: Mapping[str, int] | None = None,
     figsize: tuple[float, float] = (13.0, 13.5),

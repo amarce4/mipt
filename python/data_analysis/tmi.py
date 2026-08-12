@@ -124,7 +124,7 @@ def tmi_collapse(
     min_common_p: int = 4,
     interpolate: bool = True,
     chunksize: int = 1_000_000,
-    mi_units: str = "nats",
+    mi_units: str = "bits",
     error_floor: float = 1e-12,
     curvature_step: float = 1e-3,
     colors: Sequence[Any] | None = None,
@@ -133,7 +133,8 @@ def tmi_collapse(
 ) -> dict[str, Any]:
     """Fit p_c and nu for the TMI crossing using pyfssa.
 
-    ``mi_units`` selects ``"nats"`` or ``"bits"`` for TMI values and errors.
+    ``mi_units`` selects ``"bits"`` (the default) or ``"nats"`` for TMI values
+    and errors.
     """
     try:
         import fssa
