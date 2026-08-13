@@ -352,7 +352,7 @@ def free_energy_ceff(
     information = ax.text(
         0.025,
         0.025,
-        rf"$a={alpha_in_units:.5g}$ [{alpha_units}]" + "\n" +
+        rf"$a={alpha_in_units:.5g}$" + "\n" +
         rf"$c_{{\mathrm{{eff}}}}={c_eff:.2g}\pm{c_eff_stderr:.1g}$",
         transform=ax.transAxes,
         ha="left",

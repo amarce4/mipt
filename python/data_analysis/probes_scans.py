@@ -634,24 +634,56 @@ def _fit_probe_pc_metric(
     fixed_pc: float | None,
     fixed_nu: float | None,
     fixed_x: float | None,
+    correction_to_scaling: bool,
+    omega_bounds: tuple[float, float],
+    fixed_omega: float | None,
+    f1_order: int,
     interpolation_points: int,
     relative_error_floor: float,
     absolute_error_floor: float,
     seed: int,
 ) -> dict[str, Any]:
-    for name, value, bound in (
+    if correction_to_scaling:
+        if not 0.0 < omega_bounds[0] < omega_bounds[1]:
+            raise ValueError(
+                "omega_bounds must be strictly increasing and positive."
+            )
+        if len(curves) < 3:
+            raise ValueError(
+                "The correction-to-scaling fit requires at least three "
+                "system sizes."
+            )
+        if (
+            isinstance(f1_order, (bool, np.bool_))
+            or not isinstance(f1_order, (int, np.integer))
+            or f1_order < 0
+        ):
+            raise ValueError("f1_order must be a non-negative integer.")
+    elif fixed_omega is not None:
+        raise ValueError(
+            "fixed_omega requires correction_to_scaling=True."
+        )
+
+    parameter_specs = [
         ("fixed_pc", fixed_pc, pc_bounds),
         ("fixed_nu", fixed_nu, nu_bounds),
         ("fixed_x", fixed_x, x_bounds),
-    ):
+    ]
+    if correction_to_scaling:
+        parameter_specs.append(("fixed_omega", fixed_omega, omega_bounds))
+    for name, value, bound in parameter_specs:
         if value is not None and not bound[0] <= value <= bound[1]:
             raise ValueError(f"{name}={value} lies outside bounds {bound}.")
+
     names, bounds, fixed = [], [], {}
-    for name, value, bound in (
+    fit_specs = [
         ("pc", fixed_pc, pc_bounds),
         ("nu", fixed_nu, nu_bounds),
         ("x", fixed_x, x_bounds),
-    ):
+    ]
+    if correction_to_scaling:
+        fit_specs.append(("omega", fixed_omega, omega_bounds))
+    for name, value, bound in fit_specs:
         if value is None:
             names.append(name)
             bounds.append(bound)
@@ -661,9 +693,14 @@ def _fit_probe_pc_metric(
     def unpack(theta):
         values = dict(fixed)
         values.update({name: float(value) for name, value in zip(names, theta)})
-        return values["pc"], values["nu"], values["x"]
+        return (
+            values["pc"],
+            values["nu"],
+            values["x"],
+            values.get("omega"),
+        )
 
-    def transformed(curve, pc, nu, exponent):
+    def raw_transformed(curve, pc, nu, exponent):
         scale = float(curve["L"]) ** exponent
         x = (curve["p"] - pc) * float(curve["L"]) ** (1.0 / nu)
         order = np.argsort(x)
@@ -671,20 +708,106 @@ def _fit_probe_pc_metric(
             curve["dvalue"] * scale
         )[order]
 
+    def correction_model(pc, nu, exponent, omega, curve_set=curves):
+        """Profile out F1 while leaving the common F0 curve nonparametric."""
+        pair_samples = []
+        x_scale = 0.0
+        for i in range(len(curve_set)):
+            for j in range(i + 1, len(curve_set)):
+                xa, ya, dya = raw_transformed(curve_set[i], pc, nu, exponent)
+                xb, yb, dyb = raw_transformed(curve_set[j], pc, nu, exponent)
+                lo, hi = max(xa.min(), xb.min()), min(xa.max(), xb.max())
+                if hi <= lo:
+                    continue
+                grid = np.linspace(lo, hi, interpolation_points)
+                ya_grid = np.interp(grid, xa, ya)
+                yb_grid = np.interp(grid, xb, yb)
+                dya_grid = np.interp(grid, xa, dya)
+                dyb_grid = np.interp(grid, xb, dyb)
+                typical = max(
+                    np.nanmedian(np.abs(ya_grid)),
+                    np.nanmedian(np.abs(yb_grid)),
+                    absolute_error_floor,
+                )
+                floor = max(absolute_error_floor, relative_error_floor * typical)
+                sigma = np.sqrt(dya_grid**2 + dyb_grid**2 + floor**2)
+                irrelevant_difference = (
+                    float(curve_set[i]["L"]) ** (-omega)
+                    - float(curve_set[j]["L"]) ** (-omega)
+                )
+                pair_samples.append(
+                    (grid, ya_grid - yb_grid, sigma, irrelevant_difference)
+                )
+                x_scale = max(x_scale, float(np.max(np.abs(grid))))
+
+        if not pair_samples or not np.isfinite(x_scale):
+            return None
+        if x_scale == 0.0:
+            x_scale = 1.0
+        design_parts, value_parts, sigma_parts = [], [], []
+        for grid, difference, sigma, irrelevant_difference in pair_samples:
+            polynomial_x = grid / x_scale
+            design_parts.append(
+                irrelevant_difference
+                * np.vander(polynomial_x, N=f1_order + 1, increasing=True)
+            )
+            value_parts.append(difference)
+            sigma_parts.append(sigma)
+        design = np.vstack(design_parts)
+        value = np.concatenate(value_parts)
+        sigma = np.concatenate(sigma_parts)
+        if value.size <= design.shape[1]:
+            return None
+        try:
+            coefficients, _, rank, _ = np.linalg.lstsq(
+                design / sigma[:, None], value / sigma, rcond=None
+            )
+        except np.linalg.LinAlgError:
+            return None
+        if rank < design.shape[1] or not np.all(np.isfinite(coefficients)):
+            return None
+
+        offset = 0
+        pair_scores = []
+        for grid, _, pair_sigma, _ in pair_samples:
+            count = grid.size
+            pair_residual = (
+                value[offset:offset + count]
+                - design[offset:offset + count] @ coefficients
+            ) / pair_sigma
+            pair_scores.append(np.mean(pair_residual**2))
+            offset += count
+        return {
+            "score": float(np.mean(pair_scores)),
+            "x_scale": x_scale,
+            "f1_coefficients": coefficients,
+        }
+
     def objective(theta, curve_set=curves):
-        pc, nu, exponent = unpack(theta)
+        pc, nu, exponent, omega = unpack(theta)
+        omega_value = 0.0 if omega is None else omega
         if (
-            not np.isfinite(pc + nu + exponent)
+            not np.isfinite(pc + nu + exponent + omega_value)
             or not pc_bounds[0] <= pc <= pc_bounds[1]
             or not nu_bounds[0] <= nu <= nu_bounds[1]
             or not x_bounds[0] <= exponent <= x_bounds[1]
+            or (
+                correction_to_scaling
+                and not omega_bounds[0] <= omega_value <= omega_bounds[1]
+            )
         ):
             return np.inf
+        if correction_to_scaling:
+            model = correction_model(
+                pc, nu, exponent, omega_value, curve_set=curve_set
+            )
+            return np.inf if model is None else model["score"]
+
         scores = []
         for i in range(len(curve_set)):
             for j in range(i + 1, len(curve_set)):
-                xa, ya, dya = transformed(curve_set[i], pc, nu, exponent)
-                xb, yb, dyb = transformed(curve_set[j], pc, nu, exponent)
+                xa, ya, dya = raw_transformed(curve_set[i], pc, nu, exponent)
+                xb, yb, dyb = raw_transformed(curve_set[j], pc, nu, exponent)
                 lo, hi = max(xa.min(), xb.min()), min(xa.max(), xb.max())
                 if hi <= lo:
                     continue
@@ -733,20 +856,61 @@ def _fit_probe_pc_metric(
         errors_free = np.empty(0)
         covariance = hessian = np.empty((0, 0))
 
-    pc, nu, exponent = unpack(theta)
-    errors = {"pc": 0.0, "nu": 0.0, "x": 0.0}
+    pc, nu, exponent, omega = unpack(theta)
+    errors = {"pc": 0.0, "nu": 0.0, "x": 0.0, "omega": 0.0}
     for name, error in zip(names, errors_free):
         errors[name] = float(error)
+
+    fitted_correction = None
+    f1_function = None
+    if correction_to_scaling:
+        fitted_correction = correction_model(pc, nu, exponent, omega)
+        if fitted_correction is None:
+            raise RuntimeError("Unable to construct the fitted correction model.")
+
+        def f1_function(scaled_x):
+            polynomial_x = np.asarray(scaled_x, dtype=float) / fitted_correction[
+                "x_scale"
+            ]
+            return np.polynomial.polynomial.polyval(
+                polynomial_x, fitted_correction["f1_coefficients"]
+            )
+
+    def transformed(curve, pc_value, nu_value, exponent_value):
+        scaled_x, value, error = raw_transformed(
+            curve, pc_value, nu_value, exponent_value
+        )
+        if correction_to_scaling:
+            value = value - float(curve["L"]) ** (-omega) * f1_function(
+                scaled_x
+            )
+        return scaled_x, value, error
+
     return {
         "metric": metric,
         "pc": pc,
         "nu": nu,
         "x": exponent,
+        "omega": omega,
         "pc_stderr": errors["pc"],
         "nu_stderr": errors["nu"],
         "x_stderr": errors["x"],
+        "omega_stderr": errors["omega"] if correction_to_scaling else None,
         "score": score,
+        "correction_to_scaling": correction_to_scaling,
+        "f1_order": f1_order,
+        "f1_coefficients": (
+            None
+            if fitted_correction is None
+            else fitted_correction["f1_coefficients"].copy()
+        ),
+        "scaling_variable_scale": (
+            None if fitted_correction is None else fitted_correction["x_scale"]
+        ),
+        "f1_function": f1_function,
         "transform": transformed,
+        "raw_transform": raw_transformed,
+        "fit_parameter_names": tuple(names),
         "global_fit": global_fit,
         "local_fit": local_fit,
         "covariance": covariance,
@@ -767,6 +931,10 @@ def probe_pc_collapse(
     fixed_pc: float | None = None,
     fixed_nu: float | None = None,
     fixed_x: float | Mapping[str, float] | None = None,
+    correction_to_scaling: bool = False,
+    omega_bounds: tuple[float, float] = (0.1, 4.0),
+    fixed_omega: float | Mapping[str, float] | None = None,
+    f1_order: int = 2,
     sq_units: str = "bits",
     mi_units: str = "bits",
     interpolation_points: int = 250,
@@ -806,6 +974,17 @@ def probe_pc_collapse(
     the noisier three-parameter multiprobe fits. ``mi_units`` controls all
     multiprobe information metrics independently of ``sq_units``.
 
+    Set ``correction_to_scaling=True`` to fit the leading irrelevant
+    correction
+    ``L^x I(p,L)=F_0(u)+L^{-omega}F_1(u)``, where
+    ``u=(p-p_c)L^{1/nu}``. The collapse panel then subtracts the fitted
+    ``L^{-omega}F_1(u)`` term. ``omega`` is fitted within ``omega_bounds``
+    unless ``fixed_omega`` is supplied, and may be fixed separately for each
+    metric with a mapping. The existing pairwise-overlap score leaves
+    ``F_0`` nonparametric, while ``F_1`` is profiled out as a weighted
+    polynomial of order ``f1_order``. Restrict ``p_range`` to the scaling
+    window when using this polynomial ansatz.
+
     Each collapse is drawn by default as an inset in the top-right corner of
     its raw panel, with one legend per row on the raw axes. ``inset_size``
     and ``inset_pad`` are fractions of the parent axes;
@@ -813,6 +992,10 @@ def probe_pc_collapse(
     legend on both panels. ``raw_title`` overrides the per-metric title;
     ``None`` keeps ``"<metric title> — raw"``.
     """
+    if fixed_omega is not None and not correction_to_scaling:
+        raise ValueError(
+            "fixed_omega requires correction_to_scaling=True."
+        )
     # S_Q keeps its own knob because it is the order parameter and was quoted in
     # bits long before the information metrics were; both go through the one
     # unit helper so the aliases and the conversion factor agree.
@@ -852,6 +1035,11 @@ def probe_pc_collapse(
             raise ValueError(f"Duplicate system sizes found: {sizes}")
         if len(curves) < 3:
             warnings.warn("Critical collapse has fewer than three system sizes.")
+        if correction_to_scaling and len(curves) < 4:
+            warnings.warn(
+                "Correction-to-scaling fits are weakly constrained with fewer "
+                "than four system sizes."
+            )
         curves_by_metric[metric] = curves
         all_p.extend(np.concatenate([curve["p"] for curve in curves]))
 
@@ -868,6 +1056,12 @@ def probe_pc_collapse(
             metric_fixed_x = float(fixed_x)
         else:
             metric_fixed_x = 0.0 if metric == "sq" else None
+        if isinstance(fixed_omega, Mapping):
+            metric_fixed_omega = fixed_omega.get(metric)
+        elif fixed_omega is not None:
+            metric_fixed_omega = float(fixed_omega)
+        else:
+            metric_fixed_omega = None
         fits[metric] = _fit_probe_pc_metric(
             curves_by_metric[metric],
             metric,
@@ -877,16 +1071,29 @@ def probe_pc_collapse(
             fixed_pc=fixed_pc,
             fixed_nu=fixed_nu,
             fixed_x=metric_fixed_x,
+            correction_to_scaling=correction_to_scaling,
+            omega_bounds=omega_bounds,
+            fixed_omega=metric_fixed_omega,
+            f1_order=f1_order,
             interpolation_points=interpolation_points,
             relative_error_floor=relative_error_floor,
             absolute_error_floor=absolute_error_floor,
             seed=seed + index,
         )
         fit = fits[metric]
+        omega_text = (
+            ""
+            if not correction_to_scaling
+            else (
+                f", omega={fit['omega']:.6g} "
+                f"± {fit['omega_stderr']:.3g}"
+            )
+        )
         print(
             f"{metric}: p_c={fit['pc']:.6g} ± {fit['pc_stderr']:.3g}, "
             f"nu={fit['nu']:.6g} ± {fit['nu_stderr']:.3g}, "
-            f"x={fit['x']:.6g} ± {fit['x_stderr']:.3g}, "
+            f"x={fit['x']:.6g} ± {fit['x_stderr']:.3g}"
+            f"{omega_text}, "
             f"score={fit['score']:.6g}"
         )
 
@@ -967,7 +1174,10 @@ def probe_pc_collapse(
         ax_scaled.axhline(0.0, color="black", linewidth=0.7, alpha=0.3)
         ax_scaled.set_xlabel(r"$(p-p_c)L^{1/\nu}$", **inset_font)
         if not collapse_inset:
-            ax_scaled.set_ylabel(spec["scaled_ylabel"] + f" [{metric_units}]")
+            scaled_ylabel = spec["scaled_ylabel"]
+            if fit["correction_to_scaling"]:
+                scaled_ylabel += r" (leading correction subtracted)"
+            ax_scaled.set_ylabel(scaled_ylabel + f" [{metric_units}]")
             ax_scaled.legend(**legend_kwargs)
         ax_scaled.grid(alpha=0.25)
         _set_secondary_title(
@@ -981,10 +1191,17 @@ def probe_pc_collapse(
             if metric == "sq" and abs(fit["x"]) < 1e-14
             else rf"${spec['x_symbol']}={fit['x']:.4g}\pm {fit['x_stderr']:.2g}$"
         )
+        correction_text = (
+            ""
+            if not fit["correction_to_scaling"]
+            else rf"$\omega={fit['omega']:.4g}\pm "
+            rf"{fit['omega_stderr']:.2g}$" + "\n"
+        )
         _annotate_axes(
             ax_raw if collapse_inset else ax_scaled,
             rf"$p_c={fit['pc']:.5g}\pm {fit['pc_stderr']:.2g}$" + "\n"
             + rf"$\nu={fit['nu']:.4g}\pm {fit['nu_stderr']:.2g}$" + "\n"
+            + correction_text
             + rf"score $={fit['score']:.3g}$",
             annotation_loc,
             **annotation_kwargs,
@@ -1003,6 +1220,7 @@ def probe_pc_collapse(
         "collapse_inset": collapse_inset,
         "probes": probes,
         "metrics": selected_metrics,
+        "correction_to_scaling": correction_to_scaling,
         "sq_units": sq_units,
         "mi_units": mi_units,
         "fits": fits,
