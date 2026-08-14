@@ -33,6 +33,32 @@ int mipt_cuda_entropy_svd_f32(
     int fermion_trace,
     double *entropy_out);
 
+/*
+ * Renyi-2 entropy S_2 = -log2 Tr(rho^2) of the same subsystem, from the same
+ * Schmidt gather.
+ *
+ * The purity is the squared Frobenius norm of rho = M M^H, so this stops after
+ * the cuBLAS herk that mipt_cuda_entropy_svd_* only uses as a prologue: no
+ * eigensolver, and none of its workspace.  At a 16384-wide half cut (N=28) that
+ * workspace alone is 6.2 GB, so this is the difference between fitting on a
+ * 16 GB card and not.  Same arguments, same return convention.
+ */
+int mipt_cuda_renyi2_f64(
+    const void *device_state_vector,
+    int n_qubits,
+    const int *host_kept_modes,
+    int kept_count,
+    int fermion_trace,
+    double *entropy_out);
+
+int mipt_cuda_renyi2_f32(
+    const void *device_state_vector,
+    int n_qubits,
+    const int *host_kept_modes,
+    int kept_count,
+    int fermion_trace,
+    double *entropy_out);
+
 #ifdef __cplusplus
 }
 #endif

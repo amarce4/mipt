@@ -5,6 +5,7 @@ These cover ``mipt_probed.exe`` modes 1, 2, and 3.
 
 from __future__ import annotations
 
+from itertools import combinations
 from pathlib import Path
 import re
 import warnings
@@ -13,7 +14,8 @@ from typing import Any, Mapping, Sequence
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from scipy.optimize import differential_evolution, minimize
+from scipy.interpolate import CubicSpline
+from scipy.optimize import brentq, differential_evolution, minimize
 
 from .fitting import _curvature_errors
 from .loading import (
@@ -911,11 +913,508 @@ def _fit_probe_pc_metric(
         "transform": transformed,
         "raw_transform": raw_transformed,
         "fit_parameter_names": tuple(names),
+        "fit_parameter_bounds": {
+            name: tuple(bound) for name, bound in zip(names, bounds)
+        },
+        "fit_theta": np.asarray(theta, dtype=float).copy(),
+        "objective": objective,
         "global_fit": global_fit,
         "local_fit": local_fit,
         "covariance": covariance,
         "hessian": hessian,
     }
+
+
+def _objective_threshold_interval(
+    fit: Mapping[str, Any],
+    parameter: str,
+    *,
+    factor: float = 1.3,
+    scan_points: int = 96,
+) -> tuple[float, float]:
+    """Return the fixed-other-parameters ``factor * O*`` interval.
+
+    Lyu et al. use the two points satisfying ``O = 1.3 O*`` as the
+    confidence limits for each pairwise collapse. If the threshold is not
+    reached before a fit bound, that bound is returned as a one-sided limit.
+    """
+    names = tuple(fit["fit_parameter_names"])
+    value = float(fit[parameter])
+    if parameter not in names:
+        return value, value
+
+    index = names.index(parameter)
+    lower_bound, upper_bound = fit["fit_parameter_bounds"][parameter]
+    theta_hat = np.asarray(fit["fit_theta"], dtype=float)
+    objective = fit["objective"]
+    target = factor * float(fit["score"])
+
+    def threshold_difference(candidate: float) -> float:
+        theta = theta_hat.copy()
+        theta[index] = candidate
+        result = float(objective(theta))
+        return result - target if np.isfinite(result) else np.inf
+
+    def find_limit(bound: float) -> float:
+        if np.isclose(bound, value):
+            return value
+        grid = np.linspace(value, bound, max(3, int(scan_points)))
+        previous_x = value
+        previous_y = threshold_difference(value)
+        for candidate in grid[1:]:
+            current_y = threshold_difference(float(candidate))
+            if current_y >= 0.0:
+                if np.isfinite(previous_y) and previous_y <= 0.0:
+                    left, right = sorted((previous_x, float(candidate)))
+                    try:
+                        return float(
+                            brentq(
+                                threshold_difference,
+                                left,
+                                right,
+                                xtol=1e-10,
+                                rtol=1e-10,
+                            )
+                        )
+                    except (ValueError, RuntimeError):
+                        pass
+                return float(candidate)
+            previous_x, previous_y = float(candidate), current_y
+        return float(bound)
+
+    return find_limit(float(lower_bound)), find_limit(float(upper_bound))
+
+
+def _curve_crossing(
+    curve_a: Mapping[str, Any],
+    curve_b: Mapping[str, Any],
+    *,
+    method: str,
+    reference: float | None = None,
+    values_a: np.ndarray | None = None,
+    values_b: np.ndarray | None = None,
+) -> float:
+    """Find a pairwise curve crossing, selecting the root nearest reference."""
+    p_a = np.asarray(curve_a["p"], dtype=float)
+    p_b = np.asarray(curve_b["p"], dtype=float)
+    y_a = np.asarray(
+        curve_a["value"] if values_a is None else values_a, dtype=float
+    )
+    y_b = np.asarray(
+        curve_b["value"] if values_b is None else values_b, dtype=float
+    )
+    lo, hi = max(float(p_a.min()), float(p_b.min())), min(
+        float(p_a.max()), float(p_b.max())
+    )
+    if hi <= lo:
+        raise ValueError(
+            f"L={curve_a['L']} and L={curve_b['L']} have no overlapping p range."
+        )
+
+    if method == "linear":
+        evaluate_a = lambda p: np.interp(p, p_a, y_a)
+        evaluate_b = lambda p: np.interp(p, p_b, y_b)
+    elif method == "spline":
+        if min(p_a.size, p_b.size) < 3:
+            raise ValueError("Spline crossings require at least three p points.")
+        spline_a = CubicSpline(p_a, y_a, extrapolate=False)
+        spline_b = CubicSpline(p_b, y_b, extrapolate=False)
+        evaluate_a, evaluate_b = spline_a, spline_b
+    else:
+        raise ValueError("method must be 'linear' or 'spline'.")
+
+    def difference(p):
+        return evaluate_a(p) - evaluate_b(p)
+
+    grid = np.unique(
+        np.concatenate(
+            (
+                p_a[(p_a >= lo) & (p_a <= hi)],
+                p_b[(p_b >= lo) & (p_b <= hi)],
+                np.linspace(lo, hi, 2049),
+            )
+        )
+    )
+    differences = np.asarray(difference(grid), dtype=float)
+    roots: list[float] = []
+    zero_tolerance = 1e-12 * max(1.0, float(np.nanmax(np.abs(differences))))
+    for index in range(grid.size - 1):
+        left_y, right_y = differences[index], differences[index + 1]
+        if not np.isfinite(left_y + right_y):
+            continue
+        if abs(left_y) <= zero_tolerance:
+            roots.append(float(grid[index]))
+            continue
+        if left_y * right_y < 0.0:
+            roots.append(
+                float(brentq(difference, grid[index], grid[index + 1]))
+            )
+    if abs(differences[-1]) <= zero_tolerance:
+        roots.append(float(grid[-1]))
+    if not roots:
+        raise ValueError(
+            f"No {method} crossing was found for L={curve_a['L']} and "
+            f"L={curve_b['L']} inside p=[{lo:g}, {hi:g}]."
+        )
+
+    roots = sorted(set(round(root, 13) for root in roots))
+    if reference is None or not np.isfinite(reference):
+        return float(roots[len(roots) // 2])
+    return float(min(roots, key=lambda root: abs(root - reference)))
+
+
+def _pair_crossing_summary(
+    curve_a: Mapping[str, Any],
+    curve_b: Mapping[str, Any],
+    *,
+    reference: float,
+) -> dict[str, float]:
+    """Spline crossing with Lyu-style interpolation and statistical errors."""
+    linear = _curve_crossing(
+        curve_a, curve_b, method="linear", reference=reference
+    )
+    try:
+        spline = _curve_crossing(
+            curve_a, curve_b, method="spline", reference=reference
+        )
+    except ValueError:
+        warnings.warn(
+            f"L={curve_a['L']}, {curve_b['L']}: spline crossing failed; "
+            "using the linear crossing."
+        )
+        spline = linear
+
+    shifted_roots = []
+    for sign in (-1.0, 1.0):
+        try:
+            shifted_roots.append(
+                _curve_crossing(
+                    curve_a,
+                    curve_b,
+                    method="spline",
+                    reference=spline,
+                    values_a=np.asarray(curve_a["value"])
+                    + sign * np.asarray(curve_a["dvalue"]),
+                    values_b=np.asarray(curve_b["value"])
+                    - sign * np.asarray(curve_b["dvalue"]),
+                )
+            )
+        except ValueError:
+            continue
+    statistical = max(
+        (abs(root - spline) for root in shifted_roots), default=0.0
+    )
+    systematic = abs(spline - linear)
+    return {
+        "pc": float(spline),
+        "stderr": float(statistical + systematic),
+        "statistical_error": float(statistical),
+        "interpolation_error": float(systematic),
+        "linear_pc": float(linear),
+        "spline_pc": float(spline),
+    }
+
+
+def _equal_weight_linear_fit(
+    x: Sequence[float],
+    y: Sequence[float],
+) -> dict[str, float]:
+    """Fit ``y = slope*x + intercept`` with the equal weights used by Lyu."""
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    valid = np.isfinite(x) & np.isfinite(y)
+    x, y = x[valid], y[valid]
+    if x.size < 3:
+        raise ValueError("At least three finite pairwise points are required.")
+    design = np.column_stack((x, np.ones_like(x)))
+    slope, intercept = np.linalg.lstsq(design, y, rcond=None)[0]
+    residual = y - (slope * x + intercept)
+    residual_variance = float(np.sum(residual**2) / (x.size - 2))
+    covariance = residual_variance * np.linalg.inv(design.T @ design)
+    total_variance = float(np.sum((y - np.mean(y)) ** 2))
+    r_squared = (
+        1.0 - float(np.sum(residual**2)) / total_variance
+        if total_variance > 0.0
+        else np.nan
+    )
+    return {
+        "slope": float(slope),
+        "intercept": float(intercept),
+        "slope_stderr": float(np.sqrt(max(0.0, covariance[0, 0]))),
+        "intercept_stderr": float(np.sqrt(max(0.0, covariance[1, 1]))),
+        "r_squared": r_squared,
+        "points": int(x.size),
+    }
+
+
+def _fit_lyu_pairwise_metric(
+    curves: Sequence[dict[str, Any]],
+    metric: str,
+    *,
+    pc_bounds: tuple[float, float],
+    nu_bounds: tuple[float, float],
+    x_bounds: tuple[float, float],
+    fixed_x: float | None,
+    interpolation_points: int,
+    relative_error_floor: float,
+    absolute_error_floor: float,
+    seed: int,
+) -> dict[str, Any]:
+    """Fit all size pairs with the original one-parameter scaling ansatz."""
+    pair_results = []
+    for pair_index, (curve_a, curve_b) in enumerate(combinations(curves, 2)):
+        fit = _fit_probe_pc_metric(
+            [curve_a, curve_b],
+            metric,
+            pc_bounds=pc_bounds,
+            nu_bounds=nu_bounds,
+            x_bounds=x_bounds,
+            fixed_pc=None,
+            fixed_nu=None,
+            fixed_x=fixed_x,
+            correction_to_scaling=False,
+            omega_bounds=(0.1, 4.0),
+            fixed_omega=None,
+            f1_order=0,
+            interpolation_points=interpolation_points,
+            relative_error_floor=relative_error_floor,
+            absolute_error_floor=absolute_error_floor,
+            seed=seed + pair_index,
+        )
+        pc_interval = _objective_threshold_interval(fit, "pc")
+        nu_interval = _objective_threshold_interval(fit, "nu")
+        crossing = _pair_crossing_summary(
+            curve_a, curve_b, reference=float(fit["pc"])
+        )
+        fit["pc_interval_1p3"] = pc_interval
+        fit["nu_interval_1p3"] = nu_interval
+        pair_results.append(
+            {
+                "L1": int(curve_a["L"]),
+                "L2": int(curve_b["L"]),
+                "inverse_product": 1.0
+                / (float(curve_a["L"]) * float(curve_b["L"])),
+                "crossing": crossing,
+                "collapse": fit,
+            }
+        )
+
+    excluded = max(pair_results, key=lambda item: item["inverse_product"])
+    for result in pair_results:
+        result["included_in_extrapolation"] = result is not excluded
+    included = [
+        result for result in pair_results if result["included_in_extrapolation"]
+    ]
+    inverse_products = [result["inverse_product"] for result in included]
+    pc_crossing_fit = _equal_weight_linear_fit(
+        inverse_products, [result["crossing"]["pc"] for result in included]
+    )
+    nu_fit = _equal_weight_linear_fit(
+        inverse_products, [result["collapse"]["nu"] for result in included]
+    )
+    return {
+        "metric": metric,
+        "pairs": pair_results,
+        "excluded_pair": (excluded["L1"], excluded["L2"]),
+        "pc_crossing_extrapolation": pc_crossing_fit,
+        "nu_extrapolation": nu_fit,
+        "confidence_objective_factor": 1.3,
+        "ansatz": r"L^x I(p,L)=F((p-p_c)L^{1/nu})",
+    }
+
+
+def _draw_lyu_figure3(
+    pairwise_fits: Mapping[str, Mapping[str, Any]],
+    selected_metrics: Sequence[str],
+    *,
+    cmap: str,
+    show_errorbars: bool,
+    capsize: float,
+    legend_loc: str | None,
+    legend_fontsize: float | None,
+    annotation_loc: str | None,
+    annotation_fontsize: float | None,
+    suptitle: str | None,
+    figsize: tuple[float, float] | None,
+    dpi: int,
+) -> tuple[Any, np.ndarray]:
+    """Draw the two-panel pairwise extrapolation used in Lyu Fig. 3."""
+    nrows = len(selected_metrics)
+    if figsize is None:
+        figsize = (13.0, 4.5 * nrows)
+    fig, axes = plt.subplots(nrows, 2, figsize=figsize, dpi=dpi, squeeze=False)
+    color_map = plt.get_cmap(cmap)
+    crossing_color = color_map(0.18)
+    collapse_color = color_map(0.72)
+    nu_color = color_map(0.46)
+    legend_kwargs: dict[str, Any] = {"loc": legend_loc or "best"}
+    if legend_fontsize is not None:
+        legend_kwargs["fontsize"] = legend_fontsize
+    annotation_kwargs: dict[str, Any] = {}
+    if annotation_fontsize is not None:
+        annotation_kwargs["fontsize"] = annotation_fontsize
+
+    for row, metric in enumerate(selected_metrics):
+        summary = pairwise_fits[metric]
+        pairs = sorted(summary["pairs"], key=lambda item: item["inverse_product"])
+        x = np.asarray([item["inverse_product"] for item in pairs])
+        crossing_pc = np.asarray([item["crossing"]["pc"] for item in pairs])
+        crossing_error = np.asarray(
+            [item["crossing"]["stderr"] for item in pairs]
+        )
+        collapse_pc = np.asarray([item["collapse"]["pc"] for item in pairs])
+        collapse_pc_error = np.asarray(
+            [
+                [
+                    item["collapse"]["pc"]
+                    - item["collapse"]["pc_interval_1p3"][0]
+                    for item in pairs
+                ],
+                [
+                    item["collapse"]["pc_interval_1p3"][1]
+                    - item["collapse"]["pc"]
+                    for item in pairs
+                ],
+            ]
+        )
+        nu = np.asarray([item["collapse"]["nu"] for item in pairs])
+        nu_error = np.asarray(
+            [
+                [
+                    item["collapse"]["nu"]
+                    - item["collapse"]["nu_interval_1p3"][0]
+                    for item in pairs
+                ],
+                [
+                    item["collapse"]["nu_interval_1p3"][1]
+                    - item["collapse"]["nu"]
+                    for item in pairs
+                ],
+            ]
+        )
+        excluded_mask = np.asarray(
+            [not item["included_in_extrapolation"] for item in pairs]
+        )
+        ax_pc, ax_nu = axes[row]
+        ax_pc.errorbar(
+            x,
+            crossing_pc,
+            yerr=crossing_error if show_errorbars else None,
+            fmt="o",
+            color=crossing_color,
+            ecolor=crossing_color,
+            markersize=4.5,
+            linewidth=1.1,
+            elinewidth=0.9,
+            capsize=capsize,
+            label="curve crossing",
+        )
+        ax_pc.errorbar(
+            x,
+            collapse_pc,
+            yerr=collapse_pc_error if show_errorbars else None,
+            fmt="s",
+            color=collapse_color,
+            ecolor=collapse_color,
+            markersize=4.2,
+            linewidth=1.1,
+            elinewidth=0.9,
+            capsize=capsize,
+            label="curve collapse",
+        )
+        ax_nu.errorbar(
+            x,
+            nu,
+            yerr=nu_error if show_errorbars else None,
+            fmt="o",
+            color=nu_color,
+            ecolor=nu_color,
+            markersize=4.5,
+            linewidth=1.1,
+            elinewidth=0.9,
+            capsize=capsize,
+            label=r"pairwise $\nu$",
+        )
+
+        # Keep the rightmost (smallest-size) pair visible but mark its omission
+        # from the equal-weight extrapolation, matching Lyu Fig. 3.
+        if np.any(excluded_mask):
+            ax_pc.plot(
+                x[excluded_mask],
+                crossing_pc[excluded_mask],
+                "o",
+                markerfacecolor="white",
+                markeredgecolor=crossing_color,
+                markersize=4.7,
+            )
+            ax_pc.plot(
+                x[excluded_mask],
+                collapse_pc[excluded_mask],
+                "s",
+                markerfacecolor="white",
+                markeredgecolor=collapse_color,
+                markersize=4.5,
+            )
+            ax_nu.plot(
+                x[excluded_mask],
+                nu[excluded_mask],
+                "o",
+                markerfacecolor="white",
+                markeredgecolor=nu_color,
+                markersize=4.7,
+                label="excluded smallest pair",
+            )
+
+        line_x = np.linspace(0.0, float(np.max(x)) * 1.03, 250)
+        pc_line = summary["pc_crossing_extrapolation"]
+        nu_line = summary["nu_extrapolation"]
+        ax_pc.plot(
+            line_x,
+            pc_line["intercept"] + pc_line["slope"] * line_x,
+            color="black",
+            linestyle="--",
+            linewidth=1.0,
+            label="equal-weight crossing fit",
+        )
+        ax_nu.plot(
+            line_x,
+            nu_line["intercept"] + nu_line["slope"] * line_x,
+            color="black",
+            linestyle="--",
+            linewidth=1.0,
+            label="equal-weight fit",
+        )
+
+        for axis in (ax_pc, ax_nu):
+            axis.set_xlabel(r"$(L_1L_2)^{-1}$")
+            axis.grid(alpha=0.25)
+            axis.legend(**legend_kwargs)
+        ax_pc.set_ylabel(r"$p_c(L_1,L_2)$")
+        ax_nu.set_ylabel(r"$\nu(L_1,L_2)$")
+        prefix = "" if nrows == 1 else _PROBE_PC_SPECS[metric]["title"] + " — "
+        ax_pc.set_title(prefix + "Critical measurement rate")
+        ax_nu.set_title(prefix + "Correlation-length exponent")
+        _annotate_axes(
+            ax_pc,
+            rf"$p_c(\infty)={pc_line['intercept']:.5g}\pm "
+            rf"{pc_line['intercept_stderr']:.2g}$",
+            annotation_loc or "lower left",
+            **annotation_kwargs,
+        )
+        _annotate_axes(
+            ax_nu,
+            rf"$\nu(\infty)={nu_line['intercept']:.4g}\pm "
+            rf"{nu_line['intercept_stderr']:.2g}$",
+            annotation_loc or "lower left",
+            **annotation_kwargs,
+        )
+
+    fig.suptitle(
+        suptitle
+        if suptitle is not None
+        else "Pairwise finite-size extrapolation (Lyu et al. Fig. 3 protocol)"
+    )
+    return fig, axes
 
 
 def probe_pc_collapse(
@@ -932,6 +1431,7 @@ def probe_pc_collapse(
     fixed_nu: float | None = None,
     fixed_x: float | Mapping[str, float] | None = None,
     correction_to_scaling: bool = False,
+    lyu_figure3: bool = False,
     omega_bounds: tuple[float, float] = (0.1, 4.0),
     fixed_omega: float | Mapping[str, float] | None = None,
     f1_order: int = 2,
@@ -985,6 +1485,16 @@ def probe_pc_collapse(
     polynomial of order ``f1_order``. Restrict ``p_range`` to the scaling
     window when using this polynomial ansatz.
 
+    Set ``lyu_figure3=True`` to replace the raw/collapse plot with the
+    pairwise large-``L`` analysis of Fig. 3 in Lyu et al. (2026). Every
+    combination ``(L1, L2)`` is fitted independently with the original
+    ansatz, and its spline crossing and collapse ``p_c`` are plotted against
+    ``1/(L1 L2)`` beside the corresponding pairwise ``nu``. The rightmost
+    smallest-size pair is displayed but omitted from the equal-weight linear
+    extrapolations, as in the paper. Pairwise collapse limits satisfy
+    ``O=1.3 O*``. This mode is deliberately incompatible with
+    ``correction_to_scaling=True``.
+
     Each collapse is drawn by default as an inset in the top-right corner of
     its raw panel, with one legend per row on the raw axes. ``inset_size``
     and ``inset_pad`` are fractions of the parent axes;
@@ -992,6 +1502,16 @@ def probe_pc_collapse(
     legend on both panels. ``raw_title`` overrides the per-metric title;
     ``None`` keeps ``"<metric title> — raw"``.
     """
+    if lyu_figure3 and correction_to_scaling:
+        raise ValueError(
+            "lyu_figure3=True uses only the original scaling ansatz and "
+            "cannot be combined with correction_to_scaling=True."
+        )
+    if lyu_figure3 and (fixed_pc is not None or fixed_nu is not None):
+        raise ValueError(
+            "lyu_figure3=True must fit p_c and nu independently for every "
+            "size pair; fixed_pc and fixed_nu must both be None."
+        )
     if fixed_omega is not None and not correction_to_scaling:
         raise ValueError(
             "fixed_omega requires correction_to_scaling=True."
@@ -1047,6 +1567,84 @@ def probe_pc_collapse(
         pc_bounds = (float(np.min(all_p)), float(np.max(all_p)))
     if not pc_bounds[0] < pc_bounds[1]:
         raise ValueError("pc_bounds must be strictly increasing.")
+
+    if lyu_figure3:
+        pairwise_fits = {}
+        for index, metric in enumerate(selected_metrics):
+            curves = curves_by_metric[metric]
+            if len(curves) < 4:
+                raise ValueError(
+                    "lyu_figure3=True requires at least four system sizes so "
+                    "the smallest pair can be omitted while retaining at "
+                    "least three extrapolation points."
+                )
+            if isinstance(fixed_x, Mapping):
+                metric_fixed_x = fixed_x.get(metric)
+            elif fixed_x is not None:
+                metric_fixed_x = float(fixed_x)
+            else:
+                metric_fixed_x = 0.0 if metric == "sq" else None
+            pairwise_fits[metric] = _fit_lyu_pairwise_metric(
+                curves,
+                metric,
+                pc_bounds=pc_bounds,
+                nu_bounds=nu_bounds,
+                x_bounds=x_bounds,
+                fixed_x=metric_fixed_x,
+                interpolation_points=interpolation_points,
+                relative_error_floor=relative_error_floor,
+                absolute_error_floor=absolute_error_floor,
+                seed=seed + 10_000 * index,
+            )
+            summary = pairwise_fits[metric]
+            for pair in summary["pairs"]:
+                collapse = pair["collapse"]
+                print(
+                    f"{metric} (L1,L2)=({pair['L1']},{pair['L2']}): "
+                    f"p_c(cross)={pair['crossing']['pc']:.6g} ± "
+                    f"{pair['crossing']['stderr']:.3g}, "
+                    f"p_c(collapse)={collapse['pc']:.6g}, "
+                    f"nu={collapse['nu']:.6g}, score={collapse['score']:.6g}"
+                )
+            pc_line = summary["pc_crossing_extrapolation"]
+            nu_line = summary["nu_extrapolation"]
+            print(
+                f"{metric}: p_c(inf)={pc_line['intercept']:.6g} ± "
+                f"{pc_line['intercept_stderr']:.3g}, "
+                f"nu(inf)={nu_line['intercept']:.6g} ± "
+                f"{nu_line['intercept_stderr']:.3g}; excluded pair="
+                f"{summary['excluded_pair']}"
+            )
+
+        fig, axes = _draw_lyu_figure3(
+            pairwise_fits,
+            selected_metrics,
+            cmap=cmap,
+            show_errorbars=show_errorbars,
+            capsize=capsize,
+            legend_loc=legend_loc,
+            legend_fontsize=legend_fontsize,
+            annotation_loc=annotation_loc,
+            annotation_fontsize=annotation_fontsize,
+            suptitle=suptitle,
+            figsize=figsize,
+            dpi=dpi,
+        )
+        _show(fig, show)
+        return {
+            "figure": fig,
+            "axes": axes,
+            "collapse_inset": False,
+            "lyu_figure3": True,
+            "probes": probes,
+            "metrics": selected_metrics,
+            "correction_to_scaling": False,
+            "sq_units": sq_units,
+            "mi_units": mi_units,
+            "fits": pairwise_fits,
+            "pairwise_fits": pairwise_fits,
+            "curves": curves_by_metric,
+        }
 
     fits = {}
     for index, metric in enumerate(selected_metrics):
@@ -1218,6 +1816,7 @@ def probe_pc_collapse(
         "figure": fig,
         "axes": np.array(axes, dtype=object),
         "collapse_inset": collapse_inset,
+        "lyu_figure3": False,
         "probes": probes,
         "metrics": selected_metrics,
         "correction_to_scaling": correction_to_scaling,

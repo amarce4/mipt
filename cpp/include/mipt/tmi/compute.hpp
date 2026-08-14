@@ -166,18 +166,19 @@ inline double tmi_from_payload(const std::vector<double> &payload,
 
     const std::size_t block_dim = std::size_t{1} << block_qubits;
     const std::size_t pair_dim = std::size_t{1} << (2u * block_qubits);
+    const EntropyOrder order = tmi_entropy_order();
 
     partial_trace_ri_ptr_to(term_ptrs[0], plans.ab_to_a, workspace.rho_a);
     partial_trace_ri_ptr_to(term_ptrs[0], plans.ab_to_b, workspace.rho_b);
     partial_trace_ri_ptr_to(term_ptrs[1], plans.ac_to_c, workspace.rho_c);
 
-    const double s_a = entropy_hermitian_inplace(workspace.rho_a, block_dim, workspace.entropy);
-    const double s_b = entropy_hermitian_inplace(workspace.rho_b, block_dim, workspace.entropy);
-    const double s_c = entropy_hermitian_inplace(workspace.rho_c, block_dim, workspace.entropy);
-    const double s_d = entropy_ri_ptr(term_ptrs[3], block_dim, workspace.direct_matrix, workspace.entropy);
-    const double s_ab = entropy_ri_ptr(term_ptrs[0], pair_dim, workspace.direct_matrix, workspace.entropy);
-    const double s_ac = entropy_ri_ptr(term_ptrs[1], pair_dim, workspace.direct_matrix, workspace.entropy);
-    const double s_bc = entropy_ri_ptr(term_ptrs[2], pair_dim, workspace.direct_matrix, workspace.entropy);
+    const double s_a = entropy_hermitian_inplace(workspace.rho_a, block_dim, workspace.entropy, order);
+    const double s_b = entropy_hermitian_inplace(workspace.rho_b, block_dim, workspace.entropy, order);
+    const double s_c = entropy_hermitian_inplace(workspace.rho_c, block_dim, workspace.entropy, order);
+    const double s_d = entropy_ri_ptr(term_ptrs[3], block_dim, workspace.direct_matrix, workspace.entropy, order);
+    const double s_ab = entropy_ri_ptr(term_ptrs[0], pair_dim, workspace.direct_matrix, workspace.entropy, order);
+    const double s_ac = entropy_ri_ptr(term_ptrs[1], pair_dim, workspace.direct_matrix, workspace.entropy, order);
+    const double s_bc = entropy_ri_ptr(term_ptrs[2], pair_dim, workspace.direct_matrix, workspace.entropy, order);
 
     return s_a + s_b + s_c + s_d - s_ab - s_ac - s_bc;
 }
@@ -204,21 +205,23 @@ inline double tmi_from_statevector(const std::complex<Real> *psi,
     const std::vector<int> AC = concatenate_modes(A, C);
     const std::vector<int> BC = concatenate_modes(B, C);
 
+    const EntropyOrder order = tmi_entropy_order();
+
     const double s_a = entropy_subsystem_rdm_from_state(
-        psi, n, A, fermion_trace, workspace.entropy_a);
+        psi, n, A, fermion_trace, workspace.entropy_a, order);
     const double s_b = entropy_subsystem_rdm_from_state(
-        psi, n, B, fermion_trace, workspace.entropy_b);
+        psi, n, B, fermion_trace, workspace.entropy_b, order);
     const double s_c = entropy_subsystem_rdm_from_state(
-        psi, n, C, fermion_trace, workspace.entropy_c);
+        psi, n, C, fermion_trace, workspace.entropy_c, order);
     const double s_d = entropy_subsystem_rdm_from_state(
-        psi, n, D, fermion_trace, workspace.entropy_d);
+        psi, n, D, fermion_trace, workspace.entropy_d, order);
 
     const double s_ab = entropy_subsystem_svd_from_state(
-        psi, n, AB, fermion_trace, workspace.entropy_half);
+        psi, n, AB, fermion_trace, workspace.entropy_half, order);
     const double s_ac = entropy_subsystem_svd_from_state(
-        psi, n, AC, fermion_trace, workspace.entropy_half);
+        psi, n, AC, fermion_trace, workspace.entropy_half, order);
     const double s_bc = entropy_subsystem_svd_from_state(
-        psi, n, BC, fermion_trace, workspace.entropy_half);
+        psi, n, BC, fermion_trace, workspace.entropy_half, order);
 
     return s_a + s_b + s_c + s_d - s_ab - s_ac - s_bc;
 }
@@ -241,19 +244,22 @@ inline bool entropy_subsystem_svd_from_device_state(const void *device_state_vec
         return false;
     }
 
-    const int status = device_state_is_fp64
-                           ? mipt_cuda_entropy_svd_f64(device_state_vector,
-                                                       n,
-                                                       kept_modes.data(),
-                                                       static_cast<int>(kept_modes.size()),
-                                                       fermion_trace ? 1 : 0,
-                                                       &entropy_out)
-                           : mipt_cuda_entropy_svd_f32(device_state_vector,
-                                                       n,
-                                                       kept_modes.data(),
-                                                       static_cast<int>(kept_modes.size()),
-                                                       fermion_trace ? 1 : 0,
-                                                       &entropy_out);
+    // The Renyi-2 entry point shares the Schmidt gather but stops at the Gram
+    // matrix, so it never allocates -- or needs -- the eigensolver workspace.
+    const bool renyi2 = tmi_entropy_order() == EntropyOrder::Renyi2;
+    const int mode_count = static_cast<int>(kept_modes.size());
+    const int trace_flag = fermion_trace ? 1 : 0;
+    const int status =
+        renyi2 ? (device_state_is_fp64
+                      ? mipt_cuda_renyi2_f64(device_state_vector, n, kept_modes.data(),
+                                             mode_count, trace_flag, &entropy_out)
+                      : mipt_cuda_renyi2_f32(device_state_vector, n, kept_modes.data(),
+                                             mode_count, trace_flag, &entropy_out))
+               : (device_state_is_fp64
+                      ? mipt_cuda_entropy_svd_f64(device_state_vector, n, kept_modes.data(),
+                                                  mode_count, trace_flag, &entropy_out)
+                      : mipt_cuda_entropy_svd_f32(device_state_vector, n, kept_modes.data(),
+                                                  mode_count, trace_flag, &entropy_out));
     status_out = status;
     return status == 0 && std::isfinite(entropy_out);
 #else
@@ -330,7 +336,8 @@ inline bool entropy_subsystem_rdm_from_device_state(const void *device_state_vec
     entropy_out = entropy_ri_ptr(workspace.device_rdm_ri.data(),
                                  dim,
                                  workspace.direct_matrix,
-                                 workspace.entropy);
+                                 workspace.entropy,
+                                 tmi_entropy_order());
     return std::isfinite(entropy_out);
 #else
     (void)device_state_vector;
@@ -488,14 +495,16 @@ inline double tmi_from_statevector_hybrid_gpu_half_svd(const std::complex<Real> 
     const std::vector<int> AC = concatenate_modes(A, C);
     const std::vector<int> BC = concatenate_modes(B, C);
 
+    const EntropyOrder order = tmi_entropy_order();
+
     const double s_a = entropy_subsystem_rdm_from_state(
-        host_psi, n, A, fermion_trace, workspace.entropy_a);
+        host_psi, n, A, fermion_trace, workspace.entropy_a, order);
     const double s_b = entropy_subsystem_rdm_from_state(
-        host_psi, n, B, fermion_trace, workspace.entropy_b);
+        host_psi, n, B, fermion_trace, workspace.entropy_b, order);
     const double s_c = entropy_subsystem_rdm_from_state(
-        host_psi, n, C, fermion_trace, workspace.entropy_c);
+        host_psi, n, C, fermion_trace, workspace.entropy_c, order);
     const double s_d = entropy_subsystem_rdm_from_state(
-        host_psi, n, D, fermion_trace, workspace.entropy_d);
+        host_psi, n, D, fermion_trace, workspace.entropy_d, order);
 
     auto half_entropy = [&](const std::vector<int> &modes) -> double {
         double entropy = 0.0;
@@ -519,7 +528,7 @@ inline double tmi_from_statevector_hybrid_gpu_half_svd(const std::complex<Real> 
             workspace.cuda_svd_failure_status = status;
         }
         return entropy_subsystem_svd_from_state(
-            host_psi, n, modes, fermion_trace, workspace.entropy_half);
+            host_psi, n, modes, fermion_trace, workspace.entropy_half, order);
     };
 
     const double s_ab = half_entropy(AB);

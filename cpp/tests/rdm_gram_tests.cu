@@ -215,6 +215,75 @@ void check_rdm(int n, const std::vector<int> &kept, bool fermionic, bool fp64,
                 fp64 ? "f64" : "f32", worst, std::abs(trace - 1.0));
 }
 
+// Tr(rho^2) straight from the fp64 reference RDM, with no eigensolver in the
+// path at all -- so this checks the device purity reduction against the
+// definition rather than against another spectral routine.
+double reference_renyi2_bits(const std::vector<Complex> &rho, std::size_t rows)
+{
+    double purity = 0.0;
+    for (std::size_t i = 0; i < rows * rows; ++i)
+    {
+        purity += std::norm(rho[i]);
+    }
+    return -std::log2(purity);
+}
+
+void check_renyi2(int n, const std::vector<int> &kept, bool fermionic, bool fp64,
+                  double tolerance)
+{
+    const auto psi = random_state(n, 0x1234567890ABCDEFULL + n + kept.size());
+    const auto reference = reference_rdm(psi, n, kept, fermionic);
+    const std::size_t rows = std::size_t{1} << kept.size();
+    const double expected = reference_renyi2_bits(reference, rows);
+
+    void *device = fp64 ? upload_state<double>(psi) : upload_state<float>(psi);
+    double got = 0.0;
+    const int status =
+        fp64 ? mipt_cuda_renyi2_f64(device, n, kept.data(),
+                                    static_cast<int>(kept.size()),
+                                    fermionic ? 1 : 0, &got)
+             : mipt_cuda_renyi2_f32(device, n, kept.data(),
+                                    static_cast<int>(kept.size()),
+                                    fermionic ? 1 : 0, &got);
+    cudaFree(device);
+
+    if (status != 0)
+    {
+        std::fprintf(stderr, "FAIL renyi2 status=%d\n", status);
+        ++failures;
+        return;
+    }
+    const double delta = std::abs(got - expected);
+    const char *verdict = (delta <= tolerance) ? "ok  " : "FAIL";
+    if (verdict[0] == 'F')
+    {
+        ++failures;
+    }
+    std::printf("  %s S2   n=%2d kept=%zu %-5s %s  S=%.9f ref=%.9f  dS=%.3e\n",
+                verdict, n, kept.size(), fermionic ? "fermi" : "qubit",
+                fp64 ? "f64" : "f32", got, expected, delta);
+}
+
+// A product state across the cut has purity 1, so S_2 must be exactly 0 rather
+// than the small negative -log2(1+eps) that an unclamped reduction would give.
+void check_renyi2_product_state_is_zero(int n, const std::vector<int> &kept)
+{
+    std::vector<Complex> psi(std::size_t{1} << n, Complex(0.0, 0.0));
+    psi[0] = Complex(1.0, 0.0);
+    void *device = upload_state<float>(psi);
+    double got = -1.0;
+    const int status = mipt_cuda_renyi2_f32(device, n, kept.data(),
+                                            static_cast<int>(kept.size()), 0, &got);
+    cudaFree(device);
+    const bool ok = (status == 0) && (got == 0.0);
+    if (!ok)
+    {
+        ++failures;
+    }
+    std::printf("  %s S2 of a product state is exactly 0: got %.3e (status=%d)\n",
+                ok ? "ok  " : "FAIL", got, status);
+}
+
 template <std::size_t ROWS>
 void check_entropy(int n, const std::vector<int> &kept, bool fermionic, bool fp64,
                    double tolerance)
@@ -310,6 +379,16 @@ int main()
         check_entropy<64>(12, {0, 2, 4, 6, 8, 10}, fermionic, false, 5.0e-4);
         check_entropy<64>(12, {0, 1, 2, 3, 4, 5}, fermionic, true, 1.0e-9);
     }
+
+    std::printf("\nHalf-cut Renyi-2 (Gram + purity reduction, no eigensolver, bits):\n");
+    for (bool fermionic : {false, true})
+    {
+        check_renyi2(10, {0, 1, 2, 3, 4}, fermionic, false, 5.0e-5);
+        check_renyi2(12, {0, 1, 2, 3, 4, 5}, fermionic, false, 5.0e-5);
+        check_renyi2(12, {0, 2, 4, 6, 8, 10}, fermionic, false, 5.0e-5);
+        check_renyi2(12, {0, 1, 2, 3, 4, 5}, fermionic, true, 1.0e-12);
+    }
+    check_renyi2_product_state_is_zero(12, {0, 1, 2, 3, 4, 5});
 
     if (failures != 0)
     {

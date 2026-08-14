@@ -305,6 +305,90 @@ The old Makefile referenced `tmi.cpp`, but that source was absent from the suppl
 archive. The stale `tmi.exe` target was therefore removed; `sim_tmi.exe` remains the
 maintained online TMI path.
 
+## `sim_tmi.exe` entropy order — `SIM_TMI_ENTROPY_ORDER`
+
+`I_3 = S_A + S_B + S_C + S_D - S_AB - S_AC - S_BC` can be built from either
+entropy. `SIM_TMI_ENTROPY_ORDER=1` (**the default**) uses the von Neumann
+entropy and is exactly the historical behaviour. `SIM_TMI_ENTROPY_ORDER=2` uses
+the Rényi-2 entropy `S_2 = -log2 Tr(rho^2)`.
+
+**Order 2 exists because it removes the half-cut eigensolve.** For a pure
+state the purity is the squared Frobenius norm of `rho = M M^H`, so the device
+path stops at the cuBLAS `herk` that the von Neumann path only uses as a
+prologue. Measured on a GTX 1650, fp32, at the half-cut sizes TMI actually
+uses:
+
+| half cut | gather + herk | `Tr(rho^2)` | `Cheevd` | `Cgesvd` (the >512 path) |
+|---|---|---|---|---|
+| 1024 (N=20) | 2.3 ms | 0.25 ms | 51.9 ms | 230.6 ms |
+| 4096 (N=24) | 110.8 ms | 2.4 ms | 1497.5 ms | 4636.6 ms |
+| 8192 (N=26) | 887.4 ms | 8.3 ms | 10626.7 ms | — |
+
+Instrumented on real trajectories at N=24 (Haar, `p=0.2`, `all_cycles=0`), the
+three half cuts are **98.7%** of a TMI evaluation — 9.30 s against 0.12 s for
+all four quarter RDMs. End to end, per realization:
+
+| | order 1 | order 2 | |
+|---|---|---|---|
+| N=20 | 1.047 s | 0.072 s | **14.5×** |
+| N=24 | 9.275 s | 1.010 s | **9.2×** |
+
+The whole-app factor is smaller than the per-half-cut one because once the
+eigensolve is gone the circuit and the Schmidt gather dominate again.
+
+**At N=28 the memory matters more than the time.** The half cut is
+16384×16384, and cuSOLVER's workspace *alone* is 6.16 GB for `Cheevd`,
+`Xsyevd`, and `Cgesvd`, or 10.26 GB for `Xgesvdp`. With the state (2.15 GB),
+the Schmidt matrix (2.15 GB) and the Gram (2.15 GB) on top, order 1 needs
+~12.6 GB before CUDA-Q's own allocations. `retry_entropy_in_f64` would want a
+4.3 GB fp64 Gram plus ~12 GB of fp64 workspace, so at that size the middle rung
+of the fallback ladder cannot run at all. Order 2 allocates no solver
+workspace: ~6.45 GB total.
+
+Precision is *better*, not worse. The fp32 Gram plus an fp64 purity reduction
+reproduces an fp64 `Zherk` reference to ≤5e-7 bits at dim 4096, on both flat
+(Page) and steeply decaying spectra, against the ~6e-5 bits the von Neumann
+path already accepts.
+
+**The physics caveat is the real cost.** `I_3` at criticality is a universal
+number that depends on the Rényi index, so order-2 output must never be pooled
+with order-1 output. `p_c` and `nu` do not depend on it, so a crossing/collapse
+analysis is unaffected. To keep the two archives from ever landing in one glob,
+order 2 appends `_s2` to the output tag — it lands in both the directory and
+the file stem, and order-1 paths are byte-identical to before:
+
+```text
+csv/tmi/haar/tmi_haar_n_24_real_...csv        # order 1 (unchanged)
+csv/tmi/haar_s2/tmi_haar_s2_n_24_real_...csv  # order 2
+```
+
+The CSV schema stays `p,tmi` — these files reach millions of rows, the same
+reason `gmn.exe` keeps its schema minimal — so the order is carried by the path
+and by the banner's `entropy_order=` field. Unlike the other `MIPT_*`/`SIM_TMI_*`
+knobs, an unparseable value **refuses** instead of falling back to the default:
+silently spending a multi-hour run on the other observable is a worse failure
+than an early exit.
+
+Validation, since trajectories are not reproducible: a deep `p=0` Haar circuit
+at N=16 reproduces the Page-state closed forms for both orders — order 1 gives
+`-5.84743 ± 0.00028` against `-5.847228`, order 2 gives `-5.02235 ± 0.00038`
+against `-5.022476` (300 realizations each). All four dispatch combinations
+(device/host quarters × device/host half cuts) agree with the order-2 value
+within 1.5σ. `make test-rdm-gram` pins the device purity reduction against a
+purity taken straight from an fp64 reference RDM under both traces, and
+`make test-core` pins the host primitives against closed forms.
+
+### What was measured and rejected
+
+- **Raising `MIPT_TMI_HEEVD_MAX_ROWS` above 512.** On physical N=24 states,
+  `Cgesvd` gives 9.27 / 9.08 / 9.62 s per evaluation while `Cheevd` gives
+  4.99 / 19.5 / 9.14 s — intermittently faster, intermittently 2× slower as the
+  documented non-convergence fires and drags in the fp64 retry. The 512 cap is
+  correct.
+- **The 64-bit API.** `cusolverDnXsyevd` matches legacy `Cheevd` to within noise
+  at every size tried and has byte-identical workspace.
+- **`cusolverDnXgesvdp`.** 1.66× more workspace.
+
 ## Host pause control
 
 Every executable honours the same cooperative pause. Creating `PAUSE_MIPT` in

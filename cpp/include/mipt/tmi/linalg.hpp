@@ -140,6 +140,86 @@ inline double finish_entropy(double entropy)
     return entropy;
 }
 
+// Which entropy the TMI terms are built from.
+//
+// Order 1 is the von Neumann entropy -Tr(rho log2 rho), the historical
+// quantity, and stays the default everywhere.  Order 2 is the Renyi-2 entropy
+// -log2 Tr(rho^2), which needs no spectrum at all: the purity is a single
+// Frobenius-norm pass over the reduced density matrix.  That removes the
+// half-cut eigensolve, which is ~98% of a TMI evaluation at N=24 and is what
+// makes N=28 infeasible -- both in time and, at a 16384-wide half cut, in the
+// 6.2 GB of cuSOLVER workspace it demands.  See cpp/README.md.
+//
+// I_3 at criticality is a universal number that *does* depend on the Renyi
+// index, so order-2 output must never be pooled with order-1 output; p_c and
+// nu do not depend on it.  sim_tmi.exe keeps the two archives apart by giving
+// order-2 runs their own output tag.
+enum class EntropyOrder : int
+{
+    VonNeumann = 1,
+    Renyi2 = 2
+};
+
+inline EntropyOrder tmi_entropy_order()
+{
+    static const EntropyOrder order = []() {
+        const char *raw = std::getenv("SIM_TMI_ENTROPY_ORDER");
+        if (raw == nullptr || *raw == '\0')
+        {
+            return EntropyOrder::VonNeumann;
+        }
+        const std::string_view text(raw);
+        if (text == "1")
+        {
+            return EntropyOrder::VonNeumann;
+        }
+        if (text == "2")
+        {
+            return EntropyOrder::Renyi2;
+        }
+        // env::integer would quietly fall back to the default here, which is
+        // the house style for the MIPT_* knobs but is the wrong trade for this
+        // one: a typo would silently spend a multi-hour run computing the other
+        // observable, and the two are not comparable.  Refuse instead.
+        throw std::invalid_argument(
+            "SIM_TMI_ENTROPY_ORDER must be 1 (von Neumann) or 2 (Renyi-2), got \"" +
+            std::string(text) + "\".");
+    }();
+    return order;
+}
+
+inline const char *entropy_order_name(EntropyOrder order)
+{
+    return (order == EntropyOrder::Renyi2) ? "renyi2" : "von_neumann";
+}
+
+// S_2 = -log2 Tr(rho^2).
+//
+// A purity at or above 1 is fp roundoff on an (almost) pure subsystem, whose
+// entropy is 0; letting -log2 return a small negative number instead would put
+// a spurious sign on individual terms of the seven-term TMI sum.
+inline double renyi2_from_purity(double purity)
+{
+    if (!(purity > 0.0) || purity >= 1.0)
+    {
+        return 0.0;
+    }
+    return finish_entropy(-std::log2(purity));
+}
+
+// Tr(rho^2) for Hermitian rho is sum_ij rho_ij conj(rho_ij), so this is
+// indifferent to row- versus column-major storage.
+inline double purity_hermitian(const C64 *a, std::size_t n)
+{
+    double purity = 0.0;
+    const std::size_t count = n * n;
+    for (std::size_t i = 0; i < count; ++i)
+    {
+        purity += std::norm(a[i]);
+    }
+    return purity;
+}
+
 inline void append_double(std::string &s, double value)
 {
     char buf[64];
@@ -441,7 +521,10 @@ inline void prepare_lapack_workspace(std::size_t n, EntropyWorkspace &ws)
     ws.iwork.assign(static_cast<std::size_t>(liwork_opt), 0);
 }
 
-inline double entropy_hermitian_inplace(std::vector<C64> &a, std::size_t n, EntropyWorkspace &ws)
+inline double entropy_hermitian_inplace(std::vector<C64> &a,
+                                        std::size_t n,
+                                        EntropyWorkspace &ws,
+                                        EntropyOrder order = EntropyOrder::VonNeumann)
 {
     if (n == 0 || a.size() != n * n)
     {
@@ -450,6 +533,15 @@ inline double entropy_hermitian_inplace(std::vector<C64> &a, std::size_t n, Entr
     if (n == 1)
     {
         return 0.0;
+    }
+    if (order == EntropyOrder::Renyi2)
+    {
+        // No spectrum needed.  Hermitize first for the same reason the
+        // eigensolver path does: sum_ij |a_ij|^2 is Tr(a^2) only when a is
+        // Hermitian, and callers hand us matrices that are Hermitian to
+        // roundoff rather than exactly.
+        hermitize_in_place(a, n);
+        return renyi2_from_purity(purity_hermitian(a.data(), n));
     }
     if (n == 2)
     {
@@ -502,10 +594,11 @@ inline void fill_complex_from_ri_ptr(const double *rho_ri, std::size_t dim, std:
 inline double entropy_ri_ptr(const double *rho_ri,
                       std::size_t dim,
                       std::vector<C64> &matrix_buffer,
-                      EntropyWorkspace &entropy_ws)
+                      EntropyWorkspace &entropy_ws,
+                      EntropyOrder order = EntropyOrder::VonNeumann)
 {
     fill_complex_from_ri_ptr(rho_ri, dim, matrix_buffer);
-    return entropy_hermitian_inplace(matrix_buffer, dim, entropy_ws);
+    return entropy_hermitian_inplace(matrix_buffer, dim, entropy_ws, order);
 }
 
 struct SvdWorkspace
@@ -547,6 +640,33 @@ inline double entropy_from_singular_values(const std::vector<double> &singular_v
 inline double entropy_from_singular_values(const std::vector<float> &singular_values)
 {
     return entropy_from_singular_values_raw(singular_values);
+}
+
+// Schmidt coefficients are the square roots of the eigenvalues, so the purity
+// is the fourth moment of the singular values.
+template <typename Real>
+inline double renyi2_from_singular_values_raw(const std::vector<Real> &singular_values)
+{
+    double purity = 0.0;
+    for (Real sigma_value : singular_values)
+    {
+        const double sigma = static_cast<double>(sigma_value);
+        const double lambda = sigma * sigma;
+        purity += lambda * lambda;
+    }
+    return renyi2_from_purity(purity);
+}
+
+// Host half-cut paths already own a full Schmidt spectrum by the time they get
+// here, so order 2 costs them nothing extra -- but it saves them nothing
+// either.  Only the device path in src/cuda/tmi_cuda_svd.cu skips the solve.
+template <typename Real>
+inline double entropy_from_singular_values_ordered(const std::vector<Real> &singular_values,
+                                                   EntropyOrder order)
+{
+    return (order == EntropyOrder::Renyi2)
+               ? renyi2_from_singular_values_raw(singular_values)
+               : entropy_from_singular_values_raw(singular_values);
 }
 
 inline void prepare_zgesvd_workspace(std::size_t rows, std::size_t cols, SvdWorkspace &ws)
@@ -604,7 +724,8 @@ inline void prepare_zgesvd_workspace(std::size_t rows, std::size_t cols, SvdWork
 inline double entropy_svd_inplace(std::vector<C64> &matrix_col_major,
                            std::size_t rows,
                            std::size_t cols,
-                           SvdWorkspace &ws)
+                           SvdWorkspace &ws,
+                           EntropyOrder order = EntropyOrder::VonNeumann)
 {
     if (matrix_col_major.size() != rows * cols)
     {
@@ -638,7 +759,7 @@ inline double entropy_svd_inplace(std::vector<C64> &matrix_col_major,
     {
         throw std::runtime_error("LAPACK zgesvd failed while computing a Schmidt spectrum.");
     }
-    return entropy_from_singular_values(ws.singular_values);
+    return entropy_from_singular_values_ordered(ws.singular_values, order);
 }
 
 
@@ -697,7 +818,8 @@ inline void prepare_cgesvd_workspace(std::size_t rows, std::size_t cols, SvdWork
 inline double entropy_svd_inplace(std::vector<C32> &matrix_col_major,
                            std::size_t rows,
                            std::size_t cols,
-                           SvdWorkspaceF32 &ws)
+                           SvdWorkspaceF32 &ws,
+                           EntropyOrder order = EntropyOrder::VonNeumann)
 {
     if (matrix_col_major.size() != rows * cols)
     {
@@ -729,7 +851,7 @@ inline double entropy_svd_inplace(std::vector<C32> &matrix_col_major,
     {
         throw std::runtime_error("LAPACK cgesvd failed while computing a single-precision Schmidt spectrum.");
     }
-    return entropy_from_singular_values(ws.singular_values);
+    return entropy_from_singular_values_ordered(ws.singular_values, order);
 }
 
 inline std::vector<int> complement_modes(int n, const std::vector<int> &modes)
@@ -948,7 +1070,8 @@ inline double entropy_subsystem_svd_from_state(const std::complex<Real> *psi,
                                         int n,
                                         const std::vector<int> &kept_modes,
                                         bool fermion_trace,
-                                        StateEntropyWorkspace &ws)
+                                        StateEntropyWorkspace &ws,
+                                        EntropyOrder order = EntropyOrder::VonNeumann)
 {
     const std::vector<int> env_modes = complement_modes(n, kept_modes);
     const std::size_t rows = std::size_t{1} << kept_modes.size();
@@ -959,7 +1082,7 @@ inline double entropy_subsystem_svd_from_state(const std::complex<Real> *psi,
         if (lapack_runtime::cgesvd())
         {
             build_coefficient_matrix_col_major_f32(psi, n, kept_modes, fermion_trace, ws);
-            return entropy_svd_inplace(ws.matrix_col_major_f32, rows, cols, ws.svd_f32);
+            return entropy_svd_inplace(ws.matrix_col_major_f32, rows, cols, ws.svd_f32, order);
         }
     }
 
@@ -968,7 +1091,7 @@ inline double entropy_subsystem_svd_from_state(const std::complex<Real> *psi,
         throw std::runtime_error("Fast state-vector TMI needs LAPACK zgesvd_ or cgesvd_.");
     }
     build_coefficient_matrix_col_major(psi, n, kept_modes, fermion_trace, ws);
-    return entropy_svd_inplace(ws.matrix_col_major, rows, cols, ws.svd);
+    return entropy_svd_inplace(ws.matrix_col_major, rows, cols, ws.svd, order);
 }
 
 template <typename Real>
@@ -1116,7 +1239,8 @@ inline double entropy_subsystem_rdm_from_state(const std::complex<Real> *psi,
                                         int n,
                                         const std::vector<int> &kept_modes,
                                         bool fermion_trace,
-                                        StateEntropyWorkspace &ws)
+                                        StateEntropyWorkspace &ws,
+                                        EntropyOrder order = EntropyOrder::VonNeumann)
 {
     const std::size_t rows = std::size_t{1} << kept_modes.size();
     if (rows == 1)
@@ -1128,7 +1252,7 @@ inline double entropy_subsystem_rdm_from_state(const std::complex<Real> *psi,
     {
         reduced_density_manual_from_state(psi, n, kept_modes, fermion_trace, ws, ws.rdm_row_major);
     }
-    return entropy_hermitian_inplace(ws.rdm_row_major, rows, ws.entropy);
+    return entropy_hermitian_inplace(ws.rdm_row_major, rows, ws.entropy, order);
 }
 
 inline int index_from_new_mode_order(int new_index, const std::vector<int> &new_mode_order)

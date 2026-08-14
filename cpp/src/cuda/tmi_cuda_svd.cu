@@ -107,9 +107,60 @@ cusolverStatus_t cusolverDnZheevd(cusolverDnHandle_t handle,
 #define CUSOLVER_STATUS_SUCCESS 0
 #endif
 
+// Deliberately a *named* namespace, unlike everything else in this file.  nvcc
+// generates one `_NV_ANON_NAMESPACE` alias per translation unit, so a __global__
+// living in a second anonymous namespace -- here, this file's own, alongside
+// mipt_gram's -- makes the generated registration stub ambiguous and the build
+// fails inside cudafe1.stub.c with no reference to any line you wrote.  Nothing
+// else instantiates this template, so external linkage is safe.
+namespace mipt_tmi_purity
+{
+enum
+{
+    PURITY_BLOCKS = 1024,
+    PURITY_THREADS = 256
+};
+
+template <typename ComplexT>
+__global__ void purity_partials_kernel(const ComplexT *__restrict__ gram,
+                                       long long count,
+                                       double *__restrict__ partials)
+{
+    __shared__ double shared[PURITY_THREADS];
+
+    double acc = 0.0;
+    for (long long i = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+         i < count;
+         i += static_cast<long long>(gridDim.x) * blockDim.x)
+    {
+        const double re = static_cast<double>(gram[i].x);
+        const double im = static_cast<double>(gram[i].y);
+        acc += re * re + im * im;
+    }
+    shared[threadIdx.x] = acc;
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1)
+    {
+        if (threadIdx.x < static_cast<unsigned>(stride))
+        {
+            shared[threadIdx.x] += shared[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0)
+    {
+        partials[blockIdx.x] = shared[0];
+    }
+}
+} // namespace mipt_tmi_purity
+
+
 namespace
 {
 using namespace mipt_gram;
+using mipt_tmi_purity::PURITY_BLOCKS;
+using mipt_tmi_purity::PURITY_THREADS;
 
 enum
 {
@@ -509,6 +560,106 @@ int retry_entropy_in_f64(const void *device_state_vector,
     return 0;
 }
 
+// --- Renyi-2 path -----------------------------------------------------------
+//
+// S_2 = -log2 Tr(rho^2), and for a Hermitian rho, Tr(rho^2) is the squared
+// Frobenius norm.  build_gram already fills and symmetrizes the whole matrix,
+// so the entire remaining cost is one reduction pass -- 2.4 ms against a
+// 4637 ms Cgesvd at rows=4096 on a GTX 1650.
+//
+// The reduction accumulates in fp64 and is laid out so the result does not
+// depend on how the blocks happen to interleave: each block reduces a fixed
+// strided slice into shared memory and writes one partial, and the partials are
+// summed on the host in block order.  An atomicAdd on doubles would have been
+// shorter but would make the value depend on scheduling, which is exactly the
+// kind of irreproducibility that is painful to chase later.
+
+template <typename Real, typename ComplexT>
+int launch_subsystem_renyi2(const void *device_state_vector,
+                            int n_qubits,
+                            const int *host_kept_modes,
+                            int kept_count,
+                            int fermion_trace,
+                            double *entropy_out)
+{
+    if (device_state_vector == NULL || entropy_out == NULL ||
+        host_kept_modes == NULL || n_qubits <= 0 || n_qubits >= 63 ||
+        kept_count <= 0 || kept_count >= n_qubits || kept_count >= 31)
+    {
+        return static_cast<int>(cudaErrorInvalidValue);
+    }
+
+    const size_t rows = size_t{1} << kept_count;
+    const size_t cols = size_t{1} << (n_qubits - kept_count);
+    if (rows == 1 || cols == 1)
+    {
+        *entropy_out = 0.0;
+        return 0;
+    }
+    if (rows > static_cast<size_t>(INT_MAX))
+    {
+        return static_cast<int>(cudaErrorInvalidValue);
+    }
+
+    // Deliberately the same workspace object the von Neumann path uses: a run
+    // picks one order and keeps it, so sharing the gather cache costs nothing
+    // and avoids holding two multi-gigabyte Schmidt buffers at N=28.
+    static thread_local GramWorkspace<ComplexT> ws;
+    static thread_local double *d_partials = NULL;
+    static thread_local size_t partials_capacity = 0;
+
+    size_t built_rows = 0;
+    size_t built_cols = 0;
+    int status = build_gram<Real, ComplexT>(device_state_vector, n_qubits,
+                                            host_kept_modes, kept_count,
+                                            fermion_trace, ws,
+                                            built_rows, built_cols);
+    if (status != 0)
+    {
+        return status;
+    }
+
+    cudaError_t cuda_status = cudaSuccess;
+    if (thread_buffer(static_cast<size_t>(PURITY_BLOCKS), d_partials,
+                      partials_capacity, cuda_status) == NULL)
+    {
+        return static_cast<int>(cuda_status);
+    }
+
+    const long long elements = static_cast<long long>(rows) * static_cast<long long>(rows);
+    mipt_tmi_purity::purity_partials_kernel<ComplexT><<<PURITY_BLOCKS, PURITY_THREADS>>>(
+        ws.gram, elements, d_partials);
+    cuda_status = cudaGetLastError();
+    if (cuda_status != cudaSuccess)
+    {
+        return static_cast<int>(cuda_status);
+    }
+
+    double host_partials[PURITY_BLOCKS];
+    cuda_status = cudaMemcpy(host_partials, d_partials,
+                             sizeof(double) * PURITY_BLOCKS, cudaMemcpyDeviceToHost);
+    if (cuda_status != cudaSuccess)
+    {
+        return static_cast<int>(cuda_status);
+    }
+
+    double purity = 0.0;
+    for (int i = 0; i < PURITY_BLOCKS; ++i)
+    {
+        purity += host_partials[i];
+    }
+
+    if (!(purity > 0.0) || purity != purity)
+    {
+        return static_cast<int>(cudaErrorInvalidValue);
+    }
+    // A purity at or above 1 is roundoff on an (almost) pure subsystem; clamp
+    // to 0 rather than emit a small negative entropy.  Mirrors
+    // mipt::tmi::renyi2_from_purity, which the host paths use.
+    *entropy_out = (purity >= 1.0) ? 0.0 : -log2(purity);
+    return 0;
+}
+
 template <typename Real, typename ComplexT, typename EigReal>
 int launch_subsystem_entropy(const void *device_state_vector,
                              int n_qubits,
@@ -669,6 +820,32 @@ extern "C" int mipt_cuda_entropy_svd_f64(
     double *entropy_out)
 {
     return launch_subsystem_entropy<double, cuDoubleComplex, double>(
+        device_state_vector, n_qubits, host_kept_modes, kept_count,
+        fermion_trace, entropy_out);
+}
+
+extern "C" int mipt_cuda_renyi2_f32(
+    const void *device_state_vector,
+    int n_qubits,
+    const int *host_kept_modes,
+    int kept_count,
+    int fermion_trace,
+    double *entropy_out)
+{
+    return launch_subsystem_renyi2<float, cuComplex>(
+        device_state_vector, n_qubits, host_kept_modes, kept_count,
+        fermion_trace, entropy_out);
+}
+
+extern "C" int mipt_cuda_renyi2_f64(
+    const void *device_state_vector,
+    int n_qubits,
+    const int *host_kept_modes,
+    int kept_count,
+    int fermion_trace,
+    double *entropy_out)
+{
+    return launch_subsystem_renyi2<double, cuDoubleComplex>(
         device_state_vector, n_qubits, host_kept_modes, kept_count,
         fermion_trace, entropy_out);
 }

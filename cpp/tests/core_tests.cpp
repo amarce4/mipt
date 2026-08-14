@@ -3,6 +3,7 @@
 #include "mipt/free_energy_measure.hpp"
 #include "mipt/entropy_resume.hpp"
 #include "mipt/free_energy_resume.hpp"
+#include "mipt/tmi/linalg.hpp"
 #include "mipt/types.hpp"
 
 #include <cassert>
@@ -725,6 +726,88 @@ void test_entropy_resume()
 
     std::filesystem::remove_all(directory);
 }
+// The Renyi-2 branch of the TMI entropy primitives.
+//
+// These are the only pieces sim_tmi.exe's order-2 mode uses that are not
+// behind CUDA, so pinning them here keeps them covered on a machine with no
+// GPU.  The device purity reduction has its own check in
+// tests/rdm_gram_tests.cu.
+void test_tmi_renyi2_primitives()
+{
+    using namespace mipt::tmi;
+    const double tol = 1.0e-12;
+
+    // A maximally mixed rho_A of dimension d has purity 1/d, so S_2 = log2 d --
+    // the same as its von Neumann entropy, which is what makes this a usable
+    // cross-check on both branches at once.
+    for (std::size_t dim : {std::size_t{2}, std::size_t{4}, std::size_t{8}})
+    {
+        std::vector<C64> rho(dim * dim, C64(0.0, 0.0));
+        for (std::size_t i = 0; i < dim; ++i)
+        {
+            rho[i * dim + i] = C64(1.0 / static_cast<double>(dim), 0.0);
+        }
+        EntropyWorkspace ws;
+        std::vector<C64> copy = rho;
+        const double s2 = entropy_hermitian_inplace(copy, dim, ws, EntropyOrder::Renyi2);
+        copy = rho;
+        const double s1 = entropy_hermitian_inplace(copy, dim, ws, EntropyOrder::VonNeumann);
+        assert(std::abs(s2 - std::log2(static_cast<double>(dim))) < tol);
+        assert(std::abs(s1 - s2) < 1.0e-9);
+    }
+
+    // A pure rho has purity 1 and must give exactly 0, not -log2(1+eps).
+    {
+        std::vector<C64> pure(4, C64(0.0, 0.0));
+        pure[0] = C64(1.0, 0.0);
+        EntropyWorkspace ws;
+        assert(entropy_hermitian_inplace(pure, 2, ws, EntropyOrder::Renyi2) == 0.0);
+        assert(renyi2_from_purity(1.0 + 1.0e-9) == 0.0);
+    }
+
+    // A rank-2 state with weights (q, 1-q): purity q^2 + (1-q)^2.
+    {
+        const double q = 0.3;
+        std::vector<C64> rho(4, C64(0.0, 0.0));
+        rho[0] = C64(q, 0.0);
+        rho[3] = C64(1.0 - q, 0.0);
+        EntropyWorkspace ws;
+        const double expected = -std::log2(q * q + (1.0 - q) * (1.0 - q));
+        assert(std::abs(entropy_hermitian_inplace(rho, 2, ws, EntropyOrder::Renyi2) -
+                        expected) < tol);
+
+        // Same state seen as Schmidt coefficients: purity is the fourth moment.
+        const std::vector<double> sigma{std::sqrt(q), std::sqrt(1.0 - q)};
+        assert(std::abs(renyi2_from_singular_values_raw(sigma) - expected) < tol);
+        assert(std::abs(entropy_from_singular_values_ordered(sigma, EntropyOrder::Renyi2) -
+                        expected) < tol);
+    }
+
+    // Purity must ignore storage order and be blind to a non-Hermitian
+    // perturbation only after hermitizing -- the sum of |a_ij|^2 is Tr(a^2)
+    // only for Hermitian a, which is why the order-2 branch hermitizes first.
+    {
+        std::vector<C64> rho{C64(0.6, 0.0), C64(0.2, 0.1), C64(0.2, -0.1), C64(0.4, 0.0)};
+        const double direct = purity_hermitian(rho.data(), 2);
+        const double expected = 0.6 * 0.6 + 0.4 * 0.4 + 2.0 * (0.2 * 0.2 + 0.1 * 0.1);
+        assert(std::abs(direct - expected) < tol);
+    }
+
+    // Order 1 is the default on every overload that gained the parameter.
+    {
+        std::vector<C64> rho(4, C64(0.0, 0.0));
+        rho[0] = C64(0.5, 0.0);
+        rho[3] = C64(0.5, 0.0);
+        EntropyWorkspace ws;
+        std::vector<C64> copy = rho;
+        assert(std::abs(entropy_hermitian_inplace(copy, 2, ws) - 1.0) < tol);
+        const std::vector<double> sigma{std::sqrt(0.5), std::sqrt(0.5)};
+        assert(std::abs(entropy_from_singular_values(sigma) - 1.0) < tol);
+    }
+
+    std::cout << "tmi renyi-2 primitives ok\n";
+}
+
 } // namespace
 
 int main()
@@ -740,5 +823,6 @@ int main()
     test_resume_running_stats_round_trip();
     test_resume_checkpoint_scanning();
     test_entropy_resume();
+    test_tmi_renyi2_primitives();
     std::cout << "core tests passed\n";
 }

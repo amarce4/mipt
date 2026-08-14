@@ -85,6 +85,9 @@ inline void run_1d_sim_tmi(int n,
 {
     validate_sim_args(n, periods, realizations, res, p_min, p_max);
     validate_circuit_site_count(circuit_mode, n);
+    // Resolve before anything is printed or opened: an unusable
+    // SIM_TMI_ENTROPY_ORDER throws here rather than partway through the banner.
+    const EntropyOrder entropy_order = tmi_entropy_order();
 
     const std::uint32_t block_qubits = static_cast<std::uint32_t>(n / 4);
     const int cycle_count = tmi_cycle_count(n, all_cycles);
@@ -125,6 +128,7 @@ inline void run_1d_sim_tmi(int n,
               << ", all_cycles=" << (all_cycles ? 1 : 0)
               << ", tmi_cycles_per_circuit=" << cycle_count
               << ", mode=" << circuit_type_name(circuit_mode)
+              << ", entropy_order=" << entropy_order_name(entropy_order)
               << ", output=" << output_path << '\n'
               << "build_target=" << compile_target_name()
               << ", cuda_rho=" << cuda_rho_build_name()
@@ -364,6 +368,10 @@ inline std::string tmi_output_tag(CircuitType circuit_mode, bool all_cycles)
 {
     std::string tag(circuit_type_tag(circuit_mode));
     if (all_cycles) tag += 'c';
+    // I_3 built from S_2 is a different universal number from I_3 built from
+    // S_1, so the two must never end up in one glob.  The suffix lands in both
+    // the directory and the file stem; order-1 paths are unchanged.
+    if (tmi_entropy_order() == EntropyOrder::Renyi2) tag += "_s2";
     return tag;
 }
 
@@ -469,9 +477,18 @@ inline void print_usage(const char *argv0)
         << "  For backward compatibility, output.csv may also be supplied before all_cycles.\n"
         << "  If output.csv is omitted, the default path is:\n"
         << "    csv/tmi/<tag>/tmi_<tag>_n_<n>_real_<realizations>_<p_min>_<p_max>_res_<resolution>.csv\n"
-        << "  Tags are mms, haar, rppu, rfgs, and qrppu; all_cycles=1 appends c.\n\n"
+        << "  Tags are mms, haar, rppu, rfgs, and qrppu; all_cycles=1 appends c,\n"
+        << "  and SIM_TMI_ENTROPY_ORDER=2 appends _s2.\n\n"
         << "Output CSV columns:\n"
         << "  p,tmi\n\n"
+        << "Entropy order:\n"
+        << "  SIM_TMI_ENTROPY_ORDER=1 (default) builds I_3 from the von Neumann entropy.\n"
+        << "  SIM_TMI_ENTROPY_ORDER=2 builds it from the Renyi-2 entropy -log2 Tr(rho^2).\n"
+        << "  Order 2 needs no spectrum, so it skips the half-cut eigensolve entirely --\n"
+        << "  about 98% of a TMI evaluation at N=24, and 6.2 GB of cuSOLVER workspace at\n"
+        << "  the 16384-wide half cut of N=28.  I_3 at criticality is Renyi-index\n"
+        << "  dependent, so order-2 output must not be pooled with order-1 output; p_c\n"
+        << "  and nu are unaffected.  Output paths carry an _s2 tag to keep them apart.\n\n"
         << "Host pause control:\n"
         << "  By default, creating PAUSE_MIPT in the process working directory pauses at the next safe checkpoint.\n"
         << "  Removing PAUSE_MIPT resumes the run. Set SIM_TMI_PAUSE_FILE=/path/to/file to use another sentinel,\n"
