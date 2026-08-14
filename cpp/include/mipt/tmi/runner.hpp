@@ -1,6 +1,7 @@
 #pragma once
 
 #include "mipt/tmi/compute.hpp"
+#include "mipt/tmi/resume.hpp"
 #include "mipt/util/pause.hpp"
 
 #include <chrono>
@@ -11,6 +12,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <filesystem>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -73,6 +75,16 @@ inline void validate_sim_args(int n, int periods, int realizations, int res, dou
 
 void ensure_output_parent_directory(const std::string &output_path);
 
+// Defined below; declared here so the runner can regenerate the name the
+// current arguments would produce and hold an existing file against it.
+inline std::string default_tmi_output_path(int n,
+                                    int realizations,
+                                    int res,
+                                    double p_min,
+                                    double p_max,
+                                    CircuitType circuit_mode,
+                                    bool all_cycles);
+
 inline void run_1d_sim_tmi(int n,
                     int periods,
                     int realizations,
@@ -99,18 +111,63 @@ inline void run_1d_sim_tmi(int n,
                                 static_cast<std::uint64_t>(realizations) *
                                 static_cast<std::uint64_t>(cycle_count);
 
+    // The grid as the writer renders it.  resume::load compares the p field as
+    // text, so these strings are the checkpoint's notion of the grid.
+    std::vector<std::string> p_texts;
+    p_texts.reserve(ps.size());
+    for (const double p_value : ps)
+    {
+        std::string text;
+        append_double(text, p_value);
+        p_texts.push_back(std::move(text));
+    }
+
     ensure_output_parent_directory(output_path);
 
-    std::ofstream csv(output_path, std::ios::binary | std::ios::trunc);
+    resume::Checkpoint checkpoint;
+    const bool resume_enabled = resume::enabled();
+    if (resume_enabled && std::filesystem::exists(output_path))
+    {
+        checkpoint = resume::load(output_path,
+                                  default_tmi_output_path(n, realizations, res, p_min,
+                                                          p_max, circuit_mode, all_cycles),
+                                  realizations,
+                                  cycle_count,
+                                  p_texts);
+    }
+
+    if (checkpoint.rows >= total)
+    {
+        std::cerr << output_path << " already holds all " << total
+                  << " TMI row(s) for this scan; nothing to do.\n"
+                  << "Set SIM_TMI_RESUME=0 to overwrite it instead.\n";
+        return;
+    }
+
+    // Only whole circuits are kept, so an interrupted run's trailing partial
+    // circuit (and any unterminated final line) is trimmed off before the file
+    // is reopened for appending.
+    const bool resuming = checkpoint.rows > 0;
+    if (resuming && checkpoint.kept_bytes < std::filesystem::file_size(output_path))
+    {
+        std::filesystem::resize_file(output_path, checkpoint.kept_bytes);
+    }
+
+    std::ofstream csv(output_path,
+                      resuming ? (std::ios::binary | std::ios::app)
+                               : (std::ios::binary | std::ios::trunc));
     if (!csv)
     {
         throw std::runtime_error("Could not create output CSV: " + output_path);
     }
-    csv << "p,tmi\n";
-    csv.flush();
-    if (!csv)
+    if (!resuming)
     {
-        throw std::runtime_error("Failed while writing output CSV header.");
+        csv << resume::kResultsHeader << '\n';
+        csv.flush();
+        if (!csv)
+        {
+            throw std::runtime_error("Failed while writing output CSV header.");
+        }
     }
 
     const std::uint64_t flush_rows = csv_flush_row_interval(n, cycle_count);
@@ -141,6 +198,33 @@ inline void run_1d_sim_tmi(int n,
               << ", csv_flush_rows=" << flush_rows
               << '\n';
     std::cerr << pause_sentinel.describe() << '\n';
+    if (resuming)
+    {
+        std::cerr << "RESUMED from " << output_path << ": " << checkpoint.rows
+                  << " TMI row(s) already recorded";
+        if (checkpoint.dropped_rows > 0)
+        {
+            std::cerr << "; dropped " << checkpoint.dropped_rows
+                      << " row(s) of a partially written circuit";
+        }
+        std::cerr << ".\nContinuing at p[" << checkpoint.start_p_index << "]="
+                  << ps[checkpoint.start_p_index] << ", realization "
+                  << checkpoint.start_realization << '/' << realizations << ".\n";
+        if (!checkpoint.name_verified)
+        {
+            std::cerr << "Warning: this output path does not follow the generated naming "
+                         "convention, so n, realizations, the p range, the resolution and "
+                         "the circuit tag could not be checked against it. Only the p grid "
+                         "and the per-p row counts inside the CSV were verified.\n";
+        }
+        std::cerr << "Note: periods is recorded neither in the file nor in its name, so it "
+                     "is not validated on resume.\n";
+    }
+    else if (!resume_enabled)
+    {
+        std::cerr << "Resume disabled by SIM_TMI_RESUME=0; any existing output was "
+                     "overwritten.\n";
+    }
 
     TmiWorkspace workspace;
     std::string line;
@@ -168,8 +252,11 @@ inline void run_1d_sim_tmi(int n,
 
     const auto start = std::chrono::steady_clock::now();
     auto last_report = start;
-    std::uint64_t processed = 0;
-    std::uint64_t last_processed = 0;
+    // Seeded from the checkpoint so the progress line counts toward the whole
+    // scan, while the rate and ETA describe this session only.
+    const std::uint64_t resumed_rows = checkpoint.rows;
+    std::uint64_t processed = resumed_rows;
+    std::uint64_t last_processed = resumed_rows;
     bool printed_state_backend = false;
 
     auto wait_if_host_paused = [&]() {
@@ -179,10 +266,12 @@ inline void run_1d_sim_tmi(int n,
             std::chrono::duration<double>(duration));
     };
 
-    for (std::size_t p_index = 0; p_index < ps.size(); ++p_index)
+    for (std::size_t p_index = checkpoint.start_p_index; p_index < ps.size(); ++p_index)
     {
         const double p = ps[p_index];
-        for (int r = 0; r < realizations; ++r)
+        const int first_realization =
+            (p_index == checkpoint.start_p_index) ? checkpoint.start_realization : 0;
+        for (int r = first_realization; r < realizations; ++r)
         {
             wait_if_host_paused();
 
@@ -267,7 +356,7 @@ inline void run_1d_sim_tmi(int n,
                 {
                     const double wall_elapsed = std::chrono::duration<double>(now - start).count();
                     const double active_elapsed = std::max(1.0e-12, wall_elapsed - pause_sentinel.paused_seconds());
-                    const double avg = static_cast<double>(processed) / active_elapsed;
+                    const double avg = static_cast<double>(processed - resumed_rows) / active_elapsed;
                     const double recent = static_cast<double>(processed - last_processed) / std::max(1.0e-12, since_last);
                     const double eta = avg > 0.0 ? static_cast<double>(total - processed) / avg : 0.0;
                     std::cerr << '\r'
@@ -298,15 +387,19 @@ inline void run_1d_sim_tmi(int n,
     const double wall_total = std::chrono::duration<double>(finish - start).count();
     const double active_total = std::max(1.0e-12, wall_total - pause_sentinel.paused_seconds());
     std::cerr << '\n'
-              << "Completed " << processed << " TMI row(s) in "
+              << "Completed " << (processed - resumed_rows) << " TMI row(s) in "
               << format_duration(active_total) << " active time";
+    if (resumed_rows > 0)
+    {
+        std::cerr << " (" << processed << " total in " << output_path << ")";
+    }
     if (pause_sentinel.paused_seconds() > 0.0)
     {
         std::cerr << " plus " << format_duration(pause_sentinel.paused_seconds()) << " paused by host";
     }
     std::cerr << ". Overall active throughput "
               << std::fixed << std::setprecision(2)
-              << (static_cast<double>(processed) / active_total) << "/s.\n";
+              << (static_cast<double>(processed - resumed_rows) / active_total) << "/s.\n";
     if (workspace.cuda_svd_disabled)
     {
         std::cerr << "Warning: cuSOLVER half-cut SVD was disabled after status "
@@ -489,6 +582,16 @@ inline void print_usage(const char *argv0)
         << "  the 16384-wide half cut of N=28.  I_3 at criticality is Renyi-index\n"
         << "  dependent, so order-2 output must not be pooled with order-1 output; p_c\n"
         << "  and nu are unaffected.  Output paths carry an _s2 tag to keep them apart.\n\n"
+        << "Resuming an interrupted run:\n"
+        << "  Re-issue the identical command and the run continues where it stopped instead\n"
+        << "  of overwriting. The output CSV is the checkpoint; there is no side-car state.\n"
+        << "  The run's identity is recovered from the generated file name, which carries the\n"
+        << "  circuit tag (and with it circ_type, all_cycles and the entropy order), n,\n"
+        << "  realizations, the p range and the resolution; the p column and per-p row counts\n"
+        << "  inside the CSV are cross-checked against the grid. periods is recorded nowhere\n"
+        << "  and is NOT validated, so do not point two runs of differing depth at one file.\n"
+        << "  Only whole circuits are kept: a partially written one is trimmed, costing at\n"
+        << "  most cycles-1 rows. Set SIM_TMI_RESUME=0 to overwrite instead.\n\n"
         << "Host pause control:\n"
         << "  By default, creating PAUSE_MIPT in the process working directory pauses at the next safe checkpoint.\n"
         << "  Removing PAUSE_MIPT resumes the run. Set SIM_TMI_PAUSE_FILE=/path/to/file to use another sentinel,\n"

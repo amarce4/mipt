@@ -85,13 +85,13 @@ free-energy-specific threshold with
 
 ### Resuming an interrupted run
 
-`free_energy.exe`, `entropy.exe` and `dist_scaling.exe` all resume; the shared
-CSV-reading and Welford-reconstruction machinery is in
+`free_energy.exe`, `entropy.exe`, `dist_scaling.exe` and `sim_tmi.exe` all
+resume; the shared CSV-reading and Welford-reconstruction machinery is in
 `include/mipt/util/resume_csv.hpp`, with one small per-application header on
 top. In every case the run's own output file *is* the checkpoint — there is no
 side-car state — which is what lets a run interrupted by a binary that predates
 the feature be picked up by one that has it. See "Resuming entropy.exe and
-dist_scaling.exe" below for those two.
+dist_scaling.exe" and "Resuming sim_tmi.exe" below for the other three.
 
 Re-issuing the identical command continues an interrupted run instead of
 overwriting it. The two CSVs are themselves the checkpoint: the samples file
@@ -119,6 +119,55 @@ divided by `N`, in natural-log units, before the spacetime anisotropy is
 applied. In the extracted root-level `data_analysis.py`, use
 `free_energy_ceff(..., alpha=...)` for the Fig. 1(b) double fit and
 `free_energy_equilibration(...)` for Supplementary Fig. S1(a,b).
+
+## Resuming sim_tmi.exe
+
+Re-issue the identical command and the scan continues where it stopped.
+`SIM_TMI_RESUME=0` overwrites instead.
+
+What makes this one different is that its CSV is deliberately *not*
+self-describing. A TMI scan emits `res * realizations * cycles` rows — 6.3M for
+an N=12 100k-realization all-cycles scan — so the schema stays `p,tmi` for the
+same reason `gmn.exe`'s stays `p,gmn,bipneg`, and there is no metadata block to
+validate against. The identity is recovered from the **generated file name**
+instead, which carries the circuit tag (and with it `circ_type`, `all_cycles`
+and the entropy order), `n`, `realizations`, the p range and the resolution. A
+name that parses but disagrees is refused, naming the offending field:
+
+```
+Resume refused: .../tmi_haarc_n_8_real_6_0.1_0.4_res_4.csv was produced with
+n=8 (this run uses 12). Move the existing file aside, or set SIM_TMI_RESUME=0
+to overwrite it.
+```
+
+**`periods` is recorded nowhere and is not validated.** Two runs differing only
+in depth pointed at one file would be conflated; that is an accepted gap, not an
+oversight, and the resume banner says so every time. Everything else is checked.
+
+The p column is a much stronger cross-check than it looks. Rows are written
+grouped by p in `linspace(p_min, p_max, res)` order, and writer and reader both
+render p through `append_double` at 17 significant digits, so a matching double
+round-trips to a byte-identical field. Comparing the text re-derives the whole
+grid exactly at the cost of one substring compare per row rather than a double
+parse over a several-hundred-megabyte file. A p that is off the grid, a group
+that ends early, or a group with more than `realizations * cycles` rows is
+refused.
+
+**Only whole circuits are kept.** A trailing partial circuit — reachable
+whenever `SIM_TMI_CSV_FLUSH_ROWS` is not a multiple of the cycle count, which
+the N=8/12 default of 1000 is — is trimmed before the file is reopened for
+appending, together with any unterminated final line. At most `cycles - 1` rows
+are given up, and the alternative is a trajectory whose cycle offsets are
+unevenly sampled plus an ambiguous restart point.
+
+Like `entropy.exe` and `dist_scaling.exe`, `sim_tmi.exe` never seeds its
+circuits, so there is no seed stream to continue: a resumed run simply draws
+more i.i.d. trajectories and is statistically identical to an uninterrupted one,
+though not comparable trajectory by trajectory.
+
+Note that the flush interval bounds what an interrupt can cost. For N >= 16 it
+is one circuit, so almost nothing is lost; for N=8 and N=12 it is 1000 rows, so
+a short scan that never reaches a flush can lose everything it had computed.
 
 ## Resuming entropy.exe and dist_scaling.exe
 

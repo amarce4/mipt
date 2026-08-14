@@ -4,6 +4,7 @@
 #include "mipt/entropy_resume.hpp"
 #include "mipt/free_energy_resume.hpp"
 #include "mipt/tmi/linalg.hpp"
+#include "mipt/tmi/resume.hpp"
 #include "mipt/types.hpp"
 
 #include <cassert>
@@ -810,6 +811,277 @@ void test_tmi_renyi2_primitives()
 
 } // namespace
 
+// --- sim_tmi.exe resume ------------------------------------------------------
+//
+// sim_tmi's CSV is `p,tmi` and carries no metadata, so its checkpoint rests on
+// two things: the generated file name, and the fact that rows arrive grouped by
+// p in grid order.  These tests render the CSV exactly as run_1d_sim_tmi does
+// and read it back.
+
+namespace tmi_resume = mipt::tmi::resume;
+
+// The p grid as both the writer and the checkpoint reader see it: text, at the
+// 17 significant digits append_double emits, so a matching double compares
+// byte-for-byte.
+std::vector<std::string> ps_text_grid(const std::vector<double> &ps)
+{
+    std::vector<std::string> texts;
+    texts.reserve(ps.size());
+    for (const double value : ps)
+    {
+        std::string text;
+        mipt::tmi::append_double(text, value);
+        texts.push_back(std::move(text));
+    }
+    return texts;
+}
+
+// The projection the runner performs on its rows.
+std::string render_tmi_csv(const std::vector<double> &ps,
+                           int realizations,
+                           int cycle_count,
+                           std::uint64_t rows_to_emit)
+{
+    std::string out(tmi_resume::kResultsHeader);
+    out += '\n';
+    const std::uint64_t rows_per_p =
+        static_cast<std::uint64_t>(realizations) * static_cast<std::uint64_t>(cycle_count);
+    std::uint64_t emitted = 0;
+    for (std::size_t i = 0; i < ps.size() && emitted < rows_to_emit; ++i)
+    {
+        for (std::uint64_t k = 0; k < rows_per_p && emitted < rows_to_emit; ++k)
+        {
+            mipt::tmi::append_double(out, ps[i]);
+            out += ',';
+            mipt::tmi::append_double(out, -0.5 - 1.0e-3 * static_cast<double>(emitted));
+            out += '\n';
+            ++emitted;
+        }
+    }
+    return out;
+}
+
+void test_tmi_resume()
+{
+    const auto directory =
+        std::filesystem::temp_directory_path() / "mipt_tmi_resume_core_tests";
+    std::filesystem::remove_all(directory);
+    std::filesystem::create_directories(directory);
+
+    // --- the name parser -----------------------------------------------------
+    {
+        tmi_resume::FileIdentity id;
+        assert(tmi_resume::parse_output_filename(
+            "tmi_haarc_s2_n_12_real_100000_0.07_0.27_res_21.csv", id));
+        assert(id.tag == "haarc_s2");
+        assert(id.n == 12);
+        assert(id.realizations == 100000);
+        assert(id.res == 21);
+        assert(id.p_min_text == "0.07");
+        assert(id.p_max_text == "0.27");
+
+        // The tag is whatever sits between the prefix and the last "_n_", so a
+        // plain circuit tag parses by the same rule.
+        tmi_resume::FileIdentity plain;
+        assert(tmi_resume::parse_output_filename(
+            "tmi_haar_n_16_real_20_0.1_0.4_res_3.csv", plain));
+        assert(plain.tag == "haar");
+        assert(plain.n == 16);
+
+        // A full path is accepted through path_basename.
+        assert(tmi_resume::parse_output_filename(
+            tmi_resume::path_basename("csv/tmi/rppu/tmi_rppu_n_8_real_5_0_1_res_2.csv"), plain));
+        assert(plain.tag == "rppu");
+        assert(plain.p_min_text == "0");
+        assert(plain.p_max_text == "1");
+
+        // Names that do not follow the convention are reported as unparseable
+        // rather than guessed at.
+        tmi_resume::FileIdentity junk;
+        assert(!tmi_resume::parse_output_filename("my_scan.csv", junk));
+        assert(!tmi_resume::parse_output_filename("tmi_haar_n_16_real_20_0.1_res_3.csv", junk));
+        assert(!tmi_resume::parse_output_filename("tmi_haar_n_16_real_20_0.1_0.4_res_3.txt", junk));
+    }
+
+    constexpr int realizations = 7;
+    constexpr int cycle_count = 3;
+    constexpr int res = 5;
+    const std::vector<double> ps = mipt::linspace(0.1, 0.5, res);
+    const std::uint64_t rows_per_p =
+        static_cast<std::uint64_t>(realizations) * static_cast<std::uint64_t>(cycle_count);
+    const std::uint64_t total = rows_per_p * static_cast<std::uint64_t>(res);
+
+    const std::string name = "tmi_haarc_n_12_real_7_0.1_0.5_res_5.csv";
+    const std::string path = (directory / name).string();
+
+    const auto write = [&](const std::string &content) {
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        out << content;
+    };
+    const auto scan = [&]() {
+        return tmi_resume::load(path, name, realizations, cycle_count, ps_text_grid(ps));
+    };
+
+    // --- stopped on a p boundary --------------------------------------------
+    {
+        write(render_tmi_csv(ps, realizations, cycle_count, 2 * rows_per_p));
+        const auto got = scan();
+        assert(got.loaded);
+        assert(got.name_verified);
+        assert(got.rows == 2 * rows_per_p);
+        assert(got.dropped_rows == 0);
+        assert(got.start_p_index == 2);
+        assert(got.start_realization == 0);
+        assert(got.kept_bytes == std::filesystem::file_size(path));
+    }
+
+    // --- stopped mid-p, on a whole circuit ----------------------------------
+    {
+        const std::uint64_t rows = 2 * rows_per_p + 3 * cycle_count;
+        write(render_tmi_csv(ps, realizations, cycle_count, rows));
+        const auto got = scan();
+        assert(got.rows == rows);
+        assert(got.dropped_rows == 0);
+        assert(got.start_p_index == 2);
+        assert(got.start_realization == 3);
+    }
+
+    // --- stopped mid-circuit: the partial circuit is trimmed -----------------
+    //
+    // Reachable whenever SIM_TMI_CSV_FLUSH_ROWS is not a multiple of the cycle
+    // count, which is the N=8/12 default of 1000.
+    for (std::uint64_t extra = 1; extra < static_cast<std::uint64_t>(cycle_count); ++extra)
+    {
+        const std::uint64_t whole = 2 * rows_per_p + 3 * cycle_count;
+        write(render_tmi_csv(ps, realizations, cycle_count, whole + extra));
+        const auto got = scan();
+        assert(got.dropped_rows == extra);
+        assert(got.rows == whole);
+        assert(got.start_p_index == 2);
+        assert(got.start_realization == 3);
+
+        // kept_bytes must land exactly on the trimmed file, and rescanning the
+        // trimmed file must agree -- this is the invariant the runner relies on
+        // when it reopens the CSV for appending.
+        assert(got.kept_bytes < std::filesystem::file_size(path));
+        std::filesystem::resize_file(path, got.kept_bytes);
+        const auto again = scan();
+        assert(again.rows == whole);
+        assert(again.dropped_rows == 0);
+        assert(again.start_p_index == got.start_p_index);
+        assert(again.start_realization == got.start_realization);
+        assert(again.kept_bytes == std::filesystem::file_size(path));
+    }
+
+    // --- killed mid-write: an unterminated final line ------------------------
+    {
+        std::string content = render_tmi_csv(ps, realizations, cycle_count,
+                                             2 * rows_per_p + 3 * cycle_count);
+        content += "0.3,-0.51";  // no newline
+        write(content);
+        const auto got = scan();
+        assert(got.rows == 2 * rows_per_p + 3 * cycle_count);
+        assert(got.dropped_rows == 0);
+        assert(got.kept_bytes < std::filesystem::file_size(path));
+        std::filesystem::resize_file(path, got.kept_bytes);
+        assert(scan().rows == got.rows);
+    }
+
+    // --- a complete scan ------------------------------------------------------
+    {
+        write(render_tmi_csv(ps, realizations, cycle_count, total));
+        const auto got = scan();
+        assert(got.rows == total);
+        assert(got.start_p_index == static_cast<std::size_t>(res));
+    }
+
+    // --- header only, and empty ----------------------------------------------
+    {
+        write(std::string(tmi_resume::kResultsHeader) + "\n");
+        const auto got = scan();
+        assert(got.rows == 0);
+        assert(got.start_p_index == 0);
+        assert(got.start_realization == 0);
+
+        write("");
+        const auto empty = scan();
+        assert(empty.rows == 0);
+        assert(!empty.loaded);
+    }
+
+    const auto refuses = [](auto &&action) {
+        bool threw = false;
+        try
+        {
+            action();
+        }
+        catch (const std::runtime_error &)
+        {
+            threw = true;
+        }
+        assert(threw);
+    };
+
+    // --- refusals -------------------------------------------------------------
+    write(render_tmi_csv(ps, realizations, cycle_count, 2 * rows_per_p));
+
+    // A name that parses but disagrees is a different scan sharing a directory.
+    refuses([&]() {
+        (void)tmi_resume::load(path, "tmi_haarc_n_16_real_7_0.1_0.5_res_5.csv",
+                               realizations, cycle_count, ps_text_grid(ps));
+    });
+    refuses([&]() {
+        (void)tmi_resume::load(path, "tmi_haarc_s2_n_12_real_7_0.1_0.5_res_5.csv",
+                               realizations, cycle_count, ps_text_grid(ps));
+    });
+    refuses([&]() {
+        (void)tmi_resume::load(path, "tmi_haarc_n_12_real_9_0.1_0.5_res_5.csv",
+                               realizations, cycle_count, ps_text_grid(ps));
+    });
+    refuses([&]() {
+        (void)tmi_resume::load(path, "tmi_haarc_n_12_real_7_0.1_0.5_res_9.csv",
+                               realizations, cycle_count, ps_text_grid(ps));
+    });
+
+    // A p grid the file was not written against.
+    refuses([&]() {
+        const std::vector<double> other = mipt::linspace(0.2, 0.5, res);
+        (void)tmi_resume::load(path, name, realizations, cycle_count, ps_text_grid(other));
+    });
+
+    // Realizations that do not divide the recorded groups: the p change lands
+    // somewhere a complete group cannot end.
+    refuses([&]() {
+        (void)tmi_resume::load(path, name, realizations + 1, cycle_count, ps_text_grid(ps));
+    });
+
+    // A truncated header, and a row with no comma.
+    refuses([&]() {
+        write("p,tmi,extra\n");
+        (void)scan();
+    });
+    refuses([&]() {
+        write(std::string(tmi_resume::kResultsHeader) + "\nnot-a-row\n");
+        (void)scan();
+    });
+
+    // More rows for one p than a complete group can hold.
+    refuses([&]() {
+        std::string content(tmi_resume::kResultsHeader);
+        content += '\n';
+        for (std::uint64_t k = 0; k < rows_per_p + 1; ++k)
+        {
+            mipt::tmi::append_double(content, ps[0]);
+            content += ",-0.5\n";
+        }
+        write(content);
+        (void)scan();
+    });
+
+    std::filesystem::remove_all(directory);
+    std::cout << "tmi resume tests passed\n";
+}
+
 int main()
 {
     test_circuit_metadata();
@@ -824,5 +1096,6 @@ int main()
     test_resume_checkpoint_scanning();
     test_entropy_resume();
     test_tmi_renyi2_primitives();
+    test_tmi_resume();
     std::cout << "core tests passed\n";
 }
