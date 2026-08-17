@@ -19,6 +19,8 @@ from scipy.optimize import brentq, differential_evolution, minimize
 
 from .fitting import _curvature_errors
 from .loading import (
+    _REALIZATION_COLUMNS,
+    _constant_column,
     _constant_csv_value,
     _find_column,
     _parse_size,
@@ -28,12 +30,14 @@ from .plotting import (
     _annotate_axes,
     _color_map_by_size,
     _font_kwargs,
+    _inset_rectangle,
     _inset_overlay_defaults,
     _set_secondary_title,
     _mi_unit_spec,
     _paired_axes,
     _reserve_axis_space,
     _show,
+    _style_inset,
 )
 
 
@@ -599,13 +603,18 @@ def _load_probe_pc_curve(
     p_col = _find_column(df, ["p", "measurement_rate"])
     mean_col = _find_column(df, spec["mean"])
     stderr_col = _find_column(df, spec["stderr"])
-    clean = pd.DataFrame(
-        {
-            "p": pd.to_numeric(df[p_col], errors="coerce"),
-            "value": pd.to_numeric(df[mean_col], errors="coerce"),
-            "dvalue": pd.to_numeric(df[stderr_col], errors="coerce"),
-        }
-    ).replace([np.inf, -np.inf], np.nan).dropna()
+    # The realization count rides along per row so that several scans at one L
+    # can be pooled exactly (see `_merge_probe_pc_curves`). It is optional:
+    # older files without the column pool by inverse variance instead.
+    reals_col = _find_column(df, list(_REALIZATION_COLUMNS), required=False)
+    columns = {
+        "p": pd.to_numeric(df[p_col], errors="coerce"),
+        "value": pd.to_numeric(df[mean_col], errors="coerce"),
+        "dvalue": pd.to_numeric(df[stderr_col], errors="coerce"),
+    }
+    if reals_col is not None:
+        columns["realizations"] = pd.to_numeric(df[reals_col], errors="coerce")
+    clean = pd.DataFrame(columns).replace([np.inf, -np.inf], np.nan).dropna()
     clean = clean.sort_values("p").drop_duplicates("p", keep="last")
     p_min, p_max = p_range
     if p_min is not None:
@@ -619,10 +628,330 @@ def _load_probe_pc_curve(
         clean["dvalue"] = np.abs(clean["dvalue"])
     return {
         "path": path,
+        "paths": [path],
         "L": _parse_size(path, l_by_file),
         "p": clean["p"].to_numpy(dtype=float),
         "value": clean["value"].to_numpy(dtype=float),
         "dvalue": clean["dvalue"].to_numpy(dtype=float),
+        "realizations": (
+            None
+            if reals_col is None
+            else clean["realizations"].to_numpy(dtype=float)
+        ),
+        "readout_time": _constant_column(
+            df, ["t", "time", "timestep"], integer=True
+        ),
+    }
+
+
+# Two p values are the same grid point if they agree to this. The scan grids
+# come from `checked_linspace` and are written at 17 digits, so a shared point
+# round-trips to within an ulp; anything a scan actually resolves is thousands
+# of times coarser, so there is a very wide margin either way.
+_PROBE_PC_MERGE_P_TOL = 1e-9
+
+
+def _pool_probe_pc_points(
+    values: np.ndarray,
+    errors: np.ndarray,
+    counts: np.ndarray | None,
+) -> tuple[float, float, float]:
+    """Pool independent estimates of one ``(L, p)`` point.
+
+    Returns ``(mean, stderr, realizations)``.
+
+    With realization counts known this is Welford's parallel merge, so the
+    result is exactly what one run over the concatenated trajectories would
+    have reported: ``m2 = stderr**2 * n * (n - 1)`` recovers each group's sum
+    of squares about its own mean -- the same inversion
+    ``util/resume_csv.hpp`` uses to restart a checkpointed scan -- the groups
+    are merged about the pooled mean, and the combined standard error is read
+    back out. Note the mean is weighted by ``n``, not by ``1/stderr**2``:
+    the former is the mean of the pooled sample, which is what the data would
+    have given, and the two differ whenever the per-run variances differ.
+
+    Without counts (a file carrying no realization column) there is no pooled
+    sample to reconstruct, so the estimates are combined by inverse variance
+    and the count is reported as ``nan``.
+    """
+    values = np.asarray(values, dtype=float)
+    errors = np.asarray(errors, dtype=float)
+    if values.size == 1:
+        return (
+            float(values[0]),
+            float(errors[0]),
+            float("nan") if counts is None else float(counts[0]),
+        )
+
+    if counts is None:
+        if not np.all(errors > 0.0):
+            # An exact point cannot be inverse-variance weighted. Fall back to
+            # the unweighted mean and keep the tightest error quoted.
+            return float(np.mean(values)), float(np.min(errors)), float("nan")
+        weights = 1.0 / errors**2
+        mean = float(np.sum(weights * values) / np.sum(weights))
+        return mean, float(1.0 / np.sqrt(np.sum(weights))), float("nan")
+
+    counts = np.asarray(counts, dtype=float)
+    total = float(np.sum(counts))
+    if total <= 0.0:
+        raise ValueError("Pooling requires positive realization counts.")
+    mean = float(np.sum(counts * values) / total)
+    # Each group's sum of squares about its own mean, then shifted onto the
+    # pooled mean. stderr**2 * n * (n - 1) is m2; a single-realization group
+    # contributes nothing, which is correct.
+    m2 = float(
+        np.sum(errors**2 * counts * (counts - 1.0))
+        + np.sum(counts * (values - mean) ** 2)
+    )
+    if total <= 1.0:
+        return mean, 0.0, total
+    return mean, float(np.sqrt(max(m2, 0.0) / (total * (total - 1.0)))), total
+
+
+def _merge_probe_pc_curves(
+    curves: Sequence[dict[str, Any]],
+    metric: str,
+    *,
+    verbose: bool = True,
+) -> list[dict[str, Any]]:
+    """Combine several scans at the same ``L`` into one curve.
+
+    Disjoint p grids interleave; a p point that several files share is pooled
+    by :func:`_pool_probe_pc_points`, so its error reflects the combined
+    realization count rather than one file's. Files at one ``L`` must agree on
+    the readout time -- mode 1 reads out at a fixed ``t=4N``, and two different
+    readout times are two different observables, not more statistics.
+    """
+    by_size: dict[int, list[dict[str, Any]]] = {}
+    for curve in curves:
+        by_size.setdefault(int(curve["L"]), []).append(curve)
+
+    merged: list[dict[str, Any]] = []
+    for size in sorted(by_size):
+        group = by_size[size]
+        if len(group) == 1:
+            merged.append(group[0])
+            continue
+
+        times = {
+            curve["readout_time"]
+            for curve in group
+            if curve["readout_time"] is not None
+        }
+        if len(times) > 1:
+            names = ", ".join(Path(c["path"]).name for c in group)
+            raise ValueError(
+                f"L={size}: refusing to merge scans with different readout "
+                f"times {sorted(times)}; these are different observables. "
+                f"Files: {names}."
+            )
+
+        missing = [c for c in group if c["realizations"] is None]
+        if missing and len(missing) != len(group):
+            warnings.warn(
+                f"L={size}: {len(missing)} of {len(group)} files carry no "
+                "realization column; pooling shared p points by inverse "
+                "variance instead of by realization count."
+            )
+        use_counts = not missing
+
+        points: list[tuple[float, float, float, float, int]] = []
+        stacked_p = np.concatenate([curve["p"] for curve in group])
+        stacked_value = np.concatenate([curve["value"] for curve in group])
+        stacked_error = np.concatenate([curve["dvalue"] for curve in group])
+        stacked_count = (
+            np.concatenate([curve["realizations"] for curve in group])
+            if use_counts
+            else None
+        )
+        order = np.argsort(stacked_p, kind="stable")
+        start = 0
+        shared = 0
+        while start < order.size:
+            stop = start + 1
+            while (
+                stop < order.size
+                and stacked_p[order[stop]] - stacked_p[order[start]]
+                <= _PROBE_PC_MERGE_P_TOL
+            ):
+                stop += 1
+            index = order[start:stop]
+            mean, stderr, count = _pool_probe_pc_points(
+                stacked_value[index],
+                stacked_error[index],
+                None if stacked_count is None else stacked_count[index],
+            )
+            points.append(
+                (float(np.mean(stacked_p[index])), mean, stderr, count, index.size)
+            )
+            shared += index.size > 1
+            start = stop
+
+        combined = dict(group[0])
+        combined["paths"] = [c["path"] for c in group]
+        combined["p"] = np.array([point[0] for point in points], dtype=float)
+        combined["value"] = np.array([point[1] for point in points], dtype=float)
+        combined["dvalue"] = np.array([point[2] for point in points], dtype=float)
+        combined["realizations"] = (
+            np.array([point[3] for point in points], dtype=float)
+            if use_counts
+            else None
+        )
+        combined["merged_files"] = len(group)
+        combined["shared_p_points"] = shared
+        merged.append(combined)
+
+        if verbose:
+            # Realizations per p point, not summed over the scan: the pooled
+            # count at a point is what its error bar is built from.
+            if use_counts:
+                low = int(np.min(combined["realizations"]))
+                high = int(np.max(combined["realizations"]))
+                span = f"{low:,}" if low == high else f"{low:,}-{high:,}"
+                total = f", {span} realizations per p"
+            else:
+                total = ""
+            print(
+                f"{metric}: L={size} merged {len(group)} files into "
+                f"{combined['p'].size} p points ({shared} shared{total})."
+            )
+
+    merged.sort(key=lambda curve: curve["L"])
+    return merged
+
+
+def _select_collapse_curves(
+    curves: Sequence[dict[str, Any]],
+    collapse_l_range: tuple[int | None, int | None],
+) -> list[dict[str, Any]]:
+    """Select the inclusive system-size range used by collapse fits."""
+    if not isinstance(collapse_l_range, tuple) or len(collapse_l_range) != 2:
+        raise ValueError(
+            "collapse_l_range must be a two-item tuple (L_min, L_max)."
+        )
+    lower, upper = collapse_l_range
+    for name, value in (("L_min", lower), ("L_max", upper)):
+        if value is not None and (
+            isinstance(value, (bool, np.bool_))
+            or not isinstance(value, (int, np.integer))
+        ):
+            raise ValueError(f"{name} in collapse_l_range must be an int or None.")
+    if lower is not None and upper is not None and lower > upper:
+        raise ValueError("collapse_l_range requires L_min <= L_max.")
+    selected = [
+        curve
+        for curve in curves
+        if (lower is None or curve["L"] >= lower)
+        and (upper is None or curve["L"] <= upper)
+    ]
+    if len(selected) < 2:
+        available = sorted(int(curve["L"]) for curve in curves)
+        raise ValueError(
+            "collapse_l_range must retain at least two system sizes; "
+            f"available sizes are {available}."
+        )
+    return selected
+
+
+def _zabalo_objective_from_arrays(
+    x: np.ndarray,
+    y: np.ndarray,
+    error: np.ndarray,
+    *,
+    correction_basis: np.ndarray | None = None,
+) -> dict[str, Any] | None:
+    r"""Evaluate Eqs. (S1)--(S4) of Zabalo et al. exactly.
+
+    The pooled data are sorted by their scaled coordinate.  Every interior
+    point is compared with the straight line through its two neighbours, and
+    all three quoted standard errors are propagated into the denominator.
+    If ``correction_basis`` is supplied, its linear coefficients are profiled
+    out before evaluating the same objective.  No empirical error floor or
+    interpolation grid is introduced.
+    """
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    error = np.asarray(error, dtype=float)
+    if not (x.ndim == y.ndim == error.ndim == 1):
+        raise ValueError("Zabalo objective arrays must be one-dimensional.")
+    if not (x.size == y.size == error.size):
+        raise ValueError("Zabalo objective arrays must have equal lengths.")
+    if x.size < 3:
+        return None
+    if not (
+        np.all(np.isfinite(x))
+        and np.all(np.isfinite(y))
+        and np.all(np.isfinite(error))
+        and np.all(error > 0.0)
+    ):
+        return None
+
+    order = np.argsort(x, kind="mergesort")
+    x, y, error = x[order], y[order], error[order]
+    basis = None
+    if correction_basis is not None:
+        basis = np.asarray(correction_basis, dtype=float)
+        if basis.ndim != 2 or basis.shape[0] != order.size:
+            raise ValueError(
+                "correction_basis must have shape (number of points, order)."
+            )
+        basis = basis[order]
+        if not np.all(np.isfinite(basis)):
+            return None
+
+    span = x[2:] - x[:-2]
+    # The paper assumes x_1 < ... < x_n.  Coincident triples can occur only
+    # at isolated parameter values for shared p grids; the exact expression
+    # is undefined there, so leave those values outside the objective domain.
+    if np.any(span <= 0.0):
+        return None
+    left_weight = (x[2:] - x[1:-1]) / span
+    right_weight = (x[1:-1] - x[:-2]) / span
+    interpolated = left_weight * y[:-2] + right_weight * y[2:]
+    residual = y[1:-1] - interpolated
+    variance = (
+        error[1:-1] ** 2
+        + (left_weight * error[:-2]) ** 2
+        + (right_weight * error[2:]) ** 2
+    )
+    if np.any(~np.isfinite(variance)) or np.any(variance <= 0.0):
+        return None
+
+    coefficients = None
+    if basis is not None:
+        residual_basis = (
+            basis[1:-1]
+            - left_weight[:, None] * basis[:-2]
+            - right_weight[:, None] * basis[2:]
+        )
+        if residual.size <= residual_basis.shape[1]:
+            return None
+        sigma = np.sqrt(variance)
+        try:
+            coefficients, _, rank, _ = np.linalg.lstsq(
+                residual_basis / sigma[:, None],
+                residual / sigma,
+                rcond=None,
+            )
+        except np.linalg.LinAlgError:
+            return None
+        if rank < residual_basis.shape[1] or not np.all(
+            np.isfinite(coefficients)
+        ):
+            return None
+        residual = residual - residual_basis @ coefficients
+
+    weights = residual**2 / variance
+    if not np.all(np.isfinite(weights)):
+        return None
+    return {
+        "score": float(np.sum(weights) / (x.size - 2)),
+        "weights": weights,
+        "coefficients": coefficients,
+        "x": x,
+        "y": y,
+        "error": error,
     }
 
 
@@ -640,9 +969,6 @@ def _fit_probe_pc_metric(
     omega_bounds: tuple[float, float],
     fixed_omega: float | None,
     f1_order: int,
-    interpolation_points: int,
-    relative_error_floor: float,
-    absolute_error_floor: float,
     seed: int,
 ) -> dict[str, Any]:
     if correction_to_scaling:
@@ -710,79 +1036,43 @@ def _fit_probe_pc_metric(
             curve["dvalue"] * scale
         )[order]
 
-    def correction_model(pc, nu, exponent, omega, curve_set=curves):
-        """Profile out F1 while leaving the common F0 curve nonparametric."""
-        pair_samples = []
-        x_scale = 0.0
-        for i in range(len(curve_set)):
-            for j in range(i + 1, len(curve_set)):
-                xa, ya, dya = raw_transformed(curve_set[i], pc, nu, exponent)
-                xb, yb, dyb = raw_transformed(curve_set[j], pc, nu, exponent)
-                lo, hi = max(xa.min(), xb.min()), min(xa.max(), xb.max())
-                if hi <= lo:
-                    continue
-                grid = np.linspace(lo, hi, interpolation_points)
-                ya_grid = np.interp(grid, xa, ya)
-                yb_grid = np.interp(grid, xb, yb)
-                dya_grid = np.interp(grid, xa, dya)
-                dyb_grid = np.interp(grid, xb, dyb)
-                typical = max(
-                    np.nanmedian(np.abs(ya_grid)),
-                    np.nanmedian(np.abs(yb_grid)),
-                    absolute_error_floor,
-                )
-                floor = max(absolute_error_floor, relative_error_floor * typical)
-                sigma = np.sqrt(dya_grid**2 + dyb_grid**2 + floor**2)
-                irrelevant_difference = (
-                    float(curve_set[i]["L"]) ** (-omega)
-                    - float(curve_set[j]["L"]) ** (-omega)
-                )
-                pair_samples.append(
-                    (grid, ya_grid - yb_grid, sigma, irrelevant_difference)
-                )
-                x_scale = max(x_scale, float(np.max(np.abs(grid))))
+    def pooled_transformed(pc, nu, exponent, curve_set=curves):
+        transformed = [
+            raw_transformed(curve, pc, nu, exponent) for curve in curve_set
+        ]
+        return tuple(
+            np.concatenate([values[index] for values in transformed])
+            for index in range(3)
+        )
 
-        if not pair_samples or not np.isfinite(x_scale):
+    def correction_model(pc, nu, exponent, omega, curve_set=curves):
+        """Profile polynomial F1 inside the exact Zabalo objective."""
+        x, y, error = pooled_transformed(
+            pc, nu, exponent, curve_set=curve_set
+        )
+        x_scale = float(np.max(np.abs(x)))
+        if not np.isfinite(x_scale):
             return None
         if x_scale == 0.0:
             x_scale = 1.0
-        design_parts, value_parts, sigma_parts = [], [], []
-        for grid, difference, sigma, irrelevant_difference in pair_samples:
-            polynomial_x = grid / x_scale
-            design_parts.append(
-                irrelevant_difference
-                * np.vander(polynomial_x, N=f1_order + 1, increasing=True)
-            )
-            value_parts.append(difference)
-            sigma_parts.append(sigma)
-        design = np.vstack(design_parts)
-        value = np.concatenate(value_parts)
-        sigma = np.concatenate(sigma_parts)
-        if value.size <= design.shape[1]:
+        size_factors = np.concatenate(
+            [
+                np.full(len(curve["p"]), float(curve["L"]) ** (-omega))
+                for curve in curve_set
+            ]
+        )
+        basis = size_factors[:, None] * np.vander(
+            x / x_scale, N=f1_order + 1, increasing=True
+        )
+        evaluated = _zabalo_objective_from_arrays(
+            x, y, error, correction_basis=basis
+        )
+        if evaluated is None:
             return None
-        try:
-            coefficients, _, rank, _ = np.linalg.lstsq(
-                design / sigma[:, None], value / sigma, rcond=None
-            )
-        except np.linalg.LinAlgError:
-            return None
-        if rank < design.shape[1] or not np.all(np.isfinite(coefficients)):
-            return None
-
-        offset = 0
-        pair_scores = []
-        for grid, _, pair_sigma, _ in pair_samples:
-            count = grid.size
-            pair_residual = (
-                value[offset:offset + count]
-                - design[offset:offset + count] @ coefficients
-            ) / pair_sigma
-            pair_scores.append(np.mean(pair_residual**2))
-            offset += count
         return {
-            "score": float(np.mean(pair_scores)),
+            "score": evaluated["score"],
             "x_scale": x_scale,
-            "f1_coefficients": coefficients,
+            "f1_coefficients": evaluated["coefficients"],
         }
 
     def objective(theta, curve_set=curves):
@@ -805,31 +1095,11 @@ def _fit_probe_pc_metric(
             )
             return np.inf if model is None else model["score"]
 
-        scores = []
-        for i in range(len(curve_set)):
-            for j in range(i + 1, len(curve_set)):
-                xa, ya, dya = raw_transformed(curve_set[i], pc, nu, exponent)
-                xb, yb, dyb = raw_transformed(curve_set[j], pc, nu, exponent)
-                lo, hi = max(xa.min(), xb.min()), min(xa.max(), xb.max())
-                if hi <= lo:
-                    continue
-                grid = np.linspace(lo, hi, interpolation_points)
-                ya_grid, yb_grid = np.interp(grid, xa, ya), np.interp(grid, xb, yb)
-                dya_grid = np.interp(grid, xa, dya)
-                dyb_grid = np.interp(grid, xb, dyb)
-                typical = max(
-                    np.nanmedian(np.abs(ya_grid)),
-                    np.nanmedian(np.abs(yb_grid)),
-                    absolute_error_floor,
-                )
-                floor = max(absolute_error_floor, relative_error_floor * typical)
-                scores.append(
-                    np.mean(
-                        (ya_grid - yb_grid) ** 2
-                        / (dya_grid**2 + dyb_grid**2 + floor**2)
-                    )
-                )
-        return float(np.mean(scores)) if scores else np.inf
+        x, y, error = pooled_transformed(
+            pc, nu, exponent, curve_set=curve_set
+        )
+        evaluated = _zabalo_objective_from_arrays(x, y, error)
+        return np.inf if evaluated is None else evaluated["score"]
 
     if bounds:
         global_fit = differential_evolution(
@@ -899,6 +1169,7 @@ def _fit_probe_pc_metric(
         "x_stderr": errors["x"],
         "omega_stderr": errors["omega"] if correction_to_scaling else None,
         "score": score,
+        "objective_name": "Zabalo-Kawashima-Ito",
         "correction_to_scaling": correction_to_scaling,
         "f1_order": f1_order,
         "f1_coefficients": (
@@ -983,6 +1254,25 @@ def _objective_threshold_interval(
         return float(bound)
 
     return find_limit(float(lower_bound)), find_limit(float(upper_bound))
+
+
+def _apply_objective_threshold_errors(
+    fit: dict[str, Any],
+    parameters: Sequence[str] = ("pc", "nu"),
+) -> None:
+    """Store paper-style 1.3 O* intervals and use their larger half-width."""
+    for parameter in parameters:
+        if parameter not in fit["fit_parameter_names"]:
+            continue
+        interval = _objective_threshold_interval(fit, parameter)
+        value = float(fit[parameter])
+        lower_error = max(0.0, value - interval[0])
+        upper_error = max(0.0, interval[1] - value)
+        fit[f"{parameter}_curvature_stderr"] = fit[f"{parameter}_stderr"]
+        fit[f"{parameter}_interval_1p3"] = interval
+        fit[f"{parameter}_stderr_minus"] = lower_error
+        fit[f"{parameter}_stderr_plus"] = upper_error
+        fit[f"{parameter}_stderr"] = max(lower_error, upper_error)
 
 
 def _curve_crossing(
@@ -1155,9 +1445,6 @@ def _fit_lyu_pairwise_metric(
     nu_bounds: tuple[float, float],
     x_bounds: tuple[float, float],
     fixed_x: float | None,
-    interpolation_points: int,
-    relative_error_floor: float,
-    absolute_error_floor: float,
     seed: int,
 ) -> dict[str, Any]:
     """Fit all size pairs with the original one-parameter scaling ansatz."""
@@ -1176,18 +1463,14 @@ def _fit_lyu_pairwise_metric(
             omega_bounds=(0.1, 4.0),
             fixed_omega=None,
             f1_order=0,
-            interpolation_points=interpolation_points,
-            relative_error_floor=relative_error_floor,
-            absolute_error_floor=absolute_error_floor,
             seed=seed + pair_index,
         )
-        pc_interval = _objective_threshold_interval(fit, "pc")
-        nu_interval = _objective_threshold_interval(fit, "nu")
+        _apply_objective_threshold_errors(fit)
+        pc_interval = fit["pc_interval_1p3"]
+        nu_interval = fit["nu_interval_1p3"]
         crossing = _pair_crossing_summary(
             curve_a, curve_b, reference=float(fit["pc"])
         )
-        fit["pc_interval_1p3"] = pc_interval
-        fit["nu_interval_1p3"] = nu_interval
         pair_results.append(
             {
                 "L1": int(curve_a["L"]),
@@ -1223,9 +1506,11 @@ def _fit_lyu_pairwise_metric(
     }
 
 
-def _draw_lyu_figure3(
-    pairwise_fits: Mapping[str, Mapping[str, Any]],
-    selected_metrics: Sequence[str],
+def _draw_lyu_extrapolation_row(
+    ax_pc,
+    ax_nu,
+    summary: Mapping[str, Any],
+    metric: str,
     *,
     cmap: str,
     show_errorbars: bool,
@@ -1234,15 +1519,9 @@ def _draw_lyu_figure3(
     legend_fontsize: float | None,
     annotation_loc: str | None,
     annotation_fontsize: float | None,
-    suptitle: str | None,
-    figsize: tuple[float, float] | None,
-    dpi: int,
-) -> tuple[Any, np.ndarray]:
-    """Draw the two-panel pairwise extrapolation used in Lyu Fig. 3."""
-    nrows = len(selected_metrics)
-    if figsize is None:
-        figsize = (13.0, 4.5 * nrows)
-    fig, axes = plt.subplots(nrows, 2, figsize=figsize, dpi=dpi, squeeze=False)
+    title_prefix: bool,
+) -> None:
+    """Draw one pair of Lyu-style large-size extrapolation axes."""
     color_map = plt.get_cmap(cmap)
     crossing_color = color_map(0.18)
     collapse_color = color_map(0.72)
@@ -1254,167 +1533,694 @@ def _draw_lyu_figure3(
     if annotation_fontsize is not None:
         annotation_kwargs["fontsize"] = annotation_fontsize
 
-    for row, metric in enumerate(selected_metrics):
-        summary = pairwise_fits[metric]
-        pairs = sorted(summary["pairs"], key=lambda item: item["inverse_product"])
-        x = np.asarray([item["inverse_product"] for item in pairs])
-        crossing_pc = np.asarray([item["crossing"]["pc"] for item in pairs])
-        crossing_error = np.asarray(
-            [item["crossing"]["stderr"] for item in pairs]
-        )
-        collapse_pc = np.asarray([item["collapse"]["pc"] for item in pairs])
-        collapse_pc_error = np.asarray(
+    pairs = sorted(summary["pairs"], key=lambda item: item["inverse_product"])
+    x = np.asarray([item["inverse_product"] for item in pairs])
+    crossing_pc = np.asarray([item["crossing"]["pc"] for item in pairs])
+    crossing_error = np.asarray([item["crossing"]["stderr"] for item in pairs])
+    collapse_pc = np.asarray([item["collapse"]["pc"] for item in pairs])
+    collapse_pc_error = np.asarray(
+        [
             [
-                [
-                    item["collapse"]["pc"]
-                    - item["collapse"]["pc_interval_1p3"][0]
-                    for item in pairs
-                ],
-                [
-                    item["collapse"]["pc_interval_1p3"][1]
-                    - item["collapse"]["pc"]
-                    for item in pairs
-                ],
-            ]
-        )
-        nu = np.asarray([item["collapse"]["nu"] for item in pairs])
-        nu_error = np.asarray(
+                item["collapse"]["pc"]
+                - item["collapse"]["pc_interval_1p3"][0]
+                for item in pairs
+            ],
             [
-                [
-                    item["collapse"]["nu"]
-                    - item["collapse"]["nu_interval_1p3"][0]
-                    for item in pairs
-                ],
-                [
-                    item["collapse"]["nu_interval_1p3"][1]
-                    - item["collapse"]["nu"]
-                    for item in pairs
-                ],
-            ]
-        )
-        excluded_mask = np.asarray(
-            [not item["included_in_extrapolation"] for item in pairs]
-        )
-        ax_pc, ax_nu = axes[row]
-        ax_pc.errorbar(
-            x,
-            crossing_pc,
-            yerr=crossing_error if show_errorbars else None,
-            fmt="o",
-            color=crossing_color,
-            ecolor=crossing_color,
-            markersize=4.5,
-            linewidth=1.1,
-            elinewidth=0.9,
-            capsize=capsize,
-            label="curve crossing",
-        )
-        ax_pc.errorbar(
-            x,
-            collapse_pc,
-            yerr=collapse_pc_error if show_errorbars else None,
-            fmt="s",
-            color=collapse_color,
-            ecolor=collapse_color,
-            markersize=4.2,
-            linewidth=1.1,
-            elinewidth=0.9,
-            capsize=capsize,
-            label="curve collapse",
-        )
-        ax_nu.errorbar(
-            x,
-            nu,
-            yerr=nu_error if show_errorbars else None,
-            fmt="o",
-            color=nu_color,
-            ecolor=nu_color,
-            markersize=4.5,
-            linewidth=1.1,
-            elinewidth=0.9,
-            capsize=capsize,
-            label=r"pairwise $\nu$",
-        )
+                item["collapse"]["pc_interval_1p3"][1]
+                - item["collapse"]["pc"]
+                for item in pairs
+            ],
+        ]
+    )
+    nu = np.asarray([item["collapse"]["nu"] for item in pairs])
+    nu_error = np.asarray(
+        [
+            [
+                item["collapse"]["nu"]
+                - item["collapse"]["nu_interval_1p3"][0]
+                for item in pairs
+            ],
+            [
+                item["collapse"]["nu_interval_1p3"][1]
+                - item["collapse"]["nu"]
+                for item in pairs
+            ],
+        ]
+    )
+    excluded_mask = np.asarray(
+        [not item["included_in_extrapolation"] for item in pairs]
+    )
+    ax_pc.errorbar(
+        x,
+        crossing_pc,
+        yerr=crossing_error if show_errorbars else None,
+        fmt="o",
+        color=crossing_color,
+        ecolor=crossing_color,
+        markersize=4.5,
+        linewidth=1.1,
+        elinewidth=0.9,
+        capsize=capsize,
+        label="curve crossing",
+    )
+    ax_pc.errorbar(
+        x,
+        collapse_pc,
+        yerr=collapse_pc_error if show_errorbars else None,
+        fmt="s",
+        color=collapse_color,
+        ecolor=collapse_color,
+        markersize=4.2,
+        linewidth=1.1,
+        elinewidth=0.9,
+        capsize=capsize,
+        label="curve collapse",
+    )
+    ax_nu.errorbar(
+        x,
+        nu,
+        yerr=nu_error if show_errorbars else None,
+        fmt="o",
+        color=nu_color,
+        ecolor=nu_color,
+        markersize=4.5,
+        linewidth=1.1,
+        elinewidth=0.9,
+        capsize=capsize,
+        label=r"pairwise $\nu$",
+    )
 
-        # Keep the rightmost (smallest-size) pair visible but mark its omission
-        # from the equal-weight extrapolation, matching Lyu Fig. 3.
-        if np.any(excluded_mask):
-            ax_pc.plot(
-                x[excluded_mask],
-                crossing_pc[excluded_mask],
-                "o",
-                markerfacecolor="white",
-                markeredgecolor=crossing_color,
-                markersize=4.7,
-            )
-            ax_pc.plot(
-                x[excluded_mask],
-                collapse_pc[excluded_mask],
-                "s",
-                markerfacecolor="white",
-                markeredgecolor=collapse_color,
-                markersize=4.5,
-            )
-            ax_nu.plot(
-                x[excluded_mask],
-                nu[excluded_mask],
-                "o",
-                markerfacecolor="white",
-                markeredgecolor=nu_color,
-                markersize=4.7,
-                label="excluded smallest pair",
-            )
-
-        line_x = np.linspace(0.0, float(np.max(x)) * 1.03, 250)
-        pc_line = summary["pc_crossing_extrapolation"]
-        nu_line = summary["nu_extrapolation"]
+    # Keep the rightmost (smallest-size) pair visible but mark its omission
+    # from the equal-weight extrapolation, matching Lyu Fig. 3.
+    if np.any(excluded_mask):
         ax_pc.plot(
-            line_x,
-            pc_line["intercept"] + pc_line["slope"] * line_x,
-            color="black",
-            linestyle="--",
-            linewidth=1.0,
-            label="equal-weight crossing fit",
+            x[excluded_mask],
+            crossing_pc[excluded_mask],
+            "o",
+            markerfacecolor="white",
+            markeredgecolor=crossing_color,
+            markersize=4.7,
+        )
+        ax_pc.plot(
+            x[excluded_mask],
+            collapse_pc[excluded_mask],
+            "s",
+            markerfacecolor="white",
+            markeredgecolor=collapse_color,
+            markersize=4.5,
         )
         ax_nu.plot(
-            line_x,
-            nu_line["intercept"] + nu_line["slope"] * line_x,
-            color="black",
-            linestyle="--",
-            linewidth=1.0,
-            label="equal-weight fit",
+            x[excluded_mask],
+            nu[excluded_mask],
+            "o",
+            markerfacecolor="white",
+            markeredgecolor=nu_color,
+            markersize=4.7,
+            label="excluded smallest pair",
         )
 
-        for axis in (ax_pc, ax_nu):
-            axis.set_xlabel(r"$(L_1L_2)^{-1}$")
-            axis.grid(alpha=0.25)
-            axis.legend(**legend_kwargs)
-        ax_pc.set_ylabel(r"$p_c(L_1,L_2)$")
-        ax_nu.set_ylabel(r"$\nu(L_1,L_2)$")
-        prefix = "" if nrows == 1 else _PROBE_PC_SPECS[metric]["title"] + " — "
-        ax_pc.set_title(prefix + "Critical measurement rate")
-        ax_nu.set_title(prefix + "Correlation-length exponent")
-        _annotate_axes(
+    line_x = np.linspace(0.0, float(np.max(x)) * 1.03, 250)
+    pc_line = summary["pc_crossing_extrapolation"]
+    nu_line = summary["nu_extrapolation"]
+    ax_pc.plot(
+        line_x,
+        pc_line["intercept"] + pc_line["slope"] * line_x,
+        color="black",
+        linestyle="--",
+        linewidth=1.0,
+        label="equal-weight crossing fit",
+    )
+    ax_nu.plot(
+        line_x,
+        nu_line["intercept"] + nu_line["slope"] * line_x,
+        color="black",
+        linestyle="--",
+        linewidth=1.0,
+        label="equal-weight fit",
+    )
+
+    for axis in (ax_pc, ax_nu):
+        axis.set_xlabel(r"$(L_1L_2)^{-1}$")
+        axis.grid(alpha=0.25)
+        axis.legend(**legend_kwargs)
+    ax_pc.set_ylabel(r"$p_c(L_1,L_2)$")
+    ax_nu.set_ylabel(r"$\nu(L_1,L_2)$")
+    prefix = _PROBE_PC_SPECS[metric]["title"] + " — " if title_prefix else ""
+    ax_pc.set_title(prefix + "Critical measurement rate")
+    ax_nu.set_title(prefix + "Correlation-length exponent")
+    _annotate_axes(
+        ax_pc,
+        rf"$p_c(\infty)={pc_line['intercept']:.5g}\pm "
+        rf"{pc_line['intercept_stderr']:.2g}$",
+        annotation_loc or "lower left",
+        **annotation_kwargs,
+    )
+    _annotate_axes(
+        ax_nu,
+        rf"$\nu(\infty)={nu_line['intercept']:.4g}\pm "
+        rf"{nu_line['intercept_stderr']:.2g}$",
+        annotation_loc or "lower left",
+        **annotation_kwargs,
+    )
+
+
+def _objective_plot_range(
+    fit: Mapping[str, Any],
+    parameter: str,
+    requested: tuple[float, float] | None,
+) -> tuple[float, float]:
+    """Choose a useful view around the 1.3 O* interval."""
+    bound = tuple(fit["fit_parameter_bounds"][parameter])
+    if requested is not None:
+        if not requested[0] < requested[1]:
+            raise ValueError(f"{parameter}_range must be strictly increasing.")
+        lower = max(bound[0], requested[0])
+        upper = min(bound[1], requested[1])
+        if lower >= upper:
+            raise ValueError(
+                f"{parameter}_range does not overlap the fitted bounds {bound}."
+            )
+        return lower, upper
+    value = float(fit[parameter])
+    lower, upper = _objective_threshold_interval(fit, parameter)
+    bound_span = float(bound[1] - bound[0])
+    half_width = max(
+        value - lower,
+        upper - value,
+        0.04 * bound_span,
+    )
+    if lower <= bound[0] or upper >= bound[1]:
+        half_width = max(half_width, 0.12 * bound_span)
+    return (
+        max(float(bound[0]), value - 1.5 * half_width),
+        min(float(bound[1]), value + 1.5 * half_width),
+    )
+
+
+def probe_pc_objective(
+    collapse_result: Mapping[str, Any],
+    *,
+    pc_range: tuple[float, float] | None = None,
+    nu_range: tuple[float, float] | None = None,
+    grid_points: int | tuple[int, int] = 151,
+    contour_factor: float = 1.3,
+    cmap: str = "viridis",
+    figsize: tuple[float, float] | None = None,
+    dpi: int = 130,
+    show: bool = True,
+) -> dict[str, Any]:
+    r"""Recreate Zabalo et al. (2020) Fig. S4 for a collapse result.
+
+    Pass the dictionary returned by :func:`probe_pc_collapse`.  The heatmap is
+    the exact objective ``O(p_c, nu)`` from Eqs. (S1)--(S4), with the white
+    contour at ``contour_factor * O*``.  Any additional fitted parameters are
+    held at their optimum; for the one-probe ``S_Q`` analysis, ``x=0`` is
+    fixed and the surface is exactly two-dimensional as in the paper.
+    """
+    if not np.isfinite(contour_factor) or contour_factor <= 1.0:
+        raise ValueError("contour_factor must be finite and greater than one.")
+    if isinstance(grid_points, (int, np.integer)) and not isinstance(
+        grid_points, (bool, np.bool_)
+    ):
+        pc_points = nu_points = int(grid_points)
+    elif (
+        isinstance(grid_points, tuple)
+        and len(grid_points) == 2
+        and all(
+            isinstance(value, (int, np.integer))
+            and not isinstance(value, (bool, np.bool_))
+            for value in grid_points
+        )
+    ):
+        pc_points, nu_points = map(int, grid_points)
+    else:
+        raise ValueError("grid_points must be an int or a two-int tuple.")
+    if min(pc_points, nu_points) < 20:
+        raise ValueError("grid_points must provide at least 20 points per axis.")
+
+    fits = collapse_result.get("global_fits", collapse_result.get("fits"))
+    if not isinstance(fits, Mapping):
+        raise ValueError("collapse_result does not contain global collapse fits.")
+    metrics = list(collapse_result.get("metrics", fits.keys()))
+    if not metrics:
+        raise ValueError("collapse_result contains no fitted metrics.")
+    if figsize is None:
+        figsize = (6.4 * len(metrics), 5.1)
+    fig, axes = plt.subplots(
+        1,
+        len(metrics),
+        figsize=figsize,
+        dpi=dpi,
+        squeeze=False,
+        constrained_layout=True,
+    )
+    surfaces = {}
+    for column, metric in enumerate(metrics):
+        fit = fits[metric]
+        names = tuple(fit["fit_parameter_names"])
+        if "pc" not in names or "nu" not in names:
+            raise ValueError(
+                "Zabalo Fig. S4 requires fitted p_c and nu; neither may be fixed."
+            )
+        pc_values = np.linspace(
+            *_objective_plot_range(fit, "pc", pc_range), pc_points
+        )
+        nu_values = np.linspace(
+            *_objective_plot_range(fit, "nu", nu_range), nu_points
+        )
+        theta = np.asarray(fit["fit_theta"], dtype=float)
+        pc_index, nu_index = names.index("pc"), names.index("nu")
+        surface = np.full((nu_points, pc_points), np.nan)
+        for nu_index_grid, nu_value in enumerate(nu_values):
+            for pc_index_grid, pc_value in enumerate(pc_values):
+                candidate = theta.copy()
+                candidate[pc_index] = pc_value
+                candidate[nu_index] = nu_value
+                score = float(fit["objective"](candidate))
+                if np.isfinite(score):
+                    surface[nu_index_grid, pc_index_grid] = score
+        finite = surface[np.isfinite(surface)]
+        if finite.size == 0:
+            raise RuntimeError(f"No finite objective values were found for {metric}.")
+        color_max = float(np.percentile(finite, 98.0))
+        color_min = float(np.min(finite))
+        if color_max <= color_min:
+            color_max = color_min + max(abs(color_min), 1.0) * 1e-6
+        axis = axes[0, column]
+        mesh = axis.pcolormesh(
+            pc_values,
+            nu_values,
+            surface,
+            shading="auto",
+            cmap=cmap,
+            vmin=color_min,
+            vmax=color_max,
+        )
+        threshold = contour_factor * float(fit["score"])
+        if color_min <= threshold <= float(np.nanmax(surface)):
+            axis.contour(
+                pc_values,
+                nu_values,
+                surface,
+                levels=[threshold],
+                colors="white",
+                linewidths=1.35,
+            )
+        axis.plot(
+            fit["pc"],
+            fit["nu"],
+            marker="*",
+            markersize=9,
+            markerfacecolor="white",
+            markeredgecolor="black",
+            markeredgewidth=0.7,
+            linestyle="none",
+        )
+        axis.set_xlabel(r"$p_c$")
+        axis.set_ylabel(r"$\nu$")
+        axis.set_title(
+            "Collapse objective"
+            if len(metrics) == 1
+            else _PROBE_PC_SPECS[metric]["title"]
+        )
+        colorbar = fig.colorbar(mesh, ax=axis)
+        colorbar.set_label(r"$O(p_c,\nu)$")
+        confidence = np.isfinite(surface) & (surface <= threshold)
+        if np.any(confidence):
+            pc_mask = np.any(confidence, axis=0)
+            nu_mask = np.any(confidence, axis=1)
+            pc_interval = (
+                float(pc_values[pc_mask][0]),
+                float(pc_values[pc_mask][-1]),
+            )
+            nu_interval = (
+                float(nu_values[nu_mask][0]),
+                float(nu_values[nu_mask][-1]),
+            )
+        else:
+            pc_interval = (np.nan, np.nan)
+            nu_interval = (np.nan, np.nan)
+        surfaces[metric] = {
+            "pc": pc_values,
+            "nu": nu_values,
+            "objective": surface,
+            "minimum": float(fit["score"]),
+            "threshold": threshold,
+            "pc_interval": pc_interval,
+            "nu_interval": nu_interval,
+            "mesh": mesh,
+            "colorbar": colorbar,
+        }
+
+    fig.suptitle("Zabalo et al. (2020) Fig. S4 collapse objective")
+    _show(fig, show)
+    return {
+        "figure": fig,
+        "axes": axes,
+        "surfaces": surfaces,
+        "contour_factor": contour_factor,
+    }
+
+
+def _resolve_raw_ylim(
+    value: Any,
+    metric: str,
+) -> tuple[float | None, float | None] | None:
+    """Pick and validate this metric's explicit raw-panel y limits.
+
+    Accepts one ``(lower, upper)`` pair shared by every metric, or a mapping
+    from metric name to such a pair -- a four-probe figure stacks ``I2``,
+    ``I3``, and ``I4``, whose scales have nothing to do with each other.
+    Either endpoint may be ``None`` to leave that side autoscaled.
+    """
+    if value is None:
+        return None
+    if isinstance(value, Mapping):
+        value = value.get(metric)
+        if value is None:
+            return None
+    if (
+        not isinstance(value, (tuple, list))
+        or len(value) != 2
+        or any(isinstance(item, (bool, np.bool_)) for item in value)
+    ):
+        raise ValueError(
+            "raw_ylim must be a (lower, upper) pair, or a mapping from metric "
+            f"name to one; got {value!r}."
+        )
+    limits: list[float | None] = []
+    for name, item in zip(("lower", "upper"), value):
+        if item is None:
+            limits.append(None)
+            continue
+        item = float(item)
+        if not np.isfinite(item):
+            raise ValueError(f"raw_ylim {name} bound must be finite; got {item!r}.")
+        limits.append(item)
+    lower, upper = limits
+    if lower is not None and upper is not None and lower >= upper:
+        raise ValueError(f"raw_ylim must be increasing; got {value!r}.")
+    return lower, upper
+
+
+def _draw_probe_pc_metric(
+    ax_raw,
+    ax_scaled,
+    *,
+    curves: Sequence[Mapping[str, Any]],
+    collapse_curves: Sequence[Mapping[str, Any]],
+    metric: str,
+    fit: Mapping[str, Any],
+    colors: Mapping[int, Any],
+    sq_units: str,
+    mi_units: str,
+    show_errorbars: bool,
+    capsize: float,
+    collapse_inset: bool,
+    inset_fontsize: float,
+    inset_headroom: float,
+    inset_corner: str,
+    legend_loc: str,
+    legend_fontsize: float | None,
+    legend_ncols: int,
+    annotation_loc: str,
+    annotation_fontsize: float | None,
+    raw_title: str | None,
+    collapse_title: str | None,
+    raw_ylim: tuple[float | None, float | None] | None = None,
+) -> None:
+    """Draw one raw/collapse pair using a pre-existing axes pair."""
+    spec = _PROBE_PC_SPECS[metric]
+    inset_font = _font_kwargs(collapse_inset, inset_fontsize)
+    _, _, reserve_side = _inset_overlay_defaults(inset_corner)
+    legend_kwargs: dict[str, Any] = {"loc": legend_loc, "ncols": legend_ncols}
+    if legend_fontsize is not None:
+        legend_kwargs["fontsize"] = legend_fontsize
+    annotation_kwargs: dict[str, Any] = {}
+    if annotation_fontsize is not None:
+        annotation_kwargs["fontsize"] = annotation_fontsize
+
+    for curve in curves:
+        size = int(curve["L"])
+        kwargs = {
+            "color": colors[size],
+            "marker": "o",
+            "markersize": 3.8,
+            "linewidth": 1.2,
+            "label": rf"$L={size}$",
+        }
+        if show_errorbars:
+            ax_raw.errorbar(
+                curve["p"],
+                curve["value"],
+                yerr=curve["dvalue"],
+                capsize=capsize,
+                elinewidth=0.9,
+                **kwargs,
+            )
+        else:
+            ax_raw.plot(curve["p"], curve["value"], **kwargs)
+    for curve in collapse_curves:
+        size = int(curve["L"])
+        kwargs = {
+            "color": colors[size],
+            "marker": "o",
+            "markersize": 3.8,
+            "linewidth": 1.2,
+            "label": rf"$L={size}$",
+        }
+        x_scaled, y_scaled, dy_scaled = fit["transform"](
+            curve, fit["pc"], fit["nu"], fit["x"]
+        )
+        if show_errorbars:
+            ax_scaled.errorbar(
+                x_scaled,
+                y_scaled,
+                yerr=dy_scaled,
+                capsize=capsize,
+                elinewidth=0.9,
+                **kwargs,
+            )
+        else:
+            ax_scaled.plot(x_scaled, y_scaled, **kwargs)
+
+    ax_raw.axvline(fit["pc"], color="black", linestyle="--", linewidth=1)
+    ax_raw.axhline(0.0, color="black", linewidth=0.7, alpha=0.3)
+    ax_raw.set_xlabel(r"Measurement rate $p$")
+    metric_units = sq_units if metric == "sq" else mi_units
+    ax_raw.set_ylabel(spec["ylabel"].replace("[nats]", f"[{metric_units}]"))
+    ax_raw.set_title(raw_title if raw_title is not None else spec["title"] + " — raw")
+    ax_raw.grid(alpha=0.25)
+    ax_raw.legend(**legend_kwargs)
+
+    ax_scaled.axvline(0.0, color="black", linestyle="--", linewidth=1)
+    ax_scaled.axhline(0.0, color="black", linewidth=0.7, alpha=0.3)
+    ax_scaled.set_xlabel(r"$(p-p_c)L^{1/\nu}$", **inset_font)
+    if not collapse_inset:
+        scaled_ylabel = spec["scaled_ylabel"]
+        if fit["correction_to_scaling"]:
+            scaled_ylabel += r" (leading correction subtracted)"
+        ax_scaled.set_ylabel(scaled_ylabel + f" [{metric_units}]")
+        ax_scaled.legend(**legend_kwargs)
+    ax_scaled.grid(alpha=0.25)
+    _set_secondary_title(
+        ax_scaled,
+        collapse_title,
+        inset=collapse_inset,
+        fontsize=inset_fontsize + 1.0,
+    )
+    correction_text = (
+        ""
+        if not fit["correction_to_scaling"]
+        else rf"$\omega={fit['omega']:.4g}\pm "
+        rf"{fit['omega_stderr']:.2g}$" + "\n"
+    )
+    _annotate_axes(
+        ax_raw if collapse_inset else ax_scaled,
+        rf"$p_c={fit['pc']:.5g}\pm {fit['pc_stderr']:.2g}$" + "\n"
+        + rf"$\nu={fit['nu']:.4g}\pm {fit['nu_stderr']:.2g}$" + "\n"
+        + correction_text
+        + rf"$O_*={fit['score']:.3g}$",
+        annotation_loc,
+        **annotation_kwargs,
+    )
+    if collapse_inset:
+        _reserve_axis_space(ax_raw, reserve_side, inset_headroom)
+    if raw_ylim is not None:
+        # Applied last, so it wins over both autoscale and the inset headroom
+        # reservation above. A `None` endpoint leaves that side as drawn, which
+        # is what makes `(0, None)` a way to just pin the floor -- autoscale
+        # puts it slightly below zero because the y=0 reference line is in the
+        # data range and matplotlib then adds its default margin.
+        lower, upper = raw_ylim
+        current_lower, current_upper = ax_raw.get_ylim()
+        ax_raw.set_ylim(
+            current_lower if lower is None else lower,
+            current_upper if upper is None else upper,
+        )
+
+
+# Inches of figure that the extrapolation layout spends on decorations rather
+# than on axes: tick labels, axis labels, panel titles, and the suptitle. They
+# turn a requested axes footprint into a figure size, so the panels come out at
+# roughly the requested inches instead of the requested inches minus whatever
+# the labels happened to need. The gutter is the inner decoration between the
+# two extrapolation panels -- counting it is what keeps the bottom row snug, so
+# that shrinking those panels moves them together instead of leaving them
+# marooned at the edges of over-wide grid cells.
+_EXTRAPOLATION_WIDTH_MARGIN = 1.00
+_EXTRAPOLATION_GUTTER = 1.03
+# Vertical decoration splits into a per-metric part (two rows of x labels and
+# the extrapolation titles) and the one suptitle, so a four-probe figure with
+# three metric rows is not sized as though it had one.
+_EXTRAPOLATION_ROW_MARGIN = 1.05
+_EXTRAPOLATION_SUPTITLE_MARGIN = 0.35
+
+
+def _panel_size(value: Any, name: str) -> tuple[float, float]:
+    """Validate a (width, height) axes footprint in inches."""
+    if (
+        not isinstance(value, (tuple, list))
+        or len(value) != 2
+        or any(isinstance(item, (bool, np.bool_)) for item in value)
+    ):
+        raise ValueError(f"{name} must be a (width, height) pair in inches.")
+    width, height = (float(item) for item in value)
+    if not (np.isfinite(width) and np.isfinite(height)) or width <= 0 or height <= 0:
+        raise ValueError(f"{name} must be positive and finite; got {value!r}.")
+    return width, height
+
+
+def _draw_probe_pc_extrapolation(
+    fits: Mapping[str, Mapping[str, Any]],
+    pairwise_fits: Mapping[str, Mapping[str, Any]],
+    curves_by_metric: Mapping[str, Sequence[Mapping[str, Any]]],
+    collapse_curves_by_metric: Mapping[str, Sequence[Mapping[str, Any]]],
+    selected_metrics: Sequence[str],
+    *,
+    sq_units: str,
+    mi_units: str,
+    cmap: str,
+    show_errorbars: bool,
+    capsize: float,
+    inset_corner: str,
+    inset_size: tuple[float, float],
+    inset_pad: tuple[float, float],
+    inset_fontsize: float,
+    inset_facecolor: str,
+    inset_alpha: float,
+    inset_headroom: float,
+    annotation_loc: str | None,
+    annotation_fontsize: float | None,
+    legend_loc: str | None,
+    legend_fontsize: float | None,
+    legend_ncols: int,
+    raw_title: str | None,
+    collapse_title: str | None,
+    suptitle: str | None,
+    raw_ylim: Any,
+    raw_panel_size: tuple[float, float],
+    extrapolation_panel_size: tuple[float, float],
+    figsize: tuple[float, float] | None,
+    dpi: int,
+) -> tuple[Any, np.ndarray]:
+    """Draw the raw collapse above the two Lyu extrapolation panels."""
+    metric_count = len(selected_metrics)
+    raw_width, raw_height = _panel_size(raw_panel_size, "raw_panel_size")
+    ext_width, ext_height = _panel_size(
+        extrapolation_panel_size, "extrapolation_panel_size"
+    )
+    if figsize is None:
+        figsize = (
+            max(raw_width, 2.0 * ext_width + _EXTRAPOLATION_GUTTER)
+            + _EXTRAPOLATION_WIDTH_MARGIN,
+            metric_count
+            * (raw_height + ext_height + _EXTRAPOLATION_ROW_MARGIN)
+            + _EXTRAPOLATION_SUPTITLE_MARGIN,
+        )
+    fig = plt.figure(figsize=figsize, dpi=dpi, constrained_layout=True)
+    # Rows are shared out by requested axes height, and every panel is locked to
+    # its requested aspect, so the realized footprints keep the requested ratio
+    # even when an explicit `figsize` scales them all.
+    height_ratios = [
+        ratio for _ in selected_metrics for ratio in (raw_height, ext_height)
+    ]
+    grid = fig.add_gridspec(2 * metric_count, 2, height_ratios=height_ratios)
+    all_sizes = sorted(
+        {int(curve["L"]) for curves in curves_by_metric.values() for curve in curves}
+    )
+    colors = _color_map_by_size(all_sizes, cmap)
+    axes = []
+    rectangle = _inset_rectangle(inset_corner, inset_size, inset_pad)
+    top_legend_loc = legend_loc or "center left"
+    top_annotation_loc = annotation_loc or "lower left"
+    for row, metric in enumerate(selected_metrics):
+        ax_raw = fig.add_subplot(grid[2 * row, :])
+        # The top panel spans both columns, so without an aspect lock it would
+        # stretch to the full figure width while the two extrapolation panels
+        # keep their own. Locking it to `raw_panel_size` is what lets the
+        # default put the three panels on a common span.
+        ax_raw.set_box_aspect(raw_height / raw_width)
+        ax_scaled = ax_raw.inset_axes(rectangle)
+        _style_inset(
+            ax_scaled,
+            inset_fontsize,
+            inset_facecolor,
+            inset_alpha,
+            rectangle,
+        )
+        ax_scaled.set_zorder(5.0)
+        _draw_probe_pc_metric(
+            ax_raw,
+            ax_scaled,
+            curves=curves_by_metric[metric],
+            collapse_curves=collapse_curves_by_metric[metric],
+            metric=metric,
+            fit=fits[metric],
+            colors=colors,
+            sq_units=sq_units,
+            mi_units=mi_units,
+            show_errorbars=show_errorbars,
+            capsize=capsize,
+            collapse_inset=True,
+            inset_fontsize=inset_fontsize,
+            inset_headroom=inset_headroom,
+            inset_corner=inset_corner,
+            legend_loc=top_legend_loc,
+            legend_fontsize=legend_fontsize,
+            legend_ncols=legend_ncols,
+            annotation_loc=top_annotation_loc,
+            annotation_fontsize=annotation_fontsize,
+            raw_title=raw_title,
+            collapse_title=collapse_title,
+            raw_ylim=_resolve_raw_ylim(raw_ylim, metric),
+        )
+        ax_pc = fig.add_subplot(grid[2 * row + 1, 0])
+        ax_nu = fig.add_subplot(grid[2 * row + 1, 1])
+        for ax in (ax_pc, ax_nu):
+            ax.set_box_aspect(ext_height / ext_width)
+        _draw_lyu_extrapolation_row(
             ax_pc,
-            rf"$p_c(\infty)={pc_line['intercept']:.5g}\pm "
-            rf"{pc_line['intercept_stderr']:.2g}$",
-            annotation_loc or "lower left",
-            **annotation_kwargs,
-        )
-        _annotate_axes(
             ax_nu,
-            rf"$\nu(\infty)={nu_line['intercept']:.4g}\pm "
-            rf"{nu_line['intercept_stderr']:.2g}$",
-            annotation_loc or "lower left",
-            **annotation_kwargs,
+            pairwise_fits[metric],
+            metric,
+            cmap=cmap,
+            show_errorbars=show_errorbars,
+            capsize=capsize,
+            legend_loc=legend_loc,
+            legend_fontsize=legend_fontsize,
+            annotation_loc=annotation_loc,
+            annotation_fontsize=annotation_fontsize,
+            title_prefix=metric_count > 1,
         )
+        axes.append((ax_raw, ax_scaled, ax_pc, ax_nu))
 
     fig.suptitle(
         suptitle
         if suptitle is not None
-        else "Pairwise finite-size extrapolation (Lyu et al. Fig. 3 protocol)"
+        else "Fixed-time probe collapse and pairwise finite-size extrapolation"
     )
-    return fig, axes
+    return fig, np.asarray(axes, dtype=object)
 
 
 def probe_pc_collapse(
@@ -1424,6 +2230,7 @@ def probe_pc_collapse(
     l_by_file: Mapping[str, int] | None = None,
     metrics: Sequence[str] | str | None = None,
     p_range: tuple[float | None, float | None] = (None, None),
+    collapse_l_range: tuple[int | None, int | None] = (None, None),
     pc_bounds: tuple[float, float] | None = None,
     nu_bounds: tuple[float, float] = (0.3, 5.0),
     x_bounds: tuple[float, float] = (0.0, 8.0),
@@ -1431,15 +2238,13 @@ def probe_pc_collapse(
     fixed_nu: float | None = None,
     fixed_x: float | Mapping[str, float] | None = None,
     correction_to_scaling: bool = False,
-    lyu_figure3: bool = False,
+    extrapolate: bool = False,
     omega_bounds: tuple[float, float] = (0.1, 4.0),
     fixed_omega: float | Mapping[str, float] | None = None,
     f1_order: int = 2,
     sq_units: str = "bits",
     mi_units: str = "bits",
-    interpolation_points: int = 250,
-    relative_error_floor: float = 0.02,
-    absolute_error_floor: float = 1e-10,
+    objective_grid_points: int | tuple[int, int] = 151,
     seed: int = 24680,
     cmap: str = "viridis",
     show_errorbars: bool = True,
@@ -1460,6 +2265,13 @@ def probe_pc_collapse(
     raw_title: str | None = None,
     collapse_title: str | None = "Finite-size scaling collapse",
     suptitle: str | None = None,
+    raw_ylim: (
+        tuple[float | None, float | None]
+        | Mapping[str, tuple[float | None, float | None]]
+        | None
+    ) = None,
+    raw_panel_size: tuple[float, float] = (9.4, 5.3),
+    extrapolation_panel_size: tuple[float, float] = (4.15, 3.5),
     figsize: tuple[float, float] | None = None,
     dpi: int = 130,
     show: bool = True,
@@ -1474,26 +2286,72 @@ def probe_pc_collapse(
     the noisier three-parameter multiprobe fits. ``mi_units`` controls all
     multiprobe information metrics independently of ``sq_units``.
 
+    **Several files may target one ``L``** -- an interleaved refinement of the
+    critical window, or a rerun adding realizations -- and they are pooled into
+    a single curve. Disjoint p grids simply interleave. A p point that more
+    than one file carries is pooled by realization count via Welford's
+    parallel merge, so its mean and standard error are exactly what one run
+    over the combined trajectories would have reported; the error therefore
+    shrinks as it should rather than being taken from whichever file was read
+    last. Files at one ``L`` must agree on the readout time ``t`` -- two
+    readout times are two different observables, not more statistics -- and a
+    file with no ``realizations`` column falls back to inverse-variance
+    weighting with a warning.
+
     Set ``correction_to_scaling=True`` to fit the leading irrelevant
     correction
     ``L^x I(p,L)=F_0(u)+L^{-omega}F_1(u)``, where
     ``u=(p-p_c)L^{1/nu}``. The collapse panel then subtracts the fitted
     ``L^{-omega}F_1(u)`` term. ``omega`` is fitted within ``omega_bounds``
     unless ``fixed_omega`` is supplied, and may be fixed separately for each
-    metric with a mapping. The existing pairwise-overlap score leaves
-    ``F_0`` nonparametric, while ``F_1`` is profiled out as a weighted
+    metric with a mapping. The Zabalo neighbour objective leaves ``F_0``
+    nonparametric, while ``F_1`` is profiled out as a weighted
     polynomial of order ``f1_order``. Restrict ``p_range`` to the scaling
     window when using this polynomial ansatz.
 
-    Set ``lyu_figure3=True`` to replace the raw/collapse plot with the
-    pairwise large-``L`` analysis of Fig. 3 in Lyu et al. (2026). Every
-    combination ``(L1, L2)`` is fitted independently with the original
-    ansatz, and its spline crossing and collapse ``p_c`` are plotted against
-    ``1/(L1 L2)`` beside the corresponding pairwise ``nu``. The rightmost
-    smallest-size pair is displayed but omitted from the equal-weight linear
-    extrapolations, as in the paper. Pairwise collapse limits satisfy
-    ``O=1.3 O*``. This mode is deliberately incompatible with
-    ``correction_to_scaling=True``.
+    Every collapse is scored with the exact Zabalo--Kawashima--Ito objective:
+    the scaled points from all sizes are pooled and sorted, each interior
+    point is compared with the line through its neighbours, and the three
+    quoted standard errors are propagated exactly. No relative error floor or
+    interpolation grid is used. Reported ``p_c`` and ``nu`` errors are the
+    larger half-widths of the one-parameter ``O <= 1.3 O*`` slices; the old
+    local-curvature estimates remain available as ``*_curvature_stderr``.
+
+    ``collapse_l_range=(L_min, L_max)`` inclusively selects which sizes enter
+    the fit and collapse inset; use ``None`` for either open endpoint. All
+    loaded sizes remain visible in the raw panel.
+
+    Set ``extrapolate=True`` for a three-panel figure: the ordinary raw scan
+    and collapse inset on top, followed by the pairwise large-``L`` analysis
+    of Fig. 3 in Lyu et al. (2026). Every ``(L1,L2)`` combination from the
+    selected collapse-size range is fitted independently with the original
+    ansatz. A separate supplemental figure recreates Zabalo et al. Fig. S4,
+    including the white ``O=1.3 O*`` contour. This mode is deliberately
+    incompatible with ``correction_to_scaling=True`` and fixed ``p_c`` or
+    ``nu``.
+
+    ``raw_ylim`` sets the raw panel's y limits explicitly, in both layouts. It
+    is applied after autoscaling and after the inset headroom reservation, so
+    it always wins; either endpoint may be ``None`` to leave that side alone.
+    That is usually what you want, because the ``y=0`` reference line puts zero
+    inside the autoscale range and matplotlib then adds its default margin
+    below it -- ``raw_ylim=(0, None)`` pins the floor to zero and leaves the
+    top free. Pass a mapping from metric name to a pair to set them per metric,
+    which is what stacked four-probe figures need.
+
+    ``raw_panel_size`` and ``extrapolation_panel_size`` size that figure's
+    panels, as ``(width, height)`` axes footprints in inches; the second sets
+    *each* of the two extrapolation panels, which are always equal. Both are
+    ignored when ``extrapolate=False``. Every panel is locked to the requested
+    aspect and the figure size is derived from them, so the realized footprints
+    come out at the requested inches. The defaults are chosen so the top panel
+    spans exactly the two extrapolation panels plus their gutter; changing one
+    without the other breaks that alignment, and a top width of about
+    ``2 * width + 1.03`` restores it to within half a percent (the gutter
+    itself creeps up a little as the panels grow). Passing ``figsize``
+    explicitly overrides the
+    derived size -- the panels then keep their aspect ratios but scale to fit,
+    so an under-sized ``figsize`` shrinks them rather than distorting them.
 
     Each collapse is drawn by default as an inset in the top-right corner of
     its raw panel, with one legend per row on the raw axes. ``inset_size``
@@ -1502,15 +2360,20 @@ def probe_pc_collapse(
     legend on both panels. ``raw_title`` overrides the per-metric title;
     ``None`` keeps ``"<metric title> — raw"``.
     """
-    if lyu_figure3 and correction_to_scaling:
+    if extrapolate and correction_to_scaling:
         raise ValueError(
-            "lyu_figure3=True uses only the original scaling ansatz and "
+            "extrapolate=True uses only the original scaling ansatz and "
             "cannot be combined with correction_to_scaling=True."
         )
-    if lyu_figure3 and (fixed_pc is not None or fixed_nu is not None):
+    if extrapolate and (fixed_pc is not None or fixed_nu is not None):
         raise ValueError(
-            "lyu_figure3=True must fit p_c and nu independently for every "
+            "extrapolate=True must fit p_c and nu independently for every "
             "size pair; fixed_pc and fixed_nu must both be None."
+        )
+    if extrapolate and not collapse_inset:
+        raise ValueError(
+            "extrapolate=True requires collapse_inset=True so the top panel "
+            "retains the original raw-plus-inset layout."
         )
     if fixed_omega is not None and not correction_to_scaling:
         raise ValueError(
@@ -1539,112 +2402,49 @@ def probe_pc_collapse(
         )
 
     curves_by_metric = {}
+    collapse_curves_by_metric = {}
     all_p = []
     for metric in selected_metrics:
         curves = [
             _load_probe_pc_curve(path, metric, l_by_file, p_range)
             for path in paths
         ]
-        curves.sort(key=lambda curve: curve["L"])
+        # Several scans may target one L -- an interleaved refinement of the
+        # critical window, or a rerun adding realizations. Pool them before
+        # anything downstream sees a size twice.
+        curves = _merge_probe_pc_curves(curves, metric)
         scale = sq_scale if metric == "sq" else mi_scale
         for curve in curves:
             curve["value"] *= scale
             curve["dvalue"] *= scale
-        sizes = [curve["L"] for curve in curves]
-        if len(set(sizes)) != len(sizes):
-            raise ValueError(f"Duplicate system sizes found: {sizes}")
-        if len(curves) < 3:
+        collapse_curves = _select_collapse_curves(curves, collapse_l_range)
+        collapse_sizes = [int(curve["L"]) for curve in collapse_curves]
+        for curve in collapse_curves:
+            if np.any(np.asarray(curve["dvalue"], dtype=float) <= 0.0):
+                raise ValueError(
+                    "The exact Zabalo objective requires strictly positive "
+                    f"standard errors; found a zero error for L={curve['L']}."
+                )
+        if len(collapse_curves) < 3:
             warnings.warn("Critical collapse has fewer than three system sizes.")
-        if correction_to_scaling and len(curves) < 4:
+        if correction_to_scaling and len(collapse_curves) < 4:
             warnings.warn(
                 "Correction-to-scaling fits are weakly constrained with fewer "
                 "than four system sizes."
             )
+        if extrapolate and len(collapse_curves) < 4:
+            raise ValueError(
+                "extrapolate=True requires at least four sizes inside "
+                f"collapse_l_range; selected {collapse_sizes}."
+            )
         curves_by_metric[metric] = curves
-        all_p.extend(np.concatenate([curve["p"] for curve in curves]))
+        collapse_curves_by_metric[metric] = collapse_curves
+        all_p.extend(np.concatenate([curve["p"] for curve in collapse_curves]))
 
     if pc_bounds is None:
         pc_bounds = (float(np.min(all_p)), float(np.max(all_p)))
     if not pc_bounds[0] < pc_bounds[1]:
         raise ValueError("pc_bounds must be strictly increasing.")
-
-    if lyu_figure3:
-        pairwise_fits = {}
-        for index, metric in enumerate(selected_metrics):
-            curves = curves_by_metric[metric]
-            if len(curves) < 4:
-                raise ValueError(
-                    "lyu_figure3=True requires at least four system sizes so "
-                    "the smallest pair can be omitted while retaining at "
-                    "least three extrapolation points."
-                )
-            if isinstance(fixed_x, Mapping):
-                metric_fixed_x = fixed_x.get(metric)
-            elif fixed_x is not None:
-                metric_fixed_x = float(fixed_x)
-            else:
-                metric_fixed_x = 0.0 if metric == "sq" else None
-            pairwise_fits[metric] = _fit_lyu_pairwise_metric(
-                curves,
-                metric,
-                pc_bounds=pc_bounds,
-                nu_bounds=nu_bounds,
-                x_bounds=x_bounds,
-                fixed_x=metric_fixed_x,
-                interpolation_points=interpolation_points,
-                relative_error_floor=relative_error_floor,
-                absolute_error_floor=absolute_error_floor,
-                seed=seed + 10_000 * index,
-            )
-            summary = pairwise_fits[metric]
-            for pair in summary["pairs"]:
-                collapse = pair["collapse"]
-                print(
-                    f"{metric} (L1,L2)=({pair['L1']},{pair['L2']}): "
-                    f"p_c(cross)={pair['crossing']['pc']:.6g} ± "
-                    f"{pair['crossing']['stderr']:.3g}, "
-                    f"p_c(collapse)={collapse['pc']:.6g}, "
-                    f"nu={collapse['nu']:.6g}, score={collapse['score']:.6g}"
-                )
-            pc_line = summary["pc_crossing_extrapolation"]
-            nu_line = summary["nu_extrapolation"]
-            print(
-                f"{metric}: p_c(inf)={pc_line['intercept']:.6g} ± "
-                f"{pc_line['intercept_stderr']:.3g}, "
-                f"nu(inf)={nu_line['intercept']:.6g} ± "
-                f"{nu_line['intercept_stderr']:.3g}; excluded pair="
-                f"{summary['excluded_pair']}"
-            )
-
-        fig, axes = _draw_lyu_figure3(
-            pairwise_fits,
-            selected_metrics,
-            cmap=cmap,
-            show_errorbars=show_errorbars,
-            capsize=capsize,
-            legend_loc=legend_loc,
-            legend_fontsize=legend_fontsize,
-            annotation_loc=annotation_loc,
-            annotation_fontsize=annotation_fontsize,
-            suptitle=suptitle,
-            figsize=figsize,
-            dpi=dpi,
-        )
-        _show(fig, show)
-        return {
-            "figure": fig,
-            "axes": axes,
-            "collapse_inset": False,
-            "lyu_figure3": True,
-            "probes": probes,
-            "metrics": selected_metrics,
-            "correction_to_scaling": False,
-            "sq_units": sq_units,
-            "mi_units": mi_units,
-            "fits": pairwise_fits,
-            "pairwise_fits": pairwise_fits,
-            "curves": curves_by_metric,
-        }
 
     fits = {}
     for index, metric in enumerate(selected_metrics):
@@ -1661,7 +2461,7 @@ def probe_pc_collapse(
         else:
             metric_fixed_omega = None
         fits[metric] = _fit_probe_pc_metric(
-            curves_by_metric[metric],
+            collapse_curves_by_metric[metric],
             metric,
             pc_bounds=pc_bounds,
             nu_bounds=nu_bounds,
@@ -1673,12 +2473,10 @@ def probe_pc_collapse(
             omega_bounds=omega_bounds,
             fixed_omega=metric_fixed_omega,
             f1_order=f1_order,
-            interpolation_points=interpolation_points,
-            relative_error_floor=relative_error_floor,
-            absolute_error_floor=absolute_error_floor,
             seed=seed + index,
         )
         fit = fits[metric]
+        _apply_objective_threshold_errors(fit)
         omega_text = (
             ""
             if not correction_to_scaling
@@ -1695,6 +2493,115 @@ def probe_pc_collapse(
             f"score={fit['score']:.6g}"
         )
 
+    pairwise_fits = None
+    if extrapolate:
+        pairwise_fits = {}
+        for index, metric in enumerate(selected_metrics):
+            if isinstance(fixed_x, Mapping):
+                metric_fixed_x = fixed_x.get(metric)
+            elif fixed_x is not None:
+                metric_fixed_x = float(fixed_x)
+            else:
+                metric_fixed_x = 0.0 if metric == "sq" else None
+            pairwise_fits[metric] = _fit_lyu_pairwise_metric(
+                collapse_curves_by_metric[metric],
+                metric,
+                pc_bounds=pc_bounds,
+                nu_bounds=nu_bounds,
+                x_bounds=x_bounds,
+                fixed_x=metric_fixed_x,
+                seed=seed + 10_000 * index,
+            )
+            summary = pairwise_fits[metric]
+            for pair in summary["pairs"]:
+                collapse = pair["collapse"]
+                print(
+                    f"{metric} (L1,L2)=({pair['L1']},{pair['L2']}): "
+                    f"p_c(cross)={pair['crossing']['pc']:.6g} ± "
+                    f"{pair['crossing']['stderr']:.3g}, "
+                    f"p_c(collapse)={collapse['pc']:.6g}, "
+                    f"nu={collapse['nu']:.6g}, O*={collapse['score']:.6g}"
+                )
+            pc_line = summary["pc_crossing_extrapolation"]
+            nu_line = summary["nu_extrapolation"]
+            print(
+                f"{metric}: p_c(inf)={pc_line['intercept']:.6g} ± "
+                f"{pc_line['intercept_stderr']:.3g}, "
+                f"nu(inf)={nu_line['intercept']:.6g} ± "
+                f"{nu_line['intercept_stderr']:.3g}; excluded pair="
+                f"{summary['excluded_pair']}"
+            )
+
+        fig, axes = _draw_probe_pc_extrapolation(
+            fits,
+            pairwise_fits,
+            curves_by_metric,
+            collapse_curves_by_metric,
+            selected_metrics,
+            sq_units=sq_units,
+            mi_units=mi_units,
+            cmap=cmap,
+            show_errorbars=show_errorbars,
+            capsize=capsize,
+            inset_corner=inset_corner,
+            inset_size=inset_size,
+            inset_pad=inset_pad,
+            inset_fontsize=inset_fontsize,
+            inset_facecolor=inset_facecolor,
+            inset_alpha=inset_alpha,
+            inset_headroom=inset_headroom,
+            annotation_loc=annotation_loc,
+            annotation_fontsize=annotation_fontsize,
+            legend_loc=legend_loc,
+            legend_fontsize=legend_fontsize,
+            legend_ncols=legend_ncols,
+            raw_title=raw_title,
+            collapse_title=collapse_title,
+            suptitle=suptitle,
+            raw_ylim=raw_ylim,
+            raw_panel_size=raw_panel_size,
+            extrapolation_panel_size=extrapolation_panel_size,
+            figsize=figsize,
+            dpi=dpi,
+        )
+        collapse_sizes_by_metric = {
+            metric: tuple(int(curve["L"]) for curve in curves)
+            for metric, curves in collapse_curves_by_metric.items()
+        }
+        result = {
+            "figure": fig,
+            "axes": axes,
+            "collapse_inset": True,
+            "extrapolate": True,
+            "probes": probes,
+            "metrics": selected_metrics,
+            "correction_to_scaling": False,
+            "sq_units": sq_units,
+            "mi_units": mi_units,
+            "fits": fits,
+            "global_fits": fits,
+            "pairwise_fits": pairwise_fits,
+            "curves": curves_by_metric,
+            "collapse_curves": collapse_curves_by_metric,
+            "collapse_l_range": collapse_l_range,
+            "collapse_sizes": collapse_sizes_by_metric,
+        }
+        # Show the main composite first, then create/show the supplemental
+        # objective figure so notebook output naturally stacks them.
+        _show(fig, show)
+        objective_result = probe_pc_objective(
+            result,
+            grid_points=objective_grid_points,
+            cmap=cmap,
+            dpi=dpi,
+            show=show,
+        )
+        result["objective_figure"] = objective_result["figure"]
+        result["objective_axes"] = objective_result["axes"]
+        result["objective_surfaces"] = objective_result["surfaces"]
+        result["supplemental"] = objective_result
+        return result
+
     nrows = len(selected_metrics)
     if figsize is None:
         figsize = (7.6, 5.2 * nrows) if collapse_inset else (13, 4.5 * nrows)
@@ -1710,102 +2617,43 @@ def probe_pc_collapse(
         inset_facecolor=inset_facecolor,
         inset_alpha=inset_alpha,
     )
-    inset_font = _font_kwargs(collapse_inset, inset_fontsize)
-    _, _, reserve_side = _inset_overlay_defaults(inset_corner)
-    # Crossing curves leave the left column free, so both overlays stack
-    # there: the parameter box in the corner, the legend centred above it.
-    if legend_loc is None:
-        legend_loc = "center left" if collapse_inset else "best"
-    if annotation_loc is None:
-        annotation_loc = "lower left" if collapse_inset else "lower right"
-    legend_kwargs: dict[str, Any] = {"loc": legend_loc, "ncols": legend_ncols}
-    if legend_fontsize is not None:
-        legend_kwargs["fontsize"] = legend_fontsize
-    annotation_kwargs: dict[str, Any] = {}
-    if annotation_fontsize is not None:
-        annotation_kwargs["fontsize"] = annotation_fontsize
-    sizes = sorted({curve["L"] for curves in curves_by_metric.values() for curve in curves})
+    resolved_legend_loc = legend_loc or (
+        "center left" if collapse_inset else "best"
+    )
+    resolved_annotation_loc = annotation_loc or (
+        "lower left" if collapse_inset else "lower right"
+    )
+    sizes = sorted(
+        {curve["L"] for curves in curves_by_metric.values() for curve in curves}
+    )
     colors = _color_map_by_size(sizes, cmap)
     for row, metric in enumerate(selected_metrics):
-        spec = _PROBE_PC_SPECS[metric]
-        fit = fits[metric]
         ax_raw, ax_scaled = axes[row]
-        for curve in curves_by_metric[metric]:
-            size = curve["L"]
-            kwargs = {
-                "color": colors[size],
-                "marker": "o",
-                "markersize": 3.8,
-                "linewidth": 1.2,
-                "label": rf"$L={size}$",
-            }
-            if show_errorbars:
-                ax_raw.errorbar(
-                    curve["p"], curve["value"], yerr=curve["dvalue"],
-                    capsize=capsize, elinewidth=0.9, **kwargs
-                )
-            else:
-                ax_raw.plot(curve["p"], curve["value"], **kwargs)
-            x_scaled, y_scaled, dy_scaled = fit["transform"](
-                curve, fit["pc"], fit["nu"], fit["x"]
-            )
-            if show_errorbars:
-                ax_scaled.errorbar(
-                    x_scaled, y_scaled, yerr=dy_scaled,
-                    capsize=capsize, elinewidth=0.9, **kwargs
-                )
-            else:
-                ax_scaled.plot(x_scaled, y_scaled, **kwargs)
-
-        ax_raw.axvline(fit["pc"], color="black", linestyle="--", linewidth=1)
-        ax_raw.axhline(0.0, color="black", linewidth=0.7, alpha=0.3)
-        ax_raw.set_xlabel(r"Measurement rate $p$")
-        metric_units = sq_units if metric == "sq" else mi_units
-        ax_raw.set_ylabel(spec["ylabel"].replace("[nats]", f"[{metric_units}]"))
-        ax_raw.set_title(
-            raw_title if raw_title is not None else spec["title"] + " — raw"
-        )
-        ax_raw.grid(alpha=0.25)
-        ax_raw.legend(**legend_kwargs)
-
-        ax_scaled.axvline(0.0, color="black", linestyle="--", linewidth=1)
-        ax_scaled.axhline(0.0, color="black", linewidth=0.7, alpha=0.3)
-        ax_scaled.set_xlabel(r"$(p-p_c)L^{1/\nu}$", **inset_font)
-        if not collapse_inset:
-            scaled_ylabel = spec["scaled_ylabel"]
-            if fit["correction_to_scaling"]:
-                scaled_ylabel += r" (leading correction subtracted)"
-            ax_scaled.set_ylabel(scaled_ylabel + f" [{metric_units}]")
-            ax_scaled.legend(**legend_kwargs)
-        ax_scaled.grid(alpha=0.25)
-        _set_secondary_title(
+        _draw_probe_pc_metric(
+            ax_raw,
             ax_scaled,
-            collapse_title,
-            inset=collapse_inset,
-            fontsize=inset_fontsize + 1.0,
+            curves=curves_by_metric[metric],
+            collapse_curves=collapse_curves_by_metric[metric],
+            metric=metric,
+            fit=fits[metric],
+            colors=colors,
+            sq_units=sq_units,
+            mi_units=mi_units,
+            show_errorbars=show_errorbars,
+            capsize=capsize,
+            collapse_inset=collapse_inset,
+            inset_fontsize=inset_fontsize,
+            inset_headroom=inset_headroom,
+            inset_corner=inset_corner,
+            legend_loc=resolved_legend_loc,
+            legend_fontsize=legend_fontsize,
+            legend_ncols=legend_ncols,
+            annotation_loc=resolved_annotation_loc,
+            annotation_fontsize=annotation_fontsize,
+            raw_title=raw_title,
+            collapse_title=collapse_title,
+            raw_ylim=_resolve_raw_ylim(raw_ylim, metric),
         )
-        x_text = (
-            r"$x=0$ fixed"
-            if metric == "sq" and abs(fit["x"]) < 1e-14
-            else rf"${spec['x_symbol']}={fit['x']:.4g}\pm {fit['x_stderr']:.2g}$"
-        )
-        correction_text = (
-            ""
-            if not fit["correction_to_scaling"]
-            else rf"$\omega={fit['omega']:.4g}\pm "
-            rf"{fit['omega_stderr']:.2g}$" + "\n"
-        )
-        _annotate_axes(
-            ax_raw if collapse_inset else ax_scaled,
-            rf"$p_c={fit['pc']:.5g}\pm {fit['pc_stderr']:.2g}$" + "\n"
-            + rf"$\nu={fit['nu']:.4g}\pm {fit['nu_stderr']:.2g}$" + "\n"
-            + correction_text
-            + rf"score $={fit['score']:.3g}$",
-            annotation_loc,
-            **annotation_kwargs,
-        )
-        if collapse_inset:
-            _reserve_axis_space(ax_raw, reserve_side, inset_headroom)
     fig.suptitle(
         suptitle
         if suptitle is not None
@@ -1816,14 +2664,22 @@ def probe_pc_collapse(
         "figure": fig,
         "axes": np.array(axes, dtype=object),
         "collapse_inset": collapse_inset,
-        "lyu_figure3": False,
+        "extrapolate": False,
         "probes": probes,
         "metrics": selected_metrics,
         "correction_to_scaling": correction_to_scaling,
         "sq_units": sq_units,
         "mi_units": mi_units,
         "fits": fits,
+        "global_fits": fits,
+        "pairwise_fits": None,
         "curves": curves_by_metric,
+        "collapse_curves": collapse_curves_by_metric,
+        "collapse_l_range": collapse_l_range,
+        "collapse_sizes": {
+            metric: tuple(int(curve["L"]) for curve in curves)
+            for metric, curves in collapse_curves_by_metric.items()
+        },
     }
 
 

@@ -20,6 +20,7 @@ free_energy_ceff(...)  Recreate Fig. 1(b) and extract the effective central char
 free_energy_equilibration(...) Recreate Supplementary Fig. S1(a,b).
 probe4_collapse(...)   Fit and plot four-ancilla I2/I3/I4 collapses.
 probe_pc_collapse(...) Fit fixed-t p scans for one/two/four probes.
+probe_pc_objective(...) Recreate the Zabalo Fig. S4 collapse-objective map.
 probe_entropy_map(...) Plot the p-t S_Q heatmap and selected-p time curves.
 front_velocity(...)    Fit one-probe mode-5 classical and entanglement front velocities.
 stagger_velocity(...)  Fit two-probe mode-5 one-way velocities from insertion-delay
@@ -53,7 +54,12 @@ from .front import front_velocity
 from .gmn import gmn
 from .probes_collapse import probe1_collapse, probe2_collapse, probe4_collapse
 from .probes_dynamics import probe3_dynamics, probe_distance_collapse
-from .probes_scans import probe_anisotropy, probe_entropy_map, probe_pc_collapse
+from .probes_scans import (
+    probe_anisotropy,
+    probe_entropy_map,
+    probe_pc_collapse,
+    probe_pc_objective,
+)
 from .stagger import stagger_velocity
 from .tmi import tmi_collapse
 
@@ -72,6 +78,7 @@ __all__ = [
     "free_energy_equilibration",
     "probe4_collapse",
     "probe_pc_collapse",
+    "probe_pc_objective",
     "probe_entropy_map",
     "front_velocity",
     "stagger_velocity",
