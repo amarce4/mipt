@@ -206,6 +206,12 @@ must agree. For k=3 the SDP schedule also has to resume in position:
 `bin.gmn.requested`, and both come back (the former as `tmi_samples`, since
 every record feeds the TMI; the latter as `gmn_requested_count`).
 
+A `k=0` run resumes both of its files independently, and either can equally be
+picked up by the matching exclusive run — the files it writes are exactly the
+ones `k=2` and `k=3` write, `k` column included. If the two checkpoints sit at
+different trajectory counts, the shared circuits stop feeding whichever file is
+already ahead, so each still receives `realizations` trajectories in total.
+
 > **GMN solves in flight at the interrupt are lost, and their loss is not
 > neutral.** A record is counted in `gmn_requested_count` when it is submitted
 > but contributes its value only when its batch is collected, so a kill leaves

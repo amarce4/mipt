@@ -10,6 +10,11 @@
 //        (TMI), the mean pairwise MI, the minimum one-vs-rest bipartite
 //        negativity, and the genuine multipartite negativity (GMN), binned by
 //        triangle geometry.
+//   k=0  both, measured on the *same* trajectories and written to the two
+//        files the exclusive runs would have written. The pair and triangle
+//        RDMs are reductions of one state, so this costs one circuit rather
+//        than two, and the two-party and three-party exponents it produces
+//        come from a common ensemble instead of two independent ones.
 //
 // Qubit circuits (circ_type 0, 1) report the ordinary-trace quantities only.
 // Parity-preserving circuits (circ_type 2, 3, 4) additionally report the
@@ -830,104 +835,111 @@ class ProgressLine
 
 // ---------------------------------------------------------------------------
 // k=2: pairs
+//
+// A protocol owns its aggregation bins, its checkpoint, and its output file,
+// and knows how to fold one already-simulated trajectory into them. The two
+// protocols were originally two copies of one trajectory loop; splitting them
+// out is what lets k=0 drive both from a single circuit. Each still writes
+// exactly the file its exclusive run writes -- it holds a RunConfig copy
+// carrying the corresponding `k`, so the header, the metadata block, and the
+// checkpoint semantics are unchanged, and a k=0 run can continue a file an
+// exclusive run left behind or vice versa.
 // ---------------------------------------------------------------------------
 
-inline void run_pairs(const RunConfig &config)
+class PairProtocol
 {
-    const int n = config.n;
-    const bool include_fermionic = config.fermionic_outputs();
-    const std::vector<Pair> pairs = all_unordered_pairs(n);
-    std::vector<PairBin> bins = make_pair_bins(n);
-    std::vector<std::size_t> bin_of_pair;
-    bin_of_pair.reserve(pairs.size());
-    for (const Pair &pair : pairs)
+  public:
+    explicit PairProtocol(RunConfig config)
+        : config_(std::move(config)), include_fermionic_(config_.fermionic_outputs()),
+          pairs_(all_unordered_pairs(config_.n)), bins_(make_pair_bins(config_.n))
     {
-        bin_of_pair.push_back(static_cast<std::size_t>(periodic_distance(pair[0], pair[1], n)) - 1u);
+        bin_of_pair_.reserve(pairs_.size());
+        for (const Pair &pair : pairs_)
+        {
+            bin_of_pair_.push_back(
+                static_cast<std::size_t>(periodic_distance(pair[0], pair[1], config_.n)) - 1u);
+        }
+
+        // The existing CSV is the checkpoint. Read it before anything is
+        // written, so a refusal cannot have destroyed the run it refused --
+        // and, under k=0, so that neither file is touched until both have
+        // been accepted.
+        checkpoint_ = resume::enabled() ? resume::load_pairs(config_, bins_) : resume::Report{};
+        start_realization_ = static_cast<int>(checkpoint_.completed);
+        processed_ = records_per_trajectory() * static_cast<std::uint64_t>(start_realization_);
     }
 
-    // The existing CSV is the checkpoint. Read it before anything is written,
-    // so a refusal cannot have destroyed the run it refused.
-    const resume::Report checkpoint =
-        resume::enabled() ? resume::load_pairs(config, bins) : resume::Report{};
-    const int start_realization = static_cast<int>(checkpoint.completed);
+    const std::string &output_path() const { return config_.output_path; }
+    int start_realization() const { return start_realization_; }
+    bool complete() const { return start_realization_ >= config_.realizations; }
+    std::uint64_t records_per_trajectory() const { return static_cast<std::uint64_t>(pairs_.size()); }
+    std::uint64_t processed() const { return processed_; }
+    const char *rdm_backend_name(cudaq::state &state) const { return rho2_backend_name(state, config_.n); }
 
-    const std::uint64_t total_records =
-        static_cast<std::uint64_t>(pairs.size()) * static_cast<std::uint64_t>(config.realizations);
-    std::uint64_t processed =
-        static_cast<std::uint64_t>(pairs.size()) * static_cast<std::uint64_t>(start_realization);
-
-    ensure_output_parent_directory(config.output_path);
-    publish_csv(config.output_path, render_pair_csv(config, bins));
-
-    backend::print_backend_banner_once("dist_scaling.exe");
-    if (checkpoint.loaded)
+    void announce_resume(std::ostream &out) const
     {
-        std::cerr << "Resuming from " << config.output_path << ": "
-                  << start_realization << '/' << config.realizations
-                  << " trajectories already binned.\n";
-        if (start_realization >= config.realizations)
+        if (!checkpoint_.loaded)
         {
-            std::cerr << config.output_path << " is already complete. Nothing to do.\n";
             return;
         }
-    }
-    std::cerr << "Two-site distance-scaling simulation\n"
-              << "N=" << n
-              << ", periods=" << config.periods
-              << ", p=" << config.p
-              << ", realizations=" << config.realizations
-              << ", pairs_per_realization=" << pairs.size()
-              << ", separation_bins=" << bins.size()
-              << ", mode=" << circuit_type_name(config.type)
-              << ", fermionic_outputs=" << (include_fermionic ? 1 : 0)
-              << ", output=" << config.output_path << '\n'
-              << "pair_policy=unordered i<j; reversed pairs are observable-equivalent\n";
-
-    CircuitWorkspace1D circuit_workspace;
-    circuit_workspace.reserve(config.periods);
-    RdmWorkspace rdm_workspace;
-
-    util::PauseSentinel pause_sentinel("MIPT_DIST_PAUSE_FILE");
-    ProgressLine progress(total_records, "processed pairs", processed);
-    bool backend_reported = false;
-
-    auto flush = [&]() { publish_csv(config.output_path, render_pair_csv(config, bins)); };
-
-    for (int realization = start_realization; realization < config.realizations; ++realization)
-    {
-        progress.absorb_pause(pause_sentinel.wait(flush));
-
-        auto state = circuit_workspace.simulate(n, config.periods, config.p, config.type, "dist_scaling");
-        if (!backend_reported)
+        out << "Resuming from " << config_.output_path << ": " << start_realization_ << '/'
+            << config_.realizations << " trajectories already binned.\n";
+        if (complete())
         {
-            std::cerr << "state_backend=" << (state.is_on_gpu() ? "gpu" : "host")
-                      << ", precision="
-                      << (state.get_precision() == cudaq::SimulationState::precision::fp64 ? "fp64" : "fp32")
-                      << ", rho2_backend=" << rho2_backend_name(state, n) << '\n';
-            backend_reported = true;
+            out << config_.output_path << " is already complete.\n";
         }
+    }
 
-        if (include_fermionic)
+    void announce_run(std::ostream &out) const
+    {
+        out << "Two-site distance-scaling simulation\n"
+            << "N=" << config_.n
+            << ", periods=" << config_.periods
+            << ", p=" << config_.p
+            << ", realizations=" << config_.realizations
+            << ", pairs_per_realization=" << pairs_.size()
+            << ", separation_bins=" << bins_.size()
+            << ", mode=" << circuit_type_name(config_.type)
+            << ", fermionic_outputs=" << (include_fermionic_ ? 1 : 0)
+            << ", output=" << config_.output_path << '\n'
+            << "pair_policy=unordered i<j; reversed pairs are observable-equivalent\n";
+    }
+
+    void publish()
+    {
+        publish_csv(config_.output_path, render_pair_csv(config_, bins_));
+    }
+
+    void prepare_output()
+    {
+        ensure_output_parent_directory(config_.output_path);
+        publish();
+    }
+
+    void measure(cudaq::state &state)
+    {
+        const int n = config_.n;
+        if (include_fermionic_)
         {
-            rho2_subsystems_both_from_cudaq_state(state, n, pairs, rdm_workspace);
+            rho2_subsystems_both_from_cudaq_state(state, n, pairs_, rdm_workspace_);
         }
         else
         {
-            rho2_subsystems_from_cudaq_state(state, n, pairs, false, rdm_workspace);
+            rho2_subsystems_from_cudaq_state(state, n, pairs_, false, rdm_workspace_);
         }
-        if (rdm_workspace.rho_ri.size() != pairs.size() * RHO2_VALUES)
+        if (rdm_workspace_.rho_ri.size() != pairs_.size() * RHO2_VALUES)
         {
             throw std::runtime_error("Internal two-site RDM payload-size mismatch.");
         }
-        if (include_fermionic && rdm_workspace.fermion_rho_ri.size() != pairs.size() * RHO2_VALUES)
+        if (include_fermionic_ && rdm_workspace_.fermion_rho_ri.size() != pairs_.size() * RHO2_VALUES)
         {
             throw std::runtime_error("Internal fermionic two-site RDM payload-size mismatch.");
         }
 
-        for (std::size_t pair_index = 0; pair_index < pairs.size(); ++pair_index)
+        for (std::size_t pair_index = 0; pair_index < pairs_.size(); ++pair_index)
         {
-            PairBin &bin = bins[bin_of_pair[pair_index]];
-            const double *rho = rdm_workspace.rho_ri.data() + pair_index * RHO2_VALUES;
+            PairBin &bin = bins_[bin_of_pair_[pair_index]];
+            const double *rho = rdm_workspace_.rho_ri.data() + pair_index * RHO2_VALUES;
             const PairMetrics metrics = two_party_metrics(rho, false);
             bin.mi.add(metrics.mi);
             bin.mn.add(metrics.mn);
@@ -935,9 +947,10 @@ inline void run_pairs(const RunConfig &config)
             {
                 ++bin.mn_positive;
             }
-            if (include_fermionic)
+            if (include_fermionic_)
             {
-                const double *fermion_rho = rdm_workspace.fermion_rho_ri.data() + pair_index * RHO2_VALUES;
+                const double *fermion_rho =
+                    rdm_workspace_.fermion_rho_ri.data() + pair_index * RHO2_VALUES;
                 const PairMetrics fermion_metrics = two_party_metrics(fermion_rho, true);
                 bin.fmi.add(fermion_metrics.mi);
                 bin.fmn.add(fermion_metrics.mn);
@@ -946,24 +959,31 @@ inline void run_pairs(const RunConfig &config)
                     ++bin.fmn_positive;
                 }
             }
-            ++processed;
-        }
-
-        if (progress.due(processed))
-        {
-            flush();
-            progress.report(processed, pause_sentinel.paused_seconds(), "");
+            ++processed_;
         }
     }
 
-    flush();
-    const double active_seconds =
-        std::max(1.0e-12, progress.elapsed_seconds() - pause_sentinel.paused_seconds());
-    std::cerr << "\nCompleted " << processed << " pair record(s) over " << bins.size()
-              << " separation bin(s) in " << format_duration(active_seconds) << " active time at "
-              << std::fixed << std::setprecision(2) << static_cast<double>(processed) / active_seconds
-              << " record(s)/s.\n";
-}
+    void finish(std::ostream &out, double active_seconds)
+    {
+        publish();
+        out << "Completed " << processed_ << " pair record(s) over " << bins_.size()
+            << " separation bin(s) in " << format_duration(active_seconds) << " active time at "
+            << std::fixed << std::setprecision(2)
+            << static_cast<double>(processed_) / active_seconds << " record(s)/s.\n"
+            << std::defaultfloat;
+    }
+
+  private:
+    RunConfig config_;
+    bool include_fermionic_ = false;
+    std::vector<Pair> pairs_;
+    std::vector<PairBin> bins_;
+    std::vector<std::size_t> bin_of_pair_;
+    RdmWorkspace rdm_workspace_;
+    resume::Report checkpoint_;
+    int start_realization_ = 0;
+    std::uint64_t processed_ = 0;
+};
 
 // ---------------------------------------------------------------------------
 // k=3: balanced triangles
@@ -1008,57 +1028,62 @@ inline void sample_trajectory_triangles(const std::vector<probed::ProbeGeometry>
     }
 }
 
-inline void run_triples(const RunConfig &config)
+class TripleProtocol
 {
-    const int n = config.n;
-    const bool include_fermionic = config.fermionic_outputs();
-    const auto sdp = SdpSettings::from_environment();
-    const long per_geometry = embeddings_per_geometry();
-
-    // The same enumeration and the same balance filter three-probe mode 4
-    // uses, so a triangle admitted by one protocol is admitted by the other.
-    const std::vector<probed::ProbeGeometry> geometries =
-        probed::enumerate_three_probe_geometries(n, config.triangle_balance_cutoff);
-    std::vector<TripleBin> bins = make_triple_bins(n, geometries);
-
-    std::mt19937 rng{std::random_device{}()};
-    std::vector<Subsystem> subsystems;
-    std::vector<std::size_t> bin_of_subsystem;
-    sample_trajectory_triangles(geometries, per_geometry, rng, subsystems, bin_of_subsystem);
-    const bool resample_each_trajectory =
-        per_geometry > 0 &&
-        std::any_of(geometries.begin(), geometries.end(), [&](const probed::ProbeGeometry &geometry) {
-            return geometry.embeddings.size() > static_cast<std::size_t>(per_geometry);
-        });
-    const std::size_t triangles_per_trajectory = subsystems.size();
-    if (triangles_per_trajectory == 0)
+  public:
+    explicit TripleProtocol(RunConfig config)
+        : config_(std::move(config)), include_fermionic_(config_.fermionic_outputs()),
+          sdp_(SdpSettings::from_environment()), per_geometry_(embeddings_per_geometry()),
+          // The same enumeration and the same balance filter three-probe mode 4
+          // uses, so a triangle admitted by one protocol is admitted by the other.
+          geometries_(probed::enumerate_three_probe_geometries(config_.n,
+                                                               config_.triangle_balance_cutoff)),
+          bins_(make_triple_bins(config_.n, geometries_)), rng_(std::random_device{}()),
+          queue_(bins_, sdp_.batch_size, sdp_.pending_batches)
     {
-        throw std::runtime_error("No triangles were selected; check B_min and "
-                                 "MIPT_DIST_EMBEDDINGS_PER_GEOMETRY.");
+        sample_trajectory_triangles(geometries_, per_geometry_, rng_, subsystems_, bin_of_subsystem_);
+        resample_each_trajectory_ =
+            per_geometry_ > 0 &&
+            std::any_of(geometries_.begin(), geometries_.end(),
+                        [&](const probed::ProbeGeometry &geometry) {
+                            return geometry.embeddings.size() >
+                                   static_cast<std::size_t>(per_geometry_);
+                        });
+        if (subsystems_.empty())
+        {
+            throw std::runtime_error("No triangles were selected; check B_min and "
+                                     "MIPT_DIST_EMBEDDINGS_PER_GEOMETRY.");
+        }
+        rho_ri_.assign(subsystems_.size() * RHO3_VALUES, 0.0);
+        fermion_rho_ri_.assign(include_fermionic_ ? subsystems_.size() * RHO3_VALUES : 0u, 0.0);
+
+        // The existing CSV is the checkpoint; see PairProtocol for why it is
+        // read before anything is written.
+        checkpoint_ = resume::enabled() ? resume::load_triples(config_, bins_, per_geometry_)
+                                        : resume::Report{};
+        start_realization_ = static_cast<int>(checkpoint_.completed);
+        processed_ = records_per_trajectory() * static_cast<std::uint64_t>(start_realization_);
     }
-    // The existing CSV is the checkpoint. Read it before anything is written,
-    // so a refusal cannot have destroyed the run it refused.
-    const resume::Report checkpoint =
-        resume::enabled() ? resume::load_triples(config, bins, per_geometry)
-                         : resume::Report{};
-    const int start_realization = static_cast<int>(checkpoint.completed);
 
-    const std::uint64_t total_records = static_cast<std::uint64_t>(triangles_per_trajectory) *
-                                        static_cast<std::uint64_t>(config.realizations);
-    std::uint64_t processed = static_cast<std::uint64_t>(triangles_per_trajectory) *
-                              static_cast<std::uint64_t>(start_realization);
+    const std::string &output_path() const { return config_.output_path; }
+    int start_realization() const { return start_realization_; }
+    bool complete() const { return start_realization_ >= config_.realizations; }
+    std::uint64_t records_per_trajectory() const { return static_cast<std::uint64_t>(subsystems_.size()); }
+    std::uint64_t processed() const { return processed_; }
+    std::uint64_t solved() const { return queue_.solved(); }
+    std::uint64_t queued() const { return queue_.queued(); }
+    const char *rdm_backend_name(cudaq::state &state) const { return rho3_backend_name(state, config_.n); }
 
-    ensure_output_parent_directory(config.output_path);
-    publish_csv(config.output_path, render_triple_csv(config, bins));
-
-    backend::print_backend_banner_once("dist_scaling.exe");
-    if (checkpoint.loaded)
+    void announce_resume(std::ostream &out) const
     {
-        std::cerr << "Resuming from " << config.output_path << ": "
-                  << start_realization << '/' << config.realizations
-                  << " trajectories already binned.\n";
+        if (!checkpoint_.loaded)
+        {
+            return;
+        }
+        out << "Resuming from " << config_.output_path << ": " << start_realization_ << '/'
+            << config_.realizations << " trajectories already binned.\n";
         const std::uint64_t reclaimed =
-            checkpoint.reclaimed_gmn_slots + checkpoint.reclaimed_fgmn_slots;
+            checkpoint_.reclaimed_gmn_slots + checkpoint_.reclaimed_fgmn_slots;
         if (reclaimed > 0)
         {
             // Those records were submitted but never came back, so their values
@@ -1068,108 +1093,99 @@ inline void run_triples(const RunConfig &config)
             // skew already in the file: the lost records are exactly the ones
             // the zero prefilter did *not* settle, so what survives them
             // over-weights GMN=0.
-            std::cerr << "  " << reclaimed
-                      << " SDP solve(s) were still in flight when the run stopped. "
-                         "Their schedule slots are returned, so sampling from here "
-                         "on is unbiased.\n";
-            const double lost = checkpoint.worst_lost_sdp_fraction;
+            out << "  " << reclaimed
+                << " SDP solve(s) were still in flight when the run stopped. "
+                   "Their schedule slots are returned, so sampling from here "
+                   "on is unbiased.\n";
+            const double lost = checkpoint_.worst_lost_sdp_fraction;
             if (lost > 0.02)
             {
-                std::cerr << "  WARNING: up to " << std::fixed << std::setprecision(1)
-                          << 100.0 * lost
-                          << "% of one geometry's requested GMN records were lost "
-                             "with them. Those are the non-zero ones, so this "
-                             "checkpoint's GMN mean is biased low until enough new "
-                             "records dilute it.\n"
-                          << std::defaultfloat;
+                out << "  WARNING: up to " << std::fixed << std::setprecision(1) << 100.0 * lost
+                    << "% of one geometry's requested GMN records were lost "
+                       "with them. Those are the non-zero ones, so this "
+                       "checkpoint's GMN mean is biased low until enough new "
+                       "records dilute it.\n"
+                    << std::defaultfloat;
             }
         }
-        if (start_realization >= config.realizations)
+        if (complete())
         {
-            std::cerr << config.output_path << " is already complete. Nothing to do.\n";
-            return;
+            out << config_.output_path << " is already complete.\n";
         }
     }
-    std::cerr << "Three-site distance-scaling simulation\n"
-              << "N=" << n
-              << ", periods=" << config.periods
-              << ", p=" << config.p
-              << ", realizations=" << config.realizations
-              << ", B_min=" << config.triangle_balance_cutoff
-              << ", geometries=" << geometries.size()
-              << ", embeddings_per_geometry=" << (per_geometry > 0 ? std::to_string(per_geometry) : "all")
-              << ", triangles_per_realization=" << triangles_per_trajectory
-              << ", mode=" << circuit_type_name(config.type)
-              << ", fermionic_outputs=" << (include_fermionic ? 1 : 0)
-              << ", output=" << config.output_path << '\n';
-    if (sdp.enabled)
+
+    void announce_run(std::ostream &out)
     {
-        std::cerr << "gmn_schedule: stride=" << sdp.stride << ", samples_per_geometry="
-                  << (sdp.samples_per_geometry > 0 ? std::to_string(sdp.samples_per_geometry) : "all")
-                  << ", zero_tol=" << sdp.zero_tolerance << ", batch=" << sdp.batch_size
-                  << ", pending_batches=" << sdp.pending_batches
-                  << ", measures=" << (include_fermionic ? "GMN+fGMN" : "GMN") << '\n';
-        // The SDP workers are what use the cores here, so keep MOSEK
-        // single-threaded and bound how many solve at once. The bound scales
-        // with the machine; see default_sdp_worker_count.
-        env::set_if_unset("GMN_MOSEK_NUM_THREADS", "1");
-        env::set_if_unset("FGMN_MAX_CONCURRENT_MOSEK",
-                          analysis::default_sdp_worker_count_text().c_str());
-        env::set_if_unset("GMN_MOSEK_TOL", analysis::DEFAULT_SDP_TOLERANCE_TEXT);
+        out << "Three-site distance-scaling simulation\n"
+            << "N=" << config_.n
+            << ", periods=" << config_.periods
+            << ", p=" << config_.p
+            << ", realizations=" << config_.realizations
+            << ", B_min=" << config_.triangle_balance_cutoff
+            << ", geometries=" << geometries_.size()
+            << ", embeddings_per_geometry="
+            << (per_geometry_ > 0 ? std::to_string(per_geometry_) : "all")
+            << ", triangles_per_realization=" << subsystems_.size()
+            << ", mode=" << circuit_type_name(config_.type)
+            << ", fermionic_outputs=" << (include_fermionic_ ? 1 : 0)
+            << ", output=" << config_.output_path << '\n';
+        if (sdp_.enabled)
+        {
+            out << "gmn_schedule: stride=" << sdp_.stride << ", samples_per_geometry="
+                << (sdp_.samples_per_geometry > 0 ? std::to_string(sdp_.samples_per_geometry) : "all")
+                << ", zero_tol=" << sdp_.zero_tolerance << ", batch=" << sdp_.batch_size
+                << ", pending_batches=" << sdp_.pending_batches
+                << ", measures=" << (include_fermionic_ ? "GMN+fGMN" : "GMN") << '\n';
+            // The SDP workers are what use the cores here, so keep MOSEK
+            // single-threaded and bound how many solve at once. The bound scales
+            // with the machine; see default_sdp_worker_count.
+            env::set_if_unset("GMN_MOSEK_NUM_THREADS", "1");
+            env::set_if_unset("FGMN_MAX_CONCURRENT_MOSEK",
+                              analysis::default_sdp_worker_count_text().c_str());
+            env::set_if_unset("GMN_MOSEK_TOL", analysis::DEFAULT_SDP_TOLERANCE_TEXT);
+        }
+        else
+        {
+            out << "gmn_schedule: disabled by MIPT_DIST_GMN=0; TMI and bipartite "
+                   "negativity only\n";
+        }
     }
-    else
+
+    // Fold in whatever the solver threads have already returned, then rewrite
+    // the file. See SdpBatchQueue::collect_ready.
+    void publish()
     {
-        std::cerr << "gmn_schedule: disabled by MIPT_DIST_GMN=0; TMI and bipartite "
-                     "negativity only\n";
+        queue_.collect_ready();
+        publish_csv(config_.output_path, render_triple_csv(config_, bins_));
     }
 
-    SdpBatchQueue sdp_queue(bins, sdp.batch_size, sdp.pending_batches);
-    CircuitWorkspace1D circuit_workspace;
-    circuit_workspace.reserve(config.periods);
-
-    std::vector<double> rho_ri(triangles_per_trajectory * RHO3_VALUES);
-    std::vector<double> fermion_rho_ri(include_fermionic ? triangles_per_trajectory * RHO3_VALUES : 0u);
-
-    util::PauseSentinel pause_sentinel("MIPT_DIST_PAUSE_FILE");
-    ProgressLine progress(total_records, "processed triangles", processed);
-    bool backend_reported = false;
-
-    auto flush = [&]() {
-        sdp_queue.collect_ready();
-        publish_csv(config.output_path, render_triple_csv(config, bins));
-    };
-
-    for (int realization = start_realization; realization < config.realizations; ++realization)
+    void prepare_output()
     {
-        progress.absorb_pause(pause_sentinel.wait(flush));
+        ensure_output_parent_directory(config_.output_path);
+        publish_csv(config_.output_path, render_triple_csv(config_, bins_));
+    }
 
-        if (resample_each_trajectory && realization > start_realization)
+    void measure(cudaq::state &state, int realization)
+    {
+        if (resample_each_trajectory_ && realization > start_realization_)
         {
-            sample_trajectory_triangles(geometries, per_geometry, rng, subsystems, bin_of_subsystem);
+            sample_trajectory_triangles(geometries_, per_geometry_, rng_, subsystems_,
+                                        bin_of_subsystem_);
         }
 
-        auto state = circuit_workspace.simulate(n, config.periods, config.p, config.type, "dist_scaling");
-        if (!backend_reported)
+        const int n = config_.n;
+        cudaq_three_site_density_matrices(state, n, subsystems_, rho_ri_.data(), false);
+        normalize_rho3_subsystems(rho_ri_.data(), subsystems_.size());
+        if (include_fermionic_)
         {
-            std::cerr << "state_backend=" << (state.is_on_gpu() ? "gpu" : "host")
-                      << ", precision="
-                      << (state.get_precision() == cudaq::SimulationState::precision::fp64 ? "fp64" : "fp32")
-                      << ", rho3_backend=" << rho3_backend_name(state, n) << '\n';
-            backend_reported = true;
+            cudaq_three_site_density_matrices(state, n, subsystems_, fermion_rho_ri_.data(), true);
+            normalize_rho3_subsystems(fermion_rho_ri_.data(), subsystems_.size());
         }
 
-        cudaq_three_site_density_matrices(state, n, subsystems, rho_ri.data(), false);
-        normalize_rho3_subsystems(rho_ri.data(), subsystems.size());
-        if (include_fermionic)
+        for (std::size_t index = 0; index < subsystems_.size(); ++index)
         {
-            cudaq_three_site_density_matrices(state, n, subsystems, fermion_rho_ri.data(), true);
-            normalize_rho3_subsystems(fermion_rho_ri.data(), subsystems.size());
-        }
-
-        for (std::size_t index = 0; index < subsystems.size(); ++index)
-        {
-            TripleBin &bin = bins[bin_of_subsystem[index]];
-            const double *rho = rho_ri.data() + index * RHO3_VALUES;
+            TripleBin &bin = bins_[bin_of_subsystem_[index]];
+            const double *rho = rho_ri_.data() + index * RHO3_VALUES;
 
             const TripleMetrics metrics = three_party_metrics(rho, false);
             bin.tmi.add(metrics.tmi);
@@ -1187,16 +1203,17 @@ inline void run_triples(const RunConfig &config)
 
             const double *fermion_rho = nullptr;
             double min_fermionic_negativity = 0.0;
-            if (include_fermionic)
+            if (include_fermionic_)
             {
-                fermion_rho = fermion_rho_ri.data() + index * RHO3_VALUES;
+                fermion_rho = fermion_rho_ri_.data() + index * RHO3_VALUES;
                 const TripleMetrics fermion_metrics = three_party_metrics(fermion_rho, true);
                 bin.ftmi.add(fermion_metrics.tmi);
                 bin.faverage_mi.add(fermion_metrics.average_mi);
                 bin.fjoint_purity.add(fermion_metrics.joint_purity);
                 bin.fmean_single_purity.add(fermion_metrics.mean_single_purity);
 
-                min_fermionic_negativity = compute_min_bipartite_fermionic_negativity_8x8_cpp(fermion_rho);
+                min_fermionic_negativity =
+                    compute_min_bipartite_fermionic_negativity_8x8_cpp(fermion_rho);
                 if (!std::isfinite(min_fermionic_negativity))
                 {
                     throw std::runtime_error("Three-site fermionic bipartite-negativity "
@@ -1210,60 +1227,292 @@ inline void run_triples(const RunConfig &config)
             // minimum bipartite negativity certifies GMN=0 and the solve is
             // skipped. The record still counts, which is what keeps the mean
             // over selected records unbiased.
-            if (sdp.selects(bin.records, bin.gmn.requested))
+            if (sdp_.selects(bin.records, bin.gmn.requested))
             {
                 ++bin.gmn.requested;
-                if (min_negativity <= sdp.zero_tolerance)
+                if (min_negativity <= sdp_.zero_tolerance)
                 {
                     bin.gmn.value.add(0.0);
                     ++bin.gmn.zero_prefiltered;
                 }
                 else
                 {
-                    sdp_queue.submit(bin_of_subsystem[index], false, rho);
+                    queue_.submit(bin_of_subsystem_[index], false, rho);
                 }
 
-                if (include_fermionic)
+                if (include_fermionic_)
                 {
                     ++bin.fgmn.requested;
-                    if (min_fermionic_negativity <= sdp.zero_tolerance)
+                    if (min_fermionic_negativity <= sdp_.zero_tolerance)
                     {
                         bin.fgmn.value.add(0.0);
                         ++bin.fgmn.zero_prefiltered;
                     }
                     else
                     {
-                        sdp_queue.submit(bin_of_subsystem[index], true, fermion_rho);
+                        queue_.submit(bin_of_subsystem_[index], true, fermion_rho);
                     }
                 }
             }
 
             ++bin.records;
-            ++processed;
+            ++processed_;
+        }
+    }
+
+    void finish(std::ostream &out, double active_seconds)
+    {
+        queue_.finish();
+        publish_csv(config_.output_path, render_triple_csv(config_, bins_));
+        out << "Completed " << processed_ << " triangle record(s) over " << bins_.size()
+            << " geometry bin(s) and " << queue_.solved() << " SDP solve(s) in "
+            << format_duration(active_seconds) << " active time at " << std::fixed
+            << std::setprecision(2) << static_cast<double>(processed_) / active_seconds
+            << " record(s)/s.\n"
+            << std::defaultfloat;
+    }
+
+  private:
+    RunConfig config_;
+    bool include_fermionic_ = false;
+    SdpSettings sdp_;
+    long per_geometry_ = 1;
+    std::vector<probed::ProbeGeometry> geometries_;
+    std::vector<TripleBin> bins_;
+    std::mt19937 rng_;
+    // Holds a reference to bins_, so it must outlive nothing else and this
+    // class must stay non-copyable -- which it is, by holding it.
+    SdpBatchQueue queue_;
+    std::vector<Subsystem> subsystems_;
+    std::vector<std::size_t> bin_of_subsystem_;
+    bool resample_each_trajectory_ = false;
+    std::vector<double> rho_ri_;
+    std::vector<double> fermion_rho_ri_;
+    resume::Report checkpoint_;
+    int start_realization_ = 0;
+    std::uint64_t processed_ = 0;
+};
+
+// ---------------------------------------------------------------------------
+// The shared trajectory loop
+//
+// One simulated circuit feeds whichever protocols are active. Under k=0 that
+// is the whole point: the pair and triangle RDMs are reductions of the same
+// state, so measuring both costs one circuit instead of two.
+// ---------------------------------------------------------------------------
+
+inline void run_protocols(const RunConfig &config, PairProtocol *pairs, TripleProtocol *triples)
+{
+    const int realizations = config.realizations;
+    int start = realizations;
+    if (pairs != nullptr)
+    {
+        start = std::min(start, pairs->start_realization());
+    }
+    if (triples != nullptr)
+    {
+        start = std::min(start, triples->start_realization());
+    }
+
+    // Every checkpoint has been accepted by now, so it is safe to write.
+    if (pairs != nullptr)
+    {
+        pairs->prepare_output();
+    }
+    if (triples != nullptr)
+    {
+        triples->prepare_output();
+    }
+
+    backend::print_backend_banner_once("dist_scaling.exe");
+    if (pairs != nullptr)
+    {
+        pairs->announce_resume(std::cerr);
+    }
+    if (triples != nullptr)
+    {
+        triples->announce_resume(std::cerr);
+    }
+    if (start >= realizations)
+    {
+        std::cerr << "Nothing to do.\n";
+        return;
+    }
+    // A protocol whose file is already complete sits out the trajectories the
+    // other one still needs, so it describes no run and reports no rate.
+    if (pairs != nullptr && !pairs->complete())
+    {
+        pairs->announce_run(std::cerr);
+    }
+    if (triples != nullptr && !triples->complete())
+    {
+        triples->announce_run(std::cerr);
+    }
+
+    // Progress is counted in records when one protocol is running, so the
+    // exclusive k=2 and k=3 runs report exactly what they always did. With both
+    // active the two record counts are incommensurable, so trajectories -- the
+    // thing they actually share -- are counted instead.
+    std::uint64_t total = 0;
+    std::uint64_t processed = 0;
+    const char *unit = "trajectories";
+    if (pairs != nullptr && triples != nullptr)
+    {
+        total = static_cast<std::uint64_t>(realizations);
+        processed = static_cast<std::uint64_t>(start);
+    }
+    else if (pairs != nullptr)
+    {
+        total = pairs->records_per_trajectory() * static_cast<std::uint64_t>(realizations);
+        processed = pairs->processed();
+        unit = "processed pairs";
+    }
+    else
+    {
+        total = triples->records_per_trajectory() * static_cast<std::uint64_t>(realizations);
+        processed = triples->processed();
+        unit = "processed triangles";
+    }
+
+    CircuitWorkspace1D circuit_workspace;
+    circuit_workspace.reserve(config.periods);
+
+    util::PauseSentinel pause_sentinel("MIPT_DIST_PAUSE_FILE");
+    ProgressLine progress(total, unit, processed);
+    bool backend_reported = false;
+
+    auto flush = [&]() {
+        if (pairs != nullptr)
+        {
+            pairs->publish();
+        }
+        if (triples != nullptr)
+        {
+            triples->publish();
+        }
+    };
+
+    for (int realization = start; realization < realizations; ++realization)
+    {
+        progress.absorb_pause(pause_sentinel.wait(flush));
+
+        auto state =
+            circuit_workspace.simulate(config.n, config.periods, config.p, config.type, "dist_scaling");
+        if (!backend_reported)
+        {
+            std::cerr << "state_backend=" << (state.is_on_gpu() ? "gpu" : "host")
+                      << ", precision="
+                      << (state.get_precision() == cudaq::SimulationState::precision::fp64 ? "fp64"
+                                                                                           : "fp32");
+            if (pairs != nullptr)
+            {
+                std::cerr << ", rho2_backend=" << pairs->rdm_backend_name(state);
+            }
+            if (triples != nullptr)
+            {
+                std::cerr << ", rho3_backend=" << triples->rdm_backend_name(state);
+            }
+            std::cerr << '\n';
+            backend_reported = true;
+        }
+
+        // A protocol whose checkpoint is further ahead sits out the shared
+        // trajectories it has already been given, so each still receives
+        // exactly `realizations` of them in total.
+        if (pairs != nullptr && realization >= pairs->start_realization())
+        {
+            pairs->measure(state);
+        }
+        if (triples != nullptr && realization >= triples->start_realization())
+        {
+            triples->measure(state, realization);
+        }
+
+        if (pairs != nullptr && triples != nullptr)
+        {
+            processed = static_cast<std::uint64_t>(realization) + 1u;
+        }
+        else if (pairs != nullptr)
+        {
+            processed = pairs->processed();
+        }
+        else
+        {
+            processed = triples->processed();
         }
 
         if (progress.due(processed))
         {
             flush();
-            std::string suffix = " | sdp " + std::to_string(sdp_queue.solved()) + "/" +
-                                 std::to_string(sdp_queue.queued());
+            std::string suffix;
+            if (triples != nullptr)
+            {
+                suffix = " | sdp " + std::to_string(triples->solved()) + "/" +
+                         std::to_string(triples->queued());
+            }
             progress.report(processed, pause_sentinel.paused_seconds(), suffix);
         }
     }
 
-    sdp_queue.finish();
-    publish_csv(config.output_path, render_triple_csv(config, bins));
     const double active_seconds =
         std::max(1.0e-12, progress.elapsed_seconds() - pause_sentinel.paused_seconds());
-    std::cerr << "\nCompleted " << processed << " triangle record(s) over " << bins.size()
-              << " geometry bin(s) and " << sdp_queue.solved() << " SDP solve(s) in "
-              << format_duration(active_seconds) << " active time at " << std::fixed << std::setprecision(2)
-              << static_cast<double>(processed) / active_seconds << " record(s)/s.\n";
+    std::cerr << '\n';
+    if (pairs != nullptr && !pairs->complete())
+    {
+        pairs->finish(std::cerr, active_seconds);
+    }
+    if (triples != nullptr && !triples->complete())
+    {
+        triples->finish(std::cerr, active_seconds);
+    }
 }
 
-inline void run(const RunConfig &config)
+inline void run_pairs(const RunConfig &config)
 {
-    validate_args(config);
+    PairProtocol pairs(config);
+    run_protocols(config, &pairs, nullptr);
+}
+
+inline void run_triples(const RunConfig &config)
+{
+    TripleProtocol triples(config);
+    run_protocols(config, nullptr, &triples);
+}
+
+// k=0: both party counts, measured on the same trajectories.
+//
+// The two protocols are handed RunConfig copies that differ from this one only
+// in `k` and the output path, so each writes byte-for-byte the file its
+// exclusive run writes -- including the `k` column of the metadata block.
+// Nothing downstream, the resume path included, can tell the difference.
+inline void run_both(const RunConfig &config)
+{
+    RunConfig pair_config = config;
+    pair_config.k = 2;
+    pair_config.output_path = default_output_path(config, 2);
+
+    RunConfig triple_config = config;
+    triple_config.k = 3;
+    triple_config.output_path = default_output_path(config, 3);
+
+    PairProtocol pairs(pair_config);
+    TripleProtocol triples(triple_config);
+    run_protocols(config, &pairs, &triples);
+}
+
+inline void run(const RunConfig &input)
+{
+    validate_args(input);
+    if (input.k == 0)
+    {
+        run_both(input);
+        return;
+    }
+    RunConfig config = input;
+    if (config.output_path.empty())
+    {
+        config.output_path = default_output_path(config);
+    }
     if (config.k == 3)
     {
         run_triples(config);
@@ -1280,8 +1529,11 @@ inline void print_usage(const char *argv0)
         << " [k = 2] [N = 10] [periods = 10] [p = 0.17] [realizations = 10]"
            " [circ_type = 0] [output.csv = auto] [B_min = 0.5]\n\n"
         << "Arguments:\n"
-        << "  k          2 = every unordered site pair; 3 = every balanced site triangle.\n"
-        << "  B_min      k=3 only: minimum CFT chord balance B = l_min/l_max a triangle\n"
+        << "  k          2 = every unordered site pair; 3 = every balanced site triangle;\n"
+        << "             0 = both, measured on the same trajectories and written to the\n"
+        << "             two files the exclusive runs write. k=0 takes no explicit\n"
+        << "             output path, since it produces two of them.\n"
+        << "  B_min      k=0 and k=3: minimum CFT chord balance B = l_min/l_max a triangle\n"
         << "             must reach to be simulated. Identical filter and enumeration to\n"
         << "             mipt_probed.exe probes=3 mode=4. Ignored for k=2.\n"
         << "  circ_type:\n";
@@ -1289,11 +1541,15 @@ inline void print_usage(const char *argv0)
     std::cerr
         << "  output.csv defaults to:\n"
         << "    k=2: csv/dist_scaling/<tag>/dist_scaling_<tag>_n_<N>_periods_<periods>_p_<p>_real_<realizations>.csv\n"
-        << "    k=3: csv/dist_scaling/<tag>/dist_scaling3_<tag>_n_<N>_periods_<periods>_p_<p>_real_<realizations>_b_<B_min>.csv\n\n"
+        << "    k=3: csv/dist_scaling/<tag>/dist_scaling3_<tag>_n_<N>_periods_<periods>_p_<p>_real_<realizations>_b_<B_min>.csv\n"
+        << "    k=0: both of the above.\n\n"
         << "Reported measures:\n"
         << "  k=2  mi, mn      mutual information and bipartite negativity per pair\n"
         << "  k=3  tmi, gmn    tripartite information and genuine multipartite negativity\n"
         << "       average_mi, min_bipneg, purities as supporting columns\n"
+        << "  k=0  all of the above, from one circuit per trajectory. Either file can be\n"
+        << "  resumed by a k=0 run or by the matching exclusive run; if one is already\n"
+        << "  complete the shared trajectories simply stop feeding it.\n"
         << "  circ_type 0 or 1 (qubit ensembles) report those only. circ_type 2, 3, or 4\n"
         << "  (parity-preserving ensembles) additionally report the fermionic-trace\n"
         << "  versions fmi/fmn and ftmi/fgmn on the same trajectories. For qRPPU\n"
@@ -1322,7 +1578,7 @@ inline void print_usage(const char *argv0)
         << "    0 disables it. Default: PAUSE_MIPT.\n"
         << "  MIPT_DIST_MPS_DENSE_MAX_QUBITS=16 bounds exact amplitude reconstruction"
            " when a tensor/MPS backend exposes no dense state tensor.\n"
-        << "  k=3 only:\n"
+        << "  k=0 and k=3:\n"
         << "  MIPT_DIST_EMBEDDINGS_PER_GEOMETRY=1 triangles measured per geometry per\n"
         << "    trajectory (0 = every lattice embedding).\n"
         << "  MIPT_DIST_GMN=1 set to 0 to skip every GMN/fGMN solve.\n"

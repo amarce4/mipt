@@ -78,6 +78,10 @@ inline void append_uint(std::string &out, std::uint64_t value)
 
 struct RunConfig
 {
+    // 2 = pairs, 3 = triangles, 0 = both from the same trajectories. A k=0 run
+    // fans out into two RunConfig copies carrying k=2 and k=3, so every file
+    // written -- header, metadata block, checkpoint semantics -- is exactly
+    // what the corresponding exclusive run writes.
     int k = 2;
     int n = 10;
     int periods = 10;
@@ -100,21 +104,29 @@ struct RunConfig
     }
 };
 
-inline std::string default_output_path(const RunConfig &config)
+// The path an exclusive `k`-party run would write. Taking `k` explicitly rather
+// than reading `config.k` is what lets a k=0 run name its two files exactly the
+// way the two exclusive runs name theirs, so either can continue the other.
+inline std::string default_output_path(const RunConfig &config, int k)
 {
     const std::string tag(circuit_type_tag(config.type));
     std::ostringstream filename;
-    filename << (config.k == 3 ? "dist_scaling3_" : "dist_scaling_") << tag
+    filename << (k == 3 ? "dist_scaling3_" : "dist_scaling_") << tag
              << "_n_" << config.n
              << "_periods_" << config.periods
              << "_p_" << compact_decimal(config.p)
              << "_real_" << config.realizations;
-    if (config.k == 3)
+    if (k == 3)
     {
         filename << "_b_" << compact_decimal(config.triangle_balance_cutoff);
     }
     filename << ".csv";
     return std::string("csv/dist_scaling/") + tag + "/" + filename.str();
+}
+
+inline std::string default_output_path(const RunConfig &config)
+{
+    return default_output_path(config, config.k);
 }
 
 inline bool file_exists(const std::string &path)
@@ -141,13 +153,17 @@ inline void ensure_output_parent_directory(const std::string &output_path)
 
 inline void validate_args(const RunConfig &config)
 {
-    if (config.k != 2 && config.k != 3)
+    if (config.k != 0 && config.k != 2 && config.k != 3)
     {
-        throw std::invalid_argument("k must be 2 (pairs) or 3 (triangles).");
+        throw std::invalid_argument(
+            "k must be 2 (pairs), 3 (triangles), or 0 (both, on shared trajectories).");
     }
-    if (config.n < config.k || config.n >= 63)
+    // k=0 measures triangles too, so it needs the three sites k does not name.
+    const int minimum_sites = (config.k == 0) ? 3 : config.k;
+    if (config.n < minimum_sites || config.n >= 63)
     {
-        throw std::invalid_argument("N must satisfy k <= N < 63.");
+        throw std::invalid_argument("N must satisfy " + std::to_string(minimum_sites) +
+                                    " <= N < 63.");
     }
     if (config.periods <= 0)
     {
@@ -161,11 +177,18 @@ inline void validate_args(const RunConfig &config)
     {
         throw std::invalid_argument("realizations must be positive.");
     }
-    if (config.k == 3 &&
+    if (config.k != 2 &&
         (!std::isfinite(config.triangle_balance_cutoff) || config.triangle_balance_cutoff < 0.0 ||
          config.triangle_balance_cutoff > 1.0))
     {
         throw std::invalid_argument("B_min must lie in [0, 1].");
+    }
+    if (config.k == 0 && !config.output_path.empty())
+    {
+        throw std::invalid_argument(
+            "k=0 writes one CSV per party count, so it cannot take a single explicit "
+            "output path. Omit it to get the two default names, or run k=2 and k=3 "
+            "separately.");
     }
     validate_circuit_site_count(config.type, config.n, "N");
 }

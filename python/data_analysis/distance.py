@@ -11,6 +11,11 @@ Reads both output formats of ``dist_scaling.exe``:
 Both end up as the same ``{metric: DataFrame[d, mean, stderr, count]}``
 structure, so the fitting and plotting below never has to know which one it
 came from.
+
+Files at different party counts may be plotted together -- a ``k=0`` run of
+``dist_scaling.exe`` writes one of each from the same trajectories -- so the
+loaded curves are keyed by ``(k, L)`` and the panels are named by the quantity
+they hold rather than by how many parties measured it.
 """
 
 from __future__ import annotations
@@ -53,85 +58,70 @@ _UNSET = object()
 # ---------------------------------------------------------------------------
 
 _METRIC_SPECS: dict[str, dict[str, Any]] = {
-    "mi": {
-        "exponent": "MI",
-        "ylabel": r"Two-party mutual information $I_2$ [{units}]",
-        "title": "Ordinary mutual information",
-        "entropy": True,
-    },
-    "fmi": {
-        "exponent": r"\mathrm{fMI}",
-        "ylabel": r"Fermionic mutual information $I_2^f$ [{units}]",
-        "title": "Fermionic mutual information",
-        "entropy": True,
-    },
-    "mn": {
-        "exponent": "MN",
-        "ylabel": r"Bipartite negativity $\mathcal{N}_2$",
-        "title": "Ordinary negativity",
-    },
-    "fmn": {
-        "exponent": r"\mathrm{fMN}",
-        "ylabel": r"Fermionic negativity $\mathcal{N}_2^f$",
-        "title": "Fermionic negativity",
-    },
-    "tmi": {
-        "exponent": r"\mathrm{TMI}",
-        "ylabel": r"Tripartite information $|I_3|$ [{units}]",
-        "title": "Ordinary tripartite information",
-        "entropy": True,
-        "magnitude": True,
-    },
-    "ftmi": {
-        "exponent": r"\mathrm{fTMI}",
-        "ylabel": r"Fermionic tripartite information $|I_3^f|$ [{units}]",
-        "title": "Fermionic tripartite information",
-        "entropy": True,
-        "magnitude": True,
-    },
-    "gmn": {
-        "exponent": r"\mathrm{GMN}",
-        "ylabel": r"Genuine multipartite negativity $\mathcal{N}_3$",
-        "title": "Ordinary GMN",
-    },
-    "fgmn": {
-        "exponent": r"\mathrm{fGMN}",
-        "ylabel": r"Fermionic GMN $\mathcal{N}_3^f$",
-        "title": "Fermionic fGMN",
-    },
-    "average_mi": {
-        "exponent": r"\overline{\mathrm{MI}}",
-        "ylabel": r"Mean pairwise mutual information $\bar{I}_2$ [{units}]",
-        "title": "Mean pairwise mutual information",
-        "entropy": True,
-    },
-    "faverage_mi": {
-        "exponent": r"\overline{\mathrm{fMI}}",
-        "ylabel": r"Mean pairwise fermionic MI $\bar{I}_2^f$ [{units}]",
-        "title": "Mean pairwise fermionic MI",
-        "entropy": True,
-    },
-    "min_bipneg": {
-        "exponent": r"\mathrm{minN}",
-        "ylabel": r"Minimum one-vs-rest negativity $\min_s\mathcal{N}_s$",
-        "title": "Minimum bipartite negativity",
-    },
-    "min_fbipneg": {
-        "exponent": r"\mathrm{minN}^f",
-        "ylabel": r"Minimum one-vs-rest fermionic negativity",
-        "title": "Minimum fermionic bipartite negativity",
-    },
+    "mi": {"exponent": "MI", "entropy": True},
+    "fmi": {"exponent": r"\mathrm{fMI}", "entropy": True},
+    "mn": {"exponent": "MN"},
+    "fmn": {"exponent": r"\mathrm{fMN}"},
+    "tmi": {"exponent": r"\mathrm{TMI}", "entropy": True, "magnitude": True},
+    "ftmi": {"exponent": r"\mathrm{fTMI}", "entropy": True, "magnitude": True},
+    "gmn": {"exponent": r"\mathrm{GMN}"},
+    "fgmn": {"exponent": r"\mathrm{fGMN}"},
+    "average_mi": {"exponent": r"\overline{\mathrm{MI}}", "entropy": True},
+    "faverage_mi": {"exponent": r"\overline{\mathrm{fMI}}", "entropy": True},
+    "min_bipneg": {"exponent": r"\mathrm{minN}"},
+    "min_fbipneg": {"exponent": r"\mathrm{minN}^f"},
 }
 
-# Which measures get a panel. Everything else that a file happens to carry --
-# the supporting mean-MI and minimum-negativity columns -- is still loaded and
-# still fitted, it just does not take up a subplot.
-_PANEL_METRICS: dict[tuple[int, bool], tuple[str, ...]] = {
-    (2, False): ("mi", "mn"),
-    (2, True): ("mi", "fmi", "mn", "fmn"),
-    (3, False): ("tmi", "gmn"),
-    (3, True): ("tmi", "ftmi", "gmn", "fgmn"),
+# ---------------------------------------------------------------------------
+# Panel layout
+#
+# Rows are the two quantity families (information, then negativity) and
+# columns the two trace conventions (ordinary, then fermionic), so a panel is
+# named by *what* it measures rather than by how many parties measured it.
+# Each slot lists the metric that realizes it at each party count, which is
+# what lets one panel carry k=2 and k=3 together: the ordinary-information
+# panel holds I_2 at k=2 and |I_3| at k=3.
+#
+# Everything else a file carries -- the supporting mean-MI, minimum-negativity
+# and purity columns -- is still loaded and still fitted, it just takes up no
+# subplot.
+# ---------------------------------------------------------------------------
+
+_PANEL_GRID: tuple[tuple[dict[str, Any], ...], ...] = (
+    (
+        {
+            "label": "Mutual Information",
+            "entropy": True,
+            "metrics": {2: "mi", 3: "tmi"},
+        },
+        {
+            "label": "Fermionic Mutual Information",
+            "entropy": True,
+            "metrics": {2: "fmi", 3: "ftmi"},
+        },
+    ),
+    (
+        {"label": "Negativity", "entropy": False, "metrics": {2: "mn", 3: "gmn"}},
+        {
+            "label": "Fermionic Negativity",
+            "entropy": False,
+            "metrics": {2: "fmn", 3: "fgmn"},
+        },
+    ),
+)
+
+# Every metric that has a panel, and the slot it belongs to.
+_PANEL_SLOT_OF_METRIC: dict[str, tuple[int, int]] = {
+    metric: (row_index, column_index)
+    for row_index, row in enumerate(_PANEL_GRID)
+    for column_index, slot in enumerate(row)
+    for metric in slot["metrics"].values()
 }
+
+# k=2 and k=3 share a panel, so they are told apart by marker and by the
+# line style of their fit, with colour left to carry the system size.
+_K_MARKERS = {2: "o", 3: "s"}
+_K_LINESTYLES = {2: "--", 3: ":"}
 
 # Loaded and returned, but never power-law fitted: a purity tends to a
 # constant with distance, so an exponent for it would be noise dressed as a
@@ -147,14 +137,15 @@ _NON_SCALING_METRICS = frozenset(
 
 
 def _metric_spec(metric: str) -> dict[str, Any]:
-    return _METRIC_SPECS.get(
-        metric,
-        {
-            "exponent": metric.replace("_", r"\_"),
-            "ylabel": metric,
-            "title": metric,
-        },
-    )
+    return _METRIC_SPECS.get(metric, {"exponent": metric.replace("_", r"\_")})
+
+
+def _marker_for_k(k: int) -> str:
+    return _K_MARKERS.get(k, "^")
+
+
+def _linestyle_for_k(k: int) -> str:
+    return _K_LINESTYLES.get(k, "-.")
 
 
 # ---------------------------------------------------------------------------
@@ -589,22 +580,35 @@ def dist_scaling(
     ``_samples`` columns; the older row-level format has one ``d,mi,mn`` (or
     ``d,mi,fmi,mn,fmn``) row per pair per trajectory and is streamed in
     ``chunksize`` blocks. Files of both kinds may be mixed in one call as long
-    as they share a circuit and a party count ``k``.
+    as they share a circuit; **party counts may be mixed too**, which is what a
+    ``k=0`` run of ``dist_scaling.exe`` produces -- a pair file and a triangle
+    file measured on the same trajectories.
 
-    Panels are chosen by ``k`` and by whether the run reported the fermionic
-    trace:
+    Panels are named by the quantity they carry rather than by the number of
+    parties that measured it, so both party counts share one panel:
 
-    ===== ================ ==========================
-    ``k`` qubit ensembles  parity-preserving ensembles
-    ===== ================ ==========================
-    2     ``mi``, ``mn``   plus ``fmi``, ``fmn``
-    3     ``tmi``, ``gmn`` plus ``ftmi``, ``fgmn``
-    ===== ================ ==========================
+    ============================ =========== ============
+    panel                        ``k=2``     ``k=3``
+    ============================ =========== ============
+    Mutual Information           ``mi``      ``tmi``
+    Fermionic Mutual Information ``fmi``     ``ftmi``
+    Negativity                   ``mn``      ``gmn``
+    Fermionic Negativity         ``fmn``     ``fgmn``
+    ============================ =========== ============
+
+    Within a panel the party count is carried by the marker (``o`` for
+    ``k=2``, ``s`` for ``k=3``) and by the fit line style, and named in every
+    legend entry; colour stays with the system size. The fermionic column is
+    dropped for qubit ensembles, leaving mutual information above negativity.
 
     Every other measure the file carries -- ``average_mi``, ``min_bipneg``,
     the purities -- is still loaded into ``data`` and still fitted into
     ``fits``; it just gets no subplot. Pass ``metrics`` to override the panel
     set.
+
+    ``data`` and ``selected_fit_points`` are keyed by ``(k, L)`` and
+    ``(k, L, metric)`` respectively, and ``fits`` carries a ``k`` column,
+    since one system size can now appear at both party counts.
 
     Rows are aggregated at equal chord distance, including zero-negativity
     events. All panels use logarithmic axes and are fitted with power laws
@@ -677,12 +681,14 @@ def dist_scaling(
         )
     circuit_name = circuit_names[0]
 
-    k_values = sorted({entry["k"] for entry in loaded if entry["k"] is not None})
-    if len(k_values) != 1:
-        raise ValueError(
-            f"Distance-scaling files must share one party count k; found {k_values}."
-        )
-    k = k_values[0]
+    # Party counts may be mixed. A k=0 run of dist_scaling.exe writes one pair
+    # file and one triangle file from the same trajectories, and the point of
+    # plotting them together is to read the two-party and three-party
+    # exponents off one ensemble.
+    for entry in loaded:
+        if entry["k"] is None:
+            entry["k"] = 3 if "tmi" in entry.get("data", {}) else 2
+    k_values = sorted({int(entry["k"]) for entry in loaded})
 
     if sizes is None:
         parsed_sizes = [
@@ -693,12 +699,21 @@ def dist_scaling(
         parsed_sizes = [int(size) for size in sizes]
         if len(parsed_sizes) != len(paths):
             raise ValueError("sizes must match the number of input files.")
-    if len(set(parsed_sizes)) != len(parsed_sizes):
-        raise ValueError(f"Duplicate system sizes found: {parsed_sizes}")
 
-    order = np.argsort(parsed_sizes)
+    keys = [(int(entry["k"]), int(size)) for entry, size in zip(loaded, parsed_sizes)]
+    duplicates = sorted({key for key in keys if keys.count(key) > 1})
+    if duplicates:
+        raise ValueError(
+            "Each (k, L) may appear once; duplicated "
+            + ", ".join(f"k={k}, L={size}" for k, size in duplicates)
+            + "."
+        )
+
+    order = sorted(range(len(keys)), key=lambda index: keys[index])
     loaded = [loaded[index] for index in order]
     parsed_sizes = [parsed_sizes[index] for index in order]
+    keys = [keys[index] for index in order]
+    unique_sizes = sorted(set(parsed_sizes))
 
     # The row-level format only exists for k=2 and only ever carried these
     # four columns; which of them are present is what says whether the run
@@ -709,9 +724,10 @@ def dist_scaling(
         else ("mi", "mn")
     )
 
-    data: dict[int, dict[str, pd.DataFrame]] = {}
-    for size, entry in zip(parsed_sizes, loaded):
-        print(f"Importing L={size}: {entry['path']}")
+    data: dict[tuple[int, int], dict[str, pd.DataFrame]] = {}
+    for key, entry in zip(keys, loaded):
+        k_of_file, size = key
+        print(f"Importing k={k_of_file}, L={size}: {entry['path']}")
         if entry["aggregated"]:
             curves = entry["data"]
             stored_scale = _mi_unit_spec(entry["stored_units"] or "bits")[1]
@@ -738,14 +754,26 @@ def dist_scaling(
             raise ValueError(
                 f"No valid distance-scaling rows were found in {entry['path']}."
             )
-        data[size] = curves
+        data[key] = curves
 
-    available = list(
-        dict.fromkeys(name for size in parsed_sizes for name in data[size])
-    )
+    available = list(dict.fromkeys(name for key in keys for name in data[key]))
     is_fermionic = any(
         metric in available for metric in ("fmi", "fmn", "ftmi", "fgmn")
     )
+
+    # A metric name belongs to exactly one party count -- `mi` only ever comes
+    # from a k=2 file and `tmi` only from a k=3 one -- so the mapping is read
+    # off the data rather than declared.
+    k_of_metric: dict[str, int] = {}
+    for k_of_file, size in keys:
+        for metric in data[(k_of_file, size)]:
+            previous = k_of_metric.setdefault(metric, k_of_file)
+            if previous != k_of_file:
+                raise ValueError(
+                    f"Metric {metric!r} appears under both k={previous} and "
+                    f"k={k_of_file}; the two cannot share a fit."
+                )
+
     if metrics is not None:
         panel_metrics = tuple(metrics)
         missing = [name for name in panel_metrics if name not in available]
@@ -753,20 +781,49 @@ def dist_scaling(
             raise ValueError(
                 f"Requested metric(s) {missing} are not present; available: {available}."
             )
-    else:
-        default_panels = _PANEL_METRICS.get((k, is_fermionic))
-        if default_panels is None:
+        # The panel grid is fixed, so a supporting measure has nowhere to be
+        # drawn. Say so rather than dropping it silently -- it is still loaded
+        # and still fitted, just not plotted.
+        off_grid = [
+            name for name in panel_metrics if name not in _PANEL_SLOT_OF_METRIC
+        ]
+        if off_grid:
             raise ValueError(
-                f"No default panel set for k={k}; pass metrics=[...] explicitly. "
-                f"Available: {available}."
+                f"Metric(s) {off_grid} have no panel; the grid holds "
+                f"{sorted(_PANEL_SLOT_OF_METRIC)}. They are still returned in "
+                "`data` and `fits`."
             )
+    else:
         panel_metrics = tuple(
-            metric for metric in default_panels if metric in available
+            metric
+            for row in _PANEL_GRID
+            for slot in row
+            for k_of_slot in sorted(slot["metrics"])
+            for metric in (slot["metrics"][k_of_slot],)
+            if metric in available
         )
         if not panel_metrics:
             raise ValueError(
-                f"None of the expected k={k} measures were found; available: {available}."
+                "None of the panel measures were found; available: "
+                f"{available}."
             )
+
+    # Which grid slots earn a subplot, and which of the fixed rows and columns
+    # therefore survive. Dropping an empty column is what turns a purely
+    # ordinary-trace run into a one-column figure with mutual information above
+    # negativity, rather than a 2x2 with two blank panels.
+    panel_slots = {
+        _PANEL_SLOT_OF_METRIC[metric]
+        for metric in panel_metrics
+        if metric in _PANEL_SLOT_OF_METRIC
+    }
+    if not panel_slots:
+        raise ValueError(
+            f"None of the requested metrics {list(panel_metrics)} has a panel; "
+            "the panel grid holds mi/tmi, fmi/ftmi, mn/gmn and fmn/fgmn."
+        )
+    panel_rows = sorted({row for row, _ in panel_slots})
+    panel_columns = sorted({column for _, column in panel_slots})
 
     # --- fit every loaded measure, draw only the panel ones ----------------
     fit_settings_range = _merge_per_metric(
@@ -793,30 +850,33 @@ def dist_scaling(
     )
 
     fit_rows: list[dict[str, Any]] = []
-    selected_points: dict[tuple[int, str], pd.DataFrame] = {}
+    selected_points: dict[tuple[int, int, str], pd.DataFrame] = {}
     fitted_metrics = [
         metric
         for metric in available
         if metric not in _NON_SCALING_METRICS or metric in panel_metrics
     ]
-    for size in parsed_sizes:
+    for k_of_file, size in keys:
         for metric in fitted_metrics:
-            if metric not in data[size]:
+            if metric not in data[(k_of_file, size)]:
                 continue
             try:
                 fit, selected = _distance_power_law_fit(
-                    data[size][metric],
+                    data[(k_of_file, size)][metric],
                     fit_range=_fit_range_for_size(
                         fit_settings_range[metric], size
                     ),
                     fit_last=fit_settings_last[metric],
                     min_relative_error=min_relative_error,
                 )
-                fit_rows.append({"L": size, "metric": metric, **fit})
-                selected_points[(size, metric)] = selected
+                fit_rows.append(
+                    {"k": k_of_file, "L": size, "metric": metric, **fit}
+                )
+                selected_points[(k_of_file, size, metric)] = selected
             except ValueError as exc:
                 fit_rows.append(
                     {
+                        "k": k_of_file,
                         "L": size,
                         "metric": metric,
                         "alpha": np.nan,
@@ -833,10 +893,16 @@ def dist_scaling(
                 )
                 if metric in panel_metrics:
                     warnings.warn(
-                        f"L={size}, {metric.upper()} fit unavailable: {exc}"
+                        f"k={k_of_file}, L={size}, {metric.upper()} fit "
+                        f"unavailable: {exc}"
                     )
 
     fits = pd.DataFrame(fit_rows)
+    # A fit_size entry names system sizes, and the sizes on offer are the ones
+    # measured at that metric's own party count.
+    sizes_by_k: dict[int, list[int]] = {}
+    for k_of_file, size in keys:
+        sizes_by_k.setdefault(k_of_file, []).append(size)
     fit_sizes = {
         metric: _normalize_fit_sizes(
             _merge_per_metric(
@@ -850,30 +916,47 @@ def dist_scaling(
                 panel_metrics,
                 None,
             )[metric],
-            parsed_sizes,
+            sizes_by_k.get(k_of_metric[metric], unique_sizes),
             metric,
         )
         for metric in panel_metrics
     }
 
-    colors = _color_map_by_size(parsed_sizes, cmap)
-    columns = 2 if len(panel_metrics) > 1 else 1
-    rows = int(np.ceil(len(panel_metrics) / columns))
+    colors = _color_map_by_size(unique_sizes, cmap)
     if figsize is None:
-        figsize = (6.25 * columns, 5.0 * rows)
+        figsize = (6.25 * len(panel_columns), 5.0 * len(panel_rows))
     fig, axis_grid = plt.subplots(
-        rows, columns, figsize=figsize, dpi=dpi, constrained_layout=True
+        len(panel_rows),
+        len(panel_columns),
+        figsize=figsize,
+        dpi=dpi,
+        constrained_layout=True,
     )
-    flat_axes = tuple(np.atleast_1d(axis_grid).flat)
-    for unused in flat_axes[len(panel_metrics) :]:
-        unused.set_visible(False)
-    axes = dict(zip(panel_metrics, flat_axes))
+    axis_array = np.atleast_1d(axis_grid).reshape(
+        len(panel_rows), len(panel_columns)
+    )
+    flat_axes = tuple(axis_array.flat)
+    slot_axes = {
+        (row, column): axis_array[row_index, column_index]
+        for row_index, row in enumerate(panel_rows)
+        for column_index, column in enumerate(panel_columns)
+    }
+    for slot, ax in slot_axes.items():
+        if slot not in panel_slots:
+            ax.set_visible(False)
+    axes = {
+        metric: slot_axes[_PANEL_SLOT_OF_METRIC[metric]]
+        for metric in panel_metrics
+        if metric in _PANEL_SLOT_OF_METRIC
+    }
 
-    for size in parsed_sizes:
+    for k_of_file, size in keys:
         color = colors[size]
         for metric in panel_metrics:
-            ax = axes[metric]
-            curve = data[size].get(metric)
+            ax = axes.get(metric)
+            if ax is None or k_of_metric.get(metric) != k_of_file:
+                continue
+            curve = data[(k_of_file, size)].get(metric)
             if curve is None:
                 continue
             positive = curve.loc[
@@ -885,8 +968,9 @@ def dist_scaling(
             omitted = len(curve) - len(positive)
             if omitted:
                 warnings.warn(
-                    f"L={size}, {metric.upper()}: omitted {omitted} non-positive "
-                    "mean point(s) from the logarithmic plot."
+                    f"k={k_of_file}, L={size}, {metric.upper()}: omitted "
+                    f"{omitted} non-positive mean point(s) from the "
+                    "logarithmic plot."
                 )
             if positive.empty:
                 continue
@@ -895,13 +979,17 @@ def dist_scaling(
             y = positive["mean"].to_numpy(dtype=float)
             dy = positive["stderr"].to_numpy(dtype=float)
             dy = np.where(np.isfinite(dy), dy, 0.0)
+            # The panel can hold both party counts, so the annotation has to
+            # say which one each series is.
+            label = rf"$k={k_of_file}$, $L={size}$"
+            marker = _marker_for_k(k_of_file)
             if show_errorbars:
                 _positive_log_errorbar(
                     ax,
                     x,
                     y,
                     dy,
-                    fmt="o",
+                    fmt=marker,
                     markersize=4.0,
                     color=color,
                     ecolor=color,
@@ -909,7 +997,7 @@ def dist_scaling(
                     capsize=capsize,
                     elinewidth=0.9,
                     linestyle="none",
-                    label=rf"$L={size}$",
+                    label=label,
                     alpha=0.95,
                 )
             else:
@@ -917,59 +1005,64 @@ def dist_scaling(
                     x,
                     y,
                     linestyle="none",
-                    marker="o",
+                    marker=marker,
                     markersize=4.0,
                     color=color,
                     markeredgecolor=color,
-                    label=rf"$L={size}$",
+                    label=label,
                     alpha=0.95,
                 )
 
     joint_rows: list[dict[str, Any]] = []
     for metric, metric_fit_sizes in fit_sizes.items():
+        if metric not in axes:
+            continue
         exponent = _metric_spec(metric)["exponent"]
+        metric_k = k_of_metric[metric]
         if joint_fit:
             usable = [
                 size
                 for size in metric_fit_sizes
-                if (size, metric) in selected_points
+                if (metric_k, size, metric) in selected_points
             ]
             missing = sorted(set(metric_fit_sizes) - set(usable))
             if missing:
                 warnings.warn(
-                    f"{metric.upper()} joint fit excludes L={missing}: no "
-                    "usable per-size fit window."
+                    f"k={metric_k}, {metric.upper()} joint fit excludes "
+                    f"L={missing}: no usable per-size fit window."
                 )
             if not usable:
                 continue
             pooled = pd.concat(
-                [selected_points[(size, metric)] for size in usable]
+                [selected_points[(metric_k, size, metric)] for size in usable]
             ).sort_values("d")
             try:
                 joint = _log_log_power_law_fit(
                     pooled, min_relative_error=min_relative_error
                 )
             except ValueError as exc:
-                warnings.warn(f"{metric.upper()} joint fit unavailable: {exc}")
+                warnings.warn(
+                    f"k={metric_k}, {metric.upper()} joint fit unavailable: {exc}"
+                )
                 continue
             joint_rows.append(
-                {"metric": metric, "sizes": tuple(usable), **joint}
+                {"k": metric_k, "metric": metric, "sizes": tuple(usable), **joint}
             )
             if len(usable) == 1:
-                prefix = rf"$L={usable[0]}$ fit: "
+                prefix = rf"$k={metric_k}$, $L={usable[0]}$ fit: "
             else:
                 sizes_text = ",".join(str(size) for size in usable)
-                prefix = rf"$L\in\{{{sizes_text}\}}$ joint fit: "
+                prefix = rf"$k={metric_k}$, $L\in\{{{sizes_text}\}}$ joint fit: "
             x_line = np.geomspace(joint["d_min"], joint["d_max"], 200)
             axes[metric].plot(
                 x_line,
                 joint["prefactor"] * x_line ** (-joint["alpha"]),
                 color="black",
-                linestyle="--",
+                linestyle=_linestyle_for_k(metric_k),
                 linewidth=1.5,
                 label=(
                     prefix
-                    + rf"$\alpha_{k}^{{{exponent}}}="
+                    + rf"$\alpha_{metric_k}^{{{exponent}}}="
                     rf"{joint['alpha']:.3g}\pm {joint['alpha_stderr']:.2g}$"
                 ),
                 zorder=5,
@@ -981,7 +1074,7 @@ def dist_scaling(
             if row.empty or not np.isfinite(row.iloc[0]["alpha"]):
                 continue
             row = row.iloc[0]
-            selected = selected_points[(size, metric)]
+            selected = selected_points[(metric_k, size, metric)]
             x_line = np.geomspace(
                 selected["d"].min(), selected["d"].max(), 200
             )
@@ -989,11 +1082,11 @@ def dist_scaling(
                 x_line,
                 row["prefactor"] * x_line ** (-row["alpha"]),
                 color=colors[size],
-                linestyle="--",
+                linestyle=_linestyle_for_k(metric_k),
                 linewidth=1.5,
                 label=(
-                    rf"$L={size}$ fit: "
-                    rf"$\alpha_{k}^{{{exponent}}}="
+                    rf"$k={metric_k}$, $L={size}$ fit: "
+                    rf"$\alpha_{metric_k}^{{{exponent}}}="
                     rf"{row['alpha']:.3g}\pm {row['alpha_stderr']:.2g}$"
                 ),
                 zorder=5,
@@ -1006,14 +1099,17 @@ def dist_scaling(
     plain_distance = FuncFormatter(
         lambda value, _: f"{value:g}" if value > 0 else ""
     )
-    for metric in panel_metrics:
-        ax = axes[metric]
-        spec = _metric_spec(metric)
+    for slot in panel_slots:
+        ax = slot_axes[slot]
+        descriptor = _PANEL_GRID[slot[0]][slot[1]]
         ax.set_xlabel(r"Effective chord distance $d$")
-        # Plain replacement rather than str.format: the labels are LaTeX and
-        # are full of braces that format() would read as fields.
-        ax.set_ylabel(str(spec["ylabel"]).replace("{units}", mi_units))
-        ax.set_title(str(spec["title"]))
+        # A panel can hold both party counts, so it is named by the quantity
+        # it measures rather than by any one of them; the unit is the only
+        # thing the party count does not change.
+        label = str(descriptor["label"])
+        if descriptor["entropy"]:
+            label += f" [{mi_units}]"
+        ax.set_ylabel(label)
         ax.set_xscale("log")
         # Plain-number formatting for logarithmic distance axis.
         ax.xaxis.set_major_formatter(plain_distance)
@@ -1030,23 +1126,23 @@ def dist_scaling(
     summary = pd.DataFrame(
         [
             {
-                "L": size,
+                "k": key[0],
+                "L": key[1],
                 "file": str(entry["path"]),
                 "circuit": circuit_name,
-                "k": k,
                 "format": "aggregate" if entry["aggregated"] else "row-level",
                 **{
-                    f"distance_points_{metric}": len(data[size][metric])
+                    f"distance_points_{metric}": len(data[key][metric])
                     for metric in panel_metrics
-                    if metric in data[size]
+                    if metric in data[key]
                 },
                 **{
-                    f"samples_{metric}": int(data[size][metric]["count"].sum())
+                    f"samples_{metric}": int(data[key][metric]["count"].sum())
                     for metric in panel_metrics
-                    if metric in data[size]
+                    if metric in data[key]
                 },
             }
-            for size, entry in zip(parsed_sizes, loaded)
+            for key, entry in zip(keys, loaded)
         ]
     )
     if show_summary:
@@ -1067,8 +1163,13 @@ def dist_scaling(
         "figure": fig,
         "axes": flat_axes,
         "axes_by_metric": axes,
-        "k": k,
+        # `k` stays a plain number for the single-party-count case every caller
+        # before mixed-k had; it is None when both are present, and
+        # `k_values` is the general answer.
+        "k": k_values[0] if len(k_values) == 1 else None,
+        "k_values": tuple(k_values),
         "metrics": panel_metrics,
+        "metric_party_counts": dict(k_of_metric),
         "available_metrics": tuple(available),
         "circuit_name": circuit_name,
         "is_fermionic": is_fermionic,

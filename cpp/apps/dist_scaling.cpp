@@ -34,11 +34,13 @@ int main(int argc, char **argv)
         config.triangle_balance_cutoff =
             (argc > 8) ? std::stod(argv[8])
                        : mipt::env::real("MIPT_DIST_TRIANGLE_BALANCE", 0.5, 0.0, 1.0);
-        // An explicit output path is taken as given; the default depends on
-        // every other argument, so it is resolved after they are parsed.
-        config.output_path = (argc > 7 && argv[7][0] != '\0')
-                                 ? std::string(argv[7])
-                                 : mipt::dist::default_output_path(config);
+        // An explicit output path is taken as given. Left empty, it is filled in
+        // by `run` once the arguments have been validated -- the default depends
+        // on all of them, and k=0 needs two paths rather than one.
+        if (argc > 7 && argv[7][0] != '\0')
+        {
+            config.output_path = std::string(argv[7]);
+        }
 
         mipt::dist::run(config);
         return 0;
