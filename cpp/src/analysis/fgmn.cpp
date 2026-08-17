@@ -65,6 +65,27 @@ namespace fgmn
         };
     }
 
+    // The cached Fusion constants below are thread_local, and that is not an
+    // optimization -- it is what keeps concurrent solves from corrupting each
+    // other's memory.
+    //
+    // Matrix::t and Expression::t are monty::rc_ptr, whose reference count is a
+    // plain non-atomic ptrdiff_t (monty_rc.h: `count_t refincr() { return
+    // ++refcount; }`).  Every solve that builds a constraint from one of these
+    // objects takes and drops a reference to it, so sharing one across the
+    // solver threads means N threads doing unsynchronized ++/-- on one integer.
+    // A lost increment frees the object while it is still referenced, and the
+    // next thread to touch it dies with SIGSEGV -- intermittently, with a
+    // probability that climbs with FGMN_MAX_CONCURRENT_MOSEK.  This is the
+    // long-standing "fgmn.exe crashes under OMP_NUM_THREADS>=4" bug.
+    //
+    // Per thread these cost one Matrix::eye each, built once.  GmnWorkspace
+    // below is thread_local for the same reason.
+    //
+    // The Int1D/Int2D tables are deliberately *not* thread_local: those are
+    // std::shared_ptr, whose control block is atomically refcounted, and their
+    // payload is read-only.  Sharing them is safe and saves rebuilding the
+    // index tables per thread.
     const Int1D &matrix_shape()
     {
         static const Int1D s = new_array_ptr<int, 1>({D, D});
@@ -73,19 +94,21 @@ namespace fgmn
 
     const Matrix::t &identity_matrix()
     {
-        static const Matrix::t I = Matrix::eye(D);
+        static thread_local const Matrix::t I = Matrix::eye(D);
         return I;
     }
 
     const Matrix::t &double_identity()
     {
-        static const Matrix::t I = Matrix::eye(2*D);
+        static thread_local const Matrix::t I = Matrix::eye(2*D);
         return I;
     }
 
     const Expression::t &double_identity_expr()
     {
-        static const Expression::t I = Expr::constTerm(double_identity());
+        // Constructed after double_identity()'s, so it is destroyed before it
+        // at thread exit -- the Expression holds a reference to that Matrix.
+        static thread_local const Expression::t I = Expr::constTerm(double_identity());
         return I;
     }
 

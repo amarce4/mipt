@@ -81,6 +81,11 @@ int run_cli(int argc, char *argv[])
 
 int main(int argc, char *argv[])
 {
+    // Three-probe mode 4 drives MOSEK Fusion, which dies on a signal rather
+    // than throwing, so nothing below could catch it. `simulate` refines the
+    // context once the SDP settings resolve; see util/crash_report.hpp.
+    mipt::util::crash::install("mipt_probed.exe");
+    mipt::util::crash::set_context("run: mipt_probed.exe (still parsing arguments)");
     try
     {
         return run_cli(argc, argv);

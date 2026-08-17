@@ -9,6 +9,11 @@
 
 int main(int argc, char **argv)
 {
+    // MOSEK Fusion dies on a signal rather than throwing, so this has to be in
+    // place before any solve. `run` refines the context once the run's settings
+    // are known; see util/crash_report.hpp.
+    mipt::util::crash::install("dist_scaling.exe");
+    mipt::util::crash::set_context("run: dist_scaling.exe (still parsing arguments)");
     try
     {
         if (argc > 1 &&

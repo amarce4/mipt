@@ -21,6 +21,7 @@
 #include "mipt/probed/sample.hpp"
 #include "mipt/probed/sdp.hpp"
 #include "mipt/types.hpp"
+#include "mipt/util/crash_report.hpp"
 #include "mipt/util/pause.hpp"
 
 #include <algorithm>
@@ -422,6 +423,21 @@ inline std::vector<OutputRow> simulate(const ProbeRunConfig &config, ProgressRep
             gmn_selected = detail::select_gmn_samples(config, sdp, origin_rng);
             sdp_queue = std::make_unique<SdpBatchQueue>(aggregates, uses_fermionic_trace(config.type), sdp.batch_size,
                                                         sdp.pending_batches);
+
+            // MOSEK Fusion dies on a signal rather than throwing, so record
+            // what is being solved and with what concurrency before the first
+            // solve; see util/crash_report.hpp.
+            const char *concurrency = std::getenv("FGMN_MAX_CONCURRENT_MOSEK");
+            util::crash::set_context(
+                "run: mipt_probed.exe " + describe_run(config) +
+                "\n  output: " + config.output +
+                "\n  sdp=" + std::string(uses_fermionic_trace(config.type) ? "fGMN" : "GMN") +
+                ", FGMN_MAX_CONCURRENT_MOSEK=" +
+                (concurrency != nullptr ? std::string(concurrency) : std::string("unset")) +
+                ", MIPT_PROBED_GMN_PENDING_BATCHES=" + std::to_string(sdp.pending_batches) +
+                ", MIPT_PROBED_GMN_BATCH_RECORDS=" + std::to_string(sdp.batch_size));
+            util::crash::watch("sdp_records_in_flight", sdp_queue->in_flight_counter());
+            util::crash::watch("sdp_records_solved", sdp_queue->solved_counter());
         }
 
         std::array<probed::CircuitWorkspace1D, 2> workspaces;

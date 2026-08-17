@@ -12,8 +12,10 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <deque>
 #include <future>
 #include <limits>
@@ -67,6 +69,12 @@ class SdpBatchQueue
         }
     }
 
+    // Read from a signal handler on whichever thread died, so atomic rather
+    // than plain; see util/crash_report.hpp. `in_flight` is the set a native
+    // crash destroys, which is the number worth reporting.
+    const std::atomic<std::uint64_t> &in_flight_counter() const { return in_flight_; }
+    const std::atomic<std::uint64_t> &solved_counter() const { return solved_; }
+
   private:
     void dispatch()
     {
@@ -77,6 +85,7 @@ class SdpBatchQueue
         std::vector<SdpJob> jobs;
         jobs.swap(batch_);
         batch_.reserve(batch_size_);
+        in_flight_.fetch_add(jobs.size(), std::memory_order_relaxed);
         const bool fermionic = fermionic_;
         pending_.push_back(std::async(std::launch::async, [jobs = std::move(jobs), fermionic]() mutable {
             std::vector<SdpResult> results;
@@ -95,6 +104,7 @@ class SdpBatchQueue
     {
         auto results = pending_.front().get();
         pending_.pop_front();
+        in_flight_.fetch_sub(results.size(), std::memory_order_relaxed);
         for (const auto &result : results)
         {
             auto &aggregate = aggregates_.at(result.aggregate_index);
@@ -106,6 +116,7 @@ class SdpBatchQueue
             {
                 ++aggregate.gmn_solver_failures;
             }
+            solved_.fetch_add(1, std::memory_order_relaxed);
         }
     }
 
@@ -115,6 +126,8 @@ class SdpBatchQueue
     std::size_t max_pending_batches_ = 1;
     std::vector<SdpJob> batch_;
     std::deque<std::future<std::vector<SdpResult>>> pending_;
+    std::atomic<std::uint64_t> in_flight_{0};
+    std::atomic<std::uint64_t> solved_{0};
 };
 
 } // namespace mipt::probed

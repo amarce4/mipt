@@ -43,6 +43,7 @@
 #include "mipt/dist_scaling_csv.hpp"
 #include "mipt/dist_scaling_resume.hpp"
 #include "mipt/probed/geometry.hpp"
+#include "mipt/util/crash_report.hpp"
 #include "mipt/util/pause.hpp"
 #include "mipt/util/stats.hpp"
 #include "mipt/util/text.hpp"
@@ -56,6 +57,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <charconv>
 #include <chrono>
 #include <cmath>
@@ -693,13 +695,19 @@ class SdpBatchQueue
 
     std::uint64_t solved() const
     {
-        return solved_;
+        return solved_.load(std::memory_order_relaxed);
     }
 
     std::uint64_t queued() const
     {
-        return queued_;
+        return queued_.load(std::memory_order_relaxed);
     }
+
+    // Registered with the crash reporter, so these are read from a signal
+    // handler on whichever thread died -- hence atomic rather than plain.
+    const std::atomic<std::uint64_t> &solved_counter() const { return solved_; }
+    const std::atomic<std::uint64_t> &queued_counter() const { return queued_; }
+    const std::atomic<std::uint64_t> &in_flight_counter() const { return in_flight_; }
 
   private:
     struct Job
@@ -725,7 +733,8 @@ class SdpBatchQueue
         std::vector<Job> jobs;
         jobs.swap(batch_);
         batch_.reserve(batch_size_);
-        queued_ += jobs.size();
+        queued_.fetch_add(jobs.size(), std::memory_order_relaxed);
+        in_flight_.fetch_add(jobs.size(), std::memory_order_relaxed);
         pending_.push_back(std::async(std::launch::async, [jobs = std::move(jobs)]() mutable {
             std::vector<Result> results;
             results.reserve(jobs.size());
@@ -743,6 +752,7 @@ class SdpBatchQueue
     {
         auto results = pending_.front().get();
         pending_.pop_front();
+        in_flight_.fetch_sub(results.size(), std::memory_order_relaxed);
         for (const auto &result : results)
         {
             TripleBin &bin = bins_.at(result.bin);
@@ -755,7 +765,7 @@ class SdpBatchQueue
             {
                 ++stats.solver_failures;
             }
-            ++solved_;
+            solved_.fetch_add(1, std::memory_order_relaxed);
         }
     }
 
@@ -764,8 +774,11 @@ class SdpBatchQueue
     std::size_t max_pending_batches_ = 1;
     std::vector<Job> batch_;
     std::deque<std::future<std::vector<Result>>> pending_;
-    std::uint64_t solved_ = 0;
-    std::uint64_t queued_ = 0;
+    std::atomic<std::uint64_t> solved_{0};
+    std::atomic<std::uint64_t> queued_{0};
+    // Submitted but not yet collected. This is exactly the set a crash
+    // destroys, so it is the number worth printing from the handler.
+    std::atomic<std::uint64_t> in_flight_{0};
 };
 
 // ---------------------------------------------------------------------------
@@ -1072,6 +1085,29 @@ class TripleProtocol
     std::uint64_t processed() const { return processed_; }
     std::uint64_t solved() const { return queue_.solved(); }
     std::uint64_t queued() const { return queue_.queued(); }
+
+    // The SDP is the only thing in this executable that can crash natively, so
+    // its settings and its in-flight count are what a crash report needs.
+    void register_crash_counters() const
+    {
+        util::crash::watch("sdp_records_in_flight", queue_.in_flight_counter());
+        util::crash::watch("sdp_records_queued", queue_.queued_counter());
+        util::crash::watch("sdp_records_solved", queue_.solved_counter());
+    }
+
+    std::string describe_sdp() const
+    {
+        if (!sdp_.enabled)
+        {
+            return "sdp=disabled (MIPT_DIST_GMN=0)";
+        }
+        const char *concurrency = std::getenv("FGMN_MAX_CONCURRENT_MOSEK");
+        return "sdp=" + std::string(include_fermionic_ ? "GMN+fGMN" : "GMN") +
+               ", FGMN_MAX_CONCURRENT_MOSEK=" +
+               (concurrency != nullptr ? std::string(concurrency) : std::string("unset")) +
+               ", MIPT_DIST_GMN_PENDING_BATCHES=" + std::to_string(sdp_.pending_batches) +
+               ", MIPT_DIST_GMN_BATCH_RECORDS=" + std::to_string(sdp_.batch_size);
+    }
     const char *rdm_backend_name(cudaq::state &state) const { return rho3_backend_name(state, config_.n); }
 
     void announce_resume(std::ostream &out) const
@@ -1347,6 +1383,30 @@ inline void run_protocols(const RunConfig &config, PairProtocol *pairs, TriplePr
     if (triples != nullptr && !triples->complete())
     {
         triples->announce_run(std::cerr);
+    }
+
+    // A Fusion crash kills the process outright, so record what the run is and
+    // what it is solving with before the first trajectory. `announce_run` has
+    // already resolved the SDP environment by now, which is why this sits here
+    // rather than in main().
+    {
+        std::string context = "run: dist_scaling.exe k=" + std::to_string(config.k) +
+                              ", N=" + std::to_string(config.n) +
+                              ", periods=" + std::to_string(config.periods) +
+                              ", p=" + compact_decimal(config.p) +
+                              ", realizations=" + std::to_string(realizations) +
+                              ", circuit=" + std::string(circuit_type_name(config.type));
+        if (pairs != nullptr)
+        {
+            context += "\n  pair output: " + pairs->output_path();
+        }
+        if (triples != nullptr)
+        {
+            context += "\n  triple output: " + triples->output_path();
+            context += "\n  " + triples->describe_sdp();
+            triples->register_crash_counters();
+        }
+        util::crash::set_context(context);
     }
 
     // Progress is counted in records when one protocol is running, so the

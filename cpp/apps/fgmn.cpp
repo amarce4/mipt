@@ -1,5 +1,6 @@
 #include "mipt/density.hpp"
 #include "mipt/env.hpp"
+#include "mipt/util/crash_report.hpp"
 #include "mipt/analysis/fgmn.hpp"
 #include "mipt/analysis/rdm_batch_cli.hpp"
 
@@ -190,32 +191,14 @@ using namespace mipt;
     }
 
 
-#if !defined(_WIN32)
-    void crash_signal_handler(int signal_number)
-    {
-        const char msg[] =
-            "\nfgmn.exe fatal native crash: received SIGSEGV/SIGABRT/SIGBUS/SIGILL/SIGFPE. "
-            "This is usually a MOSEK/Fusion native crash, not a C++ exception. "
-            "Retry with OMP_NUM_THREADS=2, FGMN_MAX_CONCURRENT_MOSEK=1, "
-            "and unset FGMN_MOSEK_PRESOLVE.\n";
-        (void)!write(STDERR_FILENO, msg, sizeof(msg) - 1);
-        _Exit(128 + signal_number);
-    }
-#endif
-
+    // The handler itself now lives in util/crash_report.hpp, shared with
+    // dist_scaling.exe and mipt_probed.exe -- three copies of an
+    // async-signal-safe handler is two too many, and only this one used to
+    // print anything about what the run was doing.
+    // FGMN_DISABLE_CRASH_HANDLER still turns it off.
     void install_crash_signal_handlers()
     {
-        if (parse_bool_env("FGMN_DISABLE_CRASH_HANDLER", false))
-        {
-            return;
-        }
-#if !defined(_WIN32)
-        std::signal(SIGSEGV, crash_signal_handler);
-        std::signal(SIGABRT, crash_signal_handler);
-        std::signal(SIGBUS, crash_signal_handler);
-        std::signal(SIGILL, crash_signal_handler);
-        std::signal(SIGFPE, crash_signal_handler);
-#endif
+        mipt::util::crash::install("fgmn.exe");
     }
 
     double imaginary_frobenius_norm(const double *rho_ri)
@@ -310,6 +293,16 @@ int main(int argc, char *argv[])
             mipt::env::set_if_unset("FGMN_MAX_CONCURRENT_MOSEK", "2");
         }
 #endif
+
+        {
+            const char *concurrency = std::getenv("FGMN_MAX_CONCURRENT_MOSEK");
+            const char *omp = std::getenv("OMP_NUM_THREADS");
+            mipt::util::crash::set_context(
+                "run: fgmn.exe input=" + input_path + ", output=" + output_path +
+                "\n  OMP_NUM_THREADS=" + (omp != nullptr ? std::string(omp) : std::string("unset")) +
+                ", FGMN_MAX_CONCURRENT_MOSEK=" +
+                (concurrency != nullptr ? std::string(concurrency) : std::string("unset")));
+        }
 
         mipt::io::DensityMatrixReader reader(input_path);
         const auto &metadata = reader.metadata();
