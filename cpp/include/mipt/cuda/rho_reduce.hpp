@@ -54,6 +54,28 @@ int mipt_cuda_rho3_subsystems_complex_fermion_f32(
     double *host_rho_ri_row_major);
 
 /*
+ * Computes the ordinary and fermionic partial traces in one statevector sweep.
+ * The fermionic sign factorizes into a per-basis-state factor, so both traces
+ * come out of the same amplitude loads; see cuda/reduce_sweep.cuh.  The two
+ * output buffers use the same layout described above.
+ */
+int mipt_cuda_rho3_subsystems_complex_both_f64(
+    const void *device_state_vector,
+    int n_qubits,
+    const int *host_subsystems,
+    int subsystem_count,
+    double *host_rho_ri_row_major,
+    double *host_fermion_rho_ri_row_major);
+
+int mipt_cuda_rho3_subsystems_complex_both_f32(
+    const void *device_state_vector,
+    int n_qubits,
+    const int *host_subsystems,
+    int subsystem_count,
+    double *host_rho_ri_row_major,
+    double *host_fermion_rho_ri_row_major);
+
+/*
  * Convenience wrappers for host-resident statevectors.  These copy the full
  * host statevector to a reusable device buffer and then run the same GPU
  * reduction kernel.  They are mainly useful for mipt.cpp's host-simulated
@@ -86,6 +108,22 @@ int mipt_cuda_rho3_subsystems_complex_host_fermion_f32(
     const int *host_subsystems,
     int subsystem_count,
     double *host_rho_ri_row_major);
+
+int mipt_cuda_rho3_subsystems_complex_host_both_f64(
+    const void *host_state_vector,
+    int n_qubits,
+    const int *host_subsystems,
+    int subsystem_count,
+    double *host_rho_ri_row_major,
+    double *host_fermion_rho_ri_row_major);
+
+int mipt_cuda_rho3_subsystems_complex_host_both_f32(
+    const void *host_state_vector,
+    int n_qubits,
+    const int *host_subsystems,
+    int subsystem_count,
+    double *host_rho_ri_row_major,
+    double *host_fermion_rho_ri_row_major);
 
 #ifdef __cplusplus
 }

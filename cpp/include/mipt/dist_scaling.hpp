@@ -1210,12 +1210,18 @@ class TripleProtocol
         }
 
         const int n = config_.n;
-        cudaq_three_site_density_matrices(state, n, subsystems_, rho_ri_.data(), false);
-        normalize_rho3_subsystems(rho_ri_.data(), subsystems_.size());
         if (include_fermionic_)
         {
-            cudaq_three_site_density_matrices(state, n, subsystems_, fermion_rho_ri_.data(), true);
+            // One sweep for both traces; see cudaq_three_site_density_matrices_both.
+            cudaq_three_site_density_matrices_both(state, n, subsystems_, rho_ri_.data(),
+                                                   fermion_rho_ri_.data());
+            normalize_rho3_subsystems(rho_ri_.data(), subsystems_.size());
             normalize_rho3_subsystems(fermion_rho_ri_.data(), subsystems_.size());
+        }
+        else
+        {
+            cudaq_three_site_density_matrices(state, n, subsystems_, rho_ri_.data(), false);
+            normalize_rho3_subsystems(rho_ri_.data(), subsystems_.size());
         }
 
         for (std::size_t index = 0; index < subsystems_.size(); ++index)

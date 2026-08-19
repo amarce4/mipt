@@ -681,6 +681,62 @@ inline void cudaq_three_site_density_matrices(
     }
 }
 
+// Both trace conventions from one statevector sweep.
+//
+// The fermionic sign factorizes into a per-basis-state factor -- see
+// cuda/reduce_sweep.cuh -- so on the CUDA path this costs one set of amplitude
+// loads rather than two. Everywhere else it is exactly the two-call form, and
+// callers get the same numbers either way.
+inline void cudaq_three_site_density_matrices_both(
+    cudaq::state &state,
+    int n,
+    const std::vector<Subsystem> &subsystems,
+    double *rho_ri,
+    double *fermion_rho_ri)
+{
+    if (rho_ri == nullptr || fermion_rho_ri == nullptr || subsystems.empty())
+    {
+        throw std::invalid_argument("Density-matrix output definition is empty.");
+    }
+    if (n < RHO3_QUBITS)
+    {
+        throw std::invalid_argument("Three-qubit RDM output requires at least three qubits.");
+    }
+
+#ifdef MIPT_ENABLE_CUDA_RHO
+    const std::uint64_t dim_u64 = checked_pow2_u64(n);
+    if (dim_u64 <= static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()))
+    {
+        const std::size_t dim = static_cast<std::size_t>(dim_u64);
+        const auto tensor = state.get_tensor();
+        const bool has_dense_rank1_tensor =
+            tensor.get_rank() == 1 && tensor.get_num_elements() >= dim && tensor.data != nullptr;
+        if (has_dense_rank1_tensor && state.is_on_gpu())
+        {
+            const std::vector<int> flat = flatten_subsystems(subsystems);
+            const int count = static_cast<int>(subsystems.size());
+            const int status =
+                (state.get_precision() == cudaq::SimulationState::precision::fp64)
+                    ? mipt_cuda_rho3_subsystems_complex_both_f64(
+                          tensor.data, n, flat.data(), count, rho_ri, fermion_rho_ri)
+                    : mipt_cuda_rho3_subsystems_complex_both_f32(
+                          tensor.data, n, flat.data(), count, rho_ri, fermion_rho_ri);
+            if (status != 0)
+            {
+                throw std::runtime_error(
+                    "CUDA three-qubit dual-trace reduced-density-matrix kernel failed; status=" +
+                    std::to_string(status));
+            }
+            return;
+        }
+    }
+#endif
+
+    cudaq_three_site_density_matrices(state, n, subsystems, rho_ri, false);
+    cudaq_three_site_density_matrices(state, n, subsystems, fermion_rho_ri, true);
+}
+
+
 inline mipt::io::DensityFileMetadata density_metadata(
     int dimension,
     int total_qubits,

@@ -249,7 +249,8 @@ MIPT_HEADERS := $(shell find include -name '*.hpp' 2>/dev/null)
 MIPT_CUDA_HEADERS := $(shell find include -name '*.cuh' 2>/dev/null) $(MIPT_HEADERS)
 
 .PHONY: all simulation analysis clean cpu gpu print-config format test-core test-dist test-front \
-  test-spectral test-gmn test-rdm-gram test-cusv test-cusv-gates test-mode3 bench-cusv \
+  test-spectral test-gmn test-rdm-gram test-rho-reduce test-cusv test-cusv-gates \
+  test-mode3 bench-cusv \
   mipt.exe mipt_probed.exe free_energy.exe sim_tmi.exe dist_scaling.exe \
   entropy.exe gmn.exe fgmn.exe ring_inflation.exe exp_vals.exe
 
@@ -348,6 +349,15 @@ $(RDM_GRAM_TEST_BIN): tests/rdm_gram_tests.cu $(BUILD)/tmi_cuda_rdm.o $(BUILD)/t
 	$(NVCC) $(NVCCFLAGS) $^ $(if $(CUDA_LIB_DIR),-L$(CUDA_LIB_DIR) -Xlinker -rpath -Xlinker $(CUDA_LIB_DIR)) -lcublas -lcusolver -o $@
 test-rdm-gram: $(RDM_GRAM_TEST_BIN)
 	$(RDM_GRAM_TEST_BIN)
+
+# Fused two- and three-site reduction sweeps against a from-first-principles
+# host reference (permutation parity, not the kernels' own sign masks), for
+# both traces, both precisions and unsorted retained sets. Needs a GPU.
+RHO_REDUCE_TEST_BIN := $(BUILD)/rho_reduce_tests
+$(RHO_REDUCE_TEST_BIN): tests/rho_reduce_tests.cu $(BUILD)/rho2_reduce.o $(BUILD)/rho_reduce.o | $(BUILD)
+	$(NVCC) $(NVCCFLAGS) $^ $(if $(CUDA_LIB_DIR),-L$(CUDA_LIB_DIR) -Xlinker -rpath -Xlinker $(CUDA_LIB_DIR)) -o $@
+test-rho-reduce: $(RHO_REDUCE_TEST_BIN)
+	$(RHO_REDUCE_TEST_BIN)
 
 # --- cuStateVec engine tests ------------------------------------------------
 #
