@@ -25,6 +25,8 @@ import warnings
 from typing import Any, Mapping, Sequence
 
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
+from matplotlib.patches import Patch
 import numpy as np
 import pandas as pd
 
@@ -42,10 +44,6 @@ from .plotting import (
     _positive_log_errorbar,
     _show,
 )
-
-# Distinguishes "argument not supplied" from an explicit None, which for the
-# `fit_last` family means "use every point" rather than "use the default".
-_UNSET = object()
 
 
 # ---------------------------------------------------------------------------
@@ -70,7 +68,37 @@ _METRIC_SPECS: dict[str, dict[str, Any]] = {
     "faverage_mi": {"exponent": r"\overline{\mathrm{fMI}}", "entropy": True},
     "min_bipneg": {"exponent": r"\mathrm{minN}"},
     "min_fbipneg": {"exponent": r"\mathrm{minN}^f"},
+    # The two factors of the entanglement decomposition (see below). Derived,
+    # not read: nothing in the CSV carries them directly.
+    "mn_ent_fraction": {"exponent": r"P_{\mathrm{ent}}"},
+    "fmn_ent_fraction": {"exponent": r"P^{f}_{\mathrm{ent}}"},
+    "mn_ent_magnitude": {"exponent": r"\mathcal{N}_{\mathrm{ent}}"},
+    "fmn_ent_magnitude": {"exponent": r"\mathcal{N}^{f}_{\mathrm{ent}}"},
+    "gmn_ent_fraction": {"exponent": r"P^{(3)}_{\mathrm{ent}}"},
+    "fgmn_ent_fraction": {"exponent": r"P^{(3)f}_{\mathrm{ent}}"},
+    "gmn_ent_magnitude": {"exponent": r"\mathcal{G}_{\mathrm{ent}}"},
+    "fgmn_ent_magnitude": {"exponent": r"\mathcal{G}^{f}_{\mathrm{ent}}"},
 }
+
+# ---------------------------------------------------------------------------
+# Entanglement decomposition
+#
+# A bipartite negativity is exactly zero on most records -- monogamy plus
+# entanglement sudden death -- so its mean over all records confounds two
+# quantities that need not share an exponent:
+#
+#     <N>(d) = P_ent(d) * <N>_ent(d)
+#
+# the probability that a pair is entangled at all, and the typical magnitude
+# when it is. `dist_scaling.exe` writes `<metric>_positive_count` beside the
+# mean, which is what makes both recoverable from the aggregate alone.
+# ---------------------------------------------------------------------------
+
+_DECOMPOSITION_SUFFIXES = ("_ent_fraction", "_ent_magnitude")
+
+
+def _is_decomposition_metric(metric: str) -> bool:
+    return metric.endswith(_DECOMPOSITION_SUFFIXES)
 
 # ---------------------------------------------------------------------------
 # Panel layout
@@ -110,13 +138,50 @@ _PANEL_GRID: tuple[tuple[dict[str, Any], ...], ...] = (
     ),
 )
 
-# Every metric that has a panel, and the slot it belongs to.
-_PANEL_SLOT_OF_METRIC: dict[str, tuple[int, int]] = {
-    metric: (row_index, column_index)
-    for row_index, row in enumerate(_PANEL_GRID)
-    for column_index, slot in enumerate(row)
-    for metric in slot["metrics"].values()
-}
+# The `ent_decomp=True` layout, a recreation of Fig. 8 of arXiv:2602.04969.
+# Here the rows are the trace conventions and the columns the two factors of
+# the decomposition, so reading a row left to right multiplies out to the
+# negativity panel of the default figure.
+_ENT_DECOMP_GRID: tuple[tuple[dict[str, Any], ...], ...] = (
+    (
+        {
+            "label": r"Entangled fraction $P_{\mathrm{ent}}$",
+            "entropy": False,
+            "metrics": {2: "mn_ent_fraction", 3: "gmn_ent_fraction"},
+        },
+        {
+            "label": r"Conditional negativity "
+            r"$\langle\mathcal{N}\rangle_{\mathrm{ent}}$",
+            "entropy": False,
+            "metrics": {2: "mn_ent_magnitude", 3: "gmn_ent_magnitude"},
+        },
+    ),
+    (
+        {
+            "label": r"Fermionic entangled fraction $P^{f}_{\mathrm{ent}}$",
+            "entropy": False,
+            "metrics": {2: "fmn_ent_fraction", 3: "fgmn_ent_fraction"},
+        },
+        {
+            "label": r"Conditional fermionic negativity "
+            r"$\langle\mathcal{N}^{f}\rangle_{\mathrm{ent}}$",
+            "entropy": False,
+            "metrics": {2: "fmn_ent_magnitude", 3: "fgmn_ent_magnitude"},
+        },
+    ),
+)
+
+
+def _panel_slot_of_metric(
+    grid: tuple[tuple[dict[str, Any], ...], ...],
+) -> dict[str, tuple[int, int]]:
+    """Every metric that has a panel in ``grid``, and the slot it belongs to."""
+    return {
+        metric: (row_index, column_index)
+        for row_index, row in enumerate(grid)
+        for column_index, slot in enumerate(row)
+        for metric in slot["metrics"].values()
+    }
 
 # k=2 and k=3 share a panel, so they are told apart by marker and by the
 # line style of their fit, with colour left to carry the system size.
@@ -251,6 +316,79 @@ def _aggregate_metric_names(columns: Sequence[str]) -> list[str]:
     ]
 
 
+def _decomposition_curves(
+    frame: pd.DataFrame,
+    distance: pd.Series,
+    stem: str,
+) -> dict[str, pd.DataFrame]:
+    """Split ``<stem>_mean`` into an entangled fraction and a magnitude.
+
+    Writing ``n`` for the records folded into the bin, ``m`` for those with a
+    strictly positive value, and ``mu`` for the mean over all ``n``:
+
+        P_ent = m / n            <N>_ent = n*mu / m = mu / P_ent
+
+    The second identity is exact, not an approximation -- the zero records
+    contribute nothing to the sum, so ``n*mu`` *is* the sum over the entangled
+    ones. Both errors follow from the file's own ``m2 = stderr^2 * n * (n-1)``,
+    and the population-level identity
+
+        var(mu) = P_ent^2 var(<N>_ent) + <N>_ent^2 var(P_ent)
+
+    says the split loses nothing: the mean's error bar is exactly the two
+    factors' error bars recombined. (Both inherit the caveat the mean already
+    carries -- every geometry is measured inside one trajectory, so records in
+    a bin are correlated and every stderr here is optimistic.)
+    """
+    count_column = f"{stem}_positive_count"
+    if count_column not in frame.columns or f"{stem}_mean" not in frame.columns:
+        return {}
+
+    n = pd.to_numeric(frame[f"{stem}_samples"], errors="coerce").to_numpy(dtype=float)
+    m = pd.to_numeric(frame[count_column], errors="coerce").to_numpy(dtype=float)
+    mu = pd.to_numeric(frame[f"{stem}_mean"], errors="coerce").to_numpy(dtype=float)
+    stderr = pd.to_numeric(frame[f"{stem}_stderr"], errors="coerce").to_numpy(
+        dtype=float
+    )
+
+    with np.errstate(invalid="ignore", divide="ignore"):
+        fraction = np.where(n > 0, m / n, np.nan)
+        fraction_stderr = np.where(
+            n > 0, np.sqrt(np.maximum(fraction * (1.0 - fraction), 0.0) / n), np.nan
+        )
+
+        magnitude = np.where(m > 0, mu / fraction, np.nan)
+        # m2_Y = m2 + n*mu^2 - n^2*mu^2/m is the sum of squared deviations of
+        # the entangled records about their own mean; the conditional standard
+        # error is its usual sqrt(m2_Y / (m * (m - 1))).
+        m2 = stderr**2 * n * (n - 1.0)
+        m2_entangled = m2 + n * mu**2 - np.square(n) * mu**2 / m
+        magnitude_stderr = np.where(
+            m > 1,
+            np.sqrt(np.maximum(m2_entangled, 0.0) / (m * (m - 1.0))),
+            np.nan,
+        )
+
+    return {
+        f"{stem}_ent_fraction": pd.DataFrame(
+            {
+                "d": distance,
+                "mean": fraction,
+                "stderr": fraction_stderr,
+                "count": pd.Series(n, index=frame.index).fillna(0).astype(np.int64),
+            }
+        ),
+        f"{stem}_ent_magnitude": pd.DataFrame(
+            {
+                "d": distance,
+                "mean": magnitude,
+                "stderr": magnitude_stderr,
+                "count": pd.Series(m, index=frame.index).fillna(0).astype(np.int64),
+            }
+        ),
+    }
+
+
 def _read_aggregate_file(path: str | Path) -> dict[str, Any]:
     """Read one aggregated dist_scaling CSV."""
     frame = pd.read_csv(path)
@@ -289,6 +427,21 @@ def _read_aggregate_file(path: str | Path) -> dict[str, Any]:
         # so pool them by their sample counts rather than plotting a column of
         # coincident points.
         data[metric] = _pool_by_distance(curve)
+
+    # Any measure that reports how often it was strictly positive can be split
+    # into its two factors: the pair negativities always have, and the
+    # GMN family since 2026-08-19. Older k=3 files carry only
+    # `gmn_zero_prefilter_count` -- the zeros a vanishing bipartite negativity
+    # settled without a solve, a lower bound on the zeros rather than their
+    # count -- and so yield no decomposition.
+    for column in frame.columns:
+        if not column.strip().lower().endswith("_positive_count"):
+            continue
+        stem = column.strip()[: -len("_positive_count")]
+        for name, curve in _decomposition_curves(frame, distance, stem).items():
+            curve = curve.replace([np.inf, -np.inf], np.nan)
+            curve = curve.loc[np.isfinite(curve["d"]) & (curve["d"] > 0.0)]
+            data[name] = _pool_by_distance(curve)
 
     k_column = next(
         (column for column in frame.columns if column.strip().lower() == "k"),
@@ -388,42 +541,45 @@ def _is_aggregate_file(path: str | Path) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _fit_range_for_size(
-    fit_range: (
-        tuple[float | None, float | None]
-        | Mapping[int, tuple[float | None, float | None]]
-        | None
-    ),
-    size: int,
+def _normalize_fit_range(
+    fit_range: tuple[float | None, float | None] | None,
+    name: str,
 ) -> tuple[float | None, float | None] | None:
+    """Validate one ``(d_min, d_max)`` fit window, either bound optional."""
     if fit_range is None:
         return None
-    if isinstance(fit_range, Mapping):
-        return fit_range.get(size)
-    return fit_range
-
-
-def _normalize_fit_sizes(
-    requested: int | Sequence[int] | None,
-    parsed_sizes: Sequence[int],
-    metric: str,
-) -> list[int]:
-    """Resolve a ``fit_size`` entry to a sorted list of system sizes."""
-    if requested is None:
-        return [max(parsed_sizes)]
-    if isinstance(requested, (int, np.integer)):
-        candidates = [int(requested)]
-    else:
-        candidates = [int(size) for size in requested]
-        if not candidates:
-            raise ValueError(f"fit_size[{metric!r}] must not be empty.")
-    unknown = sorted(set(candidates) - set(parsed_sizes))
-    if unknown:
+    try:
+        lower, upper = fit_range
+    except (TypeError, ValueError):
         raise ValueError(
-            f"fit_size[{metric!r}]={unknown if len(unknown) > 1 else unknown[0]} "
-            f"is not among {list(parsed_sizes)}."
+            f"{name} must be a (d_min, d_max) pair, either bound None; "
+            f"got {fit_range!r}."
+        ) from None
+    lower = None if lower is None else float(lower)
+    upper = None if upper is None else float(upper)
+    if lower is not None and lower <= 0.0:
+        raise ValueError(
+            f"{name} lower bound must be positive; the distance axis is "
+            "logarithmic."
         )
-    return sorted(set(candidates))
+    if lower is not None and upper is not None and upper <= lower:
+        raise ValueError(
+            f"{name}=({lower}, {upper}) is empty; the upper bound must exceed "
+            "the lower one."
+        )
+    return (lower, upper)
+
+
+def _fit_range_text(
+    fit_range: tuple[float | None, float | None] | None,
+) -> str:
+    if fit_range is None:
+        return "every positive point"
+    lower, upper = fit_range
+    return (
+        f"d in [{'0' if lower is None else format(lower, 'g')}, "
+        f"{'inf' if upper is None else format(upper, 'g')}]"
+    )
 
 
 def _log_log_power_law_fit(
@@ -471,7 +627,6 @@ def _distance_power_law_fit(
     curve: pd.DataFrame,
     *,
     fit_range: tuple[float | None, float | None] | None,
-    fit_last: int | None,
     min_relative_error: float,
 ) -> tuple[dict[str, float], pd.DataFrame]:
     """Fit mean = prefactor * d**(-alpha) in logarithmic coordinates."""
@@ -488,10 +643,6 @@ def _distance_power_law_fit(
             selected = selected.loc[selected["d"] >= lower]
         if upper is not None:
             selected = selected.loc[selected["d"] <= upper]
-    elif fit_last is not None:
-        if fit_last < 3:
-            raise ValueError("fit_last must be at least 3 or None.")
-        selected = selected.tail(fit_last)
 
     fit = _log_log_power_law_fit(
         selected, min_relative_error=min_relative_error
@@ -499,41 +650,51 @@ def _distance_power_law_fit(
     return fit, selected
 
 
-def _merge_per_metric(
-    shared: Any,
-    named: Mapping[str, Any],
+def _print_distance_fits(
+    fits: pd.DataFrame,
     metrics: Sequence[str],
-    default: Any,
-) -> dict[str, Any]:
-    """Resolve a per-metric setting from a dict, the legacy kwargs, or a default.
+    k_of_metric: Mapping[str, int],
+    fit_ranges: Mapping[int, tuple[float | None, float | None] | None],
+    plotted: Mapping[str, int],
+    circuit_name: str,
+) -> None:
+    """Report every fit, including the sizes the figure does not draw.
 
-    ``shared`` may be a mapping keyed by metric or one value applied to every
-    metric; the ``fit_*_mi``-style keyword arguments win over it, and anything
-    still unset falls back to ``default``. An explicit ``None`` is a value, not
-    an omission -- ``fit_last={"tmi": None}`` asks for every point.
+    Only the largest size gets a line in the panel -- the smaller ones lie
+    almost on top of it -- so the console is where the size dependence of an
+    exponent is actually read.
     """
-    shared_map: Mapping[str, Any] | None = None
-    shared_value: Any = _UNSET
-    if (
-        isinstance(shared, Mapping)
-        and shared
-        and set(shared) <= set(_METRIC_SPECS) | set(metrics)
-    ):
-        shared_map = shared
-    elif shared is not _UNSET:
-        # An explicit None reaches here and stays a value: `fit_last=None`
-        # asks for every point, it does not ask for the default.
-        shared_value = shared
-
-    resolved: dict[str, Any] = {}
-    for metric in metrics:
-        value = named.get(metric, _UNSET)
-        if value is _UNSET and shared_map is not None:
-            value = shared_map.get(metric, _UNSET)
-        if value is _UNSET:
-            value = shared_value
-        resolved[metric] = default if value is _UNSET else value
-    return resolved
+    if fits.empty:
+        return
+    print(f"Distance-scaling power-law fits ({circuit_name}):")
+    party_counts = sorted(
+        {int(k_of_metric[metric]) for metric in metrics if metric in k_of_metric}
+    )
+    for k in party_counts:
+        print(f"  k={k}, fit window: {_fit_range_text(fit_ranges.get(k))}")
+        for metric in metrics:
+            if k_of_metric.get(metric) != k:
+                continue
+            rows = fits.loc[fits["metric"] == metric].sort_values("L")
+            name = f"alpha_{k}^{metric.upper()}"
+            for _, row in rows.iterrows():
+                head = f"    L={int(row['L']):<3d} {name:<20s}"
+                if not np.isfinite(row["alpha"]):
+                    detail = (
+                        row["error"]
+                        if "error" in row.index and isinstance(row["error"], str)
+                        else "no usable fit window"
+                    )
+                    print(f"{head} unavailable: {detail}")
+                    continue
+                window = f"[{row['d_min']:.4g}, {row['d_max']:.4g}]"
+                print(
+                    f"{head} = {row['alpha']:7.4f} +/- {row['alpha_stderr']:.4f}"
+                    f"   d in {window:<18s}"
+                    f"{int(row['points']):3d} pts"
+                    f"   chi2/dof = {row['reduced_chi2']:6.2f}"
+                    + ("   <- plotted" if plotted.get(metric) == int(row["L"]) else "")
+                )
 
 
 def dist_scaling(
@@ -543,22 +704,9 @@ def dist_scaling(
     sizes: Sequence[int] | None = None,
     l_by_file: Mapping[str, int] | None = None,
     metrics: Sequence[str] | None = None,
-    fit_size: Any = _UNSET,
-    fit_range: Any = _UNSET,
-    fit_last: Any = _UNSET,
-    fit_size_mi: Any = _UNSET,
-    fit_size_fmi: Any = _UNSET,
-    fit_size_mn: Any = _UNSET,
-    fit_size_fmn: Any = _UNSET,
-    joint_fit: bool = False,
-    fit_range_mi: Any = _UNSET,
-    fit_range_fmi: Any = _UNSET,
-    fit_range_mn: Any = _UNSET,
-    fit_range_fmn: Any = _UNSET,
-    fit_last_mi: Any = _UNSET,
-    fit_last_fmi: Any = _UNSET,
-    fit_last_mn: Any = _UNSET,
-    fit_last_fmn: Any = _UNSET,
+    ent_decomp: bool = False,
+    fit_range_2: tuple[float | None, float | None] | None = None,
+    fit_range_3: tuple[float | None, float | None] | None = None,
     min_relative_error: float = 0.03,
     chunksize: int = 1_000_000,
     distance_round: int = 12,
@@ -596,15 +744,51 @@ def dist_scaling(
     Fermionic Negativity         ``fmn``     ``fgmn``
     ============================ =========== ============
 
-    Within a panel the party count is carried by the marker (``o`` for
-    ``k=2``, ``s`` for ``k=3``) and by the fit line style, and named in every
-    legend entry; colour stays with the system size. The fermionic column is
-    dropped for qubit ensembles, leaving mutual information above negativity.
+    Within a panel the two annotations are orthogonal and each says one
+    thing: **colour is the system size** and **marker shape is the party
+    count** (``o`` for ``k=2``, ``s`` for ``k=3``, and the fit line style to
+    match). The legend therefore holds one entry per size and one per party
+    count instead of one per series. The fermionic column is dropped for qubit
+    ensembles, leaving mutual information above negativity.
 
     Every other measure the file carries -- ``average_mi``, ``min_bipneg``,
     the purities -- is still loaded into ``data`` and still fitted into
     ``fits``; it just gets no subplot. Pass ``metrics`` to override the panel
     set.
+
+    ``ent_decomp=True`` replaces the whole figure with the **entanglement
+    decomposition**, a recreation of Fig. 8 of arXiv:2602.04969. A bipartite
+    negativity is exactly zero on most records, so its mean confounds two
+    quantities that need not share an exponent:
+
+    .. math::
+
+        \langle\mathcal{N}\rangle(d)
+            = P_{\mathrm{ent}}(d)\,
+              \langle\mathcal{N}\rangle_{\mathrm{ent}}(d)
+
+    -- how often a pair is entangled at all, and how much when it is. The
+    columns are those two factors and the rows the two trace conventions, so
+    the top row multiplies out to the Negativity panel of the default figure
+    and the bottom row to the Fermionic Negativity one:
+
+    =============== ============================ =============================
+    row              left column                  right column
+    =============== ============================ =============================
+    ordinary trace  ``mn_ent_fraction`` (k=2)    ``mn_ent_magnitude`` (k=2)
+                    ``gmn_ent_fraction`` (k=3)   ``gmn_ent_magnitude`` (k=3)
+    fermionic trace ``fmn_ent_fraction`` (k=2)   ``fmn_ent_magnitude`` (k=2)
+                    ``fgmn_ent_fraction`` (k=3)  ``fgmn_ent_magnitude`` (k=3)
+    =============== ============================ =============================
+
+    Both factors are derived from the ``<metric>_positive_count`` column, so
+    this needs the **aggregated** format. The row-level archive carries no such
+    count at all, and k=3 files written before 2026-08-19 carry only the zeros
+    the GMN prefilter settled, a lower bound on the zeros rather than their
+    count; either way those files contribute no panel and are reported. The
+    derived curves are loaded into ``data`` whether or not ``ent_decomp`` is
+    set; they are only fitted when they are on a panel. ``metrics`` cannot be
+    combined with ``ent_decomp``.
 
     ``data`` and ``selected_fit_points`` are keyed by ``(k, L)`` and
     ``(k, L, metric)`` respectively, and ``fits`` carries a ``k`` column,
@@ -625,14 +809,13 @@ def dist_scaling(
     ``tmi``/``ftmi`` are plotted and fitted as :math:`|I_3|`. Their signed
     means are kept in the ``signed_mean`` column of ``data``.
 
-    ``fit_size``, ``fit_range``, and ``fit_last`` take a dictionary keyed by
-    metric -- ``fit_last={"tmi": 5, "gmn": 3}`` -- or one value applied to
-    every metric. The older ``fit_size_mi``/``fit_range_mn``/``fit_last_fmi``
-    style keywords still work and win over the dictionary. Fit results for
-    every size are returned in ``fits``, while dashed lines are drawn only for
-    the corresponding ``fit_size`` entry (largest size by default). With a
-    list of sizes, ``joint_fit=True`` pools their selected points into one
-    weighted fit with a shared exponent, returned in ``joint_fits``.
+    ``fit_range_2`` and ``fit_range_3`` are the ``(d_min, d_max)`` windows
+    the power laws are fitted over, one per party count and applied to every
+    measure at that count; either bound may be ``None`` for unbounded, and a
+    range left ``None`` fits every positive point. **Every** size is fitted,
+    every fit is printed, and all of them are returned in ``fits``; only the
+    largest size per measure gets a line in the panel, since the smaller ones
+    lie nearly on top of it and say nothing the printout does not.
 
     ``mi_units`` selects the unit of every entropy-valued measure (``mi``,
     ``fmi``, ``tmi``, ``ftmi``, ``average_mi``) and of their fitted
@@ -647,6 +830,17 @@ def dist_scaling(
         raise ValueError("chunksize must be positive.")
     if distance_round < 0:
         raise ValueError("distance_round must be non-negative.")
+    if ent_decomp and metrics is not None:
+        raise ValueError(
+            "ent_decomp=True fixes the panel set to the two decomposition "
+            "factors; metrics= cannot also be given."
+        )
+    panel_grid = _ENT_DECOMP_GRID if ent_decomp else _PANEL_GRID
+    slot_of_metric = _panel_slot_of_metric(panel_grid)
+    fit_ranges = {
+        2: _normalize_fit_range(fit_range_2, "fit_range_2"),
+        3: _normalize_fit_range(fit_range_3, "fit_range_3"),
+    }
     mi_units, mi_scale_from_nats = _mi_unit_spec(mi_units)
     _, legacy_scale_from_nats = _mi_unit_spec(legacy_entropy_units)
 
@@ -784,77 +978,84 @@ def dist_scaling(
         # The panel grid is fixed, so a supporting measure has nowhere to be
         # drawn. Say so rather than dropping it silently -- it is still loaded
         # and still fitted, just not plotted.
-        off_grid = [
-            name for name in panel_metrics if name not in _PANEL_SLOT_OF_METRIC
-        ]
+        off_grid = [name for name in panel_metrics if name not in slot_of_metric]
         if off_grid:
             raise ValueError(
                 f"Metric(s) {off_grid} have no panel; the grid holds "
-                f"{sorted(_PANEL_SLOT_OF_METRIC)}. They are still returned in "
+                f"{sorted(slot_of_metric)}. They are still returned in "
                 "`data` and `fits`."
             )
     else:
         panel_metrics = tuple(
             metric
-            for row in _PANEL_GRID
+            for row in panel_grid
             for slot in row
             for k_of_slot in sorted(slot["metrics"])
             for metric in (slot["metrics"][k_of_slot],)
             if metric in available
         )
         if not panel_metrics:
+            if ent_decomp:
+                raise ValueError(
+                    "ent_decomp=True needs a negativity that reports how often "
+                    "it was positive -- a `<metric>_positive_count` column, "
+                    "which the row-level format never wrote and which k=3 "
+                    "files only gained on 2026-08-19. "
+                    f"Available here: {available}."
+                )
             raise ValueError(
                 "None of the panel measures were found; available: "
                 f"{available}."
             )
+        if ent_decomp:
+            silent = sorted(
+                {k_of_file for k_of_file, _ in keys}
+                - {k_of_metric[metric] for metric in panel_metrics}
+            )
+            if silent:
+                warnings.warn(
+                    f"ent_decomp=True: the k={silent} file(s) carry no "
+                    "positive-count column -- k=3 files written before "
+                    "2026-08-19 do not -- so they are neither drawn nor "
+                    "fitted."
+                )
 
     # Which grid slots earn a subplot, and which of the fixed rows and columns
     # therefore survive. Dropping an empty column is what turns a purely
     # ordinary-trace run into a one-column figure with mutual information above
     # negativity, rather than a 2x2 with two blank panels.
     panel_slots = {
-        _PANEL_SLOT_OF_METRIC[metric]
+        slot_of_metric[metric]
         for metric in panel_metrics
-        if metric in _PANEL_SLOT_OF_METRIC
+        if metric in slot_of_metric
     }
     if not panel_slots:
         raise ValueError(
             f"None of the requested metrics {list(panel_metrics)} has a panel; "
-            "the panel grid holds mi/tmi, fmi/ftmi, mn/gmn and fmn/fgmn."
+            f"the panel grid holds {sorted(slot_of_metric)}."
         )
     panel_rows = sorted({row for row, _ in panel_slots})
     panel_columns = sorted({column for _, column in panel_slots})
 
     # --- fit every loaded measure, draw only the panel ones ----------------
-    fit_settings_range = _merge_per_metric(
-        fit_range,
-        {
-            "mi": fit_range_mi,
-            "fmi": fit_range_fmi,
-            "mn": fit_range_mn,
-            "fmn": fit_range_fmn,
-        },
-        available,
-        None,
-    )
-    fit_settings_last = _merge_per_metric(
-        fit_last,
-        {
-            "mi": fit_last_mi,
-            "fmi": fit_last_fmi,
-            "mn": fit_last_mn,
-            "fmn": fit_last_fmn,
-        },
-        available,
-        4,
-    )
-
     fit_rows: list[dict[str, Any]] = []
     selected_points: dict[tuple[int, int, str], pd.DataFrame] = {}
+    # A purity is constant with distance and the decomposition factors are
+    # only wanted when they are the subject of the figure, so neither is fitted
+    # unless it earns a panel. In `ent_decomp` mode a party count with no panel
+    # is dropped whole: a k=3 file passed along with the pair files would
+    # otherwise contribute sixteen fits to a figure it does not appear in.
+    panel_party_counts = {k_of_metric[metric] for metric in panel_metrics}
     fitted_metrics = [
         metric
         for metric in available
-        if metric not in _NON_SCALING_METRICS or metric in panel_metrics
+        if (not ent_decomp or k_of_metric[metric] in panel_party_counts)
+        and (
+            metric in panel_metrics
+            or not (
+                metric in _NON_SCALING_METRICS or _is_decomposition_metric(metric)
+            )
+        )
     ]
     for k_of_file, size in keys:
         for metric in fitted_metrics:
@@ -863,10 +1064,7 @@ def dist_scaling(
             try:
                 fit, selected = _distance_power_law_fit(
                     data[(k_of_file, size)][metric],
-                    fit_range=_fit_range_for_size(
-                        fit_settings_range[metric], size
-                    ),
-                    fit_last=fit_settings_last[metric],
+                    fit_range=fit_ranges.get(k_of_file),
                     min_relative_error=min_relative_error,
                 )
                 fit_rows.append(
@@ -898,29 +1096,30 @@ def dist_scaling(
                     )
 
     fits = pd.DataFrame(fit_rows)
-    # A fit_size entry names system sizes, and the sizes on offer are the ones
-    # measured at that metric's own party count.
-    sizes_by_k: dict[int, list[int]] = {}
-    for k_of_file, size in keys:
-        sizes_by_k.setdefault(k_of_file, []).append(size)
-    fit_sizes = {
-        metric: _normalize_fit_sizes(
-            _merge_per_metric(
-                fit_size,
-                {
-                    "mi": fit_size_mi,
-                    "fmi": fit_size_fmi,
-                    "mn": fit_size_mn,
-                    "fmn": fit_size_fmn,
-                },
-                panel_metrics,
-                None,
-            )[metric],
-            sizes_by_k.get(k_of_metric[metric], unique_sizes),
-            metric,
+
+    # One line per panel, drawn for the largest size that produced a usable
+    # fit at that measure's own party count. Every other size is still fitted
+    # and reported -- the panel just stops carrying a stack of nearly parallel
+    # dashed lines that no reader can tell apart.
+    plotted_fit_size: dict[str, int] = {}
+    for metric in panel_metrics:
+        usable = [
+            size
+            for k_of_file, size in keys
+            if k_of_file == k_of_metric[metric]
+            and (k_of_file, size, metric) in selected_points
+        ]
+        if usable:
+            plotted_fit_size[metric] = max(usable)
+    if show_summary:
+        _print_distance_fits(
+            fits,
+            fitted_metrics,
+            k_of_metric,
+            fit_ranges,
+            plotted_fit_size,
+            circuit_name,
         )
-        for metric in panel_metrics
-    }
 
     colors = _color_map_by_size(unique_sizes, cmap)
     if figsize is None:
@@ -945,11 +1144,15 @@ def dist_scaling(
         if slot not in panel_slots:
             ax.set_visible(False)
     axes = {
-        metric: slot_axes[_PANEL_SLOT_OF_METRIC[metric]]
+        metric: slot_axes[slot_of_metric[metric]]
         for metric in panel_metrics
-        if metric in _PANEL_SLOT_OF_METRIC
+        if metric in slot_of_metric
     }
 
+    # Colour and marker are the whole legend, so each panel only needs to
+    # know which sizes and which party counts actually reached it.
+    drawn_sizes: dict[tuple[int, int], set[int]] = {}
+    drawn_party_counts: dict[tuple[int, int], set[int]] = {}
     for k_of_file, size in keys:
         color = colors[size]
         for metric in panel_metrics:
@@ -979,9 +1182,12 @@ def dist_scaling(
             y = positive["mean"].to_numpy(dtype=float)
             dy = positive["stderr"].to_numpy(dtype=float)
             dy = np.where(np.isfinite(dy), dy, 0.0)
-            # The panel can hold both party counts, so the annotation has to
-            # say which one each series is.
-            label = rf"$k={k_of_file}$, $L={size}$"
+            # The series carries no legend entry of its own: colour already
+            # names the size and the marker already names the party count, and
+            # one entry per (k, L) pair says both twice.
+            slot = slot_of_metric[metric]
+            drawn_sizes.setdefault(slot, set()).add(size)
+            drawn_party_counts.setdefault(slot, set()).add(k_of_file)
             marker = _marker_for_k(k_of_file)
             if show_errorbars:
                 _positive_log_errorbar(
@@ -997,7 +1203,7 @@ def dist_scaling(
                     capsize=capsize,
                     elinewidth=0.9,
                     linestyle="none",
-                    label=label,
+                    label="_nolegend_",
                     alpha=0.95,
                 )
             else:
@@ -1009,90 +1215,41 @@ def dist_scaling(
                     markersize=4.0,
                     color=color,
                     markeredgecolor=color,
-                    label=label,
+                    label="_nolegend_",
                     alpha=0.95,
                 )
 
-    joint_rows: list[dict[str, Any]] = []
-    for metric, metric_fit_sizes in fit_sizes.items():
-        if metric not in axes:
+    # The exponent's own subscript names the party count, so the fit needs no
+    # `k=..., L=...` prefix; its colour is the size it belongs to and its line
+    # style matches that party count's marker.
+    for metric, size in plotted_fit_size.items():
+        ax = axes.get(metric)
+        if ax is None:
             continue
-        exponent = _metric_spec(metric)["exponent"]
         metric_k = k_of_metric[metric]
-        if joint_fit:
-            usable = [
-                size
-                for size in metric_fit_sizes
-                if (metric_k, size, metric) in selected_points
-            ]
-            missing = sorted(set(metric_fit_sizes) - set(usable))
-            if missing:
-                warnings.warn(
-                    f"k={metric_k}, {metric.upper()} joint fit excludes "
-                    f"L={missing}: no usable per-size fit window."
-                )
-            if not usable:
-                continue
-            pooled = pd.concat(
-                [selected_points[(metric_k, size, metric)] for size in usable]
-            ).sort_values("d")
-            try:
-                joint = _log_log_power_law_fit(
-                    pooled, min_relative_error=min_relative_error
-                )
-            except ValueError as exc:
-                warnings.warn(
-                    f"k={metric_k}, {metric.upper()} joint fit unavailable: {exc}"
-                )
-                continue
-            joint_rows.append(
-                {"k": metric_k, "metric": metric, "sizes": tuple(usable), **joint}
-            )
-            if len(usable) == 1:
-                prefix = rf"$k={metric_k}$, $L={usable[0]}$ fit: "
-            else:
-                sizes_text = ",".join(str(size) for size in usable)
-                prefix = rf"$k={metric_k}$, $L\in\{{{sizes_text}\}}$ joint fit: "
-            x_line = np.geomspace(joint["d_min"], joint["d_max"], 200)
-            axes[metric].plot(
-                x_line,
-                joint["prefactor"] * x_line ** (-joint["alpha"]),
-                color="black",
-                linestyle=_linestyle_for_k(metric_k),
-                linewidth=1.5,
-                label=(
-                    prefix
-                    + rf"$\alpha_{metric_k}^{{{exponent}}}="
-                    rf"{joint['alpha']:.3g}\pm {joint['alpha_stderr']:.2g}$"
-                ),
-                zorder=5,
-            )
+        row = fits.loc[
+            (fits["k"] == metric_k)
+            & (fits["L"] == size)
+            & (fits["metric"] == metric)
+        ]
+        if row.empty or not np.isfinite(row.iloc[0]["alpha"]):
             continue
-
-        for size in metric_fit_sizes:
-            row = fits.loc[(fits["L"] == size) & (fits["metric"] == metric)]
-            if row.empty or not np.isfinite(row.iloc[0]["alpha"]):
-                continue
-            row = row.iloc[0]
-            selected = selected_points[(metric_k, size, metric)]
-            x_line = np.geomspace(
-                selected["d"].min(), selected["d"].max(), 200
-            )
-            axes[metric].plot(
-                x_line,
-                row["prefactor"] * x_line ** (-row["alpha"]),
-                color=colors[size],
-                linestyle=_linestyle_for_k(metric_k),
-                linewidth=1.5,
-                label=(
-                    rf"$k={metric_k}$, $L={size}$ fit: "
-                    rf"$\alpha_{metric_k}^{{{exponent}}}="
-                    rf"{row['alpha']:.3g}\pm {row['alpha_stderr']:.2g}$"
-                ),
-                zorder=5,
-            )
-
-    joint_fits = pd.DataFrame(joint_rows) if joint_fit else None
+        row = row.iloc[0]
+        exponent = _metric_spec(metric)["exponent"]
+        selected = selected_points[(metric_k, size, metric)]
+        x_line = np.geomspace(selected["d"].min(), selected["d"].max(), 200)
+        ax.plot(
+            x_line,
+            row["prefactor"] * x_line ** (-row["alpha"]),
+            color=colors[size],
+            linestyle=_linestyle_for_k(metric_k),
+            linewidth=1.5,
+            label=(
+                rf"$\alpha_{metric_k}^{{{exponent}}}="
+                rf"{row['alpha']:.3g}\pm {row['alpha_stderr']:.2g}$"
+            ),
+            zorder=5,
+        )
 
     from matplotlib.ticker import FuncFormatter
 
@@ -1101,7 +1258,7 @@ def dist_scaling(
     )
     for slot in panel_slots:
         ax = slot_axes[slot]
-        descriptor = _PANEL_GRID[slot[0]][slot[1]]
+        descriptor = panel_grid[slot[0]][slot[1]]
         ax.set_xlabel(r"Effective chord distance $d$")
         # A panel can hold both party counts, so it is named by the quantity
         # it measures rather than by any one of them; the unit is the only
@@ -1117,7 +1274,30 @@ def dist_scaling(
         ax.xaxis.get_offset_text().set_visible(False)
         ax.set_yscale("log")
         ax.grid(True, which="both", alpha=0.20)
-        ax.legend(fontsize=8)
+        # Two orthogonal keys plus the fits, rather than one entry per series.
+        # The size swatches carry no marker at all so that shape is left to
+        # mean only the party count.
+        handles: list[Any] = [
+            Patch(facecolor=colors[size], edgecolor="none", label=rf"$L={size}$")
+            for size in sorted(drawn_sizes.get(slot, ()))
+        ]
+        handles += [
+            Line2D(
+                [],
+                [],
+                linestyle="none",
+                marker=_marker_for_k(k_of_slot),
+                color="0.35",
+                markersize=4.5,
+                label=rf"$k={k_of_slot}$",
+            )
+            for k_of_slot in sorted(drawn_party_counts.get(slot, ()))
+        ]
+        # Only the fit lines were given a real label, so this returns them and
+        # nothing else.
+        handles += ax.get_legend_handles_labels()[0]
+        if handles:
+            ax.legend(handles=handles, fontsize=8)
 
     if title is not None:
         fig.suptitle(title, fontsize=14)
@@ -1151,13 +1331,9 @@ def dist_scaling(
 
             display(summary)
             display(fits)
-            if joint_fits is not None and not joint_fits.empty:
-                display(joint_fits)
         except ImportError:
             print(summary.to_string(index=False))
             print(fits.to_string(index=False))
-            if joint_fits is not None and not joint_fits.empty:
-                print(joint_fits.to_string(index=False))
 
     return {
         "figure": fig,
@@ -1169,6 +1345,7 @@ def dist_scaling(
         "k": k_values[0] if len(k_values) == 1 else None,
         "k_values": tuple(k_values),
         "metrics": panel_metrics,
+        "ent_decomp": ent_decomp,
         "metric_party_counts": dict(k_of_metric),
         "available_metrics": tuple(available),
         "circuit_name": circuit_name,
@@ -1176,9 +1353,8 @@ def dist_scaling(
         "data": data,
         "summary": summary,
         "fits": fits,
-        "joint_fit": joint_fit,
-        "joint_fits": joint_fits,
-        "fit_sizes": fit_sizes,
+        "fit_ranges": dict(fit_ranges),
+        "plotted_fit_sizes": dict(plotted_fit_size),
         "mi_units": mi_units,
         "selected_fit_points": selected_points,
     }

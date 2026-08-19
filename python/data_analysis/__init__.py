@@ -6,7 +6,9 @@ gmn(...)               Plot GMN/fGMN and optional minimum bipartite negativity.
 entropy(...)           Plot entropy scaling curves and weighted fits; ``order=1``
                        selects von Neumann, ``order=2`` (default) Rényi-2.
 dist_scaling(...)      Plot two-site (MI/negativity) or three-site (TMI/GMN)
-                       distance scaling and power-law fits.
+                       distance scaling and power-law fits; ``ent_decomp=True``
+                       splits the pair negativities into the entangled fraction
+                       and the conditional magnitude instead.
 expvals(...)           Plot aggregate fermionic observables and Wick residuals.
 tmi_collapse(...)      Fit and plot the TMI finite-size scaling collapse.
 probe1_collapse(...)   Fit and plot the one-ancilla dynamical collapse.

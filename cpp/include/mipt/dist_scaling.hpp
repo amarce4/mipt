@@ -650,9 +650,11 @@ struct SdpSettings
 class SdpBatchQueue
 {
   public:
-    SdpBatchQueue(std::vector<TripleBin> &bins, std::size_t batch_size, std::size_t max_pending_batches)
+    SdpBatchQueue(std::vector<TripleBin> &bins, std::size_t batch_size,
+                  std::size_t max_pending_batches, double positive_tolerance)
         : bins_(bins), batch_size_(std::max<std::size_t>(1, batch_size)),
-          max_pending_batches_(std::max<std::size_t>(1, max_pending_batches))
+          max_pending_batches_(std::max<std::size_t>(1, max_pending_batches)),
+          positive_tolerance_(positive_tolerance)
     {
         batch_.reserve(batch_size_);
     }
@@ -759,7 +761,20 @@ class SdpBatchQueue
             SdpStats &stats = result.fermionic ? bin.fgmn : bin.gmn;
             if (std::isfinite(result.value))
             {
-                stats.value.add(std::max(0.0, result.value));
+                const double value = std::max(0.0, result.value);
+                stats.value.add(value);
+                // The same tolerance the prefilter uses, so one threshold
+                // decides positivity on both paths. It is comfortably clear of
+                // the solver's floor: measured on states whose GMN is exactly
+                // zero -- Bell(AB)x|0>, |000>, GHZ+white noise below p*=3/7,
+                // and random separable mixtures -- MOSEK returns between
+                // -4e-7 and +9e-13, while a genuinely entangled record comes
+                // back at 1e-3 or above. Anything the clamp above did not
+                // already flatten to zero is noise well under 1e-10.
+                if (value > positive_tolerance_)
+                {
+                    ++stats.positive;
+                }
             }
             else
             {
@@ -772,6 +787,7 @@ class SdpBatchQueue
     std::vector<TripleBin> &bins_;
     std::size_t batch_size_ = 1;
     std::size_t max_pending_batches_ = 1;
+    double positive_tolerance_ = 0.0;
     std::vector<Job> batch_;
     std::deque<std::future<std::vector<Result>>> pending_;
     std::atomic<std::uint64_t> solved_{0};
@@ -1052,7 +1068,7 @@ class TripleProtocol
           geometries_(probed::enumerate_three_probe_geometries(config_.n,
                                                                config_.triangle_balance_cutoff)),
           bins_(make_triple_bins(config_.n, geometries_)), rng_(std::random_device{}()),
-          queue_(bins_, sdp_.batch_size, sdp_.pending_batches)
+          queue_(bins_, sdp_.batch_size, sdp_.pending_batches, sdp_.zero_tolerance)
     {
         sample_trajectory_triangles(geometries_, per_geometry_, rng_, subsystems_, bin_of_subsystem_);
         resample_each_trajectory_ =

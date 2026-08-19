@@ -366,9 +366,17 @@ void test_triple_round_trip(const std::string &directory)
                 bin.gmn.value.add(0.0);
                 ++bin.gmn.zero_prefiltered;
             }
-            else if (roll < 0.9)
+            else if (roll < 0.8)
             {
                 bin.gmn.value.add(roll);
+                ++bin.gmn.positive;
+            }
+            else if (roll < 0.9)
+            {
+                // Solved, but the solver returned a zero the prefilter did not
+                // catch: a value with no positive count behind it, which is
+                // what the restore's positive <= solved check has to allow.
+                bin.gmn.value.add(0.0);
             }
             else if (!leave_in_flight)
             {
@@ -378,7 +386,12 @@ void test_triple_round_trip(const std::string &directory)
             // the queue when the process died.
 
             ++bin.fgmn.requested;
-            bin.fgmn.value.add(unit(rng));
+            const double fermionic_value = unit(rng);
+            bin.fgmn.value.add(fermionic_value);
+            if (fermionic_value > 0.0)
+            {
+                ++bin.fgmn.positive;
+            }
             ++bin.records;
         }
     };
@@ -419,6 +432,8 @@ void test_triple_round_trip(const std::string &directory)
                "triple gmn zero_prefiltered");
         expect(restored[b].gmn.solver_failures == bins[b].gmn.solver_failures,
                "triple gmn solver_failures");
+        expect(restored[b].gmn.positive == bins[b].gmn.positive, "triple gmn positive");
+        expect(restored[b].fgmn.positive == bins[b].fgmn.positive, "triple fgmn positive");
 
         // In-flight solves: `requested` is rolled back to what actually landed,
         // so the schedule re-offers those slots instead of retiring them.
@@ -430,6 +445,18 @@ void test_triple_round_trip(const std::string &directory)
     }
     expect(expected_reclaimed > 0,
            "the fixture must actually leave some solves in flight");
+    std::uint64_t total_positive = 0;
+    std::uint64_t total_solved_zero = 0;
+    for (const auto &bin : bins)
+    {
+        total_positive += bin.gmn.positive;
+        total_solved_zero +=
+            bin.gmn.value.count - bin.gmn.zero_prefiltered - bin.gmn.positive;
+    }
+    expect(total_positive > 0, "the fixture must record some positive GMN values");
+    expect(total_solved_zero > 0,
+           "the fixture must record some solved-but-zero GMN values, or the "
+           "positive <= solved check is never exercised");
     expect(report.reclaimed_gmn_slots == expected_reclaimed,
            "reclaimed slot count " + std::to_string(report.reclaimed_gmn_slots) +
                " != " + std::to_string(expected_reclaimed));

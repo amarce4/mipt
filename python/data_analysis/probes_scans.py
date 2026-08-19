@@ -592,6 +592,50 @@ def _infer_probe_count(path: Path, df: pd.DataFrame) -> int:
     return 1
 
 
+def _repaired_realization_counts(
+    counts: pd.Series,
+    path: Path,
+    column: str,
+) -> pd.Series | None:
+    """Refill a per-row realization count that a CSV merge left blank.
+
+    ``realizations`` is run metadata: constant for one scan file, repeated on
+    every row only so that several files at one ``L`` can be pooled exactly.
+    A file stitched together from two runs can therefore carry blank metadata
+    cells on the rows contributed by the second one -- ``N``, ``circ_type``,
+    ``circuit_name`` and ``realizations`` empty, the measurement columns
+    intact. Those rows are complete data, so the count is refilled from the
+    file's own constant value rather than the row being discarded.
+
+    Returns ``None`` when the gap cannot be closed unambiguously (the file is
+    not constant in the column, or carries no value at all), which sends the
+    caller down the inverse-variance path it already uses for files with no
+    realization column.
+    """
+    missing = int(counts.isna().sum())
+    if missing == 0:
+        return counts
+    present = counts.dropna().unique()
+    if len(present) == 1:
+        warnings.warn(
+            f"{path}: {missing} of {len(counts)} rows carry no "
+            f"{column!r}; refilling from the file's constant value "
+            f"{present[0]:,.0f}."
+        )
+        return counts.fillna(present[0])
+    detail = (
+        "the file carries no value for it"
+        if len(present) == 0
+        else f"the file is not constant in it ({sorted(present)})"
+    )
+    warnings.warn(
+        f"{path}: {missing} of {len(counts)} rows carry no {column!r} and "
+        f"{detail}; pooling shared p points in this file by inverse variance "
+        "instead."
+    )
+    return None
+
+
 def _load_probe_pc_curve(
     path: Path,
     metric: str,
@@ -613,9 +657,21 @@ def _load_probe_pc_curve(
         "dvalue": pd.to_numeric(df[stderr_col], errors="coerce"),
     }
     if reals_col is not None:
-        columns["realizations"] = pd.to_numeric(df[reals_col], errors="coerce")
-    clean = pd.DataFrame(columns).replace([np.inf, -np.inf], np.nan).dropna()
-    clean = clean.sort_values("p").drop_duplicates("p", keep="last")
+        repaired = _repaired_realization_counts(
+            pd.to_numeric(df[reals_col], errors="coerce"), path, reals_col
+        )
+        if repaired is not None:
+            columns["realizations"] = repaired
+    # Only the measurement columns can invalidate a row. Dropping on the
+    # metadata columns as well would discard every p point a merged file
+    # carries with blank metadata cells -- silently, since the curve that
+    # remains is still a valid curve, just a sparser one.
+    clean = (
+        pd.DataFrame(columns)
+        .replace([np.inf, -np.inf], np.nan)
+        .dropna(subset=["p", "value", "dvalue"])
+        .sort_values("p", kind="stable")
+    )
     p_min, p_max = p_range
     if p_min is not None:
         clean = clean.loc[clean["p"] >= p_min]
@@ -626,18 +682,34 @@ def _load_probe_pc_curve(
     if np.any(clean["dvalue"] < 0):
         warnings.warn(f"{path}: negative standard errors found; taking abs().")
         clean["dvalue"] = np.abs(clean["dvalue"])
+    # One file can hold a p point twice, for the same reason two files can:
+    # a rerun that added realizations was concatenated into it. Pool them the
+    # way `_merge_probe_pc_curves` pools across files, rather than keeping
+    # whichever row came last and throwing the other run's statistics away.
+    pooled, shared = _pool_curve_by_p(
+        clean["p"].to_numpy(dtype=float),
+        clean["value"].to_numpy(dtype=float),
+        clean["dvalue"].to_numpy(dtype=float),
+        (
+            clean["realizations"].to_numpy(dtype=float)
+            if "realizations" in clean.columns
+            else None
+        ),
+    )
+    if shared:
+        print(
+            f"{metric}: {path.name} pooled {shared} repeated p "
+            f"point{'s' if shared > 1 else ''} into "
+            f"{pooled['p'].size} points."
+        )
     return {
         "path": path,
         "paths": [path],
         "L": _parse_size(path, l_by_file),
-        "p": clean["p"].to_numpy(dtype=float),
-        "value": clean["value"].to_numpy(dtype=float),
-        "dvalue": clean["dvalue"].to_numpy(dtype=float),
-        "realizations": (
-            None
-            if reals_col is None
-            else clean["realizations"].to_numpy(dtype=float)
-        ),
+        "p": pooled["p"],
+        "value": pooled["value"],
+        "dvalue": pooled["dvalue"],
+        "realizations": pooled["realizations"],
         "readout_time": _constant_column(
             df, ["t", "time", "timestep"], integer=True
         ),
@@ -709,6 +781,54 @@ def _pool_probe_pc_points(
     return mean, float(np.sqrt(max(m2, 0.0) / (total * (total - 1.0)))), total
 
 
+def _pool_curve_by_p(
+    p: np.ndarray,
+    values: np.ndarray,
+    errors: np.ndarray,
+    counts: np.ndarray | None,
+) -> tuple[dict[str, np.ndarray | None], int]:
+    """Collapse repeated p values into one point each.
+
+    Points within ``_PROBE_PC_MERGE_P_TOL`` of each other are one grid point
+    and are pooled by :func:`_pool_probe_pc_points`. Returns the pooled curve
+    arrays and how many grid points had more than one estimate. This is used
+    both within a file (a rerun concatenated into it) and across the files at
+    one ``L``, so the two cases cannot drift apart.
+    """
+    order = np.argsort(p, kind="stable")
+    pooled: list[tuple[float, float, float, float]] = []
+    shared = 0
+    start = 0
+    while start < order.size:
+        stop = start + 1
+        while (
+            stop < order.size
+            and p[order[stop]] - p[order[start]] <= _PROBE_PC_MERGE_P_TOL
+        ):
+            stop += 1
+        index = order[start:stop]
+        mean, stderr, count = _pool_probe_pc_points(
+            values[index],
+            errors[index],
+            None if counts is None else counts[index],
+        )
+        pooled.append((float(np.mean(p[index])), mean, stderr, count))
+        shared += index.size > 1
+        start = stop
+
+    arrays = {
+        "p": np.array([point[0] for point in pooled], dtype=float),
+        "value": np.array([point[1] for point in pooled], dtype=float),
+        "dvalue": np.array([point[2] for point in pooled], dtype=float),
+        "realizations": (
+            None
+            if counts is None
+            else np.array([point[3] for point in pooled], dtype=float)
+        ),
+    }
+    return arrays, shared
+
+
 def _merge_probe_pc_curves(
     curves: Sequence[dict[str, Any]],
     metric: str,
@@ -756,48 +876,23 @@ def _merge_probe_pc_curves(
             )
         use_counts = not missing
 
-        points: list[tuple[float, float, float, float, int]] = []
-        stacked_p = np.concatenate([curve["p"] for curve in group])
-        stacked_value = np.concatenate([curve["value"] for curve in group])
-        stacked_error = np.concatenate([curve["dvalue"] for curve in group])
-        stacked_count = (
-            np.concatenate([curve["realizations"] for curve in group])
-            if use_counts
-            else None
+        pooled, shared = _pool_curve_by_p(
+            np.concatenate([curve["p"] for curve in group]),
+            np.concatenate([curve["value"] for curve in group]),
+            np.concatenate([curve["dvalue"] for curve in group]),
+            (
+                np.concatenate([curve["realizations"] for curve in group])
+                if use_counts
+                else None
+            ),
         )
-        order = np.argsort(stacked_p, kind="stable")
-        start = 0
-        shared = 0
-        while start < order.size:
-            stop = start + 1
-            while (
-                stop < order.size
-                and stacked_p[order[stop]] - stacked_p[order[start]]
-                <= _PROBE_PC_MERGE_P_TOL
-            ):
-                stop += 1
-            index = order[start:stop]
-            mean, stderr, count = _pool_probe_pc_points(
-                stacked_value[index],
-                stacked_error[index],
-                None if stacked_count is None else stacked_count[index],
-            )
-            points.append(
-                (float(np.mean(stacked_p[index])), mean, stderr, count, index.size)
-            )
-            shared += index.size > 1
-            start = stop
 
         combined = dict(group[0])
         combined["paths"] = [c["path"] for c in group]
-        combined["p"] = np.array([point[0] for point in points], dtype=float)
-        combined["value"] = np.array([point[1] for point in points], dtype=float)
-        combined["dvalue"] = np.array([point[2] for point in points], dtype=float)
-        combined["realizations"] = (
-            np.array([point[3] for point in points], dtype=float)
-            if use_counts
-            else None
-        )
+        combined["p"] = pooled["p"]
+        combined["value"] = pooled["value"]
+        combined["dvalue"] = pooled["dvalue"]
+        combined["realizations"] = pooled["realizations"]
         combined["merged_files"] = len(group)
         combined["shared_p_points"] = shared
         merged.append(combined)
@@ -2296,7 +2391,12 @@ def probe_pc_collapse(
     last. Files at one ``L`` must agree on the readout time ``t`` -- two
     readout times are two different observables, not more statistics -- and a
     file with no ``realizations`` column falls back to inverse-variance
-    weighting with a warning.
+    weighting with a warning. **A single file holding a p point twice is
+    pooled the same way**, since a rerun is as often concatenated into an
+    existing scan as left beside it. Such a merge also tends to leave the
+    repeated metadata cells (``N``, ``circ_type``, ``circuit_name``,
+    ``realizations``) blank on the rows it appended; those rows are kept and
+    their realization count is refilled from the file's own constant value.
 
     Set ``correction_to_scaling=True`` to fit the leading irrelevant
     correction

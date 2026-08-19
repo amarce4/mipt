@@ -23,6 +23,10 @@
 //     the TMI sample count (every record feeds the TMI), and `requested` is an
 //     explicit column.
 //
+// `SdpStats::positive` needs neither: it is its own column, and the solves
+// lost in flight contributed no value, so nothing about it is rolled back
+// alongside `requested`.
+//
 // The one thing that genuinely needs repair is GMN solves that were in flight
 // when the run died. Those were counted in `requested` at submit time but their
 // values never arrived, so a naive restore would retire schedule slots that
@@ -251,6 +255,7 @@ inline void restore_sdp(
 {
     const std::string stem(prefix);
     stats.value = table.stats_by_stderr(row, prefix);
+    stats.positive = table.counter(row, stem + "_positive_count");
     stats.requested = table.counter(row, stem + "_requested_count");
     stats.zero_prefiltered = table.counter(row, stem + "_zero_prefilter_count");
     stats.solver_failures = table.counter(row, stem + "_solver_failure_count");
@@ -269,6 +274,17 @@ inline void restore_sdp(
         csv::refuse(
             path + " line " + std::to_string(row + 2) + " prefiltered more " +
             stem + " records than it recorded values for.");
+    }
+    // A prefiltered record is non-positive by construction, so the positives
+    // can only have come from the solved remainder.
+    if (stats.positive > stats.value.count - stats.zero_prefiltered)
+    {
+        csv::refuse(
+            path + " line " + std::to_string(row + 2) + " counts " +
+            std::to_string(stats.positive) + " positive " + stem +
+            " record(s) against " +
+            std::to_string(stats.value.count - stats.zero_prefiltered) +
+            " that were actually solved.");
     }
     const std::uint64_t lost = stats.requested - landed;
     if (lost > 0 && stats.requested > 0)

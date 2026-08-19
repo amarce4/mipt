@@ -222,12 +222,25 @@ struct PairBin
 // `zero_prefiltered` the subset a vanishing bipartite negativity settled for
 // free, and `solver_failures` the subset MOSEK could not solve -- those are
 // excluded from the mean rather than counted as zero.
+//
+// `positive` counts the records whose measure came out strictly positive, the
+// same quantity `PairBin::mn_positive` carries for the two-party negativities.
+// It is what splits the mean into how often a triangle is genuinely entangled
+// at all and how much it is when it is; without it the two are indivisible in
+// the aggregate, since the CSV keeps no records.
+//
+// Prefiltered records need no test: the prefilter fires when the minimum
+// bipartite negativity is at or below the tolerance, and GMN <= that minimum,
+// so a prefiltered record is non-positive by construction. Only solved values
+// are compared, against the *same* tolerance, which is what keeps one
+// threshold behind both paths.
 struct SdpStats
 {
     RunningStats value;
     std::uint64_t requested = 0;
     std::uint64_t zero_prefiltered = 0;
     std::uint64_t solver_failures = 0;
+    std::uint64_t positive = 0;
 };
 
 struct TripleBin
@@ -309,9 +322,23 @@ inline void append_stats(std::string &out, const RunningStats &stats)
     append_uint(out, stats.count);
 }
 
+inline double positive_fraction(std::uint64_t positive, std::uint64_t total)
+{
+    return total > 0 ? static_cast<double>(positive) / static_cast<double>(total)
+                     : std::numeric_limits<double>::quiet_NaN();
+}
+
 inline void append_sdp_stats(std::string &out, const SdpStats &stats)
 {
+    // Mean, then the positive count and fraction, then the schedule
+    // bookkeeping -- so the leading five fields read exactly like a pair
+    // negativity's and a reader can find `<stem>_positive_count` in the same
+    // place for both party counts.
     append_stats(out, stats.value);
+    out += ',';
+    append_uint(out, stats.positive);
+    out += ',';
+    append_double(out, positive_fraction(stats.positive, stats.value.count));
     out += ',';
     append_uint(out, stats.requested);
     out += ',';
@@ -346,7 +373,8 @@ inline std::string triple_csv_header(const RunConfig &config)
         "tmi_mean,tmi_stderr,tmi_samples,"
         "average_mi_mean,average_mi_stderr,average_mi_samples,"
         "min_bipneg_mean,min_bipneg_stderr,min_bipneg_samples,"
-        "gmn_mean,gmn_stderr,gmn_samples,gmn_requested_count,"
+        "gmn_mean,gmn_stderr,gmn_samples,gmn_positive_count,gmn_positive_fraction,"
+        "gmn_requested_count,"
         "gmn_zero_prefilter_count,gmn_solver_failure_count,"
         "joint_purity_mean,joint_purity_stderr,joint_purity_samples,"
         "mean_single_purity_mean,mean_single_purity_stderr,mean_single_purity_samples";
@@ -356,19 +384,14 @@ inline std::string triple_csv_header(const RunConfig &config)
             ",ftmi_mean,ftmi_stderr,ftmi_samples,"
             "faverage_mi_mean,faverage_mi_stderr,faverage_mi_samples,"
             "min_fbipneg_mean,min_fbipneg_stderr,min_fbipneg_samples,"
-            "fgmn_mean,fgmn_stderr,fgmn_samples,fgmn_requested_count,"
+            "fgmn_mean,fgmn_stderr,fgmn_samples,fgmn_positive_count,"
+            "fgmn_positive_fraction,fgmn_requested_count,"
             "fgmn_zero_prefilter_count,fgmn_solver_failure_count,"
             "fjoint_purity_mean,fjoint_purity_stderr,fjoint_purity_samples,"
             "fmean_single_purity_mean,fmean_single_purity_stderr,fmean_single_purity_samples";
     }
     header += '\n';
     return header;
-}
-
-inline double positive_fraction(std::uint64_t positive, std::uint64_t total)
-{
-    return total > 0 ? static_cast<double>(positive) / static_cast<double>(total)
-                     : std::numeric_limits<double>::quiet_NaN();
 }
 
 inline std::string render_pair_csv(const RunConfig &config, const std::vector<PairBin> &bins)
