@@ -217,11 +217,29 @@ inline Report load_pairs(const RunConfig &config, std::vector<PairBin> &bins)
                 " has mi_samples and mn_samples that disagree; both are recorded "
                 "for every pair of every trajectory.");
         }
+        bin.g2 = table.stats_by_stderr(row, "g2");
+        bin.f2 = table.stats_by_stderr(row, "f2");
+        if (bin.g2.count != bin.mi.count || bin.f2.count != bin.mi.count)
+        {
+            csv::refuse(
+                path + " line " + std::to_string(row + 2) +
+                " has two-point correlator sample counts that disagree with "
+                "mi_samples; every pair of every trajectory records all of them.");
+        }
         if (fermionic)
         {
             bin.fmi = table.stats_by_stderr(row, "fmi");
             bin.fmn = table.stats_by_stderr(row, "fmn");
             bin.fmn_positive = table.counter(row, "fmn_positive_count");
+            bin.fg2 = table.stats_by_stderr(row, "fg2");
+            bin.ff2 = table.stats_by_stderr(row, "ff2");
+            if (bin.fg2.count != bin.mi.count || bin.ff2.count != bin.mi.count)
+            {
+                csv::refuse(
+                    path + " line " + std::to_string(row + 2) +
+                    " has fermionic two-point correlator sample counts that "
+                    "disagree with mi_samples.");
+            }
             if (bin.fmi.count != bin.mi.count || bin.fmn.count != bin.mi.count)
             {
                 csv::refuse(

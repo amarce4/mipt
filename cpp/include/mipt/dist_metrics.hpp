@@ -34,7 +34,52 @@ struct PairMetrics
 {
     double mi = 0.0;
     double mn = 0.0;
+    // Squared magnitudes of the two fermionic two-point functions; see
+    // two_point_correlators() for what they are and which trace they mean.
+    double g2 = 0.0;
+    double f2 = 0.0;
 };
+
+// The two fermionic two-point functions of a mode pair (i, j) with i < j:
+// the hopping correlator G_ij = <c_i^dag c_j> and the pairing (anomalous)
+// correlator F_ij = <c_i c_j>.
+//
+// Both are *single entries* of the two-mode density matrix, because each
+// operator connects exactly one pair of Fock states. In the basis
+// |n_i n_j> = (c_i^dag)^{n_i} (c_j^dag)^{n_j} |vac> indexed as n_i + 2 n_j --
+// which is what the fermionic partial trace produces, bit k of the RDM being
+// retained[k], and the pair list being ascending --
+//
+//     c_i^dag c_j |0,1> = |1,0>,   zero on every other basis state
+//     c_i c_j     |1,1> = -|0,0>,  zero on every other basis state
+//
+// so Tr(rho c_i^dag c_j) = rho[2][1] and Tr(rho c_i c_j) = -rho[3][0].
+//
+// The *positions* follow from particle number alone -- c_i^dag c_j moves one
+// fermion from j to i, c_i c_j removes both -- so they carry no Jordan-Wigner
+// phase convention. The signs do, but this returns squared magnitudes, in
+// which they cancel: |G|^2 and |F|^2 are convention-independent given a
+// correct fermionic reduced density matrix.
+//
+// F is identically zero whenever the circuit conserves particle number. RPPU
+// conserves only parity, so it is a genuine observable there.
+//
+// **Which rho matters.** Fed the fermionic-trace RDM these are G and F. Fed
+// the ordinary-trace one they are the spin correlators
+// |<sigma_i^+ sigma_j^->|^2 and |<sigma_i^- sigma_j^->|^2 -- the same matrix
+// entries of a different matrix. The Jordan-Wigner string running between the
+// two modes is exactly what the fermionic partial trace restores and the
+// ordinary one drops.
+struct TwoPointCorrelators
+{
+    double g2 = 0.0; // |<c_i^dag c_j>|^2
+    double f2 = 0.0; // |<c_i c_j>|^2
+};
+
+inline TwoPointCorrelators two_point_correlators(const Matrix4 &rho)
+{
+    return {std::norm(rho[2 * 4 + 1]), std::norm(rho[3 * 4 + 0])};
+}
 
 // The three-party analogue. `tmi` is the tripartite information
 // I_3 = S_A + S_B + S_C - S_AB - S_AC - S_BC + S_ABC, which is the same
@@ -323,7 +368,9 @@ inline PairMetrics two_party_metrics(const double *rho_ri, bool fermionic)
         throw std::runtime_error("Mutual-information calculation produced an invalid value.");
     }
 
-    return {std::max(0.0, mi), detail::negativity(rho, fermionic)};
+    const TwoPointCorrelators correlators = two_point_correlators(rho);
+    return {std::max(0.0, mi), detail::negativity(rho, fermionic), correlators.g2,
+            correlators.f2};
 }
 
 using util::chord_length;

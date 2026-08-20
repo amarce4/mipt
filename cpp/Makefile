@@ -212,12 +212,13 @@ GMN_SOLVER_TEST_OBJS := $(HOST_BUILD)/gmn_solver_tests.o $(HOST_BUILD)/gmn_mosek
 
 # Every executable that builds circuit states now goes through mipt/cusv.
 ifeq ($(CUSV),1)
-  MIPT_OBJS += $(BUILD)/cusv_diag.o
-  MIPT_PROBED_OBJS += $(BUILD)/cusv_diag.o
-  FREE_ENERGY_OBJS += $(BUILD)/cusv_diag.o
-  SIM_TMI_OBJS += $(BUILD)/cusv_diag.o
-  DIST_SCALING_OBJS += $(BUILD)/cusv_diag.o
-  ENTROPY_OBJS += $(BUILD)/cusv_diag.o
+  CUSV_OBJS := $(BUILD)/cusv_diag.o $(BUILD)/cusv_parity.o
+  MIPT_OBJS += $(CUSV_OBJS)
+  MIPT_PROBED_OBJS += $(CUSV_OBJS)
+  FREE_ENERGY_OBJS += $(CUSV_OBJS)
+  SIM_TMI_OBJS += $(CUSV_OBJS)
+  DIST_SCALING_OBJS += $(CUSV_OBJS)
+  ENTROPY_OBJS += $(CUSV_OBJS)
 endif
 
 ifeq ($(CUDA_RHO),1)
@@ -250,7 +251,7 @@ MIPT_CUDA_HEADERS := $(shell find include -name '*.cuh' 2>/dev/null) $(MIPT_HEAD
 
 .PHONY: all simulation analysis clean cpu gpu print-config format test-core test-dist test-front \
   test-spectral test-gmn test-rdm-gram test-rho-reduce test-cusv test-cusv-gates \
-  test-mode3 bench-cusv \
+  test-mode3 test-cusv-parity bench-cusv \
   mipt.exe mipt_probed.exe free_energy.exe sim_tmi.exe dist_scaling.exe \
   entropy.exe gmn.exe fgmn.exe ring_inflation.exe exp_vals.exe
 
@@ -370,6 +371,7 @@ CUDAQ_INC ?= $(HOME)/.cudaq/include
 CUSV_GATE_TEST_BIN := $(HOST_BUILD)/cusv_gate_tests
 DUMP_BOND_BIN := $(BUILD)/dump_bond
 CUSV_EQUIV_BIN := $(BUILD)/cusv_equiv
+CUSV_PARITY_TEST_BIN := $(BUILD)/cusv_parity_tests
 MODE3_EQUIV_BIN := $(BUILD)/mode3_equiv
 CUSV_BENCH_BIN := $(BUILD)/cusv_bench
 CUSV_GROUND_TRUTH := $(BUILD)/cusv_ground_truth.txt
@@ -382,16 +384,20 @@ $(DUMP_BOND_BIN): tests/dump_bond.cpp $(MIPT_HEADERS) | $(BUILD)
 	$(NVQXX) --target nvidia --target-option fp64 $(CPPFLAGS_COMMON) -std=c++20 -O2 \
 	  -DNDEBUG -DMIPT_CUDAQ_BACKEND_NAME=\"nvidia\" -DMIPT_CUDAQ_PRECISION=64 $< -o $@
 
-$(CUSV_EQUIV_BIN): tests/cusv_equiv.cpp $(BUILD)/cusv_diag.o $(MIPT_HEADERS) | $(BUILD)
-	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $(NVQXXFLAGS_COMMON) $< $(BUILD)/cusv_diag.o \
+$(CUSV_EQUIV_BIN): tests/cusv_equiv.cpp $(BUILD)/cusv_diag.o $(BUILD)/cusv_parity.o $(MIPT_HEADERS) | $(BUILD)
+	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $(NVQXXFLAGS_COMMON) $< $(BUILD)/cusv_diag.o $(BUILD)/cusv_parity.o \
 	  $(MIPT_CUDA_LIBS) $(CUSV_LIBS) $(DL_LIBS) -o $@
 
-$(MODE3_EQUIV_BIN): tests/mode3_equiv.cpp $(BUILD)/cusv_diag.o $(MIPT_HEADERS) | $(BUILD)
-	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $(NVQXXFLAGS_COMMON) $< $(BUILD)/cusv_diag.o \
+$(MODE3_EQUIV_BIN): tests/mode3_equiv.cpp $(BUILD)/cusv_diag.o $(BUILD)/cusv_parity.o $(MIPT_HEADERS) | $(BUILD)
+	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $(NVQXXFLAGS_COMMON) $< $(BUILD)/cusv_diag.o $(BUILD)/cusv_parity.o \
 	  $(MIPT_CUDA_LIBS) $(CUSV_LIBS) $(DL_LIBS) -o $@
 
-$(CUSV_BENCH_BIN): tests/cusv_bench.cpp $(BUILD)/cusv_diag.o $(MIPT_HEADERS) | $(BUILD)
-	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $(NVQXXFLAGS_COMMON) $< $(BUILD)/cusv_diag.o \
+$(CUSV_PARITY_TEST_BIN): tests/cusv_parity_tests.cpp $(BUILD)/cusv_diag.o $(BUILD)/cusv_parity.o $(MIPT_HEADERS) | $(BUILD)
+	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $(NVQXXFLAGS_COMMON) $< $(BUILD)/cusv_diag.o $(BUILD)/cusv_parity.o \
+	  $(MIPT_CUDA_LIBS) $(CUSV_LIBS) $(DL_LIBS) -o $@
+
+$(CUSV_BENCH_BIN): tests/cusv_bench.cpp $(BUILD)/cusv_diag.o $(BUILD)/cusv_parity.o $(MIPT_HEADERS) | $(BUILD)
+	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $(NVQXXFLAGS_COMMON) $< $(BUILD)/cusv_diag.o $(BUILD)/cusv_parity.o \
 	  $(MIPT_CUDA_LIBS) $(CUSV_LIBS) $(DL_LIBS) -o $@
 
 $(CUSV_GROUND_TRUTH): $(DUMP_BOND_BIN)
@@ -404,6 +410,10 @@ test-cusv-gates: $(CUSV_GATE_TEST_BIN) $(CUSV_GROUND_TRUTH)
 test-cusv: test-cusv-gates $(CUSV_EQUIV_BIN)
 	$(CUSV_EQUIV_BIN) 12 6 2024
 	$(CUSV_EQUIV_BIN) 14 8 31337
+
+test-cusv-parity: $(CUSV_PARITY_TEST_BIN)
+	$(CUSV_PARITY_TEST_BIN) 12 6 2026
+	$(CUSV_PARITY_TEST_BIN) 10 10 4711
 
 # The mode-3 pattern cusv_equiv cannot reach: a register two qubits wider than
 # the circuit, with references attached mid-trajectory.
@@ -445,6 +455,8 @@ $(BUILD)/tmi_cuda_rdm.o: src/cuda/tmi_cuda_rdm.cu $(MIPT_CUDA_HEADERS) | $(BUILD
 $(BUILD)/entropy_cuda.o: src/cuda/entropy_cuda.cu $(MIPT_CUDA_HEADERS) | $(BUILD)
 	$(CUDA_CU_COMPILER) $(CUDA_CU_FLAGS) -c $< -o $@
 $(BUILD)/cusv_diag.o: src/cuda/cusv_diag.cu $(MIPT_CUDA_HEADERS) | $(BUILD)
+	$(CUDA_CU_COMPILER) $(CUDA_CU_FLAGS) -c $< -o $@
+$(BUILD)/cusv_parity.o: src/cuda/cusv_parity.cu $(MIPT_CUDA_HEADERS) | $(BUILD)
 	$(CUDA_CU_COMPILER) $(CUDA_CU_FLAGS) -c $< -o $@
 
 $(HOST_BUILD)/gmn.o: apps/gmn.cpp | $(HOST_BUILD)

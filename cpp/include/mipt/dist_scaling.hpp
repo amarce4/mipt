@@ -972,6 +972,8 @@ class PairProtocol
             const PairMetrics metrics = two_party_metrics(rho, false);
             bin.mi.add(metrics.mi);
             bin.mn.add(metrics.mn);
+            bin.g2.add(metrics.g2);
+            bin.f2.add(metrics.f2);
             if (metrics.mn > 1.0e-12)
             {
                 ++bin.mn_positive;
@@ -983,6 +985,8 @@ class PairProtocol
                 const PairMetrics fermion_metrics = two_party_metrics(fermion_rho, true);
                 bin.fmi.add(fermion_metrics.mi);
                 bin.fmn.add(fermion_metrics.mn);
+                bin.fg2.add(fermion_metrics.g2);
+                bin.ff2.add(fermion_metrics.f2);
                 if (fermion_metrics.mn > 1.0e-12)
                 {
                     ++bin.fmn_positive;
@@ -1627,6 +1631,9 @@ inline void print_usage(const char *argv0)
         << "    k=0: both of the above.\n\n"
         << "Reported measures:\n"
         << "  k=2  mi, mn      mutual information and bipartite negativity per pair\n"
+        << "       g2, f2      |<c_i^dag c_j>|^2 and |<c_i c_j>|^2, averaged over records\n"
+        << "                   rather than squared after averaging -- the phases average\n"
+        << "                   to zero, so |mean|^2 is a different and less useful object\n"
         << "  k=3  tmi, gmn    tripartite information and genuine multipartite negativity\n"
         << "       average_mi, min_bipneg, purities as supporting columns\n"
         << "  k=0  all of the above, from one circuit per trajectory. Either file can be\n"
@@ -1634,7 +1641,11 @@ inline void print_usage(const char *argv0)
         << "  complete the shared trajectories simply stop feeding it.\n"
         << "  circ_type 0 or 1 (qubit ensembles) report those only. circ_type 2, 3, or 4\n"
         << "  (parity-preserving ensembles) additionally report the fermionic-trace\n"
-        << "  versions fmi/fmn and ftmi/fgmn on the same trajectories. For qRPPU\n"
+        << "  versions fmi/fmn, fg2/ff2 and ftmi/fgmn on the same trajectories. Only\n"
+        << "  the fermionic-trace fg2/ff2 are the fermionic correlators: g2/f2 come\n"
+        << "  from the ordinary trace, which drops the Jordan-Wigner string between\n"
+        << "  the two modes, so they are the spin correlators |<S_i^+ S_j^->|^2 and\n"
+        << "  |<S_i^- S_j^->|^2 instead. For qRPPU\n"
         << "  (circ_type 4) the circuit carries no Jordan-Wigner strings, so its\n"
         << "  fermionic columns are a comparison observable rather than the fermionic\n"
         << "  quantity itself.\n\n"

@@ -23,6 +23,7 @@
 //       free_energy.exe accumulates.
 
 #include "mipt/cuda/cusv_diag.hpp"
+#include "mipt/cuda/cusv_parity.hpp"
 #include "mipt/cusv/gates.hpp"
 
 #include <custatevec.h>
@@ -200,6 +201,21 @@ class Engine
 
     void apply(const Op &op)
     {
+        if (op.kind == OpKind::ParityGate)
+        {
+            const int status = fp64_ ? mipt_cuda_parity_gate_f64(active(), qubits_, op.targets[0],
+                                                                 op.parity_even.data(),
+                                                                 op.parity_odd.data())
+                                     : mipt_cuda_parity_gate_f32(active(), qubits_, op.targets[0],
+                                                                 op.parity_even.data(),
+                                                                 op.parity_odd.data());
+            if (status != 0)
+            {
+                throw std::runtime_error(std::string("Parity-gate pass failed: ") +
+                                         mipt_cuda_cusv_parity_last_error());
+            }
+            return;
+        }
         if (op.kind == OpKind::JwString)
         {
             const int status = fp64_
@@ -349,6 +365,115 @@ class Engine
                        "custatevecCollapseByBitString");
         }
         return surprisal;
+    }
+
+    // ------------------------------------------------- parity-sector encoding
+
+    // Measures the derived site n-1, which in the encoded picture is
+    // parity(e). Returns its contribution to the layer surprisal.
+    template <typename Rng>
+    double measure_derived_parity(Rng &rng, int *outcome)
+    {
+        double weight[2] = {0.0, 0.0};
+        const int status = fp64_ ? mipt_cuda_parity_abs2_f64(data(), qubits_, weight)
+                                 : mipt_cuda_parity_abs2_f32(data(), qubits_, weight);
+        if (status != 0)
+        {
+            throw std::runtime_error(std::string("Parity measurement failed: ") +
+                                     mipt_cuda_cusv_parity_last_error());
+        }
+        const double total = weight[0] + weight[1];
+        if (!(total > 0.0) || !std::isfinite(total))
+        {
+            throw std::runtime_error("Parity measurement found a zero-norm state vector.");
+        }
+
+        std::uniform_real_distribution<double> uniform(0.0, 1.0);
+        int bit = (uniform(rng) * total < weight[0]) ? 0 : 1;
+        if (!(weight[bit] > 0.0))
+        {
+            // Numerically starved branch: fall back to the heavier one.
+            bit = (weight[0] >= weight[1]) ? 0 : 1;
+        }
+        if (!(weight[bit] > 0.0))
+        {
+            throw std::runtime_error("Parity measurement has no outcome with positive weight.");
+        }
+
+        const int collapse = fp64_
+                                 ? mipt_cuda_parity_collapse_f64(active(), qubits_, bit, weight[bit])
+                                 : mipt_cuda_parity_collapse_f32(active(), qubits_, bit, weight[bit]);
+        if (collapse != 0)
+        {
+            throw std::runtime_error(std::string("Parity collapse failed: ") +
+                                     mipt_cuda_cusv_parity_last_error());
+        }
+        if (outcome != nullptr) { *outcome = bit; }
+        return -std::log(weight[bit] / total);
+    }
+
+    // A whole measurement layer in the encoded picture. Sites below the
+    // derived one go through the ordinary joint path; the derived one follows
+    // as its own chunk, which is exact for the same chain-rule reason
+    // measure_layer() already splits wide layers into chunks.
+    template <typename Rng>
+    double measure_layer_encoded(const std::vector<int> &sites, int full_qubits, Rng &rng,
+                                 std::vector<int> *outcomes = nullptr)
+    {
+        if (outcomes != nullptr) { outcomes->assign(sites.size(), 0); }
+        if (sites.empty()) { return 0.0; }
+
+        const int derived = full_qubits - 1;
+        std::vector<int> plain;
+        plain.reserve(sites.size());
+        std::size_t derived_slot = sites.size();
+        for (std::size_t i = 0; i < sites.size(); ++i)
+        {
+            if (sites[i] == derived) { derived_slot = i; }
+            else { plain.push_back(sites[i]); }
+        }
+
+        double surprisal = 0.0;
+        if (!plain.empty())
+        {
+            std::vector<int> plain_outcomes;
+            surprisal +=
+                measure_layer(plain, rng, outcomes != nullptr ? &plain_outcomes : nullptr);
+            if (outcomes != nullptr)
+            {
+                std::size_t k = 0;
+                for (std::size_t i = 0; i < sites.size(); ++i)
+                {
+                    if (i != derived_slot) { (*outcomes)[i] = plain_outcomes[k++]; }
+                }
+            }
+        }
+        if (derived_slot < sites.size())
+        {
+            int bit = 0;
+            surprisal += measure_derived_parity(rng, &bit);
+            if (outcomes != nullptr) { (*outcomes)[derived_slot] = bit; }
+        }
+        return surprisal;
+    }
+
+    // Expands the encoded state sitting in the low half of the adopted 2^n
+    // buffer into the full state vector, in place, and re-adopts it at full
+    // width. Every downstream consumer then sees an ordinary state.
+    void expand_parity_sector(int full_qubits)
+    {
+        if (qubits_ != full_qubits - 1)
+        {
+            throw std::invalid_argument("expand_parity_sector width does not match the state.");
+        }
+        const int status = fp64_ ? mipt_cuda_parity_expand_f64(active(), full_qubits)
+                                 : mipt_cuda_parity_expand_f32(active(), full_qubits);
+        if (status != 0)
+        {
+            throw std::runtime_error(std::string("Parity expansion failed: ") +
+                                     mipt_cuda_cusv_parity_last_error());
+        }
+        qubits_ = full_qubits;
     }
 
     // Squared norm of the whole state; used by the self-checks.

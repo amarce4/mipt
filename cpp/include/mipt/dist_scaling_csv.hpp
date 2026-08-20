@@ -211,8 +211,16 @@ struct PairBin
 
     RunningStats mi;
     RunningStats mn;
+    // Mean of |G|^2 and |F|^2 over records, not |mean G|^2 -- the phases of a
+    // two-point function average to zero over trajectories, so the squared
+    // mean is not the same object and is not what decays with a useful
+    // exponent. See dist::two_point_correlators.
+    RunningStats g2;
+    RunningStats f2;
     RunningStats fmi;
     RunningStats fmn;
+    RunningStats fg2;
+    RunningStats ff2;
     std::uint64_t mn_positive = 0;
     std::uint64_t fmn_positive = 0;
 };
@@ -353,12 +361,16 @@ inline std::string pair_csv_header(const RunConfig &config)
     header +=
         ",separation,chord_length,d,embedding_count,"
         "mi_mean,mi_stderr,mi_samples,"
-        "mn_mean,mn_stderr,mn_samples,mn_positive_count,mn_positive_fraction";
+        "mn_mean,mn_stderr,mn_samples,mn_positive_count,mn_positive_fraction,"
+        "g2_mean,g2_stderr,g2_samples,"
+        "f2_mean,f2_stderr,f2_samples";
     if (config.fermionic_outputs())
     {
         header +=
             ",fmi_mean,fmi_stderr,fmi_samples,"
-            "fmn_mean,fmn_stderr,fmn_samples,fmn_positive_count,fmn_positive_fraction";
+            "fmn_mean,fmn_stderr,fmn_samples,fmn_positive_count,fmn_positive_fraction,"
+            "fg2_mean,fg2_stderr,fg2_samples,"
+            "ff2_mean,ff2_stderr,ff2_samples";
     }
     header += '\n';
     return header;
@@ -417,6 +429,8 @@ inline std::string render_pair_csv(const RunConfig &config, const std::vector<Pa
         append_uint(line, bin.mn_positive);
         line += ',';
         append_double(line, positive_fraction(bin.mn_positive, bin.mn.count));
+        append_stats(line, bin.g2);
+        append_stats(line, bin.f2);
         if (config.fermionic_outputs())
         {
             append_stats(line, bin.fmi);
@@ -425,6 +439,8 @@ inline std::string render_pair_csv(const RunConfig &config, const std::vector<Pa
             append_uint(line, bin.fmn_positive);
             line += ',';
             append_double(line, positive_fraction(bin.fmn_positive, bin.fmn.count));
+            append_stats(line, bin.fg2);
+            append_stats(line, bin.ff2);
         }
         line += '\n';
         out += line;

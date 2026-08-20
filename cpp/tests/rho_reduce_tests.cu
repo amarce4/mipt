@@ -22,6 +22,7 @@
 // environment embedding may reorder them.
 
 #include "mipt/cuda/rho2_reduce.hpp"
+#include "mipt/dist_metrics.hpp"
 #include "mipt/cuda/rho_reduce.hpp"
 
 #include <cuda_runtime.h>
@@ -372,6 +373,101 @@ void check_triple(const std::vector<Complex> &psi, int n, const std::vector<int>
 // The fermionic sign only bites when an environment mode sits between two
 // retained ones, so a test using only contiguous blocks would pass with the
 // signs dropped entirely. This asserts they are live.
+int occupied_below(std::uint64_t index, int mode)
+{
+    return __builtin_popcountll(index & ((std::uint64_t{1} << mode) - 1u));
+}
+
+// <psi| c_a^dag c_b |psi>, straight from the anticommutation algebra: there is
+// no reduced density matrix anywhere in this, which is the point.
+//   c_b |x> = (-1)^{occupied below b} |x with bit b cleared>   when x_b = 1
+//   c_a^dag |y> = (-1)^{occupied below a} |y with bit a set>   when y_a = 0
+Complex hopping_correlator(const std::vector<Complex> &psi, int a, int b)
+{
+    Complex total(0.0, 0.0);
+    for (std::uint64_t x = 0; x < psi.size(); ++x)
+    {
+        if (((x >> b) & 1u) == 0u) { continue; }
+        int sign = (occupied_below(x, b) & 1) ? -1 : 1;
+        const std::uint64_t y = x & ~(std::uint64_t{1} << b);
+        if (((y >> a) & 1u) != 0u) { continue; }
+        sign *= (occupied_below(y, a) & 1) ? -1 : 1;
+        total += std::conj(psi[y | (std::uint64_t{1} << a)]) * psi[x] * static_cast<double>(sign);
+    }
+    return total;
+}
+
+// <psi| c_a c_b |psi>.
+Complex pairing_correlator(const std::vector<Complex> &psi, int a, int b)
+{
+    Complex total(0.0, 0.0);
+    for (std::uint64_t x = 0; x < psi.size(); ++x)
+    {
+        if (((x >> b) & 1u) == 0u) { continue; }
+        int sign = (occupied_below(x, b) & 1) ? -1 : 1;
+        const std::uint64_t y = x & ~(std::uint64_t{1} << b);
+        if (((y >> a) & 1u) == 0u) { continue; }
+        sign *= (occupied_below(y, a) & 1) ? -1 : 1;
+        total += std::conj(psi[y & ~(std::uint64_t{1} << a)]) * psi[x] * static_cast<double>(sign);
+    }
+    return total;
+}
+
+mipt::dist::Matrix4 as_matrix4(const std::vector<Complex> &rho)
+{
+    mipt::dist::Matrix4 m{};
+    for (std::size_t e = 0; e < 16; ++e) { m[e] = rho[e]; }
+    return m;
+}
+
+// Closes the chain behind the g2/f2 columns of the k=2 CSV.
+//
+// check_pair pins the production kernels against reference_rdm; this pins
+// dist::two_point_correlators(reference_rdm) against the operator algebra
+// above. Together they say that |<c_i^dag c_j>|^2 and |<c_i c_j>|^2 read off
+// two entries of the *fermionic* pair RDM are the real thing.
+//
+// It also checks that the ordinary-trace RDM gives something else, which is
+// the whole reason the fermionic trace exists here: the Jordan-Wigner string
+// running between the two modes is what it restores.
+void check_two_point_correlators(const std::vector<Complex> &psi, int n)
+{
+    const std::vector<std::vector<int>> pairs{{0, 1}, {0, 5}, {2, n - 1}, {4, 7}};
+    for (const auto &kept : pairs)
+    {
+        const auto correlators = mipt::dist::two_point_correlators(
+            as_matrix4(reference_rdm(psi, n, kept, true)));
+        const double g2 = std::norm(hopping_correlator(psi, kept[0], kept[1]));
+        const double f2 = std::norm(pairing_correlator(psi, kept[0], kept[1]));
+        const double worst = std::fmax(std::fabs(correlators.g2 - g2),
+                                       std::fabs(correlators.f2 - f2));
+        if (!(worst < 1.0e-12))
+        {
+            ++failures;
+            std::printf("  FAIL two-point correlators (%d,%d): rdm {%.9f, %.9f} vs operators "
+                        "{%.9f, %.9f}\n", kept[0], kept[1], correlators.g2, correlators.f2, g2, f2);
+        }
+        else
+        {
+            std::printf("  ok   |G|^2=%.6f |F|^2=%.6f from the fermionic pair RDM matches the "
+                        "operator algebra for (%d,%d): max|d|=%.2e\n",
+                        g2, f2, kept[0], kept[1], worst);
+        }
+
+        const auto qubit = mipt::dist::two_point_correlators(
+            as_matrix4(reference_rdm(psi, n, kept, false)));
+        const bool distant = std::abs(kept[1] - kept[0]) > 1;
+        const double gap = std::fmax(std::fabs(qubit.g2 - correlators.g2),
+                                     std::fabs(qubit.f2 - correlators.f2));
+        if (distant && !(gap > 1.0e-6))
+        {
+            ++failures;
+            std::printf("  FAIL ordinary-trace correlators match the fermionic ones at (%d,%d); "
+                        "the Jordan-Wigner string is not being applied\n", kept[0], kept[1]);
+        }
+    }
+}
+
 void check_fermionic_trace_is_live(const std::vector<Complex> &psi, int n)
 {
     const std::vector<int> pair{1, 6};
@@ -426,6 +522,7 @@ int main()
 
     std::printf("rho2/rho3 fused reduction sweeps, N=%d\n", n);
     check_fermionic_trace_is_live(psi, n);
+    check_two_point_correlators(psi, n);
 
     for (bool fp64 : {false, true})
     {

@@ -6,11 +6,13 @@
 
 #ifdef MIPT_ENABLE_CUSV
 #include "mipt/cusv/engine.hpp"
+#include "mipt/cusv/parity.hpp"
 #endif
 
 #include <cudaq.h>
 
 #include <chrono>
+#include <iostream>
 #include <memory>
 #include <optional>
 #include <random>
@@ -142,6 +144,75 @@ class Circuit1D
         return state;
     }
 
+    // Same as try_cusv, but simulates inside the even global-parity sector on
+    // n-1 encoded qubits, so every pass moves half the bytes. Only valid for a
+    // parity-preserving gate set started from |0...0>; see mipt/cusv/parity.hpp
+    // for why the odd half of the state vector is identically zero there.
+    //
+    // Returns nullopt without having touched a state vector when the encoding
+    // does not cover the circuit, so the caller falls back to try_cusv. The
+    // whole layer history is rewritten up front for exactly that reason: a
+    // refusal half-way through would leave a mutated buffer behind.
+    template <typename Layer, typename BuildOps>
+    std::optional<cudaq::state> try_cusv_parity(int n, const std::vector<Layer> &layers,
+                                                BuildOps build_ops)
+    {
+        if (!cusv::enabled() || !cusv::parity_encoding_enabled() || n < 4)
+        {
+            return std::nullopt;
+        }
+
+        std::vector<std::vector<cusv::Op>> encoded;
+        std::vector<std::vector<int>> measured;
+        encoded.reserve(layers.size());
+        measured.reserve(layers.size());
+        for (const auto &layer : layers)
+        {
+            auto ops = build_ops(layer);
+            auto rewritten = cusv::encode_parity_sector(ops.ops, n);
+            if (!rewritten)
+            {
+                return std::nullopt;
+            }
+            encoded.push_back(std::move(*rewritten));
+            measured.push_back(std::move(ops.measure_sites));
+        }
+
+        auto state = cudaq::get_state(ZeroStateKernel{}, n);
+        const auto tensor = state.get_tensor();
+        if (tensor.get_rank() != 1 || tensor.data == nullptr || !state.is_on_gpu() ||
+            tensor.get_num_elements() != (std::size_t{1} << n))
+        {
+            return std::nullopt;
+        }
+        const bool fp64 = state.get_precision() == cudaq::SimulationState::precision::fp64;
+        if (!engine_ || engine_->fp64() != fp64)
+        {
+            engine_ = std::make_unique<cusv::Engine>(fp64);
+        }
+        // CUDA-Q hands back |0...0>, so the low 2^(n-1) amplitudes are already
+        // the encoded |0...0> and the upper half is zero -- which is what
+        // expand_parity_sector() expects to find there at the end.
+        engine_->adopt(tensor.data, n - 1);
+
+        static bool announced = false;
+        if (!announced)
+        {
+            announced = true;
+            std::cerr << "parity_sector=1: parity-preserving circuit simulated on 2^" << (n - 1)
+                      << " amplitudes; MIPT_CUSV_PARITY=0 restores the full 2^" << n << " path.\n";
+        }
+
+        const int block = cusv::max_block_targets();
+        for (std::size_t i = 0; i < encoded.size(); ++i)
+        {
+            engine_->apply_ops(encoded[i], block);
+            engine_->measure_layer_encoded(measured[i], n, measure_rng_);
+        }
+        engine_->expand_parity_sector(n);
+        return state;
+    }
+
     std::unique_ptr<cusv::Engine> engine_;
     // Separate stream so measurement outcomes never perturb layer sampling.
     std::mt19937 measure_rng_{std::random_device{}()};
@@ -232,9 +303,14 @@ class RppuCircuit1D final : public Circuit1D
         log_start(context, "FermionRPPU", n, layers_.size());
         const auto start = std::chrono::steady_clock::now();
 #ifdef MIPT_ENABLE_CUSV
-        if (auto fast = try_cusv(n, layers_,
-                                 [n](const RppuLayer &layer)
-                                 { return cusv::build_rppu_layer_ops(layer, n); }))
+        const auto rppu_ops = [n](const RppuLayer &layer)
+        { return cusv::build_rppu_layer_ops(layer, n); };
+        if (auto fast = try_cusv_parity(n, layers_, rppu_ops))
+        {
+            log_done(context, "FermionRPPU", start);
+            return *fast;
+        }
+        if (auto fast = try_cusv(n, layers_, rppu_ops))
         {
             log_done(context, "FermionRPPU", start);
             return *fast;
@@ -291,9 +367,14 @@ class QrppuCircuit1D final : public Circuit1D
         log_start(context, "qRPPU", n, layers_.size());
         const auto start = std::chrono::steady_clock::now();
 #ifdef MIPT_ENABLE_CUSV
-        if (auto fast = try_cusv(n, layers_,
-                                 [n](const RppuLayer &layer)
-                                 { return cusv::build_rppu_layer_ops(layer, n); }))
+        const auto rppu_ops = [n](const RppuLayer &layer)
+        { return cusv::build_rppu_layer_ops(layer, n); };
+        if (auto fast = try_cusv_parity(n, layers_, rppu_ops))
+        {
+            log_done(context, "qRPPU", start);
+            return *fast;
+        }
+        if (auto fast = try_cusv(n, layers_, rppu_ops))
         {
             log_done(context, "qRPPU", start);
             return *fast;

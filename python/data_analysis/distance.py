@@ -66,6 +66,12 @@ _METRIC_SPECS: dict[str, dict[str, Any]] = {
     "fgmn": {"exponent": r"\mathrm{fGMN}"},
     "average_mi": {"exponent": r"\overline{\mathrm{MI}}", "entropy": True},
     "faverage_mi": {"exponent": r"\overline{\mathrm{fMI}}", "entropy": True},
+    # Two-point correlators, mean of |.|^2 over records. They are amplitudes
+    # squared rather than entropies, so no unit conversion applies.
+    "g2": {"exponent": r"|G|^{2}"},
+    "f2": {"exponent": r"|F|^{2}"},
+    "fg2": {"exponent": r"|G^{f}|^{2}"},
+    "ff2": {"exponent": r"|F^{f}|^{2}"},
     "min_bipneg": {"exponent": r"\mathrm{minN}"},
     "min_fbipneg": {"exponent": r"\mathrm{minN}^f"},
     # The two factors of the entanglement decomposition (see below). Derived,
@@ -99,6 +105,50 @@ _DECOMPOSITION_SUFFIXES = ("_ent_fraction", "_ent_magnitude")
 
 def _is_decomposition_metric(metric: str) -> bool:
     return metric.endswith(_DECOMPOSITION_SUFFIXES)
+
+
+def _decomposition_source(metric: str) -> str:
+    """The measure a decomposition factor was derived from, or the metric."""
+    for suffix in _DECOMPOSITION_SUFFIXES:
+        if metric.endswith(suffix):
+            return metric[: -len(suffix)]
+    return metric
+
+
+# ---------------------------------------------------------------------------
+# The published fit protocol (`paper_fit_ranges`)
+#
+# Section C of arXiv:2602.04969 does not fit every two-party measure over one
+# window. The negativities are read off the four largest distances at every
+# size, and the mutual informations are too at the sizes where the power law
+# has not yet opened up a usable window; only the larger chains get a fitted
+# range. Reproducing a published exponent means reproducing that, so the rule
+# is spelled out here rather than left to a caller to hand-assemble.
+#
+# The paper names L=18 and L=20 for the tail-fitted mutual information and
+# L>=22 for the ranged one, so the boundary sits between them; smaller chains
+# have fewer distance points still and follow the tail rule.
+# ---------------------------------------------------------------------------
+
+_PAPER_TAIL_POINTS = 4
+_PAPER_MI_TAIL_MAX_SIZE = 20
+
+
+def _paper_tail_points(metric: str, size: int, k: int) -> int | None:
+    """How many largest-distance points the paper's protocol fits, if any.
+
+    ``None`` means "use the range this call was given". A decomposition factor
+    follows its source measure, so the two factors and the mean they multiply
+    to are always fitted over the same points.
+    """
+    if k != 2:
+        return None
+    stem = _decomposition_source(metric)
+    if stem in ("mn", "fmn"):
+        return _PAPER_TAIL_POINTS
+    if stem in ("mi", "fmi") and size <= _PAPER_MI_TAIL_MAX_SIZE:
+        return _PAPER_TAIL_POINTS
+    return None
 
 # ---------------------------------------------------------------------------
 # Panel layout
@@ -167,6 +217,44 @@ _ENT_DECOMP_GRID: tuple[tuple[dict[str, Any], ...], ...] = (
             r"$\langle\mathcal{N}^{f}\rangle_{\mathrm{ent}}$",
             "entropy": False,
             "metrics": {2: "fmn_ent_magnitude", 3: "fgmn_ent_magnitude"},
+        },
+    ),
+)
+
+
+# The `correlators=True` layout: the two fermionic two-point functions by
+# column, trace convention by row. Only the bottom row is G and F proper --
+# the top row comes from the ordinary trace, which drops the Jordan-Wigner
+# string between the two modes, so it holds the spin correlators instead. The
+# two rows coincide identically at separation 1, where the string is either
+# empty or fixed by parity conservation.
+#
+# k=2 only: there is no three-party analogue of a two-point function.
+_CORRELATOR_GRID: tuple[tuple[dict[str, Any], ...], ...] = (
+    (
+        {
+            "label": r"Hopping $\overline{|\langle S^{+}_i S^{-}_j\rangle|^{2}}$",
+            "entropy": False,
+            "metrics": {2: "g2"},
+        },
+        {
+            "label": r"Pairing $\overline{|\langle S^{-}_i S^{-}_j\rangle|^{2}}$",
+            "entropy": False,
+            "metrics": {2: "f2"},
+        },
+    ),
+    (
+        {
+            "label": r"Fermionic hopping "
+            r"$\overline{|\langle c^{\dagger}_i c_j\rangle|^{2}}$",
+            "entropy": False,
+            "metrics": {2: "fg2"},
+        },
+        {
+            "label": r"Fermionic pairing "
+            r"$\overline{|\langle c_i c_j\rangle|^{2}}$",
+            "entropy": False,
+            "metrics": {2: "ff2"},
         },
     ),
 )
@@ -627,9 +715,16 @@ def _distance_power_law_fit(
     curve: pd.DataFrame,
     *,
     fit_range: tuple[float | None, float | None] | None,
+    tail_points: int | None = None,
     min_relative_error: float,
 ) -> tuple[dict[str, float], pd.DataFrame]:
-    """Fit mean = prefactor * d**(-alpha) in logarithmic coordinates."""
+    """Fit mean = prefactor * d**(-alpha) in logarithmic coordinates.
+
+    ``tail_points`` selects that many largest-distance points and **replaces**
+    ``fit_range`` rather than narrowing it -- the published protocol asks for
+    the four largest distances outright, not for the four largest inside some
+    other window.
+    """
     selected = curve.loc[
         np.isfinite(curve["d"])
         & np.isfinite(curve["mean"])
@@ -637,7 +732,9 @@ def _distance_power_law_fit(
         & (curve["mean"] > 0.0)
     ].copy()
 
-    if fit_range is not None:
+    if tail_points is not None:
+        selected = selected.sort_values("d", kind="stable").tail(tail_points)
+    elif fit_range is not None:
         lower, upper = fit_range
         if lower is not None:
             selected = selected.loc[selected["d"] >= lower]
@@ -657,6 +754,7 @@ def _print_distance_fits(
     fit_ranges: Mapping[int, tuple[float | None, float | None] | None],
     plotted: Mapping[str, int],
     circuit_name: str,
+    paper_fit_ranges: bool = False,
 ) -> None:
     """Report every fit, including the sizes the figure does not draw.
 
@@ -671,7 +769,13 @@ def _print_distance_fits(
         {int(k_of_metric[metric]) for metric in metrics if metric in k_of_metric}
     )
     for k in party_counts:
-        print(f"  k={k}, fit window: {_fit_range_text(fit_ranges.get(k))}")
+        header = f"  k={k}, fit window: {_fit_range_text(fit_ranges.get(k))}"
+        if paper_fit_ranges and k == 2:
+            header += (
+                f"; paper_fit_ranges overrides the rows marked "
+                f"[tail {_PAPER_TAIL_POINTS}]"
+            )
+        print(header)
         for metric in metrics:
             if k_of_metric.get(metric) != k:
                 continue
@@ -688,11 +792,18 @@ def _print_distance_fits(
                     print(f"{head} unavailable: {detail}")
                     continue
                 window = f"[{row['d_min']:.4g}, {row['d_max']:.4g}]"
+                selection = str(row.get("fit_selection", "range"))
+                marker = (
+                    f"  [tail {selection.split(':')[1]}]"
+                    if selection.startswith("tail:")
+                    else ""
+                )
                 print(
                     f"{head} = {row['alpha']:7.4f} +/- {row['alpha_stderr']:.4f}"
                     f"   d in {window:<18s}"
                     f"{int(row['points']):3d} pts"
                     f"   chi2/dof = {row['reduced_chi2']:6.2f}"
+                    + marker
                     + ("   <- plotted" if plotted.get(metric) == int(row["L"]) else "")
                 )
 
@@ -705,8 +816,10 @@ def dist_scaling(
     l_by_file: Mapping[str, int] | None = None,
     metrics: Sequence[str] | None = None,
     ent_decomp: bool = False,
+    correlators: bool = False,
     fit_range_2: tuple[float | None, float | None] | None = None,
     fit_range_3: tuple[float | None, float | None] | None = None,
+    paper_fit_ranges: bool = False,
     min_relative_error: float = 0.03,
     chunksize: int = 1_000_000,
     distance_round: int = 12,
@@ -755,6 +868,16 @@ def dist_scaling(
     the purities -- is still loaded into ``data`` and still fitted into
     ``fits``; it just gets no subplot. Pass ``metrics`` to override the panel
     set.
+
+    ``correlators=True`` replaces the whole figure with the two fermionic
+    two-point functions: columns are the hopping correlator
+    :math:`G_{ij} = \langle c^\dagger_i c_j\rangle` and the pairing
+    correlator :math:`F_{ij} = \langle c_i c_j\rangle`, rows are the trace
+    convention. What is plotted is
+    :math:`\overline{|G_{ij}|^2}` -- the record-wise square, averaged -- not
+    :math:`|\overline{G_{ij}}|^2`, whose phases average away. Only the bottom
+    row is G and F proper; the top row comes from the ordinary trace, which
+    drops the Jordan-Wigner string between the two modes. k=2 only.
 
     ``ent_decomp=True`` replaces the whole figure with the **entanglement
     decomposition**, a recreation of Fig. 8 of arXiv:2602.04969. A bipartite
@@ -817,6 +940,28 @@ def dist_scaling(
     largest size per measure gets a line in the panel, since the smaller ones
     lie nearly on top of it and say nothing the printout does not.
 
+    ``paper_fit_ranges=True`` overrides those windows where Section C of
+    arXiv:2602.04969 uses a tail fit instead, which is what reproducing a
+    published two-party exponent needs:
+
+    ===================== ================= ==================================
+    measure               sizes             window
+    ===================== ================= ==================================
+    ``mn``, ``fmn``       every ``L``       the 4 largest distances
+    ``mi``, ``fmi``       ``L <= 20``       the 4 largest distances
+    ``mi``, ``fmi``       ``L >= 22``       ``fit_range_2``
+    everything at k=3     every ``L``       ``fit_range_3``
+    ===================== ================= ==================================
+
+    The paper names L=18 and L=20 for the tail-fitted mutual information and
+    L>=22 for the ranged one, so the boundary sits between them and smaller
+    chains -- which have fewer distance points still -- follow the tail rule.
+    A tail **replaces** the range rather than narrowing it. The decomposition
+    factors follow their source measure, so ``ent_decomp`` panels stay
+    consistent with the negativity they multiply to. Every fit records which
+    rule produced it in the ``fit_selection`` column of ``fits`` and in the
+    printed report.
+
     ``mi_units`` selects the unit of every entropy-valued measure (``mi``,
     ``fmi``, ``tmi``, ``ftmi``, ``average_mi``) and of their fitted
     prefactors; it does not change their exponents. ``dist_scaling.exe``
@@ -835,12 +980,25 @@ def dist_scaling(
             "ent_decomp=True fixes the panel set to the two decomposition "
             "factors; metrics= cannot also be given."
         )
-    panel_grid = _ENT_DECOMP_GRID if ent_decomp else _PANEL_GRID
+    if correlators and (metrics is not None or ent_decomp):
+        raise ValueError(
+            "correlators=True fixes the panel set to the two-point functions; "
+            "metrics= and ent_decomp= cannot also be given."
+        )
+    if correlators:
+        panel_grid = _CORRELATOR_GRID
+    elif ent_decomp:
+        panel_grid = _ENT_DECOMP_GRID
+    else:
+        panel_grid = _PANEL_GRID
     slot_of_metric = _panel_slot_of_metric(panel_grid)
     fit_ranges = {
         2: _normalize_fit_range(fit_range_2, "fit_range_2"),
         3: _normalize_fit_range(fit_range_3, "fit_range_3"),
     }
+
+    def resolve_selection(metric: str, size: int, k: int) -> int | None:
+        return _paper_tail_points(metric, size, k) if paper_fit_ranges else None
     mi_units, mi_scale_from_nats = _mi_unit_spec(mi_units)
     _, legacy_scale_from_nats = _mi_unit_spec(legacy_entropy_units)
 
@@ -883,6 +1041,12 @@ def dist_scaling(
         if entry["k"] is None:
             entry["k"] = 3 if "tmi" in entry.get("data", {}) else 2
     k_values = sorted({int(entry["k"]) for entry in loaded})
+    if paper_fit_ranges and 2 not in k_values:
+        warnings.warn(
+            "paper_fit_ranges=True only overrides two-party measures, and no "
+            f"k=2 file was given (found k={k_values}); every fit uses "
+            "fit_range_3."
+        )
 
     if sizes is None:
         parsed_sizes = [
@@ -1061,14 +1225,25 @@ def dist_scaling(
         for metric in fitted_metrics:
             if metric not in data[(k_of_file, size)]:
                 continue
+            tail_points = resolve_selection(metric, size, k_of_file)
+            selection = (
+                f"tail:{tail_points}" if tail_points is not None else "range"
+            )
             try:
                 fit, selected = _distance_power_law_fit(
                     data[(k_of_file, size)][metric],
                     fit_range=fit_ranges.get(k_of_file),
+                    tail_points=tail_points,
                     min_relative_error=min_relative_error,
                 )
                 fit_rows.append(
-                    {"k": k_of_file, "L": size, "metric": metric, **fit}
+                    {
+                        "k": k_of_file,
+                        "L": size,
+                        "metric": metric,
+                        "fit_selection": selection,
+                        **fit,
+                    }
                 )
                 selected_points[(k_of_file, size, metric)] = selected
             except ValueError as exc:
@@ -1077,6 +1252,7 @@ def dist_scaling(
                         "k": k_of_file,
                         "L": size,
                         "metric": metric,
+                        "fit_selection": selection,
                         "alpha": np.nan,
                         "alpha_stderr": np.nan,
                         "prefactor": np.nan,
@@ -1119,6 +1295,7 @@ def dist_scaling(
             fit_ranges,
             plotted_fit_size,
             circuit_name,
+            paper_fit_ranges,
         )
 
     colors = _color_map_by_size(unique_sizes, cmap)
@@ -1346,6 +1523,7 @@ def dist_scaling(
         "k_values": tuple(k_values),
         "metrics": panel_metrics,
         "ent_decomp": ent_decomp,
+        "correlators": correlators,
         "metric_party_counts": dict(k_of_metric),
         "available_metrics": tuple(available),
         "circuit_name": circuit_name,
@@ -1354,6 +1532,7 @@ def dist_scaling(
         "summary": summary,
         "fits": fits,
         "fit_ranges": dict(fit_ranges),
+        "paper_fit_ranges": paper_fit_ranges,
         "plotted_fit_sizes": dict(plotted_fit_size),
         "mi_units": mi_units,
         "selected_fit_points": selected_points,

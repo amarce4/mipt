@@ -23,6 +23,7 @@
 #include "mipt/cusv/matrix.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <stdexcept>
 #include <vector>
@@ -32,8 +33,9 @@ namespace mipt::cusv
 
 enum class OpKind
 {
-    Matrix,   // dense matrix on `targets`
-    JwString, // diagonal: amplitude *= -1 where bit(string_control) & parity(idx & string_mask)
+    Matrix,     // dense matrix on `targets`
+    JwString,   // diagonal: amplitude *= -1 where bit(string_control) & parity(idx & string_mask)
+    ParityGate, // parity-sector encoding only; see mipt/cusv/parity.hpp
 };
 
 struct Op
@@ -43,6 +45,12 @@ struct Op
     DenseMatrix matrix;
     int string_control = -1;
     std::uint64_t string_mask = 0;
+    // ParityGate only: the two 2x2 blocks a bond on (targets[0], n-1) reduces
+    // to in the encoded picture, selected by s = parity(index with targets[0]
+    // cleared). Row-major (re, im) pairs ordered M00, M01, M10, M11, indexed
+    // by the value of the encoded bit.
+    std::array<double, 8> parity_even{};
+    std::array<double, 8> parity_odd{};
 };
 
 struct LayerOps

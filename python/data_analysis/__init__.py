@@ -8,7 +8,9 @@ entropy(...)           Plot entropy scaling curves and weighted fits; ``order=1`
 dist_scaling(...)      Plot two-site (MI/negativity) or three-site (TMI/GMN)
                        distance scaling and power-law fits; ``ent_decomp=True``
                        splits the pair negativities into the entangled fraction
-                       and the conditional magnitude instead.
+                       and the conditional magnitude instead, and
+                       ``paper_fit_ranges=True`` reproduces the published
+                       two-party fit windows.
 expvals(...)           Plot aggregate fermionic observables and Wick residuals.
 tmi_collapse(...)      Fit and plot the TMI finite-size scaling collapse.
 probe1_collapse(...)   Fit and plot the one-ancilla dynamical collapse.

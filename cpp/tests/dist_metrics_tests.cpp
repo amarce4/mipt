@@ -229,12 +229,16 @@ void test_pair_round_trip(const std::string &directory)
                 const double fmn = unit(rng);
                 bin.mi.add(mi);
                 bin.mn.add(mn);
+                bin.g2.add(unit(rng));
+                bin.f2.add(unit(rng));
                 if (mn > 0.5)
                 {
                     ++bin.mn_positive;
                 }
                 bin.fmi.add(fmi);
                 bin.fmn.add(fmn);
+                bin.fg2.add(unit(rng));
+                bin.ff2.add(unit(rng));
                 if (fmn > 0.5)
                 {
                     ++bin.fmn_positive;
@@ -263,6 +267,10 @@ void test_pair_round_trip(const std::string &directory)
         expect_stats_equal(restored[b].mn, bins[b].mn, "pair mn");
         expect_stats_equal(restored[b].fmi, bins[b].fmi, "pair fmi");
         expect_stats_equal(restored[b].fmn, bins[b].fmn, "pair fmn");
+        expect_stats_equal(restored[b].g2, bins[b].g2, "pair g2");
+        expect_stats_equal(restored[b].f2, bins[b].f2, "pair f2");
+        expect_stats_equal(restored[b].fg2, bins[b].fg2, "pair fg2");
+        expect_stats_equal(restored[b].ff2, bins[b].ff2, "pair ff2");
         expect(restored[b].mn_positive == bins[b].mn_positive, "pair mn_positive");
         expect(restored[b].fmn_positive == bins[b].fmn_positive, "pair fmn_positive");
     }
@@ -286,6 +294,8 @@ void test_pair_round_trip(const std::string &directory)
         expect_stats_equal(restored[b].mn, reference[b].mn, "pair mn after resume");
         expect_stats_equal(restored[b].fmi, reference[b].fmi, "pair fmi after resume");
         expect_stats_equal(restored[b].fmn, reference[b].fmn, "pair fmn after resume");
+        expect_stats_equal(restored[b].g2, reference[b].g2, "pair g2 after resume");
+        expect_stats_equal(restored[b].ff2, reference[b].ff2, "pair ff2 after resume");
         expect(restored[b].mn_positive == reference[b].mn_positive,
                "pair mn_positive after resume");
     }
@@ -562,6 +572,47 @@ int main()
                   "mixed-state swap-invariant fermionic MI");
     require_close(mixed_swapped_metrics.mn, mixed_metrics.mn, 1.0e-9,
                   "mixed-state swap-invariant fermionic negativity");
+
+    // ------------------------------------------------------- two-point correlators
+    //
+    // Closed forms in the two-mode Fock basis |n_i n_j> indexed n_i + 2 n_j.
+    // G = <c_i^dag c_j> moves one fermion from j to i, so it lives on the
+    // {|0,1>, |1,0>} pair; F = <c_i c_j> removes both, so it lives on
+    // {|1,1>, |0,0>}. rho_reduce_tests pins the same extraction against the
+    // operator algebra on a random many-mode state.
+    {
+        // (|0,1> + |1,0>)/sqrt(2): G = 1/2 exactly, F = 0.
+        const auto hop =
+            interleaved(pure_density({C{}, C(inv_sqrt2, 0.0), C(inv_sqrt2, 0.0), C{}}));
+        const auto metrics = mipt::dist::two_party_metrics(hop.data(), true);
+        require_close(metrics.g2, 0.25, 1.0e-12, "single-fermion hopping |G|^2");
+        require_close(metrics.f2, 0.0, 1.0e-12, "single-fermion hopping |F|^2");
+
+        // (|0,0> + |1,1>)/sqrt(2), the paired state: F = 1/2 exactly, G = 0.
+        const auto metrics_pair = mipt::dist::two_party_metrics(bell.data(), true);
+        require_close(metrics_pair.g2, 0.0, 1.0e-12, "paired-state |G|^2");
+        require_close(metrics_pair.f2, 0.25, 1.0e-12, "paired-state |F|^2");
+
+        // A product state and a classical mixture of |0,0> and |1,1> have no
+        // coherence on either pair of basis states.
+        for (bool fermionic : {false, true})
+        {
+            const auto p = mipt::dist::two_party_metrics(product.data(), fermionic);
+            require_close(p.g2, 0.0, 1.0e-12, "product |G|^2");
+            require_close(p.f2, 0.0, 1.0e-12, "product |F|^2");
+            const auto c = mipt::dist::two_party_metrics(classical_ri.data(), fermionic);
+            require_close(c.g2, 0.0, 1.0e-12, "classical-mixture |G|^2");
+            require_close(c.f2, 0.0, 1.0e-12, "classical-mixture |F|^2");
+        }
+
+        // Both are read off a trace-normalized rho, so an unnormalized input
+        // must give the same answer -- the CSV means would otherwise drift
+        // with whatever trace the reduction happened to accumulate.
+        auto scaled = hop;
+        for (double &v : scaled) { v *= 3.7; }
+        const auto scaled_metrics = mipt::dist::two_party_metrics(scaled.data(), true);
+        require_close(scaled_metrics.g2, 0.25, 1.0e-12, "|G|^2 is trace-normalized");
+    }
 
     require_close(mipt::dist::two_party_geometric_chord_distance(4, 0, 1),
                   2.0 * std::sqrt(2.0) / std::acos(-1.0), 1.0e-12,

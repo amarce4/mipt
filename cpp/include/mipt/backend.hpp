@@ -124,6 +124,15 @@ namespace mipt::backend
         return env::boolean("MIPT_DIRECT_FERMION_BOUNDARY", true);
     }
 
+    // Whether the cuStateVec engine simulates a parity-preserving circuit inside
+    // the even global-parity sector, on half the state vector. See
+    // mipt/cusv/parity.hpp; MIPT_CUSV_PARITY=0 is the A/B control and restores
+    // the full 2^n path exactly.
+    inline bool parity_sector_encoding_enabled()
+    {
+        return env::boolean("MIPT_CUSV_PARITY", true);
+    }
+
     inline void print_backend_banner_once(const char *program_name)
     {
         static bool printed = false;
@@ -138,6 +147,14 @@ namespace mipt::backend
         if (MIPT_CUDAQ_PRECISION == 32 || MIPT_CUDAQ_PRECISION == 64)
         {
             std::cerr << ", statevector_precision=fp" << MIPT_CUDAQ_PRECISION;
+        }
+
+        // Only when turned off: the default is documented, and a run under a
+        // non-default setting should say so without adding a field to every
+        // banner of every executable.
+        if (!parity_sector_encoding_enabled())
+        {
+            std::cerr << ", MIPT_CUSV_PARITY=0";
         }
 
         const char *requested = std::getenv("MIPT_TENSOR_BACKEND");
