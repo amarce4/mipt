@@ -245,6 +245,107 @@ def _probe4_metric_spec(metric: str) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
+def _is_batch_format(df: pd.DataFrame) -> bool:
+    """Whether this frame is a ``*_batches.csv`` sidecar rather than aggregates."""
+    return _find_column(df, ["batch_id"], required=False) is not None
+
+
+def _reduce_batch_curve(
+    df: pd.DataFrame,
+    path: Path,
+    metric_spec: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Reduce a batch-mean sidecar to one mean and one standard error per time.
+
+    The sidecar holds ``batch_count`` independent copies of the whole curve --
+    one per disjoint block of trajectories -- instead of a single pre-averaged
+    point per time. Pooling them reproduces the aggregate CSV's mean exactly,
+    because a weighted average of the block means *is* the grand mean, and
+    reproduces its standard error up to sampling noise, because trajectories
+    are i.i.d. across blocks.
+
+    What the aggregate file cannot give back is the matrix itself, which is
+    returned alongside: each row is a statistically independent measurement of
+    every time at once, so resampling rows carries the temporal covariance that
+    a per-point resample against independent stderrs discards.
+    """
+    batch_col = _find_column(df, ["batch_id"])
+    count_col = _find_column(df, ["batch_realizations", "batch_reals"], required=False)
+    mean_col = _find_column(df, metric_spec["mean_columns"])
+    t_col = _find_column(df, ["t", "time", "timestep"], required=False)
+    if t_col is None:
+        raise KeyError(
+            f"{path} is a batch sidecar with no 't' column. Two-probe mode-4 "
+            "sidecars are indexed by (distance, tau) and belong to "
+            "probe_distance_collapse, not probe2_collapse. "
+            f"Available columns: {list(df.columns)}"
+        )
+    distance_col = _find_column(df, ["distance"], required=False)
+    if distance_col is not None:
+        distances = pd.to_numeric(df[distance_col], errors="coerce").dropna().unique()
+        if len(distances) > 1:
+            raise ValueError(
+                f"{path} holds {len(distances)} probe separations. "
+                "probe2_collapse fits one curve per file; use "
+                "probe_distance_collapse for a distance-resolved run."
+            )
+
+    frame = pd.DataFrame(
+        {
+            "batch": pd.to_numeric(df[batch_col], errors="coerce"),
+            "t": pd.to_numeric(df[t_col], errors="coerce"),
+            "value": pd.to_numeric(df[mean_col], errors="coerce"),
+            "n": (
+                pd.to_numeric(df[count_col], errors="coerce")
+                if count_col is not None
+                else 1.0
+            ),
+        }
+    ).dropna()
+    if frame.empty:
+        raise ValueError(f"No valid batch rows found in {path}.")
+    # keep="last" matches the aggregate path's handling of a file that has been
+    # appended to twice.
+    frame = frame.drop_duplicates(["batch", "t"], keep="last")
+
+    values = frame.pivot(index="batch", columns="t", values="value").sort_index()
+    counts = frame.groupby("batch")["n"].last().sort_index()
+    if values.isna().to_numpy().any():
+        incomplete = values.columns[values.isna().any(axis=0)]
+        warnings.warn(
+            f"{path}: dropping {len(incomplete)} readout time(s) that some "
+            "batches do not cover."
+        )
+        values = values.dropna(axis=1)
+    if values.shape[1] == 0:
+        raise ValueError(f"No readout time is covered by every batch in {path}.")
+    if values.shape[0] < 2:
+        raise ValueError(
+            f"{path} holds {values.shape[0]} batch(es); a batch spread needs at "
+            "least two. Re-run with a larger MIPT_PROBED_BATCHES, or point at "
+            "the aggregate CSV instead."
+        )
+
+    matrix = values.to_numpy(dtype=float)
+    weights = counts.to_numpy(dtype=float)
+    total = float(weights.sum())
+    mean = (weights[:, None] * matrix).sum(axis=0) / total
+    # Var(batch mean) = sigma^2 / n_b for i.i.d. trajectories, so weighting the
+    # squared deviations by n_b estimates the *trajectory* variance sigma^2,
+    # and the grand mean's variance is that over the total trajectory count.
+    # For equal batch sizes this is exactly std(batch means, ddof=1)/sqrt(B).
+    variance = (weights[:, None] * (matrix - mean) ** 2).sum(axis=0) / (
+        matrix.shape[0] - 1
+    )
+    return {
+        "t": values.columns.to_numpy(dtype=float),
+        "value": mean,
+        "dvalue": np.sqrt(variance / total),
+        "batches": matrix,
+        "batch_realizations": weights,
+    }
+
+
 def load_scaled_time_curve(
     path: Path,
     *,
@@ -252,22 +353,45 @@ def load_scaled_time_curve(
     x_load: tuple[float | None, float | None],
     metric_spec: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Load one probe time series and attach the scaled time x=(t-2L)/L."""
+    """Load one probe time series and attach the scaled time x=(t-2L)/L.
+
+    Accepts both of ``mipt_probed.exe``'s two-probe formats: the aggregate CSV,
+    which carries one ``<metric>_mean``/``<metric>_stderr`` pair per readout
+    time, and the ``*_batches.csv`` sidecar, which carries one batch-mean curve
+    per independent block of trajectories. The two are told apart by the
+    presence of a ``batch_id`` column and produce the same curve; only the
+    sidecar also returns the per-batch matrix in ``batches``.
+    """
     df = pd.read_csv(path)
     metadata = resolve_metadata(df, path, l_by_file=l_by_file)
     size = metadata["L"]
 
-    t_col = _find_column(df, ["t", "time", "timestep"])
-    mean_col = _find_column(df, metric_spec["mean_columns"])
-    stderr_col = _find_column(df, metric_spec["stderr_columns"])
+    batched = _is_batch_format(df)
     scaled_col = _find_column(df, ["scaled_time", "scaled_t", "x"], required=False)
-    clean = pd.DataFrame(
-        {
-            "t": pd.to_numeric(df[t_col], errors="coerce"),
-            "value": pd.to_numeric(df[mean_col], errors="coerce"),
-            "dvalue": pd.to_numeric(df[stderr_col], errors="coerce"),
-        }
-    )
+    if batched:
+        reduced = _reduce_batch_curve(df, path, metric_spec)
+        clean = pd.DataFrame(
+            {
+                "t": reduced["t"],
+                "value": reduced["value"],
+                "dvalue": reduced["dvalue"],
+            }
+        )
+        # The sidecar's scaled_time is per row, not per time; it is recomputed
+        # below from t and L exactly as the aggregate path does, so the
+        # cross-check is skipped rather than run against a mismatched index.
+        scaled_col = None
+    else:
+        t_col = _find_column(df, ["t", "time", "timestep"])
+        mean_col = _find_column(df, metric_spec["mean_columns"])
+        stderr_col = _find_column(df, metric_spec["stderr_columns"])
+        clean = pd.DataFrame(
+            {
+                "t": pd.to_numeric(df[t_col], errors="coerce"),
+                "value": pd.to_numeric(df[mean_col], errors="coerce"),
+                "dvalue": pd.to_numeric(df[stderr_col], errors="coerce"),
+            }
+        )
     if scaled_col is not None:
         clean["x_csv"] = pd.to_numeric(df[scaled_col], errors="coerce")
     clean = clean.dropna(subset=["t", "value", "dvalue"])
@@ -301,18 +425,29 @@ def load_scaled_time_curve(
     if np.any(clean["x"] < -1e-12):
         warnings.warn(f"{path}: contains points before t0=2L.")
 
-    return {
+    curve = {
         "path": path,
         "L": size,
         "p": metadata["p"],
         "circuit": metadata["circuit"],
         "metadata_source": metadata["source"],
         "metric": metric_spec["key"],
+        "format": "batches" if batched else "aggregate",
         "t": clean["t"].to_numpy(dtype=float),
         "x": clean["x"].to_numpy(dtype=float),
         "value": clean["value"].to_numpy(dtype=float),
         "dvalue": clean["dvalue"].to_numpy(dtype=float),
+        "batches": None,
+        "batch_realizations": None,
     }
+    if batched:
+        # `clean` starts life indexed by the batch matrix's columns and every
+        # step since then has preserved that index, so the surviving index is
+        # the column selection -- which keeps the matrix aligned with `t`
+        # through the sort and the load cutoffs.
+        curve["batches"] = reduced["batches"][:, clean.index.to_numpy()]
+        curve["batch_realizations"] = reduced["batch_realizations"]
+    return curve
 
 
 # ---------------------------------------------------------------------------
@@ -332,6 +467,13 @@ def _collapse_summary(
         "points": [len(curve["x"]) for curve in curves],
         "x_min": [np.min(curve["x"]) for curve in curves],
         "x_max": [np.max(curve["x"]) for curve in curves],
+        # Which of the two CSV formats each curve came from, and how many
+        # independent replicas a batch sidecar supplied.
+        "format": [curve.get("format", "aggregate") for curve in curves],
+        "batches": [
+            0 if curve.get("batches") is None else int(curve["batches"].shape[0])
+            for curve in curves
+        ],
     }
     if metric_spec["signed"]:
         extrema = {
@@ -385,6 +527,11 @@ def _fit_bulk_exponent(
         for curve in curves:
             curve["value"] *= mi_scale
             curve["dvalue"] *= mi_scale
+            # The batch replicas are the same observable in the same units, so
+            # they have to move with it or a later batch bootstrap would work
+            # in nats while the curve is drawn in bits.
+            if curve.get("batches") is not None:
+                curve["batches"] = curve["batches"] * mi_scale
         if metric_spec["bootstrap_upper"] is not None:
             metric_spec["bootstrap_upper"] *= mi_scale
 

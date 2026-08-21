@@ -240,6 +240,9 @@ All one-, two-, and four-reference protocols are provided by one executable:
 | 1 | `p_min p_max p_res` | Fixed-`t=4N` critical scan. One probe uses the Gullans--Huse no-measurement encoding quench; two/four output `I2` or `I2,I3,I4`. |
 | 2 | `t_min t_max t_res p_min p_max p_res` | Rectangular `p,t` scan of the joint reference entropy `S_Q`. |
 
+Modes 3, 4, and 5 exist too and are in active use; `--help` is the authoritative
+list.
+
 The output filename is always generated from the arguments. Use the supplied
 `data_analysis.py` functions
 `probe_pc_collapse(...)` and `probe_entropy_map(...)` for the mode-1 and mode-2
@@ -253,6 +256,32 @@ command resumes an existing output; set `MIPT_PROBED_RESUME=0` to replace it or
 `MIPT_PROBED_ISOLATE_P=0` to restore the single-process behavior. A failed point
 is retried once in a fresh process with CPU prefetch disabled; control this with
 `MIPT_PROBED_RETRIES`.
+
+### Batch-mean sidecar for two-probe modes 0 and 4
+
+Two-probe modes 0 and 4 write a second file next to the aggregate CSV,
+`<output>_batches.csv`, holding `MIPT_PROBED_BATCHES` (default 64) independent
+batch-mean copies of the whole `(bin, time)` grid. The trajectories at one `p`
+are split into that many disjoint blocks, and each block accumulates its own
+copy of every bin and time, so one `batch_id` is one complete and
+statistically independent measurement of the entire grid:
+
+```
+N,circ_type,circuit_name,realizations,p,batch_id,batch_realizations,t,...,I_mean,negativity_mean,log_negativity_mean,negativity_positive_fraction
+```
+
+The aggregate CSV reports one mean and one standard error per point, which is
+enough for an error bar and not enough for a fit: a collapse exponent is
+fitted to a whole curve at once, and every point of a curve comes from the
+*same* trajectories, so resampling points independently against their own
+standard errors understates the error on `eta`. The sidecar is what a batch
+bootstrap over whole curves needs, at the cost of `batch_count x` rows rather
+than one row per trajectory.
+
+Pooling the batches by `batch_realizations` reproduces the aggregate CSV's
+means exactly (verified to 1e-16) and its standard errors up to sampling
+scatter. `MIPT_PROBED_BATCHES=0` disables the sidecar; 50-100 is the useful
+band. `data_analysis.probe2_collapse` reads either file.
 
 ### One-probe mode-1 performance
 

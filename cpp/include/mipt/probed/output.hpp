@@ -18,6 +18,7 @@
 #include "mipt/util/geometry.hpp"
 #include "mipt/util/text.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <fstream>
@@ -94,6 +95,94 @@ inline std::string default_output_name(int probes, int n, int realizations, Circ
         }
     }
     return name + ".csv";
+}
+
+// --- batch-mean sidecar -----------------------------------------------------
+//
+// The aggregate CSV reports one mean and one standard error per (bin, time),
+// which is everything a per-point error bar needs and not enough for a fit.
+// A collapse exponent is fitted to a whole curve at once, so its uncertainty
+// depends on how the points covary -- and every point of a curve comes from
+// the *same* trajectories, so they covary strongly. Resampling points
+// independently against their own stderrs therefore understates the error on
+// eta by a large factor.
+//
+// The fix is to keep a modest number of independent replicas of the whole
+// curve. Trajectories are partitioned into `batch_count` contiguous batches
+// and each batch accumulates its own copy of every bin and time, so one batch
+// is one complete, statistically independent measurement of the entire grid.
+// A batch bootstrap over those curves then carries the temporal and
+// cross-metric covariance that a per-point resample throws away, at the cost
+// of one extra file of batch_count x rows rather than one row per trajectory.
+//
+// 50-100 batches is the useful band: enough replicas for a percentile
+// interval, few enough that each batch mean is still well determined.
+
+inline std::string batch_output_path(const std::string &path)
+{
+    const std::string suffix = ".csv";
+    if (path.size() >= suffix.size() && path.compare(path.size() - suffix.size(), suffix.size(), suffix) == 0)
+    {
+        return path.substr(0, path.size() - suffix.size()) + "_batches.csv";
+    }
+    return path + "_batches.csv";
+}
+
+// How many batches a run of `realizations` trajectories should use.
+//
+// Zero disables the sidecar. The default lands inside the 50-100 band whenever
+// the run is large enough to fill it; a run with fewer trajectories than that
+// gets one batch per trajectory, which is degenerate but honest -- the batch
+// spread is then just the trajectory spread.
+inline int batch_count_for(int realizations)
+{
+    const int requested = static_cast<int>(env::integer("MIPT_PROBED_BATCHES", 64, 0, 1000000));
+    if (requested <= 0 || realizations <= 0)
+    {
+        return 0;
+    }
+    return std::min(requested, realizations);
+}
+
+// Which batch each realization index belongs to, and how many realizations
+// each batch holds. Contiguous near-equal blocks: trajectories are i.i.d., so
+// any partition is as good as any other, and contiguity keeps the mapping
+// reconstructible from the CSV alone.
+struct BatchPlan
+{
+    int count = 0;
+    std::vector<int> batch_of_realization;
+    std::vector<int> realizations_in_batch;
+
+    int batch_at(std::size_t realization_index) const
+    {
+        return batch_of_realization[realization_index];
+    }
+};
+
+inline BatchPlan make_batch_plan(int realizations, int batch_count)
+{
+    BatchPlan plan;
+    plan.count = batch_count;
+    if (batch_count <= 0)
+    {
+        return plan;
+    }
+    plan.realizations_in_batch.assign(static_cast<std::size_t>(batch_count), realizations / batch_count);
+    const int remainder = realizations % batch_count;
+    for (int i = 0; i < remainder; ++i)
+    {
+        ++plan.realizations_in_batch[static_cast<std::size_t>(i)];
+    }
+    plan.batch_of_realization.reserve(static_cast<std::size_t>(realizations));
+    for (int batch = 0; batch < batch_count; ++batch)
+    {
+        for (int i = 0; i < plan.realizations_in_batch[static_cast<std::size_t>(batch)]; ++i)
+        {
+            plan.batch_of_realization.push_back(batch);
+        }
+    }
+    return plan;
 }
 
 namespace detail
@@ -380,7 +469,104 @@ inline void write_mode1(std::ostream &csv, int probes, int n, int realizations, 
     }
 }
 
+// Mode 0, two probes: one batch-mean curve per batch id.
+//
+// The observable columns keep the `_mean` spelling the aggregate CSV uses so a
+// reader that locates columns by name finds the same observables here; what is
+// absent is the `_stderr` partner, because a batch mean's error is not the
+// quantity of interest -- the spread *across* batches is.
+inline void write_mode0_batches(std::ostream &csv, int n, int realizations, CircuitType type,
+                                const std::vector<OutputRow> &rows)
+{
+    csv << METADATA_COLUMNS
+        << ",batch_id,batch_realizations,t,t_minus_t0,scaled_time,"
+           "I_mean,negativity_mean,log_negativity_mean,"
+           "negativity_positive_fraction\n";
+    for (const auto &row : rows)
+    {
+        const auto &stats = row.stats;
+        const double positive_fraction =
+            stats.negativity.count > 0
+                ? static_cast<double>(stats.positive_negativity) / static_cast<double>(stats.negativity.count)
+                : std::numeric_limits<double>::quiet_NaN();
+        write_metadata_fields(csv, n, type, realizations, row.p);
+        csv << ',' << row.batch_id << ',' << row.batch_realizations << ',' << row.t << ',' << row.t - row.t0 << ','
+            << static_cast<double>(row.t - row.t0) / n << ',' << stats.i2.mean << ',' << stats.negativity.mean << ','
+            << stats.log_negativity.mean << ',' << positive_fraction << '\n';
+    }
+}
+
+// Mode 4, two probes: one batch-mean curve per (batch id, separation).
+//
+// Batches are cut on the realization index *within* a separation group, so
+// batch b holds the same number of trajectories at every distance and covers
+// the whole (distance, tau) grid. Different separations are different
+// trajectories regardless, so a batch is a replica of the grid, not of one
+// circuit.
+inline void write_mode4_pair_batches(std::ostream &csv, int n, int realizations, CircuitType type,
+                                     const std::vector<OutputRow> &rows, int t_eq)
+{
+    csv << METADATA_COLUMNS
+        << ",batch_id,batch_realizations,distance,chord_length,t_eq,tau,"
+           "tau_over_chord,t_absolute,I_mean,negativity_mean,"
+           "log_negativity_mean,negativity_positive_fraction\n";
+    for (const auto &row : rows)
+    {
+        const auto &stats = row.stats;
+        const double chord = util::chord_length(n, row.distance);
+        const double positive_fraction =
+            stats.negativity.count > 0
+                ? static_cast<double>(stats.positive_negativity) / static_cast<double>(stats.negativity.count)
+                : std::numeric_limits<double>::quiet_NaN();
+        write_metadata_fields(csv, n, type, realizations, row.p);
+        csv << ',' << row.batch_id << ',' << row.batch_realizations << ',' << row.distance << ',' << chord << ','
+            << t_eq << ',' << row.t << ',' << static_cast<double>(row.t) / chord << ',' << t_eq + row.t << ','
+            << stats.i2.mean << ',' << stats.negativity.mean << ',' << stats.log_negativity.mean << ','
+            << positive_fraction << '\n';
+    }
+}
+
 } // namespace detail
+
+// Whether this configuration writes a batch-mean sidecar at all.
+//
+// Only the two protocols whose curves are fitted as curves: two-probe mode 0
+// (the eta collapse) and two-probe mode 4 (the distance collapse). Three-probe
+// mode 4 is excluded because its GMN column is filled asynchronously from a
+// solver queue that knows only the global bin, so a batch copy of it would be
+// silently empty.
+inline bool writes_batch_csv(int probes, int mode)
+{
+    return probes == 2 && (mode == 0 || mode == 4);
+}
+
+inline void write_batch_csv(const std::string &path, int probes, int mode, int n, int realizations, CircuitType type,
+                            const std::vector<OutputRow> &rows, int t_eq)
+{
+    if (!writes_batch_csv(probes, mode))
+    {
+        return;
+    }
+    std::ofstream csv(path, std::ios::out | std::ios::trunc);
+    if (!csv)
+    {
+        throw std::runtime_error("Could not open batch CSV: " + path);
+    }
+    csv << std::setprecision(17);
+    if (mode == 0)
+    {
+        detail::write_mode0_batches(csv, n, realizations, type, rows);
+    }
+    else
+    {
+        detail::write_mode4_pair_batches(csv, n, realizations, type, rows, t_eq);
+    }
+    csv.flush();
+    if (!csv)
+    {
+        throw std::runtime_error("Failed while writing batch CSV: " + path);
+    }
+}
 
 inline void write_csv(const std::string &path, int probes, int mode, int n, int realizations, CircuitType type,
                       const std::vector<OutputRow> &rows, int delta_x, int delta_t, int t_eq,

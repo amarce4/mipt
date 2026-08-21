@@ -139,6 +139,11 @@ struct OutputRow
     std::array<int, 3> distances{};
     double triangle_balance = 0.0;
     std::size_t embedding_count = 0;
+    // Batch-mean rows only: which independent batch of trajectories this row
+    // averages, and how many trajectories went into it. -1/0 on the ordinary
+    // rows, which average every trajectory at the point.
+    int batch_id = -1;
+    int batch_realizations = 0;
     Aggregate stats;
 };
 

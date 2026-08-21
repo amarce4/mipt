@@ -10,6 +10,7 @@
 
 #include "mipt/backend.hpp"
 #include "mipt/env.hpp"
+#include "mipt/probed/output.hpp"
 #include "mipt/types.hpp"
 #include "mipt/util/text.hpp"
 
@@ -187,14 +188,30 @@ inline void append_checkpoint_csv(const std::string &point_path, const std::stri
     }
 }
 
+// The batch-mean sidecar, when the protocol writes one, is checkpointed by the
+// same append-and-rename as the aggregate CSV. It is optional: most modes
+// produce none, and the caller must not fail when it is absent.
+inline void append_optional_checkpoint_csv(const std::string &point_path, const std::string &output_path)
+{
+    std::ifstream probe(point_path);
+    if (!probe)
+    {
+        return;
+    }
+    probe.close();
+    append_checkpoint_csv(point_path, output_path);
+}
+
 inline int run_isolated_p_scan(const char *program, int probes, int n, int realizations, CircuitType type, int mode,
                                const std::vector<double> &p_values, const std::vector<int> &times,
                                const std::string &output)
 {
     const bool resume = env::boolean("MIPT_PROBED_RESUME", true);
+    const std::string batch_output = batch_output_path(output);
     if (!resume)
     {
         std::remove(output.c_str());
+        std::remove(batch_output.c_str());
     }
     auto completed = completed_probabilities(output);
     const int retries = static_cast<int>(env::integer("MIPT_PROBED_RETRIES", 1, 0, 10));
@@ -254,6 +271,7 @@ inline int run_isolated_p_scan(const char *program, int probes, int n, int reali
         for (int attempt = 0; attempt <= retries; ++attempt)
         {
             std::remove(point_output.c_str());
+            std::remove(batch_output_path(point_output).c_str());
             std::string command;
             if (attempt > 0)
             {
@@ -277,7 +295,9 @@ inline int run_isolated_p_scan(const char *program, int probes, int n, int reali
         }
 
         append_checkpoint_csv(point_output, output);
+        append_optional_checkpoint_csv(batch_output_path(point_output), batch_output);
         std::remove(point_output.c_str());
+        std::remove(batch_output_path(point_output).c_str());
         completed.push_back(p);
         backend::verbose_log("checkpointed p=" + precise_decimal(p) + " to " + output);
     }

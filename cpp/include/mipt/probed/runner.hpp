@@ -74,8 +74,8 @@ namespace detail
 // read out along tau. Three-probe runs also queue each RDM for an SDP solve.
 inline void run_mode4_trajectory(const ProbeRunConfig &config, probed::CircuitWorkspace1D &workspace,
                                  cudaq::state &state, std::vector<Aggregate> &aggregates,
-                                 const std::vector<int> &active_sites, std::size_t geometry_index,
-                                 std::size_t realization_index, const SdpSettings &sdp,
+                                 std::vector<Aggregate> *batch_aggregates, const std::vector<int> &active_sites,
+                                 std::size_t geometry_index, std::size_t realization_index, const SdpSettings &sdp,
                                  const std::vector<std::vector<unsigned char>> &gmn_selected, SdpBatchQueue *sdp_queue)
 {
     const int n = config.n;
@@ -98,7 +98,12 @@ inline void run_mode4_trajectory(const ProbeRunConfig &config, probed::CircuitWo
         const std::size_t aggregate_index = distance_offset + sample_index;
         if (config.probes == 2)
         {
-            aggregates[aggregate_index].add(measure_sample(state, config.probes, n, config.type));
+            const Sample sample = measure_sample(state, config.probes, n, config.type);
+            aggregates[aggregate_index].add(sample);
+            if (batch_aggregates != nullptr)
+            {
+                (*batch_aggregates)[aggregate_index].add(sample);
+            }
             continue;
         }
 
@@ -247,9 +252,19 @@ inline void run_mode3_trajectory(const ProbeRunConfig &config, probed::CircuitWo
 // straight through it, and `t_readout_origin` puts a readout time of zero at
 // its end.
 inline void run_sampling_trajectory(const ProbeRunConfig &config, probed::CircuitWorkspace1D &workspace,
-                                    cudaq::state &state, std::vector<Aggregate> &aggregates, int current_t)
+                                    cudaq::state &state, std::vector<Aggregate> &aggregates,
+                                    std::vector<Aggregate> *batch_aggregates, int current_t)
 {
     const int n = config.n;
+    // The batch replica sees exactly the samples the global accumulator sees,
+    // so the two can never disagree about what was measured.
+    const auto record = [&](std::size_t index, const Sample &sample) {
+        aggregates[index].add(sample);
+        if (batch_aggregates != nullptr)
+        {
+            (*batch_aggregates)[index].add(sample);
+        }
+    };
     if ((config.mode == 0 || config.mode == 1) && config.probes > 1)
     {
         workspace.advance(state, 0, 2 * n);
@@ -267,18 +282,18 @@ inline void run_sampling_trajectory(const ProbeRunConfig &config, probed::Circui
         }
         if (config.parity_encoding)
         {
-            aggregates[sample_index].add(measure_parity_encoded_probe(state, n));
+            record(sample_index, measure_parity_encoded_probe(state, n));
         }
         else if (config.mode == 2 || config.mode == 1 || config.probes != 1 || target_t > 0)
         {
-            aggregates[sample_index].add(measure_sample(state, config.probes, n, config.type));
+            record(sample_index, measure_sample(state, config.probes, n, config.type));
         }
         else
         {
             // Before any layer runs a single reference is maximally entangled by
             // construction. Only an encoder-free run (MIPT_PROBED_T_ENCODE=0
             // with t_min=0) reaches this; otherwise the encoder has already run.
-            aggregates[sample_index].add({std::log(2.0), 0.0, 0.0, 0.0, 0.0, 0.0});
+            record(sample_index, {std::log(2.0), 0.0, 0.0, 0.0, 0.0, 0.0});
         }
     }
 }
@@ -340,8 +355,13 @@ inline std::vector<std::vector<unsigned char>> select_gmn_samples(const ProbeRun
 }
 
 // Fold one p point's accumulators into finished CSV rows.
+//
+// `batch_id`/`batch_realizations` are -1/0 for the ordinary rows and identify
+// the replica for a batch-mean row; the geometry of a row is otherwise
+// identical either way, which is what keeps the two files describing the same
+// grid.
 inline void append_rows(const ProbeRunConfig &config, double p, const std::vector<Aggregate> &aggregates,
-                        std::vector<OutputRow> &rows)
+                        std::vector<OutputRow> &rows, int batch_id = -1, int batch_realizations = 0)
 {
     const bool pairs = config.mode == 4 && config.probes == 2;
     const bool triangles = config.mode == 4 && config.probes == 3;
@@ -365,6 +385,8 @@ inline void append_rows(const ProbeRunConfig &config, double p, const std::vecto
             row.p = p;
             row.t = config.times[i];
             row.t0 = config.t0;
+            row.batch_id = batch_id;
+            row.batch_realizations = batch_realizations;
             row.width = fronts ? config.receivers.width_at(distance_index) : -1;
             row.distance = pairs     ? static_cast<int>(distance_index) + 1
                            : fronts  ? config.receivers.distance_at(distance_index)
@@ -386,14 +408,29 @@ inline void append_rows(const ProbeRunConfig &config, double p, const std::vecto
 
 } // namespace detail
 
+// Everything one run produces: the aggregate rows, and -- for the two
+// protocols whose curves get fitted as curves -- the independent batch-mean
+// replicas of the same grid.
+struct SimulationResult
+{
+    std::vector<OutputRow> rows;
+    std::vector<OutputRow> batch_rows;
+};
+
 // Run every p point of one configuration and return the finished rows.
-inline std::vector<OutputRow> simulate(const ProbeRunConfig &config, ProgressReporter &progress)
+inline SimulationResult simulate(const ProbeRunConfig &config, ProgressReporter &progress)
 {
     const int n = config.n;
     const int t_max = config.t_max;
     const auto sdp = SdpSettings::from_environment(config.realizations);
+    // Only the fitted-curve protocols keep batch replicas; see writes_batch_csv.
+    const BatchPlan batch_plan =
+        writes_batch_csv(config.probes, config.mode)
+            ? make_batch_plan(config.realizations, batch_count_for(config.realizations))
+            : BatchPlan{};
 
-    std::vector<OutputRow> rows;
+    SimulationResult result;
+    std::vector<OutputRow> &rows = result.rows;
     rows.reserve(config.p_values.size() * config.times.size() * static_cast<std::size_t>(config.bin_count));
     std::mt19937 origin_rng{std::random_device{}()};
     std::uint64_t completed = 0;
@@ -403,7 +440,13 @@ inline std::vector<OutputRow> simulate(const ProbeRunConfig &config, ProgressRep
     {
         progress.begin_point(completed);
         const double p = config.p_values[p_index];
-        std::vector<Aggregate> aggregates(config.times.size() * static_cast<std::size_t>(config.bin_count));
+        const std::size_t aggregate_size = config.times.size() * static_cast<std::size_t>(config.bin_count);
+        std::vector<Aggregate> aggregates(aggregate_size);
+        // One full copy of the grid per batch. At the 64-batch default this is
+        // 64 x bins x times accumulators, which is megabytes at most -- the
+        // point of batching rather than storing per-trajectory samples.
+        std::vector<std::vector<Aggregate>> batch_aggregates(
+            static_cast<std::size_t>(std::max(batch_plan.count, 0)), std::vector<Aggregate>(aggregate_size));
         // Reused by every one-probe mode-5 readout so the inner loop allocates
         // nothing.
         std::vector<Sample> front_scratch(config.mode == 5 && config.probes == 1 ? config.receivers.bin_count() : 0);
@@ -500,6 +543,16 @@ inline std::vector<OutputRow> simulate(const ProbeRunConfig &config, ProgressRep
                 grouped ? static_cast<std::size_t>(trajectory % static_cast<std::uint64_t>(config.realizations)) : 0;
             const int distance =
                 config.mode == 4 && config.probes == 2 ? static_cast<int>(geometry_index) + 1 : -1;
+            // Batches are cut on the realization index within a bin group, not
+            // on the global trajectory counter, so every batch holds the same
+            // number of trajectories at every distance and covers the whole
+            // grid. Ungrouped modes run one bin, where the two coincide.
+            const std::size_t batch_realization =
+                grouped ? realization_index : static_cast<std::size_t>(trajectory);
+            std::vector<Aggregate> *batch_target =
+                batch_plan.count > 0
+                    ? &batch_aggregates[static_cast<std::size_t>(batch_plan.batch_at(batch_realization))]
+                    : nullptr;
             const auto trajectory_sites = detail::sample_trajectory_sites(config, geometry_index, distance, origin_rng);
             const bool random_origin = config.mode == 4 || config.mode == 5;
             const auto &active_sites = random_origin ? trajectory_sites : config.sites;
@@ -525,8 +578,8 @@ inline std::vector<OutputRow> simulate(const ProbeRunConfig &config, ProgressRep
             }
             else if (config.mode == 4)
             {
-                detail::run_mode4_trajectory(config, workspace, state, aggregates, active_sites, geometry_index,
-                                             realization_index, sdp, gmn_selected, sdp_queue.get());
+                detail::run_mode4_trajectory(config, workspace, state, aggregates, batch_target, active_sites,
+                                             geometry_index, realization_index, sdp, gmn_selected, sdp_queue.get());
             }
             else if (config.mode == 3)
             {
@@ -534,7 +587,7 @@ inline std::vector<OutputRow> simulate(const ProbeRunConfig &config, ProgressRep
             }
             else
             {
-                detail::run_sampling_trajectory(config, workspace, state, aggregates, current_t);
+                detail::run_sampling_trajectory(config, workspace, state, aggregates, batch_target, current_t);
             }
 
             ++completed;
@@ -547,8 +600,13 @@ inline std::vector<OutputRow> simulate(const ProbeRunConfig &config, ProgressRep
             sdp_queue->finish();
         }
         detail::append_rows(config, p, aggregates, rows);
+        for (int batch = 0; batch < batch_plan.count; ++batch)
+        {
+            detail::append_rows(config, p, batch_aggregates[static_cast<std::size_t>(batch)], result.batch_rows, batch,
+                                batch_plan.realizations_in_batch[static_cast<std::size_t>(batch)]);
+        }
     }
-    return rows;
+    return result;
 }
 
 } // namespace mipt::probed

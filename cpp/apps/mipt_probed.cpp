@@ -63,17 +63,27 @@ int run_cli(int argc, char *argv[])
 
     const auto start = std::chrono::steady_clock::now();
     ProgressReporter progress(config.total_trajectories);
-    const auto rows = simulate(config, progress);
+    const auto result = simulate(config, progress);
     progress.finish();
 
-    write_csv(config.output, config.probes, config.mode, config.n, config.realizations, config.type, rows,
+    write_csv(config.output, config.probes, config.mode, config.n, config.realizations, config.type, result.rows,
               config.delta_x, config.delta_t, config.t_eq, config.triangle_balance_cutoff);
+    const std::string batch_path = batch_output_path(config.output);
+    if (!result.batch_rows.empty())
+    {
+        write_batch_csv(batch_path, config.probes, config.mode, config.n, config.realizations, config.type,
+                        result.batch_rows, config.t_eq);
+    }
 
     const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
     if (!internal_child)
     {
-        std::cout << "Saved " << rows.size() << " rows to " << config.output
-                  << ". Elapsed time: " << util::format_duration(elapsed) << '\n';
+        std::cout << "Saved " << result.rows.size() << " rows to " << config.output;
+        if (!result.batch_rows.empty())
+        {
+            std::cout << " and " << result.batch_rows.size() << " batch-mean rows to " << batch_path;
+        }
+        std::cout << ". Elapsed time: " << util::format_duration(elapsed) << '\n';
     }
     return 0;
 }
