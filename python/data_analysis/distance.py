@@ -31,6 +31,7 @@ import numpy as np
 import pandas as pd
 
 from .fitting import _weighted_linear_fit
+from .records import aggregate_records, is_record_file, read_records
 from .loading import (
     CIRCUIT_DISPLAY_NAMES,
     _parse_circuit_name,
@@ -624,6 +625,185 @@ def _is_aggregate_file(path: str | Path) -> bool:
     return bool(_aggregate_metric_names(header.columns))
 
 
+def _records_sidecar(path: str | Path) -> Path | None:
+    """The per-record binary beside a dist_scaling CSV, if one was written.
+
+    ``dist_scaling.exe`` names it after the CSV's own stem, so a caller who
+    named the CSV never has to know the binary exists.
+    """
+    candidate = Path(path).with_suffix("")
+    candidate = candidate.with_name(candidate.name + "_records.bin")
+    return candidate if candidate.exists() and is_record_file(candidate) else None
+
+
+# ---------------------------------------------------------------------------
+# The `show_dist` supplemental figure
+#
+# A recreation of Fig. 9 of arXiv:2602.04969: what the *distribution* of a
+# measure looks like at fixed size, over every record beyond some distance,
+# rather than what its mean does with distance. Only the non-zero records are
+# shown -- most triangles are not genuinely entangled at all, and a spike at
+# zero holding 90% of the weight would leave nothing visible of the part that
+# carries the physics. The zero fraction is stated in each panel instead, so
+# nothing is hidden by the cut.
+#
+# "Non-zero" has to mean "above a tolerance", not "> 0". A vanishing mutual
+# information comes back as +1e-16 and a vanishing TMI as -2e-16, so a literal
+# `> 0` test keeps a cloud of floating-point noise sixteen decades below the
+# physics and, on a shared logarithmic axis, squashes everything real into the
+# right quarter of the figure. The default tolerance is the same 1e-10 the C++
+# positivity counts use (MIPT_DIST_GMN_ZERO_TOL), which is measured to sit
+# seven orders of magnitude clear of the solver's floor: a genuinely entangled
+# record comes back at 1e-3 or above.
+#
+# This needs individual values, so it needs the record binary; no aggregate
+# can supply it.
+# ---------------------------------------------------------------------------
+
+_DISTRIBUTION_PANELS: tuple[tuple[str, int, str], ...] = (
+    ("mi", 2, r"$\mathcal{I}_2$"),
+    ("fmi", 2, r"$\mathcal{I}^{f}_2$"),
+    ("gmn", 3, r"$\mathcal{N}_3$"),
+    ("fgmn", 3, r"$\mathcal{N}^{f}_3$"),
+)
+
+
+def _normalize_show_dist(show_dist: Any) -> tuple[int, float] | None:
+    if show_dist is None:
+        return None
+    try:
+        size, d_min = show_dist
+    except (TypeError, ValueError) as exc:
+        raise TypeError(
+            "show_dist must be None or a (L, d_min) pair: the system size to "
+            "draw and the smallest effective chord distance to include."
+        ) from exc
+    return int(size), float(d_min)
+
+
+def _distribution_values(
+    bundle: dict[str, Any],
+    metric: str,
+    d_min: float,
+    entropy_scale: float,
+    zero_tol: float,
+) -> dict[str, Any] | None:
+    """One panel's records: the non-zero values, and what was cut to get them."""
+    if metric not in bundle["observables"]:
+        return None
+    frame = bundle["records"]
+    selected = frame.loc[np.isfinite(frame["d"]) & (frame["d"] >= d_min), metric]
+    # A NaN is a GMN the schedule never asked for. It is not a zero and not a
+    # value, so it belongs in neither count.
+    selected = selected[np.isfinite(selected)]
+    if selected.empty:
+        return None
+    values = selected.to_numpy(dtype=float)
+    if _metric_spec(metric).get("entropy") and entropy_scale != 1.0:
+        values = values * entropy_scale
+    # I_3 is negative throughout the monitored phase, so its magnitude is what
+    # has a distribution worth drawing -- the same convention the decay panels
+    # apply to tmi/ftmi.
+    if _metric_spec(metric).get("magnitude"):
+        values = np.abs(values)
+    positive = values[values > zero_tol]
+    return {
+        "values": positive,
+        "records": int(values.size),
+        "positive": int(positive.size),
+        "d_min": d_min,
+        "zero_tol": zero_tol,
+    }
+
+
+def _draw_value_distributions(
+    panels: dict[str, dict[str, Any]],
+    *,
+    size: int,
+    d_min: float,
+    bins: int,
+    mi_units: str,
+    circuit_name: str,
+    zero_tol: float,
+    dpi: int,
+    figsize: tuple[float, float] | None,
+) -> Any:
+    """The stacked histogram: one measure per row, flush, on a shared x axis."""
+    order = [metric for metric, _, _ in _DISTRIBUTION_PANELS if metric in panels]
+    if figsize is None:
+        figsize = (6.5, 2.05 * len(order) + 0.9)
+    # constrained_layout would override the zero spacing that makes the panel
+    # edges touch, so the margins are set by hand instead.
+    fig, axis_grid = plt.subplots(
+        len(order), 1, figsize=figsize, dpi=dpi, sharex=True
+    )
+    axes = np.atleast_1d(axis_grid)
+    fig.subplots_adjust(hspace=0.0, left=0.14, right=0.97, top=0.94, bottom=0.11)
+
+    # One set of bin edges for every panel: the panels share an x axis, so
+    # bars at the same position have to mean the same interval.
+    everything = np.concatenate([panels[metric]["values"] for metric in order])
+    everything = everything[everything > 0.0]
+    if everything.size == 0:
+        raise ValueError(
+            f"No strictly positive records survive d >= {d_min} at L={size}."
+        )
+    edges = np.geomspace(everything.min(), everything.max(), bins + 1)
+
+    colors = plt.get_cmap("viridis")(np.linspace(0.15, 0.8, len(order)))
+    labels = {metric: label for metric, _, label in _DISTRIBUTION_PANELS}
+    party = {metric: k for metric, k, _ in _DISTRIBUTION_PANELS}
+    for index, (metric, ax) in enumerate(zip(order, axes)):
+        panel = panels[metric]
+        values = panel["values"]
+        # Each panel integrates to one over its own positive records, so rows
+        # measuring different things are still comparable in shape.
+        weights = np.full(values.size, 1.0 / values.size)
+        ax.hist(
+            values,
+            bins=edges,
+            weights=weights,
+            color=colors[index],
+            edgecolor="0.25",
+            linewidth=0.4,
+        )
+        ax.set_xscale("log")
+        unit = f" [{mi_units}]" if _metric_spec(metric).get("entropy") else ""
+        zero_fraction = 1.0 - panel["positive"] / panel["records"]
+        # Upper left: the distributions run to the right of the axis, so this
+        # is the corner that stays clear as a tail grows.
+        ax.text(
+            0.022,
+            0.88,
+            rf"{labels[metric]}  ($k={party[metric]}$){unit}"
+            + "\n"
+            + rf"$n_{{>0}}={panel['positive']:,}$ of {panel['records']:,}"
+            + rf"  (${100 * zero_fraction:.1f}\%$ zero)",
+            transform=ax.transAxes,
+            ha="left",
+            va="top",
+            fontsize=8,
+            bbox={"facecolor": "white", "alpha": 0.72, "edgecolor": "none", "pad": 1.8},
+        )
+        ax.set_ylabel("fraction")
+        ax.grid(True, which="both", axis="x", alpha=0.18)
+        # Prune the top tick of every panel but the first, or it collides with
+        # the bottom of the panel above -- the price of flush edges.
+        from matplotlib.ticker import MaxNLocator
+
+        ax.yaxis.set_major_locator(
+            MaxNLocator(nbins=4, prune="upper" if index > 0 else None)
+        )
+        ax.margins(y=0.0)
+
+    axes[-1].set_xlabel(f"Value  (records at or below {zero_tol:g} counted as zero)")
+    axes[0].set_title(
+        f"{circuit_name}, $L={size}$, records with $d \geq {d_min:g}$",
+        fontsize=11,
+    )
+    return fig
+
+
 # ---------------------------------------------------------------------------
 # Fitting
 # ---------------------------------------------------------------------------
@@ -817,6 +997,9 @@ def dist_scaling(
     metrics: Sequence[str] | None = None,
     ent_decomp: bool = False,
     correlators: bool = False,
+    show_dist: tuple[int, float] | None = None,
+    dist_bins: int = 40,
+    dist_zero_tol: float = 1.0e-10,
     fit_range_2: tuple[float | None, float | None] | None = None,
     fit_range_3: tuple[float | None, float | None] | None = None,
     paper_fit_ranges: bool = False,
@@ -836,14 +1019,24 @@ def dist_scaling(
 ) -> dict[str, Any]:
     r"""Plot Fig.-4-style distance scaling for two- and three-party measures.
 
-    Accepts either output format of ``dist_scaling.exe``. The aggregated
-    format has one row per geometry with ``<metric>_mean``/``_stderr``/
-    ``_samples`` columns; the older row-level format has one ``d,mi,mn`` (or
+    Accepts any output format of ``dist_scaling.exe``. The aggregated CSV has
+    one row per geometry with ``<metric>_mean``/``_stderr``/``_samples``
+    columns; the older row-level CSV has one ``d,mi,mn`` (or
     ``d,mi,fmi,mn,fmn``) row per pair per trajectory and is streamed in
-    ``chunksize`` blocks. Files of both kinds may be mixed in one call as long
-    as they share a circuit; **party counts may be mixed too**, which is what a
-    ``k=0`` run of ``dist_scaling.exe`` produces -- a pair file and a triangle
-    file measured on the same trajectories.
+    ``chunksize`` blocks; the **per-record binary** ``<stem>_records.bin`` has
+    one fixed-width record per (trajectory, geometry, embedding) and is
+    reduced here to the same curves the aggregate states outright. Files of
+    every kind may be mixed in one call as long as they share a circuit;
+    **party counts may be mixed too**, which is what a ``k=0`` run of
+    ``dist_scaling.exe`` produces -- a pair file and a triangle file measured
+    on the same trajectories.
+
+    A record file carries only :math:`I_k` and :math:`N_k`, so a run given
+    that way has no ``g2``/``f2`` and no purities; pass the CSV for those. It
+    does carry the individual values, so its negativity decompositions come
+    from the records themselves rather than from a ``_positive_count`` column.
+    A record binary beside a named CSV is located but not read unless
+    ``show_dist`` asks for it -- it is far larger than the CSV.
 
     Panels are named by the quantity they carry rather than by the number of
     parties that measured it, so both party counts share one panel:
@@ -962,6 +1155,30 @@ def dist_scaling(
     rule produced it in the ``fit_selection`` column of ``fits`` and in the
     printed report.
 
+    ``show_dist`` draws a **supplemental** second figure, a recreation of
+    Fig. 9 of arXiv:2602.04969: the distribution of the non-zero records of
+    ``mi``, ``fmi``, ``gmn`` and ``fgmn``, one measure per row, stacked flush
+    on a shared logarithmic x axis. It takes ``(L, d_min)`` --
+    the system size to draw and the smallest effective chord distance to
+    include -- or ``None`` (the default) for no such figure. Because a
+    distribution cannot be recovered from a mean, this reads the **record
+    binaries**: ``L`` must be a size for which one exists, either passed
+    directly or sitting beside a passed CSV. Both party counts are needed for
+    all four rows, which is what a ``k=0`` run writes; a missing row is warned
+    about rather than fatal. The zeros are excluded because they are the
+    majority and would leave nothing else visible; each panel states what
+    fraction was cut. ``dist_bins`` sets the number of logarithmic bins. The
+    figure is returned as ``dist_figure`` and the values behind it as
+    ``dist_panels``.
+
+    "Non-zero" means above ``dist_zero_tol`` (default ``1e-10``, the same
+    ``MIPT_DIST_GMN_ZERO_TOL`` the C++ positivity counts use), not literally
+    ``> 0``. A vanishing mutual information comes back as ``+1e-16``, so a
+    literal test would keep a cloud of floating-point noise sixteen decades
+    below the physics and squash everything real into the right quarter of a
+    shared logarithmic axis. A ``NaN`` -- a GMN the schedule never requested
+    -- is neither a value nor a zero and is left out of both counts.
+
     ``mi_units`` selects the unit of every entropy-valued measure (``mi``,
     ``fmi``, ``tmi``, ``ftmi``, ``average_mi``) and of their fitted
     prefactors; it does not change their exponents. ``dist_scaling.exe``
@@ -1002,13 +1219,54 @@ def dist_scaling(
     mi_units, mi_scale_from_nats = _mi_unit_spec(mi_units)
     _, legacy_scale_from_nats = _mi_unit_spec(legacy_entropy_units)
 
+    wanted_distribution = _normalize_show_dist(show_dist)
+    if dist_bins < 2:
+        raise ValueError("dist_bins must be at least 2.")
+    if dist_zero_tol < 0.0:
+        raise ValueError("dist_zero_tol must be non-negative.")
+
     paths = _resolve_files(files, file_glob)
 
     # --- read every file, then reconcile what they say about themselves -----
+    #
+    # Three input formats reach the same `{metric: DataFrame[d, mean, stderr,
+    # count]}` structure: the aggregated CSV, the older row-level CSV, and the
+    # per-record binary. A record file is reduced here to the same curves the
+    # CSV states outright, so nothing downstream has to know which it came
+    # from -- but it carries only I_k and N_k, so a run given as a record file
+    # has no g2/f2 and no purities.
     loaded: list[dict[str, Any]] = []
     for path in paths:
+        entry: dict[str, Any] = {"path": path}
+        if is_record_file(path):
+            bundle = read_records(path)
+            if bundle["truncated"]:
+                warnings.warn(
+                    f"{path}: {bundle['truncated']} trailing byte(s) do not "
+                    "form a whole record and were discarded; the run was "
+                    "probably killed mid-write."
+                )
+            entry["format"] = "records"
+            entry["aggregated"] = True
+            entry["data"] = aggregate_records(bundle)
+            entry["k"] = bundle["k"]
+            entry["stored_units"] = bundle["entropy_units"]
+            entry["size"] = bundle["L"]
+            entry["circuit"] = CIRCUIT_DISPLAY_NAMES.get(
+                int(bundle["circuit_type"])
+            ) if bundle["circuit_type"] is not None else _parse_circuit_name(path)
+            entry["records_bundle"] = bundle
+            entry["records_path"] = Path(path)
+            loaded.append(entry)
+            continue
+
         aggregated = _is_aggregate_file(path)
-        entry: dict[str, Any] = {"path": path, "aggregated": aggregated}
+        entry["aggregated"] = aggregated
+        entry["format"] = "aggregate" if aggregated else "row-level"
+        # The sidecar is located but not read: it is only needed for
+        # `show_dist`, and it is far larger than the CSV beside it.
+        entry["records_path"] = _records_sidecar(path)
+        entry["records_bundle"] = None
         if aggregated:
             entry.update(_read_aggregate_file(path))
             metadata = resolve_metadata(
@@ -1085,7 +1343,7 @@ def dist_scaling(
     data: dict[tuple[int, int], dict[str, pd.DataFrame]] = {}
     for key, entry in zip(keys, loaded):
         k_of_file, size = key
-        print(f"Importing k={k_of_file}, L={size}: {entry['path']}")
+        print(f"Importing k={k_of_file}, L={size} [{entry['format']}]: {entry['path']}")
         if entry["aggregated"]:
             curves = entry["data"]
             stored_scale = _mi_unit_spec(entry["stored_units"] or "bits")[1]
@@ -1165,6 +1423,15 @@ def dist_scaling(
                     "it was positive -- a `<metric>_positive_count` column, "
                     "which the row-level format never wrote and which k=3 "
                     "files only gained on 2026-08-19. "
+                    f"Available here: {available}."
+                )
+            if correlators and any(
+                entry["format"] == "records" for entry in loaded
+            ):
+                raise ValueError(
+                    "correlators=True needs g2/f2 (and fg2/ff2), which the "
+                    "per-record binary does not carry -- a record holds only "
+                    "I_k and N_k. Pass the CSV instead. "
                     f"Available here: {available}."
                 )
             raise ValueError(
@@ -1480,6 +1747,88 @@ def dist_scaling(
         fig.suptitle(title, fontsize=14)
     _show(fig, show)
 
+    # --- the supplemental distribution figure ------------------------------
+    #
+    # Drawn from the record binaries rather than from anything above: the
+    # aggregate keeps means, and a distribution cannot be recovered from a
+    # mean. A file passed as a CSV contributes through its sidecar.
+    distribution_figure = None
+    distribution_panels: dict[str, dict[str, Any]] = {}
+    if wanted_distribution is not None:
+        dist_size, dist_d_min = wanted_distribution
+        bundles: dict[int, dict[str, Any]] = {}
+        for key, entry in zip(keys, loaded):
+            k_of_file, size = key
+            if size != dist_size or entry.get("records_path") is None:
+                continue
+            bundle = entry.get("records_bundle")
+            if bundle is None:
+                bundle = read_records(entry["records_path"])
+                entry["records_bundle"] = bundle
+            bundles[k_of_file] = bundle
+
+        if not bundles:
+            available_sizes = sorted(
+                {
+                    size
+                    for (_, size), entry in zip(keys, loaded)
+                    if entry.get("records_path") is not None
+                }
+            )
+            raise ValueError(
+                f"show_dist=({dist_size}, {dist_d_min}) needs per-record output "
+                f"for L={dist_size}, and none of the given files has a record "
+                "binary at that size. dist_scaling.exe writes "
+                "`<stem>_records.bin` beside its CSV unless MIPT_DIST_RECORDS=0. "
+                + (
+                    f"Record files were found at L={available_sizes}."
+                    if available_sizes
+                    else "No record file was found beside any given file."
+                )
+            )
+
+        for metric, k_of_panel, _ in _DISTRIBUTION_PANELS:
+            bundle = bundles.get(k_of_panel)
+            if bundle is None:
+                continue
+            scale = mi_scale_from_nats / _mi_unit_spec(
+                bundle["entropy_units"] or "bits"
+            )[1]
+            panel = _distribution_values(
+                bundle, metric, dist_d_min, scale, dist_zero_tol
+            )
+            if panel is not None and panel["positive"] > 0:
+                distribution_panels[metric] = panel
+
+        missing = [
+            metric
+            for metric, _, _ in _DISTRIBUTION_PANELS
+            if metric not in distribution_panels
+        ]
+        if missing:
+            warnings.warn(
+                f"show_dist: no records above {dist_zero_tol:g} for {missing} at "
+                f"L={dist_size}, d >= {dist_d_min}; those rows are omitted. A qubit "
+                "ensemble has no fermionic measures, and the k=3 rows need a "
+                "triangle record file at that size."
+            )
+        if not distribution_panels:
+            raise ValueError(
+                f"show_dist: nothing to draw at L={dist_size}, d >= {dist_d_min}."
+            )
+        distribution_figure = _draw_value_distributions(
+            distribution_panels,
+            size=dist_size,
+            d_min=dist_d_min,
+            bins=dist_bins,
+            mi_units=mi_units,
+            circuit_name=circuit_name,
+            zero_tol=dist_zero_tol,
+            dpi=dpi,
+            figsize=None,
+        )
+        _show(distribution_figure, show)
+
     summary = pd.DataFrame(
         [
             {
@@ -1487,7 +1836,12 @@ def dist_scaling(
                 "L": key[1],
                 "file": str(entry["path"]),
                 "circuit": circuit_name,
-                "format": "aggregate" if entry["aggregated"] else "row-level",
+                "format": entry["format"],
+                "records": (
+                    str(entry["records_path"])
+                    if entry.get("records_path") is not None
+                    else ""
+                ),
                 **{
                     f"distance_points_{metric}": len(data[key][metric])
                     for metric in panel_metrics
@@ -1524,6 +1878,11 @@ def dist_scaling(
         "metrics": panel_metrics,
         "ent_decomp": ent_decomp,
         "correlators": correlators,
+        # The supplemental Fig.-9-style figure and the positive records behind
+        # it; both None/empty unless `show_dist` asked for them.
+        "dist_figure": distribution_figure,
+        "dist_panels": distribution_panels,
+        "show_dist": wanted_distribution,
         "metric_party_counts": dict(k_of_metric),
         "available_metrics": tuple(available),
         "circuit_name": circuit_name,

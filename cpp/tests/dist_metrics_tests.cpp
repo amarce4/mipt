@@ -1,15 +1,20 @@
 #include "mipt/dist_metrics.hpp"
+#include "mipt/dist_records.hpp"
 #include "mipt/dist_scaling_resume.hpp"
 
 #include <array>
 #include <cmath>
 #include <complex>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <functional>
+#include <limits>
 #include <random>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace
@@ -514,6 +519,299 @@ void test_dist_scaling_resume()
     dist_resume_tests::run(dist_resume_tests::scratch_directory());
 }
 
+// ---------------------------------------------------------------------------
+// The per-record binary
+//
+// Everything here is checked against what was written rather than against a
+// second copy of the writer's own arithmetic: a record read back is compared
+// field by field with the value handed to the sink, and the aggregate the
+// records imply is compared with the running means the CSV would have
+// reported. The three properties that are easy to get wrong and impossible to
+// notice later are deferred resolution landing in the right row, the flush
+// stopping at a trajectory boundary, and the resume trim cutting exactly at
+// the CSV's checkpoint.
+// ---------------------------------------------------------------------------
+namespace dist_record_tests
+{
+namespace rec = mipt::dist::records;
+using dist_resume_tests::expect;
+using dist_resume_tests::refuses;
+
+std::string scratch_directory()
+{
+    const auto path = std::filesystem::temp_directory_path() / "mipt_dist_record_tests";
+    std::filesystem::remove_all(path);
+    std::filesystem::create_directories(path);
+    return path.string();
+}
+
+struct Row
+{
+    std::uint32_t realization;
+    std::uint16_t geometry;
+    std::uint16_t embedding;
+    std::vector<double> values;
+};
+
+// Read a record file back with no help from the writer: the preamble gives
+// the record size and the payload offset, and the fields are pulled out by
+// memcpy at fixed offsets. If the writer and this ever disagree the test
+// fails, which is the point.
+std::pair<std::string, std::vector<Row>> read_back(const std::string &path,
+                                                   std::size_t value_count)
+{
+    std::ifstream file(path, std::ios::binary);
+    expect(static_cast<bool>(file), "the record file opens");
+    char preamble[rec::PREAMBLE_BYTES];
+    file.read(preamble, static_cast<std::streamsize>(rec::PREAMBLE_BYTES));
+    expect(std::memcmp(preamble, rec::MAGIC, sizeof(rec::MAGIC)) == 0,
+           "the record file starts with the magic");
+    std::uint32_t version = 0;
+    std::uint32_t record_bytes = 0;
+    std::uint32_t header_bytes = 0;
+    std::memcpy(&version, preamble + 8, 4);
+    std::memcpy(&record_bytes, preamble + 12, 4);
+    std::memcpy(&header_bytes, preamble + 16, 4);
+    expect(version == rec::FORMAT_VERSION, "the format version is the current one");
+    expect(record_bytes == rec::record_bytes(value_count),
+           "the declared record size matches the observable count");
+    std::string header(header_bytes, '\0');
+    file.read(header.data(), static_cast<std::streamsize>(header_bytes));
+
+    std::vector<Row> rows;
+    std::vector<char> raw(record_bytes);
+    while (file.read(raw.data(), static_cast<std::streamsize>(record_bytes)))
+    {
+        Row row{};
+        std::memcpy(&row.realization, raw.data(), 4);
+        std::memcpy(&row.geometry, raw.data() + 4, 2);
+        std::memcpy(&row.embedding, raw.data() + 6, 2);
+        row.values.resize(value_count);
+        std::memcpy(row.values.data(), raw.data() + rec::ID_BYTES, value_count * sizeof(double));
+        rows.push_back(std::move(row));
+    }
+    return {header, rows};
+}
+
+// A run with no deferred values: every record is complete when it is created,
+// so the file is a verbatim transcript of what was handed in.
+void test_immediate_round_trip(const std::string &directory)
+{
+    const std::string path = directory + "/pairs_records.bin";
+    std::vector<Row> expected;
+    {
+        rec::RecordSink sink;
+        sink.open(path, "format=test\nfields=x\n", 2, 0);
+        expect(sink.active(), "a freshly opened sink is active");
+        expect(sink.inherited_records() == 0, "a new file inherits nothing");
+        for (std::uint32_t realization = 0; realization < 5; ++realization)
+        {
+            for (std::uint16_t geometry = 0; geometry < 3; ++geometry)
+            {
+                for (std::uint16_t embedding = 0; embedding < 2; ++embedding)
+                {
+                    const double values[2] = {0.5 * realization + geometry,
+                                              -1.0 * embedding - 0.25 * geometry};
+                    sink.add(realization, geometry, embedding, values);
+                    expected.push_back({realization, geometry, embedding, {values[0], values[1]}});
+                }
+            }
+        }
+        sink.close();
+    }
+
+    const auto [header, rows] = read_back(path, 2);
+    expect(header == "format=test\nfields=x\n", "the header text round-trips verbatim");
+    expect(rows.size() == expected.size(), "every record reached the file");
+    for (std::size_t index = 0; index < rows.size(); ++index)
+    {
+        expect(rows[index].realization == expected[index].realization &&
+                   rows[index].geometry == expected[index].geometry &&
+                   rows[index].embedding == expected[index].embedding,
+               "record identifiers round-trip in order");
+        expect(rows[index].values[0] == expected[index].values[0] &&
+                   rows[index].values[1] == expected[index].values[1],
+               "record observables round-trip bit for bit");
+    }
+}
+
+// A GMN arriving out of order must land in the row that asked for it, and
+// nothing behind an unresolved record may be written -- otherwise the file
+// stops being in trajectory order and the resume trim stops being exact.
+void test_deferred_resolution(const std::string &directory)
+{
+    const std::string path = directory + "/triples_records.bin";
+    rec::RecordSink sink;
+    sink.open(path, "format=test\n", 2, 0);
+
+    // Trajectory 0: one resolved record, then one waiting on a solve.
+    const double first[2] = {1.0, 0.0};
+    sink.add(0, 0, 0, first);
+    const double second[2] = {2.0, std::numeric_limits<double>::quiet_NaN()};
+    const std::uint64_t waiting = sink.add_pending(0, 1, 0, second, 1);
+    // Trajectory 1: fully resolved, but it sits behind the pending record.
+    const double third[2] = {3.0, 0.0};
+    sink.add(1, 0, 0, third);
+
+    sink.flush();
+    expect(sink.written() == 0,
+           "nothing is written while trajectory 0 has an unresolved record -- not even the "
+           "resolved record ahead of it, since the file must hold whole trajectories");
+
+    sink.resolve(waiting, 1, 0.75);
+    sink.flush();
+    expect(sink.written() == 3, "resolving the last hole releases everything behind it");
+    sink.close();
+
+    const auto [header, rows] = read_back(path, 2);
+    expect(rows.size() == 3, "all three records are in the file");
+    expect(rows[1].geometry == 1 && rows[1].values[0] == 2.0 && rows[1].values[1] == 0.75,
+           "the deferred value landed in the row that requested it");
+    expect(rows[0].values[0] == 1.0 && rows[2].values[0] == 3.0,
+           "the surrounding records are untouched and still in order");
+}
+
+// A record whose solve never came back keeps its NaN, and must still be
+// released -- a permanently unresolved row would hold every later trajectory
+// out of the file forever.
+void test_failed_solve_releases_the_row(const std::string &directory)
+{
+    const std::string path = directory + "/failed_records.bin";
+    rec::RecordSink sink;
+    sink.open(path, "format=test\n", 2, 0);
+    const double values[2] = {1.5, std::numeric_limits<double>::quiet_NaN()};
+    const std::uint64_t waiting = sink.add_pending(0, 0, 0, values, 1);
+    sink.resolve(waiting, 1, std::numeric_limits<double>::quiet_NaN());
+    sink.close();
+
+    const auto [header, rows] = read_back(path, 2);
+    expect(rows.size() == 1, "the record is written once its solve is accounted for");
+    expect(rows[0].values[0] == 1.5, "the observable that did arrive is kept");
+    expect(std::isnan(rows[0].values[1]),
+           "a solve that failed leaves NaN, which is not the same as zero");
+}
+
+// Reopening against a CSV checkpoint discards exactly the trajectories the
+// checkpoint did not count, and keeps every record of the ones it did.
+void test_resume_trims_to_the_checkpoint(const std::string &directory)
+{
+    const std::string path = directory + "/resume_records.bin";
+    const std::string header_text = "format=test\nk=2\n";
+    {
+        rec::RecordSink sink;
+        sink.open(path, header_text, 2, 0);
+        for (std::uint32_t realization = 0; realization < 6; ++realization)
+        {
+            for (std::uint16_t geometry = 0; geometry < 4; ++geometry)
+            {
+                const double values[2] = {static_cast<double>(realization), geometry + 0.5};
+                sink.add(realization, geometry, 0, values);
+            }
+        }
+        sink.close();
+    }
+
+    {
+        // The CSV says 4 trajectories are binned, so trajectories 4 and 5 --
+        // written but never counted -- have to go, or resuming would bin them
+        // a second time.
+        rec::RecordSink sink;
+        sink.open(path, header_text, 2, 4);
+        expect(sink.inherited_records() == 16, "the four counted trajectories are kept");
+        expect(sink.truncated_on_open(), "the uncounted trajectories are reported as dropped");
+        expect(sink.realizations_in_file() == 4, "the file holds exactly the counted ones");
+        const double values[2] = {4.0, 9.0};
+        sink.add(4, 0, 0, values);
+        sink.close();
+    }
+
+    const auto [header, rows] = read_back(path, 2);
+    expect(header == header_text, "the header survives the trim untouched");
+    expect(rows.size() == 17, "the trimmed file plus one new record");
+    for (std::size_t index = 0; index < 16; ++index)
+    {
+        expect(rows[index].realization == static_cast<std::uint32_t>(index / 4),
+               "the kept records are the first four trajectories, in order");
+    }
+    expect(rows[16].realization == 4 && rows[16].values[1] == 9.0,
+           "the resumed run appends after them");
+}
+
+// Reopening a file that describes a different run must refuse rather than
+// interleave two ensembles in one table.
+void test_mismatched_header_refuses(const std::string &directory)
+{
+    const std::string path = directory + "/mismatch_records.bin";
+    {
+        rec::RecordSink sink;
+        sink.open(path, "format=test\nN=12\n", 2, 0);
+        const double values[2] = {1.0, 2.0};
+        sink.add(0, 0, 0, values);
+        sink.close();
+    }
+    expect(refuses([&] {
+               rec::RecordSink sink;
+               sink.open(path, "format=test\nN=16\n", 2, 0);
+           }),
+           "a record file describing a different run is refused");
+    expect(refuses([&] {
+               rec::RecordSink sink;
+               sink.open(path, "format=test\nN=12\n", 4, 0);
+           }),
+           "a record file with a different observable count is refused");
+}
+
+// The header has to carry the geometry table, because that is the only place
+// `d` is stored -- a record has an id, not a distance.
+void test_header_carries_the_geometry_table()
+{
+    mipt::dist::RunConfig config;
+    config.k = 2;
+    config.n = 8;
+    config.type = mipt::CircuitType::FermionRPPU;
+    const auto bins = mipt::dist::make_pair_bins(config.n);
+    const std::string header = rec::pair_header_text(config, bins);
+
+    expect(header.find("k=2\n") != std::string::npos, "the header names the party count");
+    expect(header.find("N=8\n") != std::string::npos, "the header names the system size");
+    expect(header.find("observables=mi,mn,fmi,fmn\n") != std::string::npos,
+           "a parity-preserving ensemble declares both trace conventions");
+    expect(header.find("[geometry]\ngeometry_id,separation,d,embedding_count\n") !=
+               std::string::npos,
+           "the geometry table maps a geometry id to its effective distance");
+    for (const auto &bin : bins)
+    {
+        std::string chord;
+        mipt::dist::append_double(chord, bin.chord);
+        expect(header.find(chord) != std::string::npos,
+               "every separation's chord length is in the table");
+    }
+
+    config.type = mipt::CircuitType::Haar;
+    const std::string qubit_header = rec::pair_header_text(config, bins);
+    expect(qubit_header.find("observables=mi,mn\n") != std::string::npos,
+           "a qubit ensemble declares two observables, not four");
+    expect(rec::record_bytes(2) == 24 && rec::record_bytes(4) == 40,
+           "the record is its identifiers plus its float64 observables, with no padding");
+}
+
+void run(const std::string &directory)
+{
+    test_immediate_round_trip(directory);
+    test_deferred_resolution(directory);
+    test_failed_solve_releases_the_row(directory);
+    test_resume_trims_to_the_checkpoint(directory);
+    test_mismatched_header_refuses(directory);
+    test_header_carries_the_geometry_table();
+    std::filesystem::remove_all(directory);
+}
+} // namespace dist_record_tests
+
+void test_dist_records()
+{
+    dist_record_tests::run(dist_record_tests::scratch_directory());
+}
+
 int main()
 {
     const auto product = interleaved(pure_density({C(1.0, 0.0), {}, {}, {}}));
@@ -715,6 +1013,7 @@ int main()
     }
 
     test_dist_scaling_resume();
+    test_dist_records();
 
     std::cout << "dist_metrics_tests: PASS\n";
     return 0;

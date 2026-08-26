@@ -40,6 +40,7 @@
 #include "mipt/backend.hpp"
 #include "mipt/circuit.hpp"
 #include "mipt/dist_metrics.hpp"
+#include "mipt/dist_records.hpp"
 #include "mipt/dist_scaling_csv.hpp"
 #include "mipt/dist_scaling_resume.hpp"
 #include "mipt/probed/geometry.hpp"
@@ -651,19 +652,28 @@ class SdpBatchQueue
 {
   public:
     SdpBatchQueue(std::vector<TripleBin> &bins, std::size_t batch_size,
-                  std::size_t max_pending_batches, double positive_tolerance)
+                  std::size_t max_pending_batches, double positive_tolerance,
+                  records::RecordSink *sink)
         : bins_(bins), batch_size_(std::max<std::size_t>(1, batch_size)),
           max_pending_batches_(std::max<std::size_t>(1, max_pending_batches)),
-          positive_tolerance_(positive_tolerance)
+          positive_tolerance_(positive_tolerance), sink_(sink)
     {
         batch_.reserve(batch_size_);
     }
 
-    void submit(std::size_t bin_index, bool fermionic, const double *rho_ri)
+    // `record_sequence` and `slot` address the per-record row this solve
+    // belongs to. The aggregate only needs the bin, but a record file cannot
+    // be written until the solve that fills its GMN column comes back, so the
+    // job has to remember which row it was for. Both are ignored when no sink
+    // is open.
+    void submit(std::size_t bin_index, bool fermionic, const double *rho_ri,
+                std::uint64_t record_sequence, std::size_t slot)
     {
         Job job;
         job.bin = bin_index;
         job.fermionic = fermionic;
+        job.record_sequence = record_sequence;
+        job.slot = slot;
         std::copy(rho_ri, rho_ri + RHO3_VALUES, job.rho.begin());
         batch_.push_back(std::move(job));
         if (batch_.size() >= batch_size_)
@@ -716,6 +726,8 @@ class SdpBatchQueue
     {
         std::size_t bin = 0;
         bool fermionic = false;
+        std::uint64_t record_sequence = 0;
+        std::size_t slot = 0;
         std::array<double, RHO3_VALUES> rho{};
     };
 
@@ -723,6 +735,8 @@ class SdpBatchQueue
     {
         std::size_t bin = 0;
         bool fermionic = false;
+        std::uint64_t record_sequence = 0;
+        std::size_t slot = 0;
         double value = std::numeric_limits<double>::quiet_NaN();
     };
 
@@ -744,7 +758,8 @@ class SdpBatchQueue
             {
                 const double value = job.fermionic ? compute_fgmn_mosek_8x8_cpp(job.rho.data())
                                                    : compute_gmn_mosek_complex_8x8_cpp(job.rho.data());
-                results.push_back({job.bin, job.fermionic, value});
+                results.push_back(
+                    {job.bin, job.fermionic, job.record_sequence, job.slot, value});
             }
             return results;
         }));
@@ -763,6 +778,10 @@ class SdpBatchQueue
             {
                 const double value = std::max(0.0, result.value);
                 stats.value.add(value);
+                if (sink_ != nullptr)
+                {
+                    sink_->resolve(result.record_sequence, result.slot, value);
+                }
                 // The same tolerance the prefilter uses, so one threshold
                 // decides positivity on both paths. It is comfortably clear of
                 // the solver's floor: measured on states whose GMN is exactly
@@ -779,6 +798,16 @@ class SdpBatchQueue
             else
             {
                 ++stats.solver_failures;
+                // A record whose solve failed keeps the NaN it was created
+                // with -- the reader drops it from that column, exactly as the
+                // aggregate excludes it from the mean rather than counting it
+                // as a zero -- but it still has to be released, or every
+                // record behind it stays buffered forever.
+                if (sink_ != nullptr)
+                {
+                    sink_->resolve(result.record_sequence, result.slot,
+                                   std::numeric_limits<double>::quiet_NaN());
+                }
             }
             solved_.fetch_add(1, std::memory_order_relaxed);
         }
@@ -788,6 +817,9 @@ class SdpBatchQueue
     std::size_t batch_size_ = 1;
     std::size_t max_pending_batches_ = 1;
     double positive_tolerance_ = 0.0;
+    // Owned by the protocol, which outlives the queue; null when per-record
+    // output is off.
+    records::RecordSink *sink_ = nullptr;
     std::vector<Job> batch_;
     std::deque<std::future<std::vector<Result>>> pending_;
     std::atomic<std::uint64_t> solved_{0};
@@ -883,10 +915,18 @@ class PairProtocol
           pairs_(all_unordered_pairs(config_.n)), bins_(make_pair_bins(config_.n))
     {
         bin_of_pair_.reserve(pairs_.size());
+        embedding_of_pair_.reserve(pairs_.size());
+        std::vector<std::uint32_t> seen(bins_.size(), 0);
         for (const Pair &pair : pairs_)
         {
-            bin_of_pair_.push_back(
-                static_cast<std::size_t>(periodic_distance(pair[0], pair[1], config_.n)) - 1u);
+            const std::size_t bin =
+                static_cast<std::size_t>(periodic_distance(pair[0], pair[1], config_.n)) - 1u;
+            bin_of_pair_.push_back(bin);
+            // Which embedding of its separation this pair is, in enumeration
+            // order. Every trajectory measures every pair, so the mapping is
+            // fixed by N alone and a record's (geometry, embedding) names the
+            // same two sites in every trajectory.
+            embedding_of_pair_.push_back(seen[bin]++);
         }
 
         // The existing CSV is the checkpoint. Read it before anything is
@@ -896,6 +936,14 @@ class PairProtocol
         checkpoint_ = resume::enabled() ? resume::load_pairs(config_, bins_) : resume::Report{};
         start_realization_ = static_cast<int>(checkpoint_.completed);
         processed_ = records_per_trajectory() * static_cast<std::uint64_t>(start_realization_);
+
+        if (records::enabled())
+        {
+            values_per_record_ = include_fermionic_ ? 4u : 2u;
+            sink_.open(records::records_path_for(config_.output_path),
+                       records::pair_header_text(config_, bins_), values_per_record_,
+                       static_cast<std::uint64_t>(start_realization_));
+        }
     }
 
     const std::string &output_path() const { return config_.output_path; }
@@ -932,11 +980,13 @@ class PairProtocol
             << ", fermionic_outputs=" << (include_fermionic_ ? 1 : 0)
             << ", output=" << config_.output_path << '\n'
             << "pair_policy=unordered i<j; reversed pairs are observable-equivalent\n";
+        records::announce(out, sink_, config_.output_path);
     }
 
     void publish()
     {
         publish_csv(config_.output_path, render_pair_csv(config_, bins_));
+        sink_.flush();
     }
 
     void prepare_output()
@@ -945,7 +995,7 @@ class PairProtocol
         publish();
     }
 
-    void measure(cudaq::state &state)
+    void measure(cudaq::state &state, int realization)
     {
         const int n = config_.n;
         if (include_fermionic_)
@@ -974,6 +1024,8 @@ class PairProtocol
             bin.mn.add(metrics.mn);
             bin.g2.add(metrics.g2);
             bin.f2.add(metrics.f2);
+            // I_2 and N_2 for this record, in the order the header declares.
+            std::array<double, 4> record{metrics.mi, metrics.mn, 0.0, 0.0};
             if (metrics.mn > 1.0e-12)
             {
                 ++bin.mn_positive;
@@ -987,10 +1039,18 @@ class PairProtocol
                 bin.fmn.add(fermion_metrics.mn);
                 bin.fg2.add(fermion_metrics.g2);
                 bin.ff2.add(fermion_metrics.f2);
+                record[2] = fermion_metrics.mi;
+                record[3] = fermion_metrics.mn;
                 if (fermion_metrics.mn > 1.0e-12)
                 {
                     ++bin.fmn_positive;
                 }
+            }
+            if (sink_.active())
+            {
+                sink_.add(static_cast<std::uint32_t>(realization),
+                          static_cast<std::uint32_t>(bin_of_pair_[pair_index]),
+                          embedding_of_pair_[pair_index], record.data());
             }
             ++processed_;
         }
@@ -999,6 +1059,7 @@ class PairProtocol
     void finish(std::ostream &out, double active_seconds)
     {
         publish();
+        sink_.close();
         out << "Completed " << processed_ << " pair record(s) over " << bins_.size()
             << " separation bin(s) in " << format_duration(active_seconds) << " active time at "
             << std::fixed << std::setprecision(2)
@@ -1012,6 +1073,9 @@ class PairProtocol
     std::vector<Pair> pairs_;
     std::vector<PairBin> bins_;
     std::vector<std::size_t> bin_of_pair_;
+    std::vector<std::uint32_t> embedding_of_pair_;
+    records::RecordSink sink_;
+    std::size_t values_per_record_ = 0;
     RdmWorkspace rdm_workspace_;
     resume::Report checkpoint_;
     int start_realization_ = 0;
@@ -1029,19 +1093,25 @@ class PairProtocol
 // fixed and the caller builds it once.
 inline void sample_trajectory_triangles(const std::vector<probed::ProbeGeometry> &geometries, long per_geometry,
                                         std::mt19937 &rng, std::vector<Subsystem> &subsystems,
-                                        std::vector<std::size_t> &bin_of_subsystem)
+                                        std::vector<std::size_t> &bin_of_subsystem,
+                                        std::vector<std::uint32_t> &embedding_of_subsystem)
 {
     subsystems.clear();
     bin_of_subsystem.clear();
+    // Which embedding of its geometry each triangle is. With subsampling this
+    // is redrawn per trajectory, so it is a genuine coordinate of a record
+    // rather than a running counter; the per-record output writes it.
+    embedding_of_subsystem.clear();
     for (std::size_t geometry_index = 0; geometry_index < geometries.size(); ++geometry_index)
     {
         const auto &embeddings = geometries[geometry_index].embeddings;
         if (per_geometry <= 0 || static_cast<std::size_t>(per_geometry) >= embeddings.size())
         {
-            for (const auto &embedding : embeddings)
+            for (std::size_t index = 0; index < embeddings.size(); ++index)
             {
-                subsystems.push_back(embedding);
+                subsystems.push_back(embeddings[index]);
                 bin_of_subsystem.push_back(geometry_index);
+                embedding_of_subsystem.push_back(static_cast<std::uint32_t>(index));
             }
             continue;
         }
@@ -1055,8 +1125,10 @@ inline void sample_trajectory_triangles(const std::vector<probed::ProbeGeometry>
         std::shuffle(order.begin(), order.end(), rng);
         for (long taken = 0; taken < per_geometry; ++taken)
         {
-            subsystems.push_back(embeddings[order[static_cast<std::size_t>(taken)]]);
+            const std::size_t chosen = order[static_cast<std::size_t>(taken)];
+            subsystems.push_back(embeddings[chosen]);
             bin_of_subsystem.push_back(geometry_index);
+            embedding_of_subsystem.push_back(static_cast<std::uint32_t>(chosen));
         }
     }
 }
@@ -1072,9 +1144,10 @@ class TripleProtocol
           geometries_(probed::enumerate_three_probe_geometries(config_.n,
                                                                config_.triangle_balance_cutoff)),
           bins_(make_triple_bins(config_.n, geometries_)), rng_(std::random_device{}()),
-          queue_(bins_, sdp_.batch_size, sdp_.pending_batches, sdp_.zero_tolerance)
+          queue_(bins_, sdp_.batch_size, sdp_.pending_batches, sdp_.zero_tolerance, &sink_)
     {
-        sample_trajectory_triangles(geometries_, per_geometry_, rng_, subsystems_, bin_of_subsystem_);
+        sample_trajectory_triangles(geometries_, per_geometry_, rng_, subsystems_,
+                                    bin_of_subsystem_, embedding_of_subsystem_);
         resample_each_trajectory_ =
             per_geometry_ > 0 &&
             std::any_of(geometries_.begin(), geometries_.end(),
@@ -1096,6 +1169,14 @@ class TripleProtocol
                                         : resume::Report{};
         start_realization_ = static_cast<int>(checkpoint_.completed);
         processed_ = records_per_trajectory() * static_cast<std::uint64_t>(start_realization_);
+
+        if (records::enabled())
+        {
+            values_per_record_ = include_fermionic_ ? 4u : 2u;
+            sink_.open(records::records_path_for(config_.output_path),
+                       records::triple_header_text(config_, bins_, per_geometry_),
+                       values_per_record_, static_cast<std::uint64_t>(start_realization_));
+        }
     }
 
     const std::string &output_path() const { return config_.output_path; }
@@ -1185,6 +1266,9 @@ class TripleProtocol
             << ", mode=" << circuit_type_name(config_.type)
             << ", fermionic_outputs=" << (include_fermionic_ ? 1 : 0)
             << ", output=" << config_.output_path << '\n';
+        // A record whose GMN is still with a solver holds every record behind
+        // it out of the file, so this count can lag the CSV by a trajectory.
+        records::announce(out, sink_, config_.output_path);
         if (sdp_.enabled)
         {
             out << "gmn_schedule: stride=" << sdp_.stride << ", samples_per_geometry="
@@ -1213,6 +1297,7 @@ class TripleProtocol
     {
         queue_.collect_ready();
         publish_csv(config_.output_path, render_triple_csv(config_, bins_));
+        sink_.flush();
     }
 
     void prepare_output()
@@ -1226,7 +1311,7 @@ class TripleProtocol
         if (resample_each_trajectory_ && realization > start_realization_)
         {
             sample_trajectory_triangles(geometries_, per_geometry_, rng_, subsystems_,
-                                        bin_of_subsystem_);
+                                        bin_of_subsystem_, embedding_of_subsystem_);
         }
 
         const int n = config_.n;
@@ -1250,6 +1335,12 @@ class TripleProtocol
             const double *rho = rho_ri_.data() + index * RHO3_VALUES;
 
             const TripleMetrics metrics = three_party_metrics(rho, false);
+            // I_3 and N_3 for this record, in the order the header declares.
+            // The two GMN slots start as NaN and stay that way unless the
+            // schedule selects the record: a GMN nobody asked for is missing,
+            // not zero.
+            const double missing = std::numeric_limits<double>::quiet_NaN();
+            std::array<double, 4> record{metrics.tmi, missing, missing, missing};
             bin.tmi.add(metrics.tmi);
             bin.average_mi.add(metrics.average_mi);
             bin.joint_purity.add(metrics.joint_purity);
@@ -1269,6 +1360,7 @@ class TripleProtocol
             {
                 fermion_rho = fermion_rho_ri_.data() + index * RHO3_VALUES;
                 const TripleMetrics fermion_metrics = three_party_metrics(fermion_rho, true);
+                record[2] = fermion_metrics.tmi;
                 bin.ftmi.add(fermion_metrics.tmi);
                 bin.faverage_mi.add(fermion_metrics.average_mi);
                 bin.fjoint_purity.add(fermion_metrics.joint_purity);
@@ -1289,6 +1381,8 @@ class TripleProtocol
             // minimum bipartite negativity certifies GMN=0 and the solve is
             // skipped. The record still counts, which is what keeps the mean
             // over selected records unbiased.
+            bool gmn_deferred = false;
+            bool fgmn_deferred = false;
             if (sdp_.selects(bin.records, bin.gmn.requested))
             {
                 ++bin.gmn.requested;
@@ -1296,10 +1390,11 @@ class TripleProtocol
                 {
                     bin.gmn.value.add(0.0);
                     ++bin.gmn.zero_prefiltered;
+                    record[1] = 0.0;
                 }
                 else
                 {
-                    queue_.submit(bin_of_subsystem_[index], false, rho);
+                    gmn_deferred = true;
                 }
 
                 if (include_fermionic_)
@@ -1309,12 +1404,45 @@ class TripleProtocol
                     {
                         bin.fgmn.value.add(0.0);
                         ++bin.fgmn.zero_prefiltered;
+                        record[3] = 0.0;
                     }
                     else
                     {
-                        queue_.submit(bin_of_subsystem_[index], true, fermion_rho);
+                        fgmn_deferred = true;
                     }
                 }
+            }
+
+            // The record must exist before either solve is submitted:
+            // submitting can dispatch a batch, which collects a finished one,
+            // which resolves records already in the buffer. Adding first keeps
+            // the sequence number this record is about to be told by valid at
+            // the moment the queue could use it.
+            std::uint64_t sequence = 0;
+            if (sink_.active())
+            {
+                const int deferred = (gmn_deferred ? 1 : 0) + (fgmn_deferred ? 1 : 0);
+                const std::uint32_t geometry =
+                    static_cast<std::uint32_t>(bin_of_subsystem_[index]);
+                const std::uint32_t embedding = embedding_of_subsystem_[index];
+                if (deferred == 0)
+                {
+                    sink_.add(static_cast<std::uint32_t>(realization), geometry, embedding,
+                              record.data());
+                }
+                else
+                {
+                    sequence = sink_.add_pending(static_cast<std::uint32_t>(realization), geometry,
+                                                 embedding, record.data(), deferred);
+                }
+            }
+            if (gmn_deferred)
+            {
+                queue_.submit(bin_of_subsystem_[index], false, rho, sequence, 1);
+            }
+            if (fgmn_deferred)
+            {
+                queue_.submit(bin_of_subsystem_[index], true, fermion_rho, sequence, 3);
             }
 
             ++bin.records;
@@ -1326,6 +1454,7 @@ class TripleProtocol
     {
         queue_.finish();
         publish_csv(config_.output_path, render_triple_csv(config_, bins_));
+        sink_.close();
         out << "Completed " << processed_ << " triangle record(s) over " << bins_.size()
             << " geometry bin(s) and " << queue_.solved() << " SDP solve(s) in "
             << format_duration(active_seconds) << " active time at " << std::fixed
@@ -1342,11 +1471,17 @@ class TripleProtocol
     std::vector<probed::ProbeGeometry> geometries_;
     std::vector<TripleBin> bins_;
     std::mt19937 rng_;
+    // Declared ahead of queue_, which holds a pointer to it: members are
+    // destroyed in reverse declaration order, and the queue's destructor can
+    // still be collecting solves.
+    records::RecordSink sink_;
+    std::size_t values_per_record_ = 0;
     // Holds a reference to bins_, so it must outlive nothing else and this
     // class must stay non-copyable -- which it is, by holding it.
     SdpBatchQueue queue_;
     std::vector<Subsystem> subsystems_;
     std::vector<std::size_t> bin_of_subsystem_;
+    std::vector<std::uint32_t> embedding_of_subsystem_;
     bool resample_each_trajectory_ = false;
     std::vector<double> rho_ri_;
     std::vector<double> fermion_rho_ri_;
@@ -1507,7 +1642,7 @@ inline void run_protocols(const RunConfig &config, PairProtocol *pairs, TriplePr
         // exactly `realizations` of them in total.
         if (pairs != nullptr && realization >= pairs->start_realization())
         {
-            pairs->measure(state);
+            pairs->measure(state, realization);
         }
         if (triples != nullptr && realization >= triples->start_realization())
         {
@@ -1660,15 +1795,30 @@ inline void print_usage(const char *argv0)
         << "  run leaves a complete file for the trajectories it finished -- and\n"
         << "  re-issuing the identical command continues from it rather than starting\n"
         << "  over, since that file is the checkpoint. MIPT_DIST_RESUME=0 discards it.\n\n"
+        << "Per-record output:\n"
+        << "  Alongside the CSV, `<stem>_records.bin` carries one row per (trajectory,\n"
+        << "  geometry, embedding): realization_id (u4), geometry_id (u2), embedding_id\n"
+        << "  (u2), then I_k and N_k as float64 -- (MI, negativity) at k=2 and (TMI, GMN)\n"
+        << "  at k=3 -- followed by the fermionic pair for parity-preserving ensembles.\n"
+        << "  The mapping from geometry_id to the effective chord distance d lives once\n"
+        << "  in the file's text header, not in every record. A GMN the schedule did not\n"
+        << "  select, or one the solver failed on, is written as NaN rather than 0.\n"
+        << "  This is what makes a bootstrap clustered on whole trajectories possible;\n"
+        << "  see Sampling below for why that matters. It also costs disk: a k=2 run is\n"
+        << "  40 x N(N-1)/2 bytes per trajectory, so N=24 at 100k trajectories is ~1.1 GB.\n"
+        << "  MIPT_DIST_RECORDS=0 turns it off.\n\n"
         << "Sampling:\n"
         << "  Every geometry is measured inside the same trajectory, so bins at one\n"
         << "  realization are correlated; the reported standard errors treat records as\n"
-        << "  independent and are therefore optimistic for cross-bin comparisons.\n\n"
+        << "  independent and are therefore optimistic for cross-bin comparisons. That\n"
+        << "  is what the per-record file above exists to repair.\n\n"
         << "Environment variables:\n"
         << "  MIPT_DIST_PROGRESS_MS=1000 controls progress updates and how often the CSV\n"
         << "    is republished (0 = every trajectory).\n"
         << "  MIPT_PAUSE_FILE=path or MIPT_DIST_PAUSE_FILE=path selects the pause sentinel;\n"
         << "    0 disables it. Default: PAUSE_MIPT.\n"
+        << "  MIPT_DIST_RECORDS=1 write the per-record binary beside the CSV; 0 skips it.\n"
+        << "  MIPT_DIST_RECORDS_FLUSH=8192 resolved records buffered before a write.\n"
         << "  MIPT_DIST_MPS_DENSE_MAX_QUBITS=16 bounds exact amplitude reconstruction"
            " when a tensor/MPS backend exposes no dense state tensor.\n"
         << "  k=0 and k=3:\n"
