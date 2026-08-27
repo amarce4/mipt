@@ -11,10 +11,11 @@ dist_scaling(...)      Plot two-site (MI/negativity) or three-site (TMI/GMN)
                        and the conditional magnitude instead, and
                        ``paper_fit_ranges=True`` reproduces the published
                        two-party fit windows. Reads the aggregated CSV, the
-                       legacy row-level CSV, or the per-record binary;
+                       legacy row-level CSV, the per-record binary, or the
+                       summary CSV ``./summarize_records`` reduces one to;
                        ``show_dist=(L, d_min)`` adds a stacked-histogram figure
                        of the non-zero MI/fMI/GMN/fGMN distributions, which
-                       needs the record binaries.
+                       needs the records.
 expvals(...)           Plot aggregate fermionic observables and Wick residuals.
 tmi_collapse(...)      Fit and plot the TMI finite-size scaling collapse.
 probe1_collapse(...)   Fit and plot the one-ancilla dynamical collapse.
@@ -42,7 +43,9 @@ Module layout
 -------------
 loading            file discovery, column lookup, run-metadata resolution
 records            dist_scaling.exe's per-record binary: header, geometry table,
-                   and reduction to the curves the CSV path produces
+                   streaming reduction to curves and histograms, and the
+                   summary CSV that caches it
+summarize_records  the `./summarize_records` command line front end
 plotting           figure helpers shared by every plot
 fitting            generic weighted fits and error estimates
 collapse           the shared one-parameter finite-size collapse engine
