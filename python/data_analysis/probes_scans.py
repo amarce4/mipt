@@ -34,6 +34,7 @@ from .plotting import (
     _inset_overlay_defaults,
     _set_secondary_title,
     _mi_unit_spec,
+    _panel_label,
     _paired_axes,
     _reserve_axis_space,
     _show,
@@ -1676,7 +1677,7 @@ def _draw_lyu_extrapolation_row(
         linewidth=1.1,
         elinewidth=0.9,
         capsize=capsize,
-        label="curve crossing",
+        label=r"$p_c$ (crossing)",
     )
     ax_pc.errorbar(
         x,
@@ -1689,7 +1690,7 @@ def _draw_lyu_extrapolation_row(
         linewidth=1.1,
         elinewidth=0.9,
         capsize=capsize,
-        label="curve collapse",
+        label=r"$p_c$ (collapse)",
     )
     ax_nu.errorbar(
         x,
@@ -1702,7 +1703,7 @@ def _draw_lyu_extrapolation_row(
         linewidth=1.1,
         elinewidth=0.9,
         capsize=capsize,
-        label=r"pairwise $\nu$",
+        label="_nolegend_",
     )
 
     # Keep the rightmost (smallest-size) pair visible but mark its omission
@@ -1731,7 +1732,7 @@ def _draw_lyu_extrapolation_row(
             markerfacecolor="white",
             markeredgecolor=nu_color,
             markersize=4.7,
-            label="excluded smallest pair",
+            label="_nolegend_",
         )
 
     line_x = np.linspace(0.0, float(np.max(x)) * 1.03, 250)
@@ -1743,7 +1744,7 @@ def _draw_lyu_extrapolation_row(
         color="black",
         linestyle="--",
         linewidth=1.0,
-        label="equal-weight crossing fit",
+        label="_nolegend_",
     )
     ax_nu.plot(
         line_x,
@@ -1751,13 +1752,43 @@ def _draw_lyu_extrapolation_row(
         color="black",
         linestyle="--",
         linewidth=1.0,
-        label="equal-weight fit",
+        label="_nolegend_",
+    )
+
+    # Make the N -> infinity limit a visible point at the fitted intercept,
+    # matching the construction of the paper's Fig. 3 rather than leaving it
+    # to be inferred from the dashed line.
+    ax_pc.plot(
+        0.0,
+        pc_line["intercept"],
+        marker="o",
+        markersize=4.0,
+        color="black",
+        clip_on=False,
+        zorder=8,
+    )
+    ax_nu.plot(
+        0.0,
+        nu_line["intercept"],
+        marker="o",
+        markersize=4.0,
+        color="black",
+        clip_on=False,
+        zorder=8,
     )
 
     for axis in (ax_pc, ax_nu):
         axis.set_xlabel(r"$(L_1L_2)^{-1}$")
+        # Leave enough vertical headroom for the in-panel letter even when
+        # the thermodynamic-limit intercept is the extremal data point.
+        axis.margins(y=0.12)
         axis.grid(alpha=0.25)
-        axis.legend(**legend_kwargs)
+        from matplotlib.ticker import ScalarFormatter
+
+        formatter = ScalarFormatter(useMathText=True)
+        formatter.set_powerlimits((-3, -3))
+        axis.xaxis.set_major_formatter(formatter)
+    ax_pc.legend(**legend_kwargs)
     ax_pc.set_ylabel(r"$p_c(L_1,L_2)$")
     ax_nu.set_ylabel(r"$\nu(L_1,L_2)$")
     prefix = _PROBE_PC_SPECS[metric]["title"] + " — " if title_prefix else ""
@@ -1768,6 +1799,7 @@ def _draw_lyu_extrapolation_row(
         rf"$p_c(\infty)={pc_line['intercept']:.5g}\pm "
         rf"{pc_line['intercept_stderr']:.2g}$",
         annotation_loc or "lower left",
+        bbox=None,
         **annotation_kwargs,
     )
     _annotate_axes(
@@ -1775,8 +1807,200 @@ def _draw_lyu_extrapolation_row(
         rf"$\nu(\infty)={nu_line['intercept']:.4g}\pm "
         rf"{nu_line['intercept_stderr']:.2g}$",
         annotation_loc or "lower left",
+        bbox=None,
         **annotation_kwargs,
     )
+
+
+def _pairwise_collapse_difference(
+    curve_a: Mapping[str, Any],
+    curve_b: Mapping[str, Any],
+    fit: Mapping[str, Any],
+    nu: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Interpolate two rescaled curves and return their signed difference."""
+    transformed = []
+    for curve in (curve_a, curve_b):
+        x, y, _ = fit["transform"](curve, fit["pc"], nu, fit["x"])
+        x = np.asarray(x, dtype=float)
+        y = np.asarray(y, dtype=float)
+        keep = np.isfinite(x) & np.isfinite(y)
+        x, y = x[keep], y[keep]
+        order = np.argsort(x)
+        transformed.append((x[order], y[order]))
+    (x_a, y_a), (x_b, y_b) = transformed
+    if x_a.size < 2 or x_b.size < 2:
+        return np.array([]), np.array([])
+    lower = max(float(x_a[0]), float(x_b[0]))
+    upper = min(float(x_a[-1]), float(x_b[-1]))
+    if lower >= upper:
+        return np.array([]), np.array([])
+    sample = np.unique(
+        np.concatenate(
+            (
+                x_a[(x_a >= lower) & (x_a <= upper)],
+                x_b[(x_b >= lower) & (x_b <= upper)],
+            )
+        )
+    )
+    if sample.size < 3:
+        sample = np.linspace(lower, upper, 20)
+    difference = np.interp(sample, x_a, y_a) - np.interp(sample, x_b, y_b)
+    return sample, difference
+
+
+def _draw_pairwise_collapse_figures(
+    pairwise_fits: Mapping[str, Mapping[str, Any]],
+    curves_by_metric: Mapping[str, Sequence[Mapping[str, Any]]],
+    selected_metrics: Sequence[str],
+    *,
+    sq_units: str,
+    mi_units: str,
+    cmap: str,
+    show_errorbars: bool,
+    capsize: float,
+    dpi: int,
+) -> dict[str, dict[str, Any]]:
+    """Recreate the paper's Fig. 7 pair-by-pair collapse diagnostics.
+
+    Each pair gets one collapse panel and a lower-right inset showing the
+    signed curve difference at ``nu* - dnu``, ``nu*`` and ``nu* + dnu``.
+    ``dnu`` is the larger side of the fitted ``O <= 1.3 O*`` interval.
+    """
+    from matplotlib.lines import Line2D
+
+    output: dict[str, dict[str, Any]] = {}
+    for metric in selected_metrics:
+        summary = pairwise_fits[metric]
+        pairs = sorted(
+            summary["pairs"], key=lambda item: (item["L1"], item["L2"])
+        )
+        ncols = min(3, len(pairs))
+        nrows = int(np.ceil(len(pairs) / ncols))
+        fig, raw_grid = plt.subplots(
+            nrows,
+            ncols,
+            figsize=(4.0 * ncols, 3.45 * nrows),
+            dpi=dpi,
+            squeeze=False,
+            constrained_layout=True,
+        )
+        axes = np.asarray(raw_grid, dtype=object)
+        insets: list[Any] = []
+        curve_lookup = {
+            int(curve["L"]): curve for curve in curves_by_metric[metric]
+        }
+        sizes = sorted(curve_lookup)
+        colors = _color_map_by_size(sizes, cmap)
+        units = sq_units if metric == "sq" else mi_units
+        ylabel = _PROBE_PC_SPECS[metric]["scaled_ylabel"] + f" [{units}]"
+
+        for index, item in enumerate(pairs):
+            row, column = divmod(index, ncols)
+            ax = axes[row, column]
+            fit = item["collapse"]
+            curve_a = curve_lookup[int(item["L1"])]
+            curve_b = curve_lookup[int(item["L2"])]
+            for curve in (curve_a, curve_b):
+                size = int(curve["L"])
+                x_scaled, y_scaled, dy_scaled = fit["transform"](
+                    curve, fit["pc"], fit["nu"], fit["x"]
+                )
+                kwargs = {
+                    "color": colors[size],
+                    "marker": "o",
+                    "markersize": 3.2,
+                    "linewidth": 1.0,
+                    "label": "_nolegend_",
+                }
+                if show_errorbars:
+                    ax.errorbar(
+                        x_scaled,
+                        y_scaled,
+                        yerr=dy_scaled,
+                        capsize=capsize,
+                        elinewidth=0.7,
+                        **kwargs,
+                    )
+                else:
+                    ax.plot(x_scaled, y_scaled, **kwargs)
+
+            interval = fit.get("nu_interval_1p3", (fit["nu"], fit["nu"]))
+            delta_nu = max(
+                float(fit["nu"] - interval[0]),
+                float(interval[1] - fit["nu"]),
+                0.015 * float(fit["nu"]),
+            )
+            diagnostic = ax.inset_axes([0.55, 0.08, 0.42, 0.38])
+            _style_inset(
+                diagnostic,
+                6.8,
+                "white",
+                1.0,
+                (0.55, 0.08, 0.42, 0.38),
+            )
+            diagnostic.set_zorder(8)
+            for offset, color, label in (
+                (-delta_nu, "red", r"$\nu_*-\Delta\nu$"),
+                (0.0, "black", r"$\nu_*$"),
+                (delta_nu, "blue", r"$\nu_*+\Delta\nu$"),
+            ):
+                sample, difference = _pairwise_collapse_difference(
+                    curve_a, curve_b, fit, float(fit["nu"] + offset)
+                )
+                if sample.size:
+                    diagnostic.plot(
+                        sample,
+                        difference,
+                        color=color,
+                        linewidth=0.9,
+                        label=label,
+                    )
+            diagnostic.axhline(0.0, color="0.45", linewidth=0.6)
+            diagnostic.set_title(r"$\Delta S$", fontsize=7.0, pad=1.0)
+            diagnostic.grid(alpha=0.20)
+            insets.append(diagnostic)
+
+            ax.set_title(
+                rf"$L_1={item['L1']},\ L_2={item['L2']},\ "
+                rf"\nu={fit['nu']:.3g}\pm{fit['nu_stderr']:.2g}$",
+                pad=4.0,
+            )
+            ax.grid(alpha=0.22)
+            _panel_label(ax, f"{chr(ord('a') + index)})")
+            if column == 0:
+                ax.set_ylabel(ylabel)
+            if row == nrows - 1:
+                ax.set_xlabel(r"$(p-p_c)L^{1/\nu}$")
+
+        for index in range(len(pairs), nrows * ncols):
+            row, column = divmod(index, ncols)
+            axes[row, column].set_visible(False)
+
+        size_handles = [
+            Line2D(
+                [],
+                [],
+                color=colors[size],
+                marker="o",
+                linewidth=1.0,
+                markersize=3.5,
+                label=rf"$L={size}$",
+            )
+            for size in sizes
+        ]
+        axes[0, 0].legend(
+            handles=size_handles,
+            loc="upper left",
+            bbox_to_anchor=(0.075, 1.0),
+            fontsize=7.2,
+        )
+        output[metric] = {
+            "figure": fig,
+            "axes": axes,
+            "insets": tuple(insets),
+        }
+    return output
 
 
 def _objective_plot_range(
@@ -2100,7 +2324,6 @@ def _draw_probe_pc_metric(
             ax_scaled.plot(x_scaled, y_scaled, **kwargs)
 
     ax_raw.axvline(fit["pc"], color="black", linestyle="--", linewidth=1)
-    ax_raw.axhline(0.0, color="black", linewidth=0.7, alpha=0.3)
     ax_raw.set_xlabel(r"Measurement rate $p$")
     metric_units = sq_units if metric == "sq" else mi_units
     ax_raw.set_ylabel(spec["ylabel"].replace("[nats]", f"[{metric_units}]"))
@@ -2109,7 +2332,6 @@ def _draw_probe_pc_metric(
     ax_raw.legend(**legend_kwargs)
 
     ax_scaled.axvline(0.0, color="black", linestyle="--", linewidth=1)
-    ax_scaled.axhline(0.0, color="black", linewidth=0.7, alpha=0.3)
     ax_scaled.set_xlabel(r"$(p-p_c)L^{1/\nu}$", **inset_font)
     if not collapse_inset:
         scaled_ylabel = spec["scaled_ylabel"]
@@ -2145,8 +2367,7 @@ def _draw_probe_pc_metric(
         # Applied last, so it wins over both autoscale and the inset headroom
         # reservation above. A `None` endpoint leaves that side as drawn, which
         # is what makes `(0, None)` a way to just pin the floor -- autoscale
-        # puts it slightly below zero because the y=0 reference line is in the
-        # data range and matplotlib then adds its default margin.
+        # retains Matplotlib's data-driven autoscaling on that side.
         lower, upper = raw_ylim
         current_lower, current_upper = ax_raw.get_ylim()
         ax_raw.set_ylim(
@@ -2308,6 +2529,9 @@ def _draw_probe_pc_extrapolation(
             annotation_fontsize=annotation_fontsize,
             title_prefix=metric_count > 1,
         )
+        _panel_label(ax_raw, f"{chr(ord('a') + 3 * row)})")
+        _panel_label(ax_pc, f"{chr(ord('b') + 3 * row)})")
+        _panel_label(ax_nu, f"{chr(ord('c') + 3 * row)})")
         axes.append((ax_raw, ax_scaled, ax_pc, ax_nu))
 
     fig.suptitle(
@@ -2425,8 +2649,10 @@ def probe_pc_collapse(
     and collapse inset on top, followed by the pairwise large-``L`` analysis
     of Fig. 3 in Lyu et al. (2026). Every ``(L1,L2)`` combination from the
     selected collapse-size range is fitted independently with the original
-    ansatz. A separate supplemental figure recreates Zabalo et al. Fig. S4,
-    including the white ``O=1.3 O*`` contour. This mode is deliberately
+    ansatz. A Fig.-7-style supplemental grid shows every pairwise collapse
+    with an inset of the curve difference at ``nu*`` and ``nu* +/- dnu``.
+    A second supplemental figure recreates Zabalo et al. Fig. S4, including
+    the white ``O=1.3 O*`` contour. This mode is deliberately
     incompatible with ``correction_to_scaling=True`` and fixed ``p_c`` or
     ``nu``.
 
@@ -2686,9 +2912,32 @@ def probe_pc_collapse(
             "collapse_l_range": collapse_l_range,
             "collapse_sizes": collapse_sizes_by_metric,
         }
-        # Show the main composite first, then create/show the supplemental
-        # objective figure so notebook output naturally stacks them.
+        # Show the main composite first, then the pair-by-pair Fig.-7-style
+        # collapses and finally the objective surface.  Notebook output thus
+        # follows the analysis from result to diagnostic.
         _show(fig, show)
+        pairwise_supplemental = _draw_pairwise_collapse_figures(
+            pairwise_fits,
+            collapse_curves_by_metric,
+            selected_metrics,
+            sq_units=sq_units,
+            mi_units=mi_units,
+            cmap=cmap,
+            show_errorbars=show_errorbars,
+            capsize=capsize,
+            dpi=dpi,
+        )
+        for panel in pairwise_supplemental.values():
+            _show(panel["figure"], show)
+        result["pairwise_supplemental"] = pairwise_supplemental
+        result["pairwise_figures"] = {
+            metric: panel["figure"]
+            for metric, panel in pairwise_supplemental.items()
+        }
+        if len(selected_metrics) == 1:
+            only_panel = pairwise_supplemental[selected_metrics[0]]
+            result["pairwise_figure"] = only_panel["figure"]
+            result["pairwise_axes"] = only_panel["axes"]
         objective_result = probe_pc_objective(
             result,
             grid_points=objective_grid_points,

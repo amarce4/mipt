@@ -6,7 +6,9 @@ gmn(...)               Plot GMN/fGMN and optional minimum bipartite negativity.
 entropy(...)           Plot entropy scaling curves and weighted fits; ``order=1``
                        selects von Neumann, ``order=2`` (default) Rényi-2.
 dist_scaling(...)      Plot two-site (MI/negativity) or three-site (TMI/GMN)
-                       distance scaling and power-law fits; ``ent_decomp=True``
+                       distance scaling and power-law fits as separate flush
+                       ordinary/fermionic stacks, plus finite-size exponent
+                       convergence; ``ent_decomp=True``
                        splits the pair negativities into the entangled fraction
                        and the conditional magnitude instead, and
                        ``paper_fit_ranges=True`` reproduces the published
@@ -16,6 +18,8 @@ dist_scaling(...)      Plot two-site (MI/negativity) or three-site (TMI/GMN)
                        ``show_dist=(L, d_min)`` adds a stacked-histogram figure
                        of the non-zero MI/fMI/GMN/fGMN distributions, which
                        needs the records.
+dist_scaling_comparison(...) Overlay completed distance-scaling results for
+                       circuit-ensemble or evolution-depth comparisons.
 expvals(...)           Plot aggregate fermionic observables and Wick residuals.
 tmi_collapse(...)      Fit and plot the TMI finite-size scaling collapse.
 probe1_collapse(...)   Fit and plot the one-ancilla dynamical collapse.
@@ -59,7 +63,7 @@ front, stagger     mode-5 one-probe fronts and two-probe staggered velocities
 
 from __future__ import annotations
 
-from .distance import dist_scaling
+from .distance import dist_scaling, dist_scaling_comparison
 from .entropy import entropy
 from .expvals import expvals
 from .free_energy import free_energy_ceff, free_energy_equilibration
@@ -67,6 +71,7 @@ from .front import front_velocity
 from .gmn import gmn
 from .probes_collapse import probe1_collapse, probe2_collapse, probe4_collapse
 from .probes_dynamics import probe3_dynamics, probe_distance_collapse
+from .plotting import apply_paper_style
 from .probes_scans import (
     probe_anisotropy,
     probe_entropy_map,
@@ -80,6 +85,7 @@ __all__ = [
     "gmn",
     "entropy",
     "dist_scaling",
+    "dist_scaling_comparison",
     "expvals",
     "tmi_collapse",
     "probe1_collapse",
@@ -95,4 +101,5 @@ __all__ = [
     "probe_entropy_map",
     "front_velocity",
     "stagger_velocity",
+    "apply_paper_style",
 ]

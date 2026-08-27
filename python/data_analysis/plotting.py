@@ -1,4 +1,13 @@
-"""Figure-level helpers shared by every plotting function."""
+"""Figure-level helpers shared by every plotting function.
+
+The plotting package follows the compact journal style used in
+Lyu *et al.*, arXiv:2602.04969: Computer-Modern-compatible serif text and
+mathematics, inward ticks on all four sides, thin frames and unobtrusive
+legends.  The style is installed once when this module is imported so every
+public plotter uses the same typography and geometry.  Individual plotters
+remain responsible for the scientifically meaningful choices (linear or
+logarithmic axes, grids, colours, marker encodings and panel layout).
+"""
 
 from __future__ import annotations
 
@@ -8,9 +17,123 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 
+# ---------------------------------------------------------------------------
+# Publication style
+#
+# The paper embeds Computer Modern Roman/italic throughout the principal plot
+# labels and mathematics (Latin Modern is its OpenType continuation).  A small
+# subset of numeric ticks in one panel embeds Helvetica, but that is not the
+# dominant figure face.  Latin Modern Roman therefore gives the closest
+# consistent match across every plot; Nimbus Roman and DejaVu Serif keep the
+# code portable when TeX fonts are unavailable.  ``text.usetex`` stays disabled
+# deliberately so the style does not require a working TeX installation.
+# ---------------------------------------------------------------------------
+
+PAPER_RCPARAMS: dict[str, Any] = {
+    "font.family": "serif",
+    "font.serif": [
+        "Latin Modern Roman",
+        "Computer Modern Roman",
+        "CMU Serif",
+        "Times New Roman",
+        "Nimbus Roman",
+        "DejaVu Serif",
+    ],
+    "font.size": 10.0,
+    "mathtext.fontset": "cm",
+    "mathtext.default": "it",
+    "axes.unicode_minus": True,
+    "axes.linewidth": 0.8,
+    "axes.labelsize": 11.0,
+    "axes.titlesize": 10.5,
+    "axes.titleweight": "normal",
+    "axes.labelpad": 4.0,
+    "axes.formatter.use_mathtext": True,
+    "axes.grid": False,
+    "grid.color": "0.72",
+    "grid.linestyle": ":",
+    "grid.linewidth": 0.55,
+    "grid.alpha": 0.28,
+    "xtick.direction": "in",
+    "ytick.direction": "in",
+    "xtick.top": True,
+    "ytick.right": True,
+    "xtick.major.size": 4.0,
+    "ytick.major.size": 4.0,
+    "xtick.minor.size": 2.2,
+    "ytick.minor.size": 2.2,
+    "xtick.major.width": 0.75,
+    "ytick.major.width": 0.75,
+    "xtick.minor.width": 0.55,
+    "ytick.minor.width": 0.55,
+    "xtick.minor.visible": True,
+    "ytick.minor.visible": True,
+    "legend.fontsize": 8.0,
+    "legend.frameon": True,
+    "legend.fancybox": False,
+    "legend.framealpha": 0.95,
+    "legend.edgecolor": "0.65",
+    "legend.borderpad": 0.35,
+    "legend.labelspacing": 0.3,
+    "legend.handlelength": 1.7,
+    "legend.handletextpad": 0.45,
+    "lines.linewidth": 1.1,
+    "lines.markersize": 4.0,
+    "errorbar.capsize": 2.0,
+    "figure.facecolor": "white",
+    "axes.facecolor": "white",
+    "savefig.facecolor": "white",
+    "savefig.bbox": "tight",
+    "savefig.pad_inches": 0.04,
+}
+
+
+def apply_paper_style() -> None:
+    """Install the package's publication style in Matplotlib.
+
+    The function is public enough to be called again after a notebook changes
+    ``rcParams``.  Importing :mod:`data_analysis.plotting` calls it once, so
+    ordinary users do not need to do anything.
+    """
+    plt.rcParams.update(PAPER_RCPARAMS)
+
+
+apply_paper_style()
+
+
 def _show(fig, show: bool) -> None:
     if show:
         plt.show()
+
+
+def _panel_label(
+    ax,
+    label: str,
+    *,
+    x: float = 0.018,
+    y: float = 0.982,
+    fontsize: float = 11.0,
+    outside: bool = False,
+):
+    """Place a compact journal-style panel label such as ``"a)"``.
+
+    ``outside=True`` moves the label just left of the upper frame, which is
+    useful for flush vertical stacks whose data reach the top-left corner.
+    """
+    if outside:
+        x = -0.085
+    return ax.text(
+        x,
+        y,
+        label,
+        transform=ax.transAxes,
+        ha="left",
+        va="top",
+        fontsize=fontsize,
+        fontweight="bold",
+        clip_on=False,
+        zorder=20,
+    )
 
 
 def _mi_unit_spec(mi_units: str, name: str = "mi_units") -> tuple[str, float]:
@@ -167,7 +290,24 @@ def _style_inset(
 
     ax.set_facecolor(facecolor)
     ax.patch.set_alpha(alpha)
-    ax.tick_params(labelsize=fontsize, length=2.5, pad=1.5)
+    ax.tick_params(
+        which="major",
+        direction="in",
+        top=True,
+        right=True,
+        labelsize=fontsize,
+        length=2.8,
+        width=0.65,
+        pad=1.5,
+    )
+    ax.tick_params(
+        which="minor",
+        direction="in",
+        top=True,
+        right=True,
+        length=1.6,
+        width=0.5,
+    )
     for spine in ax.spines.values():
         spine.set_linewidth(0.8)
     if rectangle is None:

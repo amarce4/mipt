@@ -49,6 +49,7 @@ from .loading import (
 from .plotting import (
     _color_map_by_size,
     _mi_unit_spec,
+    _panel_label,
     _positive_log_errorbar,
     _show,
 )
@@ -176,20 +177,26 @@ def _paper_tail_points(metric: str, size: int, k: int) -> int | None:
 _PANEL_GRID: tuple[tuple[dict[str, Any], ...], ...] = (
     (
         {
-            "label": "Mutual Information",
+            "label": r"Multiparty Information $(-1)^k\overline{I}_k$",
             "entropy": True,
             "metrics": {2: "mi", 3: "tmi"},
         },
         {
-            "label": "Fermionic Mutual Information",
+            "label": r"Multiparty Information "
+            r"$(-1)^k\overline{I}^{\,f}_k$",
             "entropy": True,
             "metrics": {2: "fmi", 3: "ftmi"},
         },
     ),
     (
-        {"label": "Negativity", "entropy": False, "metrics": {2: "mn", 3: "gmn"}},
         {
-            "label": "Fermionic Negativity",
+            "label": r"Multiparty Entanglement $\overline{\mathcal{N}}_k$",
+            "entropy": False,
+            "metrics": {2: "mn", 3: "gmn"},
+        },
+        {
+            "label": r"Multiparty Entanglement "
+            r"$\overline{\mathcal{N}}^{\,f}_k$",
             "entropy": False,
             "metrics": {2: "fmn", 3: "fgmn"},
         },
@@ -203,12 +210,12 @@ _PANEL_GRID: tuple[tuple[dict[str, Any], ...], ...] = (
 _ENT_DECOMP_GRID: tuple[tuple[dict[str, Any], ...], ...] = (
     (
         {
-            "label": r"Entangled fraction $P_{\mathrm{ent}}$",
+            "label": r"Entanglement Probability $P_{\mathrm{ent}}$",
             "entropy": False,
             "metrics": {2: "mn_ent_fraction", 3: "gmn_ent_fraction"},
         },
         {
-            "label": r"Conditional negativity "
+            "label": r"Entanglement Magnitude "
             r"$\langle\mathcal{N}\rangle_{\mathrm{ent}}$",
             "entropy": False,
             "metrics": {2: "mn_ent_magnitude", 3: "gmn_ent_magnitude"},
@@ -216,12 +223,12 @@ _ENT_DECOMP_GRID: tuple[tuple[dict[str, Any], ...], ...] = (
     ),
     (
         {
-            "label": r"Fermionic entangled fraction $P^{f}_{\mathrm{ent}}$",
+            "label": r"Entanglement Probability $P^{f}_{\mathrm{ent}}$",
             "entropy": False,
             "metrics": {2: "fmn_ent_fraction", 3: "fgmn_ent_fraction"},
         },
         {
-            "label": r"Conditional fermionic negativity "
+            "label": r"Entanglement Magnitude "
             r"$\langle\mathcal{N}^{f}\rangle_{\mathrm{ent}}$",
             "entropy": False,
             "metrics": {2: "fmn_ent_magnitude", 3: "fgmn_ent_magnitude"},
@@ -798,18 +805,15 @@ def _draw_value_distributions(
         counts = np.where(panel["above"], panel["counts"], 0)[first:last]
         edges = panel["edges"][first : last + 1 : group]
         binned = counts.reshape(-1, group).sum(axis=1).astype(float)
-        # Each panel integrates to one over its own non-zero records, so rows
-        # measuring different things stay comparable in shape.
-        total = binned.sum()
         ax.stairs(
-            binned / total if total > 0 else binned,
+            binned,
             edges,
             fill=True,
             color=colors[index],
             edgecolor="0.25",
             linewidth=0.4,
         )
-        ax.set_xscale("log")
+        ax.set_yscale("log")
         unit = f" [{mi_units}]" if _metric_spec(metric).get("entropy") else ""
         # The non-zero share rather than the zero share: a genuinely
         # multipartite-entangled triangle is rare enough that the zero
@@ -831,22 +835,16 @@ def _draw_value_distributions(
             fontsize=8,
             bbox={"facecolor": "white", "alpha": 0.72, "edgecolor": "none", "pad": 1.8},
         )
-        ax.set_ylabel("fraction")
-        ax.grid(True, which="both", axis="x", alpha=0.18)
-        # Flush edges mean a panel's top tick label sits on top of the one
-        # below it and its bottom label under the one above, so every panel
-        # but the last drops both ends; the last keeps its zero, which has
-        # nothing beneath it to collide with.
-        from matplotlib.ticker import MaxNLocator
+        ax.set_ylabel("Count")
+        ax.grid(False)
+        _panel_label(ax, f"{chr(ord('a') + index)})", outside=True)
+        # A logarithmic count axis is the essential Fig.-9 view: it resolves
+        # the heavy tail without converting the sparse events into a density.
+        ax.margins(x=0.01)
 
-        ax.yaxis.set_major_locator(
-            MaxNLocator(nbins=4, prune="upper" if index == len(order) - 1 else "both")
-        )
-        ax.margins(y=0.0)
-
-    axes[-1].set_xlabel(f"Value  (records at or below {zero_tol:g} counted as zero)")
+    axes[-1].set_xlabel("Value")
     axes[0].set_title(
-        f"{circuit_name}, $L={size}$, records with $d \geq {d_min:g}$",
+        rf"{circuit_name}, $L={size}$, records with $d \geq {d_min:g}$",
         fontsize=11,
     )
     return fig
@@ -975,6 +973,69 @@ def _distance_power_law_fit(
     return fit, selected
 
 
+_FIT_GUIDE_D_SPAN = 3.5
+
+
+def _distance_fit_guide_x(
+    curve: pd.DataFrame,
+    selected: pd.DataFrame,
+    *,
+    points: int = 200,
+) -> np.ndarray:
+    """Return the visual extent of a fitted distance-decay guide.
+
+    The statistical fit is still performed only on ``selected``.  For display,
+    the paper extrapolates the resulting dashed guide slightly backwards so it
+    spans roughly three to four integer distance values.  Never extend beyond
+    the positive distance range actually present in ``curve``.
+    """
+    selected_min = float(selected["d"].min())
+    selected_max = float(selected["d"].max())
+    available = curve.loc[
+        np.isfinite(curve["d"]) & (curve["d"] > 0.0), "d"
+    ].to_numpy(dtype=float)
+    if available.size:
+        target_min = max(
+            float(np.min(available)),
+            selected_max - _FIT_GUIDE_D_SPAN,
+        )
+        display_min = min(selected_min, target_min)
+    else:
+        display_min = selected_min
+    if not (0.0 < display_min < selected_max):
+        display_min = selected_min
+    return np.geomspace(display_min, selected_max, points)
+
+
+def _annotate_distance_fit(
+    ax,
+    x_line: np.ndarray,
+    y_line: np.ndarray,
+    alpha: float,
+    party_count: int,
+) -> None:
+    """Place a power-law label clearly above its guide, inside the axes.
+
+    The text extends rightward from an interior point.  Since every fitted
+    power law descends to the right, both the guide and its data points then
+    move away from the annotation instead of cutting through its glyphs.
+    """
+    fraction = 0.52 if party_count == 2 else 0.70
+    index = int(round(fraction * (len(x_line) - 1)))
+    ax.annotate(
+        rf"$d^{{-{alpha:.2g}}}$",
+        xy=(x_line[index], y_line[index]),
+        xytext=(4.0, 12.0),
+        textcoords="offset points",
+        ha="left",
+        va="bottom",
+        fontsize=8.0,
+        color="black",
+        annotation_clip=True,
+        zorder=7,
+    )
+
+
 def _print_distance_fits(
     fits: pd.DataFrame,
     metrics: Sequence[str],
@@ -1036,6 +1097,130 @@ def _print_distance_fits(
                 )
 
 
+def _draw_exponent_convergence(
+    fits: pd.DataFrame,
+    metrics: Sequence[str],
+    k_of_metric: Mapping[str, int],
+    *,
+    cmap: str,
+    dpi: int,
+    figsize: tuple[float, float] | None,
+) -> tuple[Any, Any, pd.DataFrame] | tuple[None, None, pd.DataFrame]:
+    """Draw a Fig.-5-style finite-size drift of the distance exponents.
+
+    The dashed curves are weighted linear guides in ``1/L``.  Unlike the
+    integer asymptotes used for the specific MMS model in the source paper,
+    these intercepts are inferred from the caller's ensemble and therefore do
+    not bake an MMS/Haar conjecture into fermionic or other circuit data.
+    """
+    usable_metrics = [
+        metric
+        for metric in metrics
+        if metric in k_of_metric
+        and np.count_nonzero(
+            (fits["metric"] == metric) & np.isfinite(fits["alpha"])
+        )
+        >= 2
+    ]
+    if not usable_metrics:
+        return None, None, pd.DataFrame()
+
+    if figsize is None:
+        figsize = (6.6, 4.35)
+    fig, ax = plt.subplots(
+        figsize=figsize, dpi=dpi, constrained_layout=True
+    )
+    metric_colors = plt.get_cmap(cmap)(
+        np.linspace(0.12, 0.88, len(usable_metrics))
+    )
+    guide_rows: list[dict[str, Any]] = []
+    all_sizes: set[int] = set()
+    for color, metric in zip(metric_colors, usable_metrics):
+        rows = fits.loc[
+            (fits["metric"] == metric) & np.isfinite(fits["alpha"])
+        ].sort_values("L", ascending=False)
+        sizes = rows["L"].to_numpy(dtype=int)
+        all_sizes.update(int(size) for size in sizes)
+        x = 1.0 / sizes.astype(float)
+        y = rows["alpha"].to_numpy(dtype=float)
+        dy = rows["alpha_stderr"].to_numpy(dtype=float)
+        k = int(k_of_metric[metric])
+        information = _metric_spec(metric).get("entropy", False)
+        marker = _marker_for_k(k)
+        exponent_name = _metric_spec(metric)["exponent"]
+        label = rf"$\alpha_{k}^{{{exponent_name}}}$"
+        ax.errorbar(
+            x,
+            y,
+            yerr=dy,
+            color=color,
+            ecolor=color,
+            marker=marker,
+            markerfacecolor="white" if information else color,
+            markeredgecolor=color,
+            markersize=4.5,
+            linewidth=1.0,
+            elinewidth=0.8,
+            capsize=2.0,
+            label=label,
+        )
+        if len(rows) >= 3:
+            try:
+                positive_dy = dy[np.isfinite(dy) & (dy > 0.0)]
+                fallback_dy = (
+                    float(np.median(positive_dy)) if positive_dy.size else 1.0
+                )
+                sigma = np.where(
+                    np.isfinite(dy) & (dy > 0.0), dy, fallback_dy
+                )
+                if not np.all(np.isfinite(sigma)):
+                    sigma = np.ones_like(y)
+                guide = _weighted_linear_fit(x, y, sigma)
+                line_x = np.linspace(0.0, float(np.max(x)) * 1.025, 200)
+                ax.plot(
+                    line_x,
+                    guide["intercept"] + guide["slope"] * line_x,
+                    color=color,
+                    linestyle="--",
+                    linewidth=0.9,
+                )
+                ax.plot(
+                    0.0,
+                    guide["intercept"],
+                    marker=marker,
+                    markerfacecolor="white" if information else color,
+                    markeredgecolor=color,
+                    markersize=4.5,
+                    clip_on=False,
+                    zorder=6,
+                )
+                guide_rows.append(
+                    {
+                        "metric": metric,
+                        "k": k,
+                        "alpha_inf": guide["intercept"],
+                        "alpha_inf_stderr": guide["intercept_stderr"],
+                        "slope_1_over_L": guide["slope"],
+                        "slope_stderr": guide["slope_stderr"],
+                        "reduced_chi2": guide["reduced_chi2"],
+                        "points": len(rows),
+                    }
+                )
+            except ValueError:
+                pass
+
+    ax.set_xlabel(r"$1/L$")
+    ax.set_ylabel(r"Decay exponent $\alpha_k$")
+    ax.set_xlim(left=0.0)
+    tick_sizes = sorted(all_sizes, reverse=True)
+    tick_positions = [0.0] + [1.0 / float(size) for size in tick_sizes]
+    ax.set_xticks(tick_positions)
+    ax.set_xticklabels(["0"] + [rf"$1/{size}$" for size in tick_sizes])
+    ax.grid(True, axis="x", alpha=0.25)
+    ax.legend(loc="best", ncols=2, fontsize=7.5)
+    return fig, ax, pd.DataFrame(guide_rows)
+
+
 def dist_scaling(
     files: Sequence[str | Path] | str | Path | None = None,
     *,
@@ -1060,6 +1245,8 @@ def dist_scaling(
     capsize: float = 2.0,
     cmap: str = "viridis",
     figsize: tuple[float, float] | None = None,
+    show_exponent_convergence: bool = True,
+    exponent_figsize: tuple[float, float] | None = None,
     dpi: int = 130,
     title: str | None = None,
     show_summary: bool = True,
@@ -1113,10 +1300,16 @@ def dist_scaling(
 
     Within a panel the two annotations are orthogonal and each says one
     thing: **colour is the system size** and **marker shape is the party
-    count** (``o`` for ``k=2``, ``s`` for ``k=3``, and the fit line style to
-    match). The legend therefore holds one entry per size and one per party
-    count instead of one per series. The fermionic column is dropped for qubit
-    ensembles, leaving mutual information above negativity.
+    count** (``o`` for ``k=2``, ``s`` for ``k=3``). The legend therefore holds
+    one entry per size and one per party count instead of one per series;
+    black dashed power-law fits are labelled directly beside the line.  The
+    default output is **two separate, flush vertical stacks** in the geometry
+    of Fig. 4: ``bosonic_figure`` holds ordinary mutual information above
+    negativity, and ``fermionic_figure`` holds the corresponding fermionic
+    measures when the input supplies them. ``figure`` remains the ordinary
+    stack for backward compatibility, while ``figures`` names every emitted
+    stack.  For a qubit ensemble only the ordinary figure is made.  A custom
+    ``figsize`` applies to each emitted stack, not to a combined 2x2 canvas.
 
     Every other measure the file carries -- ``average_mi``, ``min_bipneg``,
     the purities -- is still loaded into ``data`` and still fitted into
@@ -1194,6 +1387,14 @@ def dist_scaling(
     largest size per measure gets a line in the panel, since the smaller ones
     lie nearly on top of it and say nothing the printout does not.
 
+    With two or more system sizes, ``show_exponent_convergence=True`` also
+    emits the Fig.-5-style ``exponent_figure``: every fitted decay exponent is
+    plotted against ``1/L``.  Three or more points receive a weighted linear
+    finite-size guide and an explicit intercept at ``1/L=0``.  This avoids
+    hard-coding the MMS-specific integer mutual-information conjecture into
+    other circuit ensembles.  ``exponent_figsize`` controls this supplemental
+    canvas independently of ``figsize``.
+
     ``paper_fit_ranges=True`` overrides those windows where Section C of
     arXiv:2602.04969 uses a tail fit instead, which is what reproducing a
     published two-party exponent needs:
@@ -1219,7 +1420,7 @@ def dist_scaling(
     ``show_dist`` draws a **supplemental** second figure, a recreation of
     Fig. 9 of arXiv:2602.04969: the distribution of the non-zero records of
     ``mi``, ``fmi``, ``gmn`` and ``fgmn``, one measure per row, stacked flush
-    on a shared logarithmic x axis. It takes ``(L, d_min)`` --
+    on a shared value axis with logarithmic counts. It takes ``(L, d_min)`` --
     the system size to draw and the smallest effective chord distance to
     include -- or ``None`` (the default) for no such figure. Because a
     distribution cannot be recovered from a mean, this reads the **record
@@ -1634,27 +1835,74 @@ def dist_scaling(
         )
 
     colors = _color_map_by_size(unique_sizes, cmap)
-    if figsize is None:
-        figsize = (6.25 * len(panel_columns), 5.0 * len(panel_rows))
-    fig, axis_grid = plt.subplots(
-        len(panel_rows),
-        len(panel_columns),
-        figsize=figsize,
-        dpi=dpi,
-        constrained_layout=True,
-    )
-    axis_array = np.atleast_1d(axis_grid).reshape(
-        len(panel_rows), len(panel_columns)
-    )
-    flat_axes = tuple(axis_array.flat)
-    slot_axes = {
-        (row, column): axis_array[row_index, column_index]
-        for row_index, row in enumerate(panel_rows)
-        for column_index, column in enumerate(panel_columns)
-    }
-    for slot, ax in slot_axes.items():
-        if slot not in panel_slots:
-            ax.set_visible(False)
+    # Figure 4 is two vertically stacked observables.  The ordinary and
+    # fermionic trace conventions are separate publication figures rather
+    # than columns squeezed into one 2x2 canvas; this keeps both stacks at the
+    # paper's readable single-column width.  The decomposition and correlator
+    # modes have different row/column semantics and retain their native grid.
+    split_trace_figures = not ent_decomp and not correlators
+    figures: dict[str, Any] = {}
+    figure_slots: dict[str, list[tuple[int, int]]] = {}
+    slot_axes: dict[tuple[int, int], Any] = {}
+    if split_trace_figures:
+        for column in panel_columns:
+            slots = [
+                (row, column)
+                for row in panel_rows
+                if (row, column) in panel_slots
+            ]
+            if not slots:
+                continue
+            trace_name = "bosonic" if column == 0 else "fermionic"
+            local_figsize = (
+                figsize
+                if figsize is not None
+                else (6.45, 3.05 * len(slots) + 0.65)
+            )
+            local_fig, local_grid = plt.subplots(
+                len(slots),
+                1,
+                figsize=local_figsize,
+                dpi=dpi,
+                sharex=len(slots) > 1,
+                squeeze=False,
+                constrained_layout=False,
+                gridspec_kw={"hspace": 0.0},
+            )
+            local_axes = [local_grid[index, 0] for index in range(len(slots))]
+            figures[trace_name] = local_fig
+            figure_slots[trace_name] = slots
+            for slot, axis in zip(slots, local_axes):
+                slot_axes[slot] = axis
+    else:
+        local_figsize = (
+            figsize
+            if figsize is not None
+            else (6.25 * len(panel_columns), 4.65 * len(panel_rows))
+        )
+        combined, axis_grid = plt.subplots(
+            len(panel_rows),
+            len(panel_columns),
+            figsize=local_figsize,
+            dpi=dpi,
+            constrained_layout=True,
+            squeeze=False,
+        )
+        figures["combined"] = combined
+        slots = []
+        for row_index, row in enumerate(panel_rows):
+            for column_index, column in enumerate(panel_columns):
+                slot = (row, column)
+                if slot not in panel_slots:
+                    combined.delaxes(axis_grid[row_index, column_index])
+                    continue
+                slot_axes[slot] = axis_grid[row_index, column_index]
+                slots.append(slot)
+        figure_slots["combined"] = slots
+
+    flat_axes = tuple(slot_axes[slot] for slot in sorted(slot_axes))
+    fig = figures.get("bosonic", next(iter(figures.values())))
+    fermionic_figure = figures.get("fermionic")
     axes = {
         metric: slot_axes[slot_of_metric[metric]]
         for metric in panel_metrics
@@ -1747,20 +1995,25 @@ def dist_scaling(
         if row.empty or not np.isfinite(row.iloc[0]["alpha"]):
             continue
         row = row.iloc[0]
-        exponent = _metric_spec(metric)["exponent"]
         selected = selected_points[(metric_k, size, metric)]
-        x_line = np.geomspace(selected["d"].min(), selected["d"].max(), 200)
+        curve = data[(metric_k, size)][metric]
+        x_line = _distance_fit_guide_x(curve, selected)
+        y_line = row["prefactor"] * x_line ** (-row["alpha"])
         ax.plot(
             x_line,
-            row["prefactor"] * x_line ** (-row["alpha"]),
-            color=colors[size],
-            linestyle=_linestyle_for_k(metric_k),
-            linewidth=1.5,
-            label=(
-                rf"$\alpha_{metric_k}^{{{exponent}}}="
-                rf"{row['alpha']:.3g}\pm {row['alpha_stderr']:.2g}$"
-            ),
+            y_line,
+            color="black",
+            linestyle="--",
+            linewidth=1.25,
+            label="_nolegend_",
             zorder=5,
+        )
+        _annotate_distance_fit(
+            ax,
+            x_line,
+            y_line,
+            float(row["alpha"]),
+            metric_k,
         )
 
     from matplotlib.ticker import FuncFormatter
@@ -1771,7 +2024,6 @@ def dist_scaling(
     for slot in panel_slots:
         ax = slot_axes[slot]
         descriptor = panel_grid[slot[0]][slot[1]]
-        ax.set_xlabel(r"Effective chord distance $d$")
         # A panel can hold both party counts, so it is named by the quantity
         # it measures rather than by any one of them; the unit is the only
         # thing the party count does not change.
@@ -1785,35 +2037,130 @@ def dist_scaling(
         ax.xaxis.set_minor_formatter(plain_distance)
         ax.xaxis.get_offset_text().set_visible(False)
         ax.set_yscale("log")
-        ax.grid(True, which="both", alpha=0.20)
-        # Two orthogonal keys plus the fits, rather than one entry per series.
-        # The size swatches carry no marker at all so that shape is left to
-        # mean only the party count.
-        handles: list[Any] = [
-            Patch(facecolor=colors[size], edgecolor="none", label=rf"$L={size}$")
-            for size in sorted(drawn_sizes.get(slot, ()))
-        ]
-        handles += [
-            Line2D(
-                [],
-                [],
-                linestyle="none",
-                marker=_marker_for_k(k_of_slot),
-                color="0.35",
-                markersize=4.5,
-                label=rf"$k={k_of_slot}$",
-            )
-            for k_of_slot in sorted(drawn_party_counts.get(slot, ()))
-        ]
-        # Only the fit lines were given a real label, so this returns them and
-        # nothing else.
-        handles += ax.get_legend_handles_labels()[0]
-        if handles:
-            ax.legend(handles=handles, fontsize=8)
+        # Figs. 4, 8, 10 and 11 use clean logarithmic panels without a grid;
+        # ticks on all four sides provide the visual scale instead.
+        ax.grid(False)
 
-    if title is not None:
-        fig.suptitle(title, fontsize=14)
-    _show(fig, show)
+    for figure_name, local_fig in figures.items():
+        slots = figure_slots[figure_name]
+        ordered_axes = [slot_axes[slot] for slot in slots]
+        # In a vertical stack only the last panel owns the shared x label.
+        for index, axis in enumerate(ordered_axes):
+            if index < len(ordered_axes) - 1 and split_trace_figures:
+                axis.tick_params(labelbottom=False)
+                axis.set_xlabel("")
+            else:
+                axis.set_xlabel(r"Effective chord distance $d$")
+                axis.tick_params(labelbottom=True)
+            _panel_label(axis, f"{chr(ord('a') + index)})", outside=True)
+
+        if split_trace_figures:
+            # One orthogonal legend for the whole stack: colour means size and
+            # marker means party count.  The black dashed power laws are
+            # labelled in place, as in the source paper.
+            all_sizes = sorted(
+                set().union(*(drawn_sizes.get(slot, set()) for slot in slots))
+            )
+            all_parties = sorted(
+                set().union(
+                    *(drawn_party_counts.get(slot, set()) for slot in slots)
+                )
+            )
+            handles: list[Any] = [
+                Patch(
+                    facecolor=colors[size],
+                    edgecolor="none",
+                    label=rf"$L={size}$",
+                )
+                for size in all_sizes
+            ]
+            handles += [
+                Line2D(
+                    [],
+                    [],
+                    linestyle="none",
+                    marker=_marker_for_k(k_of_slot),
+                    color="0.30",
+                    markersize=4.5,
+                    label=rf"$k={k_of_slot}$",
+                )
+                for k_of_slot in all_parties
+            ]
+            if handles:
+                ordered_axes[0].legend(
+                    handles=handles,
+                    loc="lower left",
+                    fontsize=7.5,
+                    ncols=min(4, max(1, len(handles))),
+                )
+        else:
+            # Decomposition/correlator grids do not encode trace convention by
+            # column, so each panel keeps its own compact two-key legend.
+            for slot, axis in zip(slots, ordered_axes):
+                handles = [
+                    Patch(
+                        facecolor=colors[size],
+                        edgecolor="none",
+                        label=rf"$L={size}$",
+                    )
+                    for size in sorted(drawn_sizes.get(slot, ()))
+                ]
+                handles += [
+                    Line2D(
+                        [],
+                        [],
+                        linestyle="none",
+                        marker=_marker_for_k(k_of_slot),
+                        color="0.35",
+                        markersize=4.5,
+                        label=rf"$k={k_of_slot}$",
+                    )
+                    for k_of_slot in sorted(drawn_party_counts.get(slot, ()))
+                ]
+                if handles:
+                    axis.legend(handles=handles, fontsize=7.5)
+
+        if title is not None:
+            local_fig.suptitle(title, fontsize=12)
+        local_fig.align_ylabels(ordered_axes)
+        if split_trace_figures:
+            # A literal zero hspace is more reliable than constrained layout,
+            # whose decoration-aware padding leaves a visible strip between
+            # otherwise shared axes.  Reassert the bottom label after the
+            # shared-x tick suppression so both trace figures always own it.
+            ordered_axes[-1].set_xlabel(r"Effective chord distance $d$")
+            ordered_axes[-1].tick_params(labelbottom=True)
+            local_fig.subplots_adjust(
+                left=0.15,
+                right=0.98,
+                bottom=0.105,
+                top=0.93 if title is not None else 0.985,
+                hspace=0.0,
+            )
+        _show(local_fig, show)
+
+    exponent_figure = None
+    exponent_axis = None
+    exponent_extrapolations = pd.DataFrame()
+    if (
+        show_exponent_convergence
+        and split_trace_figures
+        and len(unique_sizes) >= 2
+    ):
+        (
+            exponent_figure,
+            exponent_axis,
+            exponent_extrapolations,
+        ) = _draw_exponent_convergence(
+            fits,
+            panel_metrics,
+            k_of_metric,
+            cmap=cmap,
+            dpi=dpi,
+            figsize=exponent_figsize,
+        )
+        if exponent_figure is not None:
+            _show(exponent_figure, show)
 
     # --- the supplemental distribution figure ------------------------------
     #
@@ -1936,8 +2283,14 @@ def dist_scaling(
 
     return {
         "figure": fig,
+        "figures": figures,
+        "bosonic_figure": figures.get("bosonic"),
+        "fermionic_figure": fermionic_figure,
         "axes": flat_axes,
         "axes_by_metric": axes,
+        "exponent_figure": exponent_figure,
+        "exponent_axis": exponent_axis,
+        "exponent_extrapolations": exponent_extrapolations,
         # `k` stays a plain number for the single-party-count case every caller
         # before mixed-k had; it is None when both are present, and
         # `k_values` is the general answer.
@@ -1963,4 +2316,302 @@ def dist_scaling(
         "plotted_fit_sizes": dict(plotted_fit_size),
         "mi_units": mi_units,
         "selected_fit_points": selected_points,
+    }
+
+
+def dist_scaling_comparison(
+    results: Mapping[str, Mapping[str, Any]],
+    *,
+    size: int | None = None,
+    fit_result: str | None = None,
+    cmap: str = "viridis",
+    figsize: tuple[float, float] | None = None,
+    dpi: int = 130,
+    title: str | None = None,
+    show_errorbars: bool = True,
+    capsize: float = 2.0,
+    show: bool = True,
+) -> dict[str, Any]:
+    r"""Overlay distance results in the style of Figs. 10 and 11.
+
+    ``results`` maps a display label to a dictionary returned by
+    :func:`dist_scaling`.  Labels can denote circuit ensembles (``"MMS"`` and
+    ``"Haar"`` for a Fig.-10 comparison) or evolution depths (``"Depth 4L"``
+    and ``"Depth 6L"`` for Fig. 11).  The first result uses filled markers and
+    subsequent results use progressively larger open markers, while colour and
+    shape identify the party count.  Ordinary and fermionic measures again
+    receive separate two-panel stacks.
+
+    ``size`` defaults to the largest system size present in every result.
+    ``fit_result`` selects which labelled result supplies the black dashed
+    power-law fits and defaults to the last mapping entry, matching the paper's
+    convention of fitting the benchmark/open-symbol data.
+    """
+    if len(results) < 2:
+        raise ValueError("dist_scaling_comparison needs at least two results.")
+    labels = list(results)
+    payloads = [results[label] for label in labels]
+    if any(payload.get("ent_decomp") or payload.get("correlators") for payload in payloads):
+        raise ValueError(
+            "Comparison inputs must be ordinary dist_scaling results, not "
+            "ent_decomp/correlator layouts."
+        )
+    units = {str(payload.get("mi_units")) for payload in payloads}
+    if len(units) != 1:
+        raise ValueError(f"Comparison results use different MI units: {sorted(units)}.")
+    mi_units = units.pop()
+
+    size_sets = [
+        {int(key[1]) for key in payload["data"]}
+        for payload in payloads
+    ]
+    common_sizes = set.intersection(*size_sets)
+    if not common_sizes:
+        raise ValueError("Comparison results share no system size.")
+    if size is None:
+        size = max(common_sizes)
+    size = int(size)
+    if size not in common_sizes:
+        raise ValueError(
+            f"L={size} is not present in every result; common sizes are "
+            f"{sorted(common_sizes)}."
+        )
+    if fit_result is None:
+        fit_result = labels[-1]
+    if fit_result not in results:
+        raise ValueError(
+            f"fit_result must name one of {labels}; got {fit_result!r}."
+        )
+
+    trace_specs = {
+        "bosonic": (("mi", "tmi"), ("mn", "gmn")),
+        "fermionic": (("fmi", "ftmi"), ("fmn", "fgmn")),
+    }
+    k_for_metric = {
+        "mi": 2,
+        "fmi": 2,
+        "mn": 2,
+        "fmn": 2,
+        "tmi": 3,
+        "ftmi": 3,
+        "gmn": 3,
+        "fgmn": 3,
+    }
+    k_values = sorted(
+        {
+            k
+            for payload in payloads
+            for k, result_size in payload["data"]
+            if int(result_size) == size
+        }
+    )
+    k_colors = {
+        k: color
+        for k, color in zip(
+            k_values,
+            plt.get_cmap(cmap)(np.linspace(0.14, 0.86, len(k_values))),
+        )
+    }
+    figures: dict[str, Any] = {}
+    axes_by_trace: dict[str, tuple[Any, ...]] = {}
+
+    for trace_name, row_metrics in trace_specs.items():
+        active_rows = []
+        for metrics_in_row in row_metrics:
+            active = [
+                metric
+                for metric in metrics_in_row
+                if any(
+                    metric in payload["data"].get((k_for_metric[metric], size), {})
+                    for payload in payloads
+                )
+            ]
+            if active:
+                active_rows.append((metrics_in_row, active))
+        if not active_rows:
+            continue
+
+        local_figsize = (
+            figsize
+            if figsize is not None
+            else (6.45, 3.05 * len(active_rows) + 0.65)
+        )
+        fig, raw_axes = plt.subplots(
+            len(active_rows),
+            1,
+            figsize=local_figsize,
+            dpi=dpi,
+            sharex=len(active_rows) > 1,
+            squeeze=False,
+            constrained_layout=False,
+            gridspec_kw={"hspace": 0.0},
+        )
+        axes = tuple(raw_axes[index, 0] for index in range(len(active_rows)))
+        figures[trace_name] = fig
+        axes_by_trace[trace_name] = axes
+
+        legend_handles: list[Any] = []
+        for row_index, (_metric_order, active) in enumerate(active_rows):
+            ax = axes[row_index]
+            for group_index, (label, payload) in enumerate(results.items()):
+                for metric in active:
+                    k = k_for_metric[metric]
+                    curve = payload["data"].get((k, size), {}).get(metric)
+                    if curve is None:
+                        continue
+                    positive = curve.loc[
+                        np.isfinite(curve["d"])
+                        & np.isfinite(curve["mean"])
+                        & (curve["d"] > 0.0)
+                        & (curve["mean"] > 0.0)
+                    ]
+                    if positive.empty:
+                        continue
+                    x = positive["d"].to_numpy(dtype=float)
+                    y = positive["mean"].to_numpy(dtype=float)
+                    dy = positive["stderr"].to_numpy(dtype=float)
+                    color = k_colors[k]
+                    marker = _marker_for_k(k)
+                    marker_face = color if group_index == 0 else "white"
+                    kwargs = {
+                        "fmt": marker,
+                        "linestyle": "none",
+                        "markersize": 4.0 + 0.9 * group_index,
+                        "markerfacecolor": marker_face,
+                        "markeredgecolor": color,
+                        "markeredgewidth": 0.9,
+                        "color": color,
+                        "ecolor": color,
+                        "elinewidth": 0.75,
+                        "capsize": capsize,
+                        "label": "_nolegend_",
+                    }
+                    if show_errorbars:
+                        _positive_log_errorbar(ax, x, y, dy, **kwargs)
+                    else:
+                        kwargs.pop("fmt")
+                        kwargs.pop("ecolor")
+                        kwargs.pop("elinewidth")
+                        kwargs.pop("capsize")
+                        ax.plot(x, y, marker=marker, **kwargs)
+                    if row_index == 0:
+                        legend_handles.append(
+                            Line2D(
+                                [],
+                                [],
+                                linestyle="none",
+                                marker=marker,
+                                markersize=4.0 + 0.9 * group_index,
+                                markerfacecolor=marker_face,
+                                markeredgecolor=color,
+                                color=color,
+                                label=rf"{label}, $k={k}$",
+                            )
+                        )
+
+            # Fit the selected comparison series only, as in Figs. 10/11.
+            fit_payload = results[fit_result]
+            for metric in active:
+                k = k_for_metric[metric]
+                row = fit_payload["fits"].loc[
+                    (fit_payload["fits"]["k"] == k)
+                    & (fit_payload["fits"]["L"] == size)
+                    & (fit_payload["fits"]["metric"] == metric)
+                ]
+                selected = fit_payload.get("selected_fit_points", {}).get(
+                    (k, size, metric)
+                )
+                if row.empty or selected is None or not np.isfinite(row.iloc[0]["alpha"]):
+                    continue
+                fit = row.iloc[0]
+                curve = fit_payload["data"].get((k, size), {}).get(metric)
+                if curve is None:
+                    continue
+                line_x = _distance_fit_guide_x(
+                    curve,
+                    selected,
+                )
+                line_y = fit["prefactor"] * line_x ** (-fit["alpha"])
+                ax.plot(line_x, line_y, "k--", linewidth=1.1)
+                _annotate_distance_fit(
+                    ax,
+                    line_x,
+                    line_y,
+                    float(fit["alpha"]),
+                    k,
+                )
+
+            entropy_row = any(_metric_spec(metric).get("entropy") for metric in active)
+            if trace_name == "bosonic":
+                ylabel = (
+                    r"Mutual information $(-1)^k\overline{I}_k$"
+                    if row_index == 0
+                    else r"Negativity $\overline{\mathcal{N}}_k$"
+                )
+            else:
+                ylabel = (
+                    r"Fermionic mutual information "
+                    r"$(-1)^k\overline{I}^{\,f}_k$"
+                    if row_index == 0
+                    else r"Fermionic negativity "
+                    r"$\overline{\mathcal{N}}^{\,f}_k$"
+                )
+            if entropy_row:
+                ylabel += f" [{mi_units}]"
+            ax.set_ylabel(ylabel)
+            ax.set_xscale("log")
+            ax.set_yscale("log")
+            from matplotlib.ticker import FuncFormatter
+
+            distance_formatter = FuncFormatter(
+                lambda value, _: f"{value:g}" if value > 0 else ""
+            )
+            ax.xaxis.set_major_formatter(distance_formatter)
+            ax.xaxis.set_minor_formatter(distance_formatter)
+            ax.xaxis.get_offset_text().set_visible(False)
+            ax.grid(False)
+            _panel_label(ax, f"{chr(ord('a') + row_index)})", outside=True)
+            if row_index < len(active_rows) - 1:
+                ax.tick_params(labelbottom=False)
+                ax.set_xlabel("")
+            else:
+                ax.set_xlabel(r"Effective chord distance $d$")
+                ax.tick_params(labelbottom=True)
+
+        # Deduplicate labels when several metrics at one k share a row.
+        unique_handles: dict[str, Any] = {}
+        for handle in legend_handles:
+            unique_handles.setdefault(handle.get_label(), handle)
+        axes[0].legend(
+            handles=list(unique_handles.values()),
+            loc="lower left",
+            ncols=2,
+            fontsize=7.3,
+        )
+        if title is not None:
+            fig.suptitle(title, fontsize=12)
+        fig.align_ylabels(axes)
+        axes[-1].set_xlabel(r"Effective chord distance $d$")
+        axes[-1].tick_params(labelbottom=True)
+        fig.subplots_adjust(
+            left=0.15,
+            right=0.98,
+            bottom=0.105,
+            top=0.93 if title is not None else 0.985,
+            hspace=0.0,
+        )
+        _show(fig, show)
+
+    primary = figures.get("bosonic", next(iter(figures.values())))
+    return {
+        "figure": primary,
+        "figures": figures,
+        "bosonic_figure": figures.get("bosonic"),
+        "fermionic_figure": figures.get("fermionic"),
+        "axes": axes_by_trace,
+        "size": size,
+        "fit_result": fit_result,
+        "labels": tuple(labels),
+        "mi_units": mi_units,
+        "source_results": dict(results),
     }

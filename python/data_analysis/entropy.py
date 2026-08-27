@@ -5,8 +5,9 @@ second Renyi entropy S2 = -ln Tr(rho^2) for every block, so ``order`` selects
 which one is plotted and fitted.
 
 A size scan at fixed measurement rate also gets a secondary panel -- an inset
-by default -- carrying the fitted log coefficient against system size and its
-``alpha(L) = alpha(inf) + a L^-2`` extrapolation.
+by default -- carrying the fitted log coefficient against ``1/L^2`` and its
+``alpha(L) = alpha(inf) + a L^-2`` extrapolation.  Thus the thermodynamic limit
+is the plotted intercept at ``1/L^2 = 0``, rather than an off-axis implication.
 
 ``entropy.exe`` writes both entropies in nats; ``units`` converts them, and
 defaults to bits.
@@ -141,15 +142,16 @@ def _draw_extrapolation_panel(
     units: str,
     capsize: float,
 ) -> None:
-    """Draw ``alpha`` against ``L`` with its ``L^-2`` extrapolation.
+    """Draw ``alpha`` against ``1/L^2`` with its thermodynamic extrapolation.
 
     The markers reuse each curve's colour from the primary panel, and the fit
     is a thin black dashed line drawn over the measured range.
     """
     font = _font_kwargs(inset, fontsize)
     for point in points:
+        inverse_square = float(point["L"]) ** -2.0
         ax.errorbar(
-            point["L"],
+            inverse_square,
             point["alpha"],
             yerr=point["alpha_stderr"],
             fmt="o",
@@ -161,15 +163,28 @@ def _draw_extrapolation_panel(
         )
     if fit is not None:
         sizes = np.asarray([point["L"] for point in points], dtype=float)
-        grid = np.linspace(sizes.min(), sizes.max(), 200)
+        inverse_square = sizes**-2.0
+        grid = np.linspace(0.0, float(np.max(inverse_square)) * 1.03, 200)
         ax.plot(
             grid,
-            fit["alpha_inf"] + fit["a"] * grid**-2.0,
+            fit["alpha_inf"] + fit["a"] * grid,
             linestyle="--",
             linewidth=0.9,
             color="black",
         )
-    ax.set_xlabel(xlabel if xlabel is not None else r"$L$", **font)
+        # The paper's large-size panels make the extrapolated limit a datum in
+        # the figure.  It is visually distinct from the measured, size-coloured
+        # points and sits exactly on the fitted intercept.
+        ax.plot(
+            0.0,
+            fit["alpha_inf"],
+            marker="o",
+            markersize=3.8,
+            color="black",
+            clip_on=False,
+            zorder=6,
+        )
+    ax.set_xlabel(xlabel if xlabel is not None else r"$1/L^2$", **font)
     # alpha is the coefficient of a plain logarithm, so it carries the entropy's
     # units: alpha[bits] = alpha[nats]/ln 2.
     ax.set_ylabel(
@@ -190,9 +205,11 @@ def _draw_extrapolation_panel(
             }
         )
     ax.grid(alpha=0.25)
-    # A handful of widely spaced sizes otherwise put the end markers on the
-    # spines, where half of each error bar is clipped.
-    ax.margins(x=0.12)
+    inverse_squares = np.asarray(
+        [float(point["L"]) ** -2.0 for point in points], dtype=float
+    )
+    if inverse_squares.size:
+        ax.set_xlim(0.0, float(np.max(inverse_squares)) * 1.08)
     # Room at the bottom for the annotation box, which sits over the corner
     # the smallest sizes leave empty.
     _reserve_axis_space(ax, "bottom", annotation_headroom)
@@ -202,11 +219,16 @@ def _draw_extrapolation_panel(
     elif inset:
         annotation_kwargs["fontsize"] = fontsize
     _annotate_axes(ax, annotation_text, annotation_loc, **annotation_kwargs)
-    # After _set_secondary_title, which reinstalls the inset tick locators:
-    # the x axis is a handful of measured sizes, not a continuum, so a
-    # general-purpose locator lands ticks on sizes that were never simulated.
+    # After _set_secondary_title, which reinstalls the inset tick locators,
+    # keep scientific notation compact (normally a few times 10^-3) and make
+    # the thermodynamic intercept an explicit tick.
     _set_secondary_title(ax, title, inset=inset, fontsize=fontsize + 1.0)
-    ax.set_xticks([point["L"] for point in points])
+    from matplotlib.ticker import MaxNLocator, ScalarFormatter
+
+    ax.xaxis.set_major_locator(MaxNLocator(nbins=4))
+    formatter = ScalarFormatter(useMathText=True)
+    formatter.set_powerlimits((-2, 2))
+    ax.xaxis.set_major_formatter(formatter)
 
 
 def entropy(
@@ -280,8 +302,9 @@ def entropy(
         ``"stderr"`` or ``"stddev"``, which follow ``order``, or an explicit
         column name.
     extrapolate:
-        Draw a secondary panel of the fitted log coefficient against system
-        size and extrapolate it with ``alpha(L) = alpha(inf) + a L^-2``. It
+        Draw a secondary panel of the fitted log coefficient against
+        ``1/L^2`` and extrapolate it with
+        ``alpha(L) = alpha(inf) + a L^-2``. It
         needs a size scan at fixed ``p`` (``vary="L"``) with at least three
         fitted curves, and is skipped silently otherwise.
     extrapolation_inset:

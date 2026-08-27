@@ -132,7 +132,7 @@ def free_energy_ceff(
     bits entropy figure (``da.entropy`` now defaults to bits) instead of
     quietly inflating ``c_eff`` by ``1/ln 2``.
 
-    ``inset_quantity`` selects what the inset shows against ``L_min``: the
+    ``inset_quantity`` selects what the inset shows against ``1/L_min^2``: the
     Casimir slope ``m0`` (the default, and the quantity the fit is done in) or
     ``c_eff``, which is the same numbers through the fixed linear map
     ``c_eff = -6*m0/(pi*alpha)``.  Both are extrapolated with the same
@@ -380,10 +380,11 @@ def free_energy_ceff(
     inset.set_facecolor("white")
     inset.patch.set_alpha(1.0)
     inset.set_zorder(10)
-    inset_x = np.asarray(
+    inset_l_min = np.asarray(
         [int(row["L_min"]) for row in fits],
         dtype=int,
     )
+    inset_x = 1.0 / inset_l_min.astype(float) ** 2
     slopes = np.asarray([float(row["slope"]) for row in fits])
     slope_errors = np.asarray([float(row["slope_stderr"]) for row in fits])
     if inset_quantity == "m0":
@@ -418,30 +419,39 @@ def free_energy_ceff(
         capthick=0.7,
     )
     if len(fits) >= 2:
-        inset_line_x = np.linspace(
-            float(np.min(inset_x)),
-            float(np.max(inset_x)),
-            200,
-        )
+        inset_line_x = np.linspace(0.0, float(np.max(inset_x)) * 1.03, 200)
         inset.plot(
             inset_line_x,
-            inset_curvature / inset_line_x**2 + inset_intercept,
-            linestyle=":",
-            color="tab:blue",
+            inset_curvature * inset_line_x + inset_intercept,
+            linestyle="--",
+            linewidth=0.9,
+            color="black",
         )
-    inset.set_xlabel(r"$L_{\min}$", fontsize=8)
+    inset.plot(
+        0.0,
+        inset_intercept,
+        marker="o",
+        markersize=3.5,
+        color="black",
+        clip_on=False,
+        zorder=6,
+    )
+    inset.set_xlabel(r"$1/L_{\min}^2$", fontsize=8)
     inset.set_ylabel(inset_ylabel, fontsize=8)
-    inset.set_xticks(inset_x)
-    inset.set_xticklabels([str(value) for value in inset_x])
-    if len(inset_x) == 1:
-        inset.set_xlim(inset_x[0] - 0.5, inset_x[0] + 0.5)
-    else:
-        inset_padding = max(0.25, 0.04 * float(np.ptp(inset_x)))
-        inset.set_xlim(
-            float(np.min(inset_x)) - inset_padding,
-            float(np.max(inset_x)) + inset_padding,
-        )
-    inset.tick_params(labelsize=8)
+    inset.set_xlim(0.0, float(np.max(inset_x)) * 1.08)
+    from matplotlib.ticker import MaxNLocator, ScalarFormatter
+
+    inset.xaxis.set_major_locator(MaxNLocator(nbins=4))
+    inset_formatter = ScalarFormatter(useMathText=True)
+    inset_formatter.set_powerlimits((-2, 2))
+    inset.xaxis.set_major_formatter(inset_formatter)
+    inset.tick_params(
+        which="both",
+        direction="in",
+        top=True,
+        right=True,
+        labelsize=8,
+    )
     inset.grid(alpha=0.2)
     _show(fig, show)
 
