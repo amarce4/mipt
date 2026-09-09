@@ -18,6 +18,12 @@ dist_scaling(...)      Plot two-site (MI/negativity) or three-site (TMI/GMN)
                        ``show_dist=(L, d_min)`` adds a stacked-histogram figure
                        of the non-zero MI/fMI/GMN/fGMN distributions, which
                        needs the records.
+dist_percolation(...) Joint spacetime-connectivity / entanglement diagnostics
+                       from format v2 per-record binaries: endpoint survival
+                       against q^2, P_perc, and the two conditionals
+                       kappa = P(entangled | connected) and
+                       eta = P(entangled | disconnected), swept over the
+                       positivity threshold. Also fits P_inf(p) = A(1-p)^beta.
 dist_scaling_comparison(...) Overlay completed distance-scaling results for
                        circuit-ensemble or evolution-depth comparisons.
 expvals(...)           Plot aggregate fermionic observables and Wick residuals.
@@ -63,7 +69,7 @@ front, stagger     mode-5 one-probe fronts and two-probe staggered velocities
 
 from __future__ import annotations
 
-from .distance import dist_scaling, dist_scaling_comparison
+from .distance import dist_percolation, dist_scaling, dist_scaling_comparison
 from .entropy import entropy
 from .expvals import expvals
 from .free_energy import free_energy_ceff, free_energy_equilibration
@@ -84,6 +90,7 @@ from .tmi import tmi_collapse
 __all__ = [
     "gmn",
     "entropy",
+    "dist_percolation",
     "dist_scaling",
     "dist_scaling_comparison",
     "expvals",

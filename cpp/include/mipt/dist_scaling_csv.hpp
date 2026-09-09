@@ -12,6 +12,7 @@
 // standard errors and sample counts. That projection is invertible, which is
 // what makes the output file its own checkpoint; see dist_scaling_resume.hpp.
 
+#include "mipt/dist_connectivity.hpp"
 #include "mipt/dist_metrics.hpp"
 #include "mipt/env.hpp"
 #include "mipt/probed/geometry.hpp"
@@ -76,6 +77,58 @@ inline void append_uint(std::string &out, std::uint64_t value)
 // Run configuration
 // ---------------------------------------------------------------------------
 
+// How much per-record detail the binary carries. Rising levels are strictly
+// additive, so a `full` file can answer every question a `basic` one can.
+//
+//   basic   - the observables format v1 wrote, plus the connectivity flags.
+//   channel - adds the occupation data and the squared two-point functions,
+//             which is the set that reconstructs rho^n, the four occupation
+//             probabilities, the occupation MI, the parity weights, and the
+//             exact negativity. This is the default: it is the minimum that
+//             answers the question the flags were added for.
+//   full    - adds Re/Im of G and F, so the channel phases survive too.
+enum class RecordDetail : int
+{
+    Basic = 0,
+    Channel = 1,
+    Full = 2,
+};
+
+inline const char *record_detail_name(RecordDetail detail)
+{
+    switch (detail)
+    {
+    case RecordDetail::Basic: return "basic";
+    case RecordDetail::Channel: return "channel";
+    case RecordDetail::Full: return "full";
+    }
+    return "channel";
+}
+
+inline RecordDetail parse_record_detail(const std::string &text)
+{
+    if (text == "basic") return RecordDetail::Basic;
+    if (text == "channel") return RecordDetail::Channel;
+    if (text == "full") return RecordDetail::Full;
+    throw std::invalid_argument(
+        "MIPT_DIST_RECORD_DETAIL must be basic, channel, or full (got \"" + text + "\").");
+}
+
+// The |G|^2 / |F|^2 floor for a given state-vector precision: one decade above
+// the square of that precision's amplitude noise, so a record sitting at the
+// floor is arithmetic and one above it is not.
+inline double default_channel_floor(int precision)
+{
+    return precision >= 64 ? 1.0e-28 : 1.0e-13;
+}
+
+// The precision the state vector was built in. Compile-time, because it is a
+// property of the build rather than of the run; `run()` cross-checks it
+// against what the backend actually hands back and complains if they differ.
+#ifndef MIPT_CUDAQ_PRECISION
+#define MIPT_CUDAQ_PRECISION 32
+#endif
+
 struct RunConfig
 {
     // 2 = pairs, 3 = triangles, 0 = both from the same trajectories. A k=0 run
@@ -93,6 +146,60 @@ struct RunConfig
     // reach to be simulated at all. Ignored for k=2.
     double triangle_balance_cutoff = 0.5;
 
+    // --- classification thresholds ---------------------------------------
+    //
+    // The negativity above which a pair counts as entangled. This was a
+    // hard-coded 1e-12 buried in PairProtocol::measure, which is exactly the
+    // wrong place for it: it is a *classification* threshold, not a
+    // mathematical zero, and every conditional probability in the output moves
+    // when it moves. It is named, defaulted to the historical value, written
+    // into both output files, and meant to be swept.
+    double pair_zero_tol = 1.0e-12;
+    // Below this, an occupation mutual information counts as zero when
+    // splitting the graph-connected but unentangled records into their three
+    // explanations.
+    double occupation_mi_tol = 1.0e-12;
+    // Below this, |G|^2 and |F|^2 count as zero for the same split.
+    //
+    // **It has to track the state-vector precision, and the default does.**
+    // These are squared amplitudes, so the floor is the square of the state
+    // vector's own noise: an fp32 trajectory carries ~1e-7 in an amplitude that
+    // is algebraically zero, giving |G|^2 ~ 1e-14, while fp64 gives ~1e-30. A
+    // single fixed floor therefore cannot work for both -- set it at 1e-30 and
+    // every fp32 record looks like it has residual coherence, which collapses
+    // the three-way split into one cell and quietly destroys the distinction it
+    // exists to draw. Set by `default_channel_floor()` below; override with
+    // MIPT_DIST_CHANNEL_FLOOR.
+    double channel_floor = 1.0e-13;
+
+    // --- spacetime connectivity ------------------------------------------
+    bool connectivity = true;
+    // Shortest spanning-path lengths cost one BFS sweep per site per
+    // trajectory. Cheap, but it is a second-stage explanatory diagnostic
+    // rather than part of the decisive measurement, so it can be switched off.
+    bool connectivity_paths = true;
+
+    // --- per-record output ------------------------------------------------
+    RecordDetail record_detail = RecordDetail::Channel;
+    // Write records only for every `record_stride`-th trajectory.
+    //
+    // The stride is over *trajectories*, not records, and that is the whole
+    // design: it is content-independent (nothing about a record's value
+    // decides whether it is kept) and it keeps every retained trajectory
+    // complete, so a bootstrap clustered on realization_id stays valid. A
+    // stride over records would do neither. At stride 1 the records still
+    // reduce to the aggregate exactly; above 1 they no longer can, and the
+    // header says so.
+    long record_stride = 1;
+
+    // --- provenance -------------------------------------------------------
+    // The master seed. Every trajectory's layer draw is
+    // trajectory_seed(seed, realization), so recording this makes any single
+    // trajectory of a finished run replayable. Filled in at run start when the
+    // caller did not pin one.
+    std::uint64_t seed = 0;
+    int statevector_precision = MIPT_CUDAQ_PRECISION;
+
     // Parity-preserving circuits report both trace conventions. This is
     // deliberately `preserves_computational_parity` and not
     // `uses_fermionic_trace`: qRPPU (circ_type 4) simulates the same
@@ -101,6 +208,29 @@ struct RunConfig
     bool fermionic_outputs() const
     {
         return preserves_computational_parity(type);
+    }
+
+    // Which negativity the contingency counts classify on: the fermionic one
+    // wherever it exists, and the ordinary one otherwise. Written into the CSV
+    // so a mixed set of files is never ambiguous.
+    const char *contingency_measure() const { return fermionic_outputs() ? "fmn" : "mn"; }
+
+    // How the periodic bond is implemented. Recorded because the FSWAP network
+    // and the Jordan-Wigner string are supposed to reduce to the *same* logical
+    // bond (0, N-1); if a graph ever came out different between them, this is
+    // the column that says which one produced it.
+    const char *boundary_implementation() const
+    {
+        switch (type)
+        {
+        case CircuitType::FermionRPPU:
+            return backend::direct_fermion_boundary_enabled() ? "jw_string" : "fswap_network";
+        case CircuitType::QubitRPPU: return "qubit_direct";
+        case CircuitType::RFGS: return "rfgs_wrapping_bond";
+        case CircuitType::Haar: return "haar_wrapping_bond";
+        case CircuitType::MMS: return "open_chain";
+        }
+        return "unknown";
     }
 };
 
@@ -223,6 +353,72 @@ struct PairBin
     RunningStats ff2;
     std::uint64_t mn_positive = 0;
     std::uint64_t fmn_positive = 0;
+
+    // --- occupation-basis diagnostics -------------------------------------
+    // Diagonal quantities, identical under both traces, so one copy each.
+    RunningStats n_i;
+    RunningStats n_j;
+    RunningStats dnn;   // D = <n_i n_j>
+    RunningStats rho_n; // D - <n_i><n_j>, signed
+    RunningStats i_occ; // occupation-basis mutual information, bits
+
+    // The disagreement between the closed-form fermionic negativity and the
+    // generic partial transpose. Should be at the generic path's own noise
+    // floor; a bin where it is not says the parity assumption failed there.
+    RunningStats fmn_residual;
+    double fmn_residual_max = 0.0;
+
+    // --- the joint contingency table --------------------------------------
+    //
+    // Everything below is conditioned on connectivity having been evaluated at
+    // all, which `conn_records` counts. The point of storing the full joint
+    // table rather than the two marginals is that P(C) and P(E) alone cannot
+    // separate "the graph is necessary but incomplete" from any number of
+    // other stories; the conditionals
+    //
+    //     kappa = connected_ent_positive / connected
+    //     eta   = disconnected_ent_positive / (conn_records - connected)
+    //
+    // can. `survive_i`/`survive_j`/`survive_both` are kept separately so that
+    // P(A_i & A_j) is measured rather than approximated as q^2 -- the two
+    // endpoints of a pair sit in the same trajectory and are not independent.
+    std::uint64_t conn_records = 0;
+    std::uint64_t survive_i = 0;
+    std::uint64_t survive_j = 0;
+    std::uint64_t survive_both = 0;
+    std::uint64_t interior_path = 0;
+    std::uint64_t connected = 0;
+    std::uint64_t connected_ent_positive = 0;
+    std::uint64_t connected_ent_zero = 0;
+    std::uint64_t disconnected_ent_positive = 0;
+    std::uint64_t disconnected_ent_zero = 0;
+
+    // The three explanations for a record that is graph-connected but carries
+    // no entanglement above threshold. Exhaustive and disjoint, so they sum to
+    // `connected_ent_zero`.
+    //
+    //   1. occupation-correlated: I_occ > tol. Connected and classically
+    //      correlated, but not fermionically entangled.
+    //   2. subthreshold: I_occ ~ 0 but |G|^2 or |F|^2 is above the numerical
+    //      floor, so there is coherence that the threshold discarded. These
+    //      are the records that would move if eps moved.
+    //   3. silent: I_occ ~ 0 and both channels at the floor. The spanning path
+    //      exists and carries no detectable two-mode correlation at all.
+    std::uint64_t classical_occ_correlated = 0;
+    std::uint64_t classical_subthreshold = 0;
+    std::uint64_t classical_silent = 0;
+
+    // Conditional magnitudes. The signed rho_n above is deliberately not the
+    // only density-correlation summary: cancellations between records of
+    // opposite sign can make its mean small while every record is strongly
+    // correlated, so the contingency counts carry the weight.
+    RunningStats ent_given_connected;
+    RunningStats ent_given_disconnected;
+    RunningStats i_occ_connected_classical; // I_occ over the C=1, E=0 records
+
+    // Second-stage explanatory diagnostics; see dist_connectivity.hpp.
+    RunningStats component_size;
+    RunningStats shortest_path; // over connected records only
 };
 
 // A GMN-family measure: its running mean plus the bookkeeping that says how
@@ -292,7 +488,8 @@ struct TripleBin
 // ---------------------------------------------------------------------------
 
 inline constexpr const char *METADATA_COLUMNS =
-    "N,circ_type,circuit_name,realizations,p,periods,k,entropy_units";
+    "N,circ_type,circuit_name,realizations,p,periods,k,entropy_units,"
+    "statevector_precision,boundary_implementation,master_seed";
 
 inline void append_metadata_fields(std::string &out, const RunConfig &config)
 {
@@ -312,7 +509,15 @@ inline void append_metadata_fields(std::string &out, const RunConfig &config)
     // Every entropy dist_scaling.exe reports -- MI, fMI, TMI, fTMI -- is a
     // log2 quantity. The probe and free-energy executables use nats, so the
     // unit is stated here rather than left to be remembered.
-    out += ",bits";
+    out += ",bits,";
+    // fp32 vs fp64 decides where the generic partial transpose stops being
+    // able to resolve a negativity at all, so a positivity threshold cannot be
+    // interpreted without it.
+    out += std::to_string(config.statevector_precision);
+    out += ',';
+    out += csv_quote(config.boundary_implementation());
+    out += ',';
+    append_uint(out, config.seed);
 }
 
 inline void append_stats(std::string &out, const RunningStats &stats)
@@ -328,6 +533,12 @@ inline void append_stats(std::string &out, const RunningStats &stats)
     append_double(out, stats.stderr());
     out += ',';
     append_uint(out, stats.count);
+}
+
+inline void append_counter(std::string &out, std::uint64_t value)
+{
+    out += ',';
+    append_uint(out, value);
 }
 
 inline double positive_fraction(std::uint64_t positive, std::uint64_t total)
@@ -358,8 +569,12 @@ inline void append_sdp_stats(std::string &out, const SdpStats &stats)
 inline std::string pair_csv_header(const RunConfig &config)
 {
     std::string header(METADATA_COLUMNS);
+    // Run-level constants that a reader must have before it can interpret any
+    // count below: which threshold decided "entangled", which measure it was
+    // applied to, and which graph convention produced the flags.
     header +=
-        ",separation,chord_length,d,embedding_count,"
+        ",pair_zero_tol,contingency_measure,connectivity_graph_version,connectivity_graph,"
+        "separation,chord_length,d,embedding_count,"
         "mi_mean,mi_stderr,mi_samples,"
         "mn_mean,mn_stderr,mn_samples,mn_positive_count,mn_positive_fraction,"
         "g2_mean,g2_stderr,g2_samples,"
@@ -370,8 +585,29 @@ inline std::string pair_csv_header(const RunConfig &config)
             ",fmi_mean,fmi_stderr,fmi_samples,"
             "fmn_mean,fmn_stderr,fmn_samples,fmn_positive_count,fmn_positive_fraction,"
             "fg2_mean,fg2_stderr,fg2_samples,"
-            "ff2_mean,ff2_stderr,ff2_samples";
+            "ff2_mean,ff2_stderr,ff2_samples,"
+            "fmn_residual_mean,fmn_residual_stderr,fmn_residual_samples,fmn_residual_max";
     }
+    header +=
+        ",n_i_mean,n_i_stderr,n_i_samples,"
+        "n_j_mean,n_j_stderr,n_j_samples,"
+        "dnn_mean,dnn_stderr,dnn_samples,"
+        "rho_n_mean,rho_n_stderr,rho_n_samples,"
+        "i_occ_mean,i_occ_stderr,i_occ_samples,"
+        "conn_records,"
+        "survive_i_count,survive_j_count,survive_both_count,"
+        "interior_path_count,connected_count,"
+        "connected_ent_positive_count,connected_ent_zero_count,"
+        "disconnected_ent_positive_count,disconnected_ent_zero_count,"
+        "classical_occ_correlated_count,classical_subthreshold_count,"
+        "classical_silent_count,"
+        "ent_given_connected_mean,ent_given_connected_stderr,ent_given_connected_samples,"
+        "ent_given_disconnected_mean,ent_given_disconnected_stderr,"
+        "ent_given_disconnected_samples,"
+        "i_occ_connected_classical_mean,i_occ_connected_classical_stderr,"
+        "i_occ_connected_classical_samples,"
+        "component_size_mean,component_size_stderr,component_size_samples,"
+        "shortest_path_mean,shortest_path_stderr,shortest_path_samples";
     header += '\n';
     return header;
 }
@@ -409,12 +645,20 @@ inline std::string triple_csv_header(const RunConfig &config)
 inline std::string render_pair_csv(const RunConfig &config, const std::vector<PairBin> &bins)
 {
     std::string out = pair_csv_header(config);
-    out.reserve(out.size() + bins.size() * 192u);
+    out.reserve(out.size() + bins.size() * 640u);
     std::string line;
     for (const PairBin &bin : bins)
     {
         line.clear();
         append_metadata_fields(line, config);
+        line += ',';
+        append_double(line, config.pair_zero_tol);
+        line += ',';
+        line += config.contingency_measure();
+        line += ',';
+        line += std::to_string(CONNECTIVITY_GRAPH_VERSION);
+        line += ',';
+        line += csv_quote(CONNECTIVITY_GRAPH_DEFINITION);
         line += ',';
         line += std::to_string(bin.separation);
         line += ',';
@@ -441,7 +685,33 @@ inline std::string render_pair_csv(const RunConfig &config, const std::vector<Pa
             append_double(line, positive_fraction(bin.fmn_positive, bin.fmn.count));
             append_stats(line, bin.fg2);
             append_stats(line, bin.ff2);
+            append_stats(line, bin.fmn_residual);
+            line += ',';
+            append_double(line, bin.fmn_residual_max);
         }
+        append_stats(line, bin.n_i);
+        append_stats(line, bin.n_j);
+        append_stats(line, bin.dnn);
+        append_stats(line, bin.rho_n);
+        append_stats(line, bin.i_occ);
+        append_counter(line, bin.conn_records);
+        append_counter(line, bin.survive_i);
+        append_counter(line, bin.survive_j);
+        append_counter(line, bin.survive_both);
+        append_counter(line, bin.interior_path);
+        append_counter(line, bin.connected);
+        append_counter(line, bin.connected_ent_positive);
+        append_counter(line, bin.connected_ent_zero);
+        append_counter(line, bin.disconnected_ent_positive);
+        append_counter(line, bin.disconnected_ent_zero);
+        append_counter(line, bin.classical_occ_correlated);
+        append_counter(line, bin.classical_subthreshold);
+        append_counter(line, bin.classical_silent);
+        append_stats(line, bin.ent_given_connected);
+        append_stats(line, bin.ent_given_disconnected);
+        append_stats(line, bin.i_occ_connected_classical);
+        append_stats(line, bin.component_size);
+        append_stats(line, bin.shortest_path);
         line += '\n';
         out += line;
     }

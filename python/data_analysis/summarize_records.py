@@ -34,10 +34,14 @@ import time
 from pathlib import Path
 
 from .records import (
+    bootstrap_probabilities,
+    contingency,
+    default_contingency_path,
     default_summary_path,
     is_record_file,
     record_file_info,
     summarize,
+    write_contingency_csv,
     write_summary_csv,
 )
 
@@ -99,6 +103,26 @@ def main(argv: list[str] | None = None) -> int:
         help="rewrite a summary that is already newer than its binary",
     )
     parser.add_argument(
+        "--no-contingency",
+        action="store_true",
+        help=(
+            "skip the joint connectivity/entanglement table. It is written by "
+            "default beside the summary whenever the records carry connectivity "
+            "flags, because it needs the same streaming pass and a production "
+            "record file should only be read through once."
+        ),
+    )
+    parser.add_argument(
+        "--bootstrap",
+        type=int,
+        default=400,
+        help=(
+            "trajectory-clustered bootstrap resamples for the contingency "
+            "errors (0 disables). Records within one trajectory covary, so "
+            "per-record errors on these probabilities are optimistic."
+        ),
+    )
+    parser.add_argument(
         "-q", "--quiet", action="store_true", help="no progress output"
     )
     arguments = parser.parse_args(argv)
@@ -144,6 +168,33 @@ def main(argv: list[str] | None = None) -> int:
             path, chunk_records=arguments.chunk_records, progress=not arguments.quiet
         )
         write_summary_csv(summary, destination)
+
+        # The contingency table is a second pass over the same file. It is
+        # worth it: without the joint cells, the marginals P(C) and P(E) cannot
+        # distinguish a necessary-but-incomplete percolation picture from a
+        # wrong one.
+        if not arguments.no_contingency and info["has_flags"] and info["k"] == 2:
+            table = contingency(path, chunk_records=arguments.chunk_records)
+            errors = None
+            if arguments.bootstrap > 0 and table["clusters"] is not None:
+                errors = bootstrap_probabilities(table, resamples=arguments.bootstrap)
+            joint = write_contingency_csv(
+                table, default_contingency_path(path), bootstrap=errors
+            )
+            if not arguments.quiet:
+                print(
+                    f"  -> {joint} "
+                    f"({len(table['thresholds'])} thresholds x "
+                    f"{table['totals']['geometry_id'].nunique()} geometries"
+                    + (f", {arguments.bootstrap} clustered resamples" if errors is not None else "")
+                    + ")"
+                )
+        elif not arguments.quiet and not arguments.no_contingency and info["k"] == 2:
+            print(
+                "  (no connectivity flags: a format v1 file, or written with "
+                "MIPT_DIST_CONNECTIVITY=0)"
+            )
+
         if not arguments.quiet:
             elapsed = time.monotonic() - started
             rows = sum(1 for _ in destination.open()) - 1

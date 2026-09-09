@@ -33,11 +33,42 @@ using Matrix4 = std::array<Complex, 16>;
 struct PairMetrics
 {
     double mi = 0.0;
+    // The reported negativity. For a fermionic trace on a parity-preserving
+    // ensemble this is `mn_closed`; otherwise it is `mn_generic`.
     double mn = 0.0;
     // Squared magnitudes of the two fermionic two-point functions; see
     // two_point_correlators() for what they are and which trace they mean.
     double g2 = 0.0;
     double f2 = 0.0;
+
+    // --- occupation-basis diagnostics ------------------------------------
+    //
+    // These are diagonal quantities, so they are *identical* under both trace
+    // conventions: a Jordan-Wigner string changes reorder signs on entries
+    // that connect different local parities, and the diagonal has none. That
+    // is why dist_scaling records them once per pair rather than once per
+    // trace.
+    double n_i = 0.0;   // <n_i>
+    double n_j = 0.0;   // <n_j>
+    double dnn = 0.0;   // D = <n_i n_j>
+    double rho_n = 0.0; // the connected density correlation D - <n_i><n_j>
+    double i_occ = 0.0; // mutual information of the joint occupation
+                        // distribution alone, in bits
+
+    // --- the two-mode channel --------------------------------------------
+    Complex g{};             // <c_i^dag c_j>
+    Complex f{};             // <c_i c_j>
+    double parity_even = 0.0; // p(00) + p(11)
+    double parity_odd = 0.0;  // p(10) + p(01)
+
+    // --- negativity, both ways -------------------------------------------
+    double mn_generic = 0.0; // from the generic partial transpose
+    double mn_closed = std::numeric_limits<double>::quiet_NaN(); // closed form
+    double mn_residual = std::numeric_limits<double>::quiet_NaN();
+    // Total weight of entries connecting different local parities. Zero in
+    // exact arithmetic for any circuit that conserves computational parity, so
+    // this is the numerical evidence that the closed form applies at all.
+    double parity_leakage = 0.0;
 };
 
 // The two fermionic two-point functions of a mode pair (i, j) with i < j:
@@ -93,6 +124,82 @@ struct TripleMetrics
     double joint_purity = 0.0;
     double mean_single_purity = 0.0;
 };
+
+// The mutual information of the *diagonal* of a two-mode RDM: how much the
+// occupation of one mode says about the other, with every coherence discarded.
+//
+// This is the classical part of the pair correlation, and it is what separates
+// the two ways a graph-connected pair can carry no entanglement. A pair with
+// I_occ > 0 is genuinely correlated and merely not entangled; a pair with
+// I_occ ~ 0 and vanishing G and F carries no detectable two-mode correlation
+// of any kind, which is a much stronger statement about the spanning path.
+//
+// Reported in bits, matching every other information measure in this header.
+inline double occupation_mutual_information(double p00, double p10, double p01, double p11)
+{
+    const double n_i = p10 + p11;
+    const double n_j = p01 + p11;
+    const std::array<double, 4> joint{p00, p10, p01, p11};
+    const std::array<double, 4> product{(1.0 - n_i) * (1.0 - n_j), n_i * (1.0 - n_j),
+                                        (1.0 - n_i) * n_j, n_i * n_j};
+    constexpr double eps = 1.0e-15;
+    double total = 0.0;
+    for (std::size_t index = 0; index < 4; ++index)
+    {
+        if (joint[index] > eps && product[index] > eps)
+        {
+            total += joint[index] * std::log2(joint[index] / product[index]);
+        }
+    }
+    // Non-negative in exact arithmetic; the clamp only removes rounding noise
+    // on a product state, where every term cancels against every other.
+    return (total < 0.0 && total > -1.0e-10) ? 0.0 : total;
+}
+
+// The fermionic negativity of a parity-preserving two-mode state, in closed
+// form.
+//
+// Derivation-free statement: for a state that is block diagonal in the local
+// fermion parity, the fermionic partial transpose has exactly two negative
+// eigenvalues, and summing them gives
+//
+//     N = (sqrt(p_e^2 + 4|G|^2) - p_e) / 2 + (sqrt(p_o^2 + 4|F|^2) - p_o) / 2
+//
+// with p_e = p(00) + p(11) and p_o = p(10) + p(01). The pairing is not the one
+// parity bookkeeping suggests -- |G|^2, an *odd*-sector coherence, rides on the
+// *even* weight -- because the fermionic partial transpose mixes the blocks.
+// It is verified against the generic path in `make test-dist`, which is the
+// only reason to trust it over intuition.
+//
+// **Why it is written this way.** The generic route computes the trace norm of
+// the partial transpose and subtracts 1. On a weakly entangled pair that norm
+// is 1 + O(10^-14), so the subtraction throws away every significant digit:
+// measured against the exact value, the generic path is still good at
+// |G|^2 = 10^-14, returns 2.2e-16 where the answer is 1.67e-16, and returns
+// *exactly zero* from |G|^2 = 10^-18 down. Multiplying through by the
+// conjugate surd turns the difference of two nearly equal numbers into a ratio
+// and removes the cancellation entirely: the form below is accurate to full
+// relative precision at any magnitude.
+//
+// That distinction is the whole point of the exercise. A fixed positivity
+// threshold applied to the generic value cannot tell a pair whose negativity
+// is algebraically zero from one whose negativity has merely shrunk below the
+// solver's noise floor, and the two make opposite predictions for how
+// P(fN > eps) behaves as eps is swept.
+inline double parity_preserving_fermionic_negativity(double parity_even, double parity_odd,
+                                                     double g2, double f2)
+{
+    double total = 0.0;
+    if (g2 > 0.0)
+    {
+        total += 2.0 * g2 / (std::sqrt(parity_even * parity_even + 4.0 * g2) + parity_even);
+    }
+    if (f2 > 0.0)
+    {
+        total += 2.0 * f2 / (std::sqrt(parity_odd * parity_odd + 4.0 * f2) + parity_odd);
+    }
+    return total;
+}
 
 namespace detail
 {
@@ -350,7 +457,15 @@ inline TripleMetrics three_party_metrics(const double *rho_ri, bool fermionic)
     return {tmi, (i_ab + i_ac + i_bc) / 3.0, ancilla::purity_from_small_rdm(reduced[7]), mean_single_purity};
 }
 
-inline PairMetrics two_party_metrics(const double *rho_ri, bool fermionic)
+// `parity_preserving` says whether the ensemble conserves computational parity,
+// which is what licenses the closed-form negativity above. It is a property of
+// the circuit, so the caller supplies it rather than this function guessing
+// from the matrix: on an fp32 trajectory the cross-parity entries are ~1e-7
+// noise rather than exactly zero, and a threshold on them would silently
+// switch formulas partway through a run. The measured leakage is reported
+// instead, so the assumption can be checked after the fact.
+inline PairMetrics two_party_metrics(const double *rho_ri, bool fermionic,
+                                     bool parity_preserving = false)
 {
     const Matrix4 rho = detail::normalized_hermitian_rho(rho_ri);
     const Matrix2 rho_a = detail::trace_to_one_mode(rho, 0, fermionic);
@@ -368,9 +483,55 @@ inline PairMetrics two_party_metrics(const double *rho_ri, bool fermionic)
         throw std::runtime_error("Mutual-information calculation produced an invalid value.");
     }
 
-    const TwoPointCorrelators correlators = two_point_correlators(rho);
-    return {std::max(0.0, mi), detail::negativity(rho, fermionic), correlators.g2,
-            correlators.f2};
+    PairMetrics out;
+    out.mi = std::max(0.0, mi);
+
+    // Basis |n_i n_j> indexed n_i + 2 n_j, as the fermionic partial trace
+    // produces it; see two_point_correlators() for why these entries are the
+    // ones they are.
+    const double p00 = rho[0].real();
+    const double p10 = rho[1 * 4 + 1].real();
+    const double p01 = rho[2 * 4 + 2].real();
+    const double p11 = rho[3 * 4 + 3].real();
+    out.n_i = p10 + p11;
+    out.n_j = p01 + p11;
+    out.dnn = p11;
+    out.rho_n = p11 - out.n_i * out.n_j;
+    out.i_occ = occupation_mutual_information(p00, p10, p01, p11);
+    out.parity_even = p00 + p11;
+    out.parity_odd = p10 + p01;
+
+    out.g = rho[2 * 4 + 1];
+    out.f = -rho[3 * 4 + 0];
+    out.g2 = std::norm(out.g);
+    out.f2 = std::norm(out.f);
+
+    // Entries joining a local-parity-even basis state to an odd one. Exactly
+    // zero for a definite-global-parity state, because tracing out the
+    // environment can only connect subsystem states of equal parity.
+    for (int row = 0; row < 4; ++row)
+    {
+        for (int col = 0; col < 4; ++col)
+        {
+            const bool row_odd = ((row & 1) ^ ((row >> 1) & 1)) != 0;
+            const bool col_odd = ((col & 1) ^ ((col >> 1) & 1)) != 0;
+            if (row_odd != col_odd)
+            {
+                out.parity_leakage += std::abs(rho[row * 4 + col]);
+            }
+        }
+    }
+
+    out.mn_generic = detail::negativity(rho, fermionic);
+    out.mn = out.mn_generic;
+    if (fermionic && parity_preserving)
+    {
+        out.mn_closed = parity_preserving_fermionic_negativity(out.parity_even, out.parity_odd,
+                                                              out.g2, out.f2);
+        out.mn_residual = std::abs(out.mn_closed - out.mn_generic);
+        out.mn = out.mn_closed;
+    }
+    return out;
 }
 
 using util::chord_length;

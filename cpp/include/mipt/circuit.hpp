@@ -28,6 +28,39 @@ struct CircuitBuildTiming
     std::chrono::steady_clock::time_point frontend_done{};
 };
 
+// One trajectory: the final state, and the logical layer history that produced
+// it.
+//
+// These two must describe the *same* random realization, which is why they
+// travel together rather than being recoverable separately. The history is
+// derived from the very layer list that is then handed to the simulator, after
+// any debug truncation, so there is no way for a caller to pair a state with
+// the graph of a different draw. That pairing is the whole basis of the
+// spacetime percolation diagnostics in dist_connectivity.hpp: comparing a
+// measured entanglement against a graph built from an independent circuit
+// would measure nothing at all.
+struct TrajectoryResult
+{
+    cudaq::state state;
+    LogicalHistory history;
+};
+
+// A 64-bit stream splitter. splitmix64 is a bijection, so distinct
+// (master, index) pairs give distinct seeds and the master seed recorded in a
+// run's output is enough to replay any one of its trajectories.
+inline std::uint64_t splitmix64(std::uint64_t value)
+{
+    value += 0x9e3779b97f4a7c15ull;
+    value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ull;
+    value = (value ^ (value >> 27)) * 0x94d049bb133111ebull;
+    return value ^ (value >> 31);
+}
+
+inline std::uint64_t trajectory_seed(std::uint64_t master, std::uint64_t index)
+{
+    return splitmix64(master + 0x2545f4914f6cdd1dull * (index + 1ull));
+}
+
 // |0...0> on n qubits. The cuStateVec engine starts from a CUDA-Q-owned buffer
 // so that the returned cudaq::state is an ordinary state as far as every
 // downstream RDM/entropy consumer is concerned.
@@ -45,13 +78,39 @@ class Circuit1D
     virtual ~Circuit1D() = default;
     virtual CircuitType type() const noexcept = 0;
     virtual void reserve(int periods) = 0;
-    virtual cudaq::state simulate(int n,
-                                  int periods,
-                                  double p,
-                                  std::string_view context,
-                                  CircuitBuildTiming *timing) = 0;
+    virtual TrajectoryResult simulate(int n,
+                                      int periods,
+                                      double p,
+                                      std::string_view context,
+                                      CircuitBuildTiming *timing) = 0;
+
+    // Pin this trajectory's layer draw.
+    //
+    // What this does and does not buy: every circuit's *layer history* --
+    // which gates are drawn and, decisively, which sites each layer measures
+    // -- becomes an exact function of the seed, so the spacetime graph is
+    // fully reproducible. Measurement *outcomes* follow only on the cuStateVec
+    // path, whose sampling runs off measure_rng_; under the CUDA-Q fallback
+    // the runtime draws them from a stream nothing here controls. The graph
+    // does not depend on outcomes, so it is reproducible either way.
+    void seed(std::uint64_t value)
+    {
+        std::seed_seq sequence{static_cast<std::uint32_t>(value & 0xffffffffu),
+                               static_cast<std::uint32_t>(value >> 32)};
+        rng_.seed(sequence);
+#ifdef MIPT_ENABLE_CUSV
+        const std::uint64_t measurement = splitmix64(value ^ 0xa0761d0dull);
+        std::seed_seq measure_sequence{static_cast<std::uint32_t>(measurement & 0xffffffffu),
+                                       static_cast<std::uint32_t>(measurement >> 32)};
+        measure_rng_.seed(measure_sequence);
+#endif
+    }
 
   protected:
+    // Shared by every circuit so that seed() has one stream to pin rather than
+    // five identical private ones.
+    std::mt19937 rng_{std::random_device{}()};
+
     static std::string prefix(std::string_view context)
     {
         return context.empty() ? std::string{} : std::string(context) + " ";
@@ -225,14 +284,18 @@ class MmsCircuit1D final : public Circuit1D
     CircuitType type() const noexcept override { return CircuitType::MMS; }
     void reserve(int periods) override { layers_.reserve(static_cast<std::size_t>(2 * periods + 1)); }
 
-    cudaq::state simulate(int n, int periods, double p, std::string_view context,
-                          CircuitBuildTiming *timing) override
+    TrajectoryResult simulate(int n, int periods, double p, std::string_view context,
+                              CircuitBuildTiming *timing) override
     {
         build_mms_layers(layers_, n, periods, p, rng_);
         apply_debug_prefix_layer_limit(layers_, (prefix(context) + "MMS").c_str());
         log_stats(context, "MMS", circuit_work_stats_mms(layers_, n, true), n, periods, p);
         mark_frontend_done(timing);
         log_start(context, "MMS", n, layers_.size());
+        // The graph is derived from the layer list that is about to be
+        // simulated -- after any debug truncation -- so state and history are
+        // the same realization by construction.
+        LogicalHistory history = logical_history_from_mms(layers_, n);
         const auto start = std::chrono::steady_clock::now();
 #ifdef MIPT_ENABLE_CUSV
         if (auto fast = try_cusv(n, layers_,
@@ -240,16 +303,15 @@ class MmsCircuit1D final : public Circuit1D
                                  { return cusv::build_mms_layer_ops(layer, n, true); }))
         {
             log_done(context, "MMS", start);
-            return *fast;
+            return {std::move(*fast), std::move(history)};
         }
 #endif
         auto state = cudaq::get_state(MmsKernel1D{}, n, layers_, true);
         log_done(context, "MMS", start);
-        return state;
+        return {std::move(state), std::move(history)};
     }
 
   private:
-    std::mt19937 rng_{std::random_device{}()};
     std::vector<MmsLayer> layers_;
 };
 
@@ -259,13 +321,17 @@ class HaarCircuit1D final : public Circuit1D
     CircuitType type() const noexcept override { return CircuitType::Haar; }
     void reserve(int periods) override { layers_.reserve(static_cast<std::size_t>(2 * periods)); }
 
-    cudaq::state simulate(int n, int periods, double p, std::string_view context,
-                          CircuitBuildTiming *timing) override
+    TrajectoryResult simulate(int n, int periods, double p, std::string_view context,
+                              CircuitBuildTiming *timing) override
     {
         build_haar_layers(layers_, n, periods, p, rng_, true);
         apply_debug_prefix_layer_limit(layers_, (prefix(context) + "Haar").c_str());
         mark_frontend_done(timing);
         log_start(context, "Haar", n, layers_.size());
+        // The graph is derived from the layer list that is about to be
+        // simulated -- after any debug truncation -- so state and history are
+        // the same realization by construction.
+        LogicalHistory history = logical_history_from_haar(layers_, n);
         const auto start = std::chrono::steady_clock::now();
 #ifdef MIPT_ENABLE_CUSV
         if (auto fast = try_cusv(n, layers_,
@@ -273,16 +339,15 @@ class HaarCircuit1D final : public Circuit1D
                                  { return cusv::build_haar_layer_ops(layer, n); }))
         {
             log_done(context, "Haar", start);
-            return *fast;
+            return {std::move(*fast), std::move(history)};
         }
 #endif
         auto state = cudaq::get_state(HaarKernel1D{}, n, layers_);
         log_done(context, "Haar", start);
-        return state;
+        return {std::move(state), std::move(history)};
     }
 
   private:
-    std::mt19937 rng_{std::random_device{}()};
     std::vector<HaarLayer> layers_;
 };
 
@@ -292,8 +357,8 @@ class RppuCircuit1D final : public Circuit1D
     CircuitType type() const noexcept override { return CircuitType::FermionRPPU; }
     void reserve(int periods) override { layers_.reserve(static_cast<std::size_t>(2 * periods + 1)); }
 
-    cudaq::state simulate(int n, int periods, double p, std::string_view context,
-                          CircuitBuildTiming *timing) override
+    TrajectoryResult simulate(int n, int periods, double p, std::string_view context,
+                              CircuitBuildTiming *timing) override
     {
         const bool direct_boundary = mipt::backend::direct_fermion_boundary_enabled();
         build_rppu_layers(layers_, n, periods, p, true, rng_, direct_boundary);
@@ -301,6 +366,10 @@ class RppuCircuit1D final : public Circuit1D
         log_stats(context, "FermionRPPU", circuit_work_stats_rppu(layers_), n, periods, p);
         mark_frontend_done(timing);
         log_start(context, "FermionRPPU", n, layers_.size());
+        // The graph is derived from the layer list that is about to be
+        // simulated -- after any debug truncation -- so state and history are
+        // the same realization by construction.
+        LogicalHistory history = logical_history_from_rppu(layers_, n);
         const auto start = std::chrono::steady_clock::now();
 #ifdef MIPT_ENABLE_CUSV
         const auto rppu_ops = [n](const RppuLayer &layer)
@@ -308,21 +377,20 @@ class RppuCircuit1D final : public Circuit1D
         if (auto fast = try_cusv_parity(n, layers_, rppu_ops))
         {
             log_done(context, "FermionRPPU", start);
-            return *fast;
+            return {std::move(*fast), std::move(history)};
         }
         if (auto fast = try_cusv(n, layers_, rppu_ops))
         {
             log_done(context, "FermionRPPU", start);
-            return *fast;
+            return {std::move(*fast), std::move(history)};
         }
 #endif
         auto state = cudaq::get_state(RppuKernel1D{}, n, layers_);
         log_done(context, "FermionRPPU", start);
-        return state;
+        return {std::move(state), std::move(history)};
     }
 
   private:
-    std::mt19937 rng_{std::random_device{}()};
     std::vector<RppuLayer> layers_;
 };
 
@@ -332,22 +400,25 @@ class RfgsCircuit1D final : public Circuit1D
     CircuitType type() const noexcept override { return CircuitType::RFGS; }
     void reserve(int periods) override { layers_.reserve(static_cast<std::size_t>(2 * periods + 1)); }
 
-    cudaq::state simulate(int n, int periods, double p, std::string_view context,
-                          CircuitBuildTiming *timing) override
+    TrajectoryResult simulate(int n, int periods, double p, std::string_view context,
+                              CircuitBuildTiming *timing) override
     {
         build_rfgs_layers(layers_, n, periods, p, rng_, true);
         apply_debug_prefix_layer_limit(layers_, (prefix(context) + "RFGS").c_str());
         log_stats(context, "RFGS", circuit_work_stats_rfgs(layers_, n, true), n, periods, p);
         mark_frontend_done(timing);
         log_start(context, "RFGS", n, layers_.size());
+        // The graph is derived from the layer list that is about to be
+        // simulated -- after any debug truncation -- so state and history are
+        // the same realization by construction.
+        LogicalHistory history = logical_history_from_rfgs(layers_, n, true);
         const auto start = std::chrono::steady_clock::now();
         auto state = cudaq::get_state(RfgsKernel1D{}, n, layers_, true);
         log_done(context, "RFGS", start);
-        return state;
+        return {std::move(state), std::move(history)};
     }
 
   private:
-    std::mt19937 rng_{std::random_device{}()};
     std::vector<RfgsLayer> layers_;
 };
 
@@ -357,14 +428,18 @@ class QrppuCircuit1D final : public Circuit1D
     CircuitType type() const noexcept override { return CircuitType::QubitRPPU; }
     void reserve(int periods) override { layers_.reserve(static_cast<std::size_t>(2 * periods + 1)); }
 
-    cudaq::state simulate(int n, int periods, double p, std::string_view context,
-                          CircuitBuildTiming *timing) override
+    TrajectoryResult simulate(int n, int periods, double p, std::string_view context,
+                              CircuitBuildTiming *timing) override
     {
         build_qrppu_layers(layers_, n, periods, p, true, rng_);
         apply_debug_prefix_layer_limit(layers_, (prefix(context) + "qRPPU").c_str());
         log_stats(context, "qRPPU", circuit_work_stats_rppu(layers_), n, periods, p);
         mark_frontend_done(timing);
         log_start(context, "qRPPU", n, layers_.size());
+        // The graph is derived from the layer list that is about to be
+        // simulated -- after any debug truncation -- so state and history are
+        // the same realization by construction.
+        LogicalHistory history = logical_history_from_rppu(layers_, n);
         const auto start = std::chrono::steady_clock::now();
 #ifdef MIPT_ENABLE_CUSV
         const auto rppu_ops = [n](const RppuLayer &layer)
@@ -372,21 +447,20 @@ class QrppuCircuit1D final : public Circuit1D
         if (auto fast = try_cusv_parity(n, layers_, rppu_ops))
         {
             log_done(context, "qRPPU", start);
-            return *fast;
+            return {std::move(*fast), std::move(history)};
         }
         if (auto fast = try_cusv(n, layers_, rppu_ops))
         {
             log_done(context, "qRPPU", start);
-            return *fast;
+            return {std::move(*fast), std::move(history)};
         }
 #endif
         auto state = cudaq::get_state(RppuKernel1D{}, n, layers_);
         log_done(context, "qRPPU", start);
-        return state;
+        return {std::move(state), std::move(history)};
     }
 
   private:
-    std::mt19937 rng_{std::random_device{}()};
     std::vector<RppuLayer> layers_;
 };
 
@@ -412,19 +486,32 @@ class CircuitWorkspace1D
         if (circuit_) circuit_->reserve(periods);
     }
 
-    cudaq::state simulate(int n, int periods, double p, CircuitType type,
-                          std::string_view context = {},
-                          CircuitBuildTiming *timing = nullptr)
+    TrajectoryResult simulate(int n, int periods, double p, CircuitType type,
+                              std::string_view context = {},
+                              CircuitBuildTiming *timing = nullptr)
+    {
+        ensure(type, periods);
+        return circuit_->simulate(n, periods, p, context, timing);
+    }
+
+    // Pin the next trajectory's layer draw. Must be called after the circuit
+    // exists, so it takes the type it will be used with.
+    void seed(CircuitType type, int periods, std::uint64_t value)
+    {
+        ensure(type, periods);
+        circuit_->seed(value);
+    }
+
+  private:
+    void ensure(CircuitType type, int periods)
     {
         if (!circuit_ || circuit_->type() != type)
         {
             circuit_ = make_circuit_1d(type);
             circuit_->reserve(reserved_periods_ >= 0 ? reserved_periods_ : periods);
         }
-        return circuit_->simulate(n, periods, p, context, timing);
     }
 
-  private:
     int reserved_periods_ = -1;
     std::unique_ptr<Circuit1D> circuit_;
 };

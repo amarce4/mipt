@@ -275,8 +275,8 @@ inline void run_1d_sim_tmi(int n,
         {
             wait_if_host_paused();
 
-            auto state = circuit_workspace.simulate(
-                n, periods, p, circuit_mode, "sim_tmi");
+            auto state = std::move(circuit_workspace.simulate(
+                n, periods, p, circuit_mode, "sim_tmi").state);
 
             const bool use_fast_state_tmi = fast_state_tmi_available(state, n, block_qubits);
             if (!printed_state_backend)

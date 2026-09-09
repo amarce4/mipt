@@ -260,6 +260,30 @@ inline void fill_haar_layer(HaarLayer &layer,
     }
 }
 
+// Every Haar bond is entangling and there is no transport, so a logical layer
+// is the bond sweep plus the measurement flags. The odd layer wraps exactly as
+// fill_haar_layer's own loop does.
+inline LogicalHistory logical_history_from_haar(const std::vector<HaarLayer> &layers, int n)
+{
+    LogicalHistory history;
+    history.reset(n);
+    history.layers.reserve(layers.size());
+    for (const HaarLayer &layer : layers)
+    {
+        LogicalLayer out;
+        out.bonds.reserve(layer.gates.size());
+        for (const HaarBondGate &gate : layer.gates)
+        {
+            out.bonds.push_back({history.mode_at_site[static_cast<std::size_t>(gate.q0)],
+                                 history.mode_at_site[static_cast<std::size_t>(gate.q1)]});
+        }
+        set_measured(out, n, layer.measure_flags, history.mode_at_site);
+        history.layers.push_back(std::move(out));
+    }
+    history.valid = true;
+    return history;
+}
+
 inline void build_haar_layers(std::vector<HaarLayer> &layers,
                            int n,
                            int periods,

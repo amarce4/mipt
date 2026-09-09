@@ -148,9 +148,9 @@ void run_1d(int n, int periods, int realizations, int res, double p_min, double 
             else
             {
                 CircuitBuildTiming build_timing;
-                auto state = circuit_workspace.simulate(
+                auto state = std::move(circuit_workspace.simulate(
                     n, periods, p, circ_type, {},
-                    r == 0 ? &build_timing : nullptr);
+                    r == 0 ? &build_timing : nullptr).state);
 
                 if (r == 0)
                 {

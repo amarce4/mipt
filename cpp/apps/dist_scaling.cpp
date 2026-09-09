@@ -47,6 +47,11 @@ int main(int argc, char **argv)
             config.output_path = std::string(argv[7]);
         }
 
+        // Everything that is not a positional argument -- thresholds,
+        // connectivity, record detail and stride, the master seed -- comes from
+        // the environment and is resolved in one place so that k=0's two
+        // configs cannot drift apart. `--help` is the authoritative list.
+        mipt::dist::apply_environment(config);
         mipt::dist::run(config);
         return 0;
     }

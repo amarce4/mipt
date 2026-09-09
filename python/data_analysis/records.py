@@ -67,6 +67,8 @@ memory budget rather than taking the machine down with it.
 
 from __future__ import annotations
 
+import warnings
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -75,13 +77,45 @@ import pandas as pd
 
 MAGIC = b"MIPTDREC"
 PREAMBLE_BYTES = 24
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
 
-_ID_DTYPE = [
+# Both formats are readable. v1 files are the pre-2026-09 archive: an 8-byte
+# identifier block, no connectivity flags, and at most four observables. v2
+# widens the identifier block to 16 bytes (flags plus an alignment word), lifts
+# the observable cap, and adds an embedding table. Everything below that reads
+# a v1 file simply finds no flag column and says so, rather than inventing one.
+SUPPORTED_FORMAT_VERSIONS = (1, 2)
+
+_ID_DTYPE_V1 = [
     ("realization_id", "<u4"),
     ("geometry_id", "<u2"),
     ("embedding_id", "<u2"),
 ]
+
+_ID_DTYPE_V2 = _ID_DTYPE_V1 + [
+    ("flags", "<u4"),
+    ("reserved", "<u4"),
+]
+
+# The per-record connectivity flag bits, mirroring dist_connectivity.hpp. The
+# C++ header writes its own copy of this mapping into every v2 file as
+# `flag_bits=`, so a file that ever disagrees can be caught rather than
+# silently misread.
+FLAG_EVALUATED = 1 << 0
+FLAG_SURVIVES_I = 1 << 1
+FLAG_SURVIVES_J = 1 << 2
+FLAG_INTERIOR_PATH = 1 << 3
+FLAG_CONNECTED = 1 << 4
+FLAG_FN_POSITIVE = 1 << 5
+FLAG_MN_POSITIVE = 1 << 6
+
+FLAG_NAMES = {
+    "evaluated": FLAG_EVALUATED,
+    "survives_i": FLAG_SURVIVES_I,
+    "survives_j": FLAG_SURVIVES_J,
+    "interior_path": FLAG_INTERIOR_PATH,
+    "connected": FLAG_CONNECTED,
+}
 
 _NUMERIC_HEADER_KEYS = {
     "version": int,
@@ -91,9 +125,16 @@ _NUMERIC_HEADER_KEYS = {
     "periods": int,
     "realizations": int,
     "geometry_rows": int,
+    "embedding_rows": int,
     "embeddings_per_geometry": int,
+    "record_stride": int,
+    "statevector_precision": int,
+    "connectivity": int,
+    "connectivity_graph_version": int,
+    "master_seed": int,
     "p": float,
     "b_min": float,
+    "pair_zero_tol": float,
 }
 
 # ---------------------------------------------------------------------------
@@ -178,25 +219,41 @@ def is_summary_file(path: str | Path) -> bool:
     return {"metric", "bin_kind", "count"}.issubset(columns)
 
 
-def _parse_header_text(text: str) -> tuple[dict[str, Any], pd.DataFrame]:
-    """Split the header into its ``key=value`` block and its geometry table."""
+def _table_frame(lines: list[str]) -> pd.DataFrame:
+    """A ``[...]`` header table as a numeric frame."""
+    columns = lines[0].split(",")
+    rows = [line.split(",") for line in lines[1:] if line]
+    frame = pd.DataFrame(rows, columns=columns)
+    for column in frame.columns:
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    return frame
+
+
+def _parse_header_text(text: str) -> tuple[dict[str, Any], pd.DataFrame, pd.DataFrame]:
+    """Split the header into its ``key=value`` block and its two tables.
+
+    v1 files carry only the geometry table, so the embedding frame comes back
+    empty for them; v2 adds ``[embedding]``, which is what makes a record's
+    endpoint-survival flags traceable to the sites they are about.
+    """
     lines = text.splitlines()
     header: dict[str, Any] = {}
-    geometry_lines: list[str] = []
-    in_table = False
+    tables: dict[str, list[str]] = {"geometry": [], "embedding": []}
+    current: str | None = None
     for line in lines:
-        if line == "[geometry]":
-            in_table = True
+        if line in ("[geometry]", "[embedding]"):
+            current = line[1:-1]
             continue
         if line == "[end]":
-            in_table = False
+            current = None
             continue
-        if in_table:
-            geometry_lines.append(line)
+        if current is not None:
+            tables[current].append(line)
             continue
         key, separator, value = line.partition("=")
         if separator:
             header[key] = value
+    geometry_lines = tables["geometry"]
 
     for key, caster in _NUMERIC_HEADER_KEYS.items():
         if key in header:
@@ -207,25 +264,26 @@ def _parse_header_text(text: str) -> tuple[dict[str, Any], pd.DataFrame]:
 
     if not geometry_lines:
         raise ValueError("A dist_scaling record file must carry a geometry table.")
-    columns = geometry_lines[0].split(",")
-    rows = [line.split(",") for line in geometry_lines[1:] if line]
-    geometries = pd.DataFrame(rows, columns=columns)
-    for column in geometries.columns:
-        geometries[column] = pd.to_numeric(geometries[column], errors="coerce")
+    geometries = _table_frame(geometry_lines)
     if "d" not in geometries.columns:
         raise ValueError(
             "A dist_scaling record file's geometry table must carry the "
             "effective chord distance column 'd'."
         )
-    return header, geometries
+    embeddings = (
+        _table_frame(tables["embedding"]) if tables["embedding"] else pd.DataFrame()
+    )
+    return header, geometries, embeddings
 
 
-def _record_dtype(fields: str) -> tuple[np.dtype, tuple[str, ...]]:
+def _record_dtype(fields: str, version: int) -> tuple[np.dtype, tuple[str, ...]]:
     """The numpy dtype the ``fields`` header line describes.
 
-    The identifiers are fixed but the observables are not -- a qubit ensemble
-    writes two and a parity-preserving one writes four -- so the layout is read
-    off the file rather than assumed.
+    Neither the identifier block nor the observable list is assumed: the
+    identifiers differ between formats (v2 adds the flag word and its alignment
+    padding) and the observables differ with the trace convention and the run's
+    record detail level, so both are read off the file and then checked against
+    what the declared version requires.
     """
     kinds = {"u4": "<u4", "u2": "<u2", "f8": "<f8"}
     entries: list[tuple[str, str]] = []
@@ -237,12 +295,12 @@ def _record_dtype(fields: str) -> tuple[np.dtype, tuple[str, ...]]:
         entries.append((name, kinds[kind]))
         if kind == "f8":
             observables.append(name)
-    if [entry[0] for entry in entries[: len(_ID_DTYPE)]] != [
-        name for name, _ in _ID_DTYPE
-    ]:
+    expected = _ID_DTYPE_V2 if version >= 2 else _ID_DTYPE_V1
+    found = [entry[0] for entry in entries[: len(expected)]]
+    if found != [name for name, _ in expected]:
         raise ValueError(
-            "A dist_scaling record must begin with realization_id, geometry_id "
-            f"and embedding_id; found {[entry[0] for entry in entries]}."
+            f"A format v{version} dist_scaling record must begin with "
+            f"{[name for name, _ in expected]}; found {found}."
         )
     return np.dtype(entries), tuple(observables)
 
@@ -261,15 +319,15 @@ def record_file_info(path: str | Path) -> dict[str, Any]:
         version, record_bytes, header_bytes = np.frombuffer(
             preamble, dtype="<u4", count=3, offset=8
         )
-        if int(version) != FORMAT_VERSION:
+        if int(version) not in SUPPORTED_FORMAT_VERSIONS:
             raise ValueError(
                 f"{path} is record format version {int(version)}; this reader "
-                f"understands version {FORMAT_VERSION}."
+                f"understands {', '.join(str(v) for v in SUPPORTED_FORMAT_VERSIONS)}."
             )
         header_text = handle.read(int(header_bytes)).decode("utf-8")
 
-    header, geometries = _parse_header_text(header_text)
-    dtype, observables = _record_dtype(header["fields"])
+    header, geometries, embeddings = _parse_header_text(header_text)
+    dtype, observables = _record_dtype(header["fields"], int(version))
     if dtype.itemsize != int(record_bytes):
         raise ValueError(
             f"{path}: the header describes a {dtype.itemsize}-byte record but "
@@ -281,10 +339,22 @@ def record_file_info(path: str | Path) -> dict[str, Any]:
     count = int(payload_bytes // dtype.itemsize)
     return {
         "path": str(path),
+        "version": int(version),
         "header": header,
         "geometries": geometries,
+        # v1 files carry no embedding table, so this is empty for them and a
+        # caller that needs the sites behind a record has to say so.
+        "embeddings": embeddings,
         "dtype": dtype,
         "observables": observables,
+        # Whether the per-record connectivity flags are present at all. A v1
+        # file and a v2 file written with MIPT_DIST_CONNECTIVITY=0 both answer
+        # no, and for the same reason: there is nothing to report.
+        "has_flags": "flags" in dtype.names,
+        "record_stride": int(header.get("record_stride", 1)),
+        "pair_zero_tol": header.get("pair_zero_tol"),
+        "statevector_precision": header.get("statevector_precision"),
+        "connectivity_graph": header.get("connectivity_graph"),
         "payload_offset": payload_offset,
         "record_bytes": int(record_bytes),
         "record_count": count,
@@ -1027,3 +1097,662 @@ def aggregate_records(bundle: dict[str, Any]) -> dict[str, pd.DataFrame]:
             .reset_index(drop=True)
         )
     return curves
+
+
+# ---------------------------------------------------------------------------
+# The joint contingency table
+#
+# The decisive measurement this whole apparatus exists for.
+#
+# Comparing the marginals P(C) and P(E) tells you almost nothing: two curves
+# that decay at similar rates are consistent with the percolation picture being
+# exactly right, being right up to a constant conversion efficiency, or being
+# wrong in a way that happens to produce a similar exponent. What separates
+# them is the *joint* distribution, and specifically the two conditionals
+#
+#     kappa(eps) = P(fN > eps |  C),      eta(eps) = P(fN > eps | not C)
+#
+# A picture in which a spanning path is necessary but not sufficient predicts
+# eta ~ 0 and kappa < 1. A picture in which it is neither predicts eta > 0.
+# A picture in which it is both predicts kappa = 1. All three have the same
+# marginals available to them.
+#
+# Everything here streams. A production record file does not fit in memory --
+# see the module docstring and `summarize` -- so the reduction makes one
+# sequential pass in bounded chunks and keeps only counters.
+# ---------------------------------------------------------------------------
+
+# The cells kept per trajectory for the clustered bootstrap.
+_CLUSTER_CELLS = (
+    "records",
+    "survive_both",
+    "interior_path",
+    "connected",
+    "connected_positive",
+    "disconnected_positive",
+)
+
+DEFAULT_CLUSTER_BUDGET_BYTES = 512 << 20
+
+
+def default_thresholds() -> np.ndarray:
+    """A decade sweep spanning the numerically meaningful range.
+
+    The top end is where a negativity is unambiguously physical; the bottom is
+    below any fp64 state vector's noise. The point of sweeping rather than
+    picking is that a probability which is genuinely zero does not move as the
+    threshold falls, while one that is merely small does -- and telling those
+    apart is the question.
+    """
+    return np.logspace(-16, -3, 14)
+
+
+def _threshold_metric(observables: Sequence[str], metric: str) -> str:
+    if metric != "auto":
+        if metric not in observables:
+            raise ValueError(
+                f"{metric!r} is not one of this file's observables {list(observables)}."
+            )
+        return metric
+    for candidate in ("fmn", "mn"):
+        if candidate in observables:
+            return candidate
+    raise ValueError(
+        "No pair negativity column to threshold; contingency tables are a k=2 "
+        f"diagnostic and this file carries {list(observables)}."
+    )
+
+
+def contingency(
+    path: str | Path,
+    *,
+    thresholds: Sequence[float] | None = None,
+    metric: str = "auto",
+    chunk_records: int = 1_000_000,
+    info: dict[str, Any] | None = None,
+    cluster: bool = True,
+    cluster_budget_bytes: int = DEFAULT_CLUSTER_BUDGET_BYTES,
+) -> dict[str, Any]:
+    """Stream a v2 record file into a joint (connectivity x entanglement) table.
+
+    Returns ``totals`` -- one row per (geometry, threshold) carrying every cell
+    of the joint table -- and, unless ``cluster=False``, ``clusters``: the same
+    cells resolved per trajectory at the *primary* threshold, which is what a
+    trajectory-clustered bootstrap resamples.
+
+    The clustered form is the one that gives honest errors. Every geometry is
+    measured inside the same trajectory, so per-record counting treats
+    thousands of correlated observations as independent and understates every
+    error bar; resampling whole trajectories does not.
+    """
+    info = info or record_file_info(path)
+    if not info["has_flags"]:
+        raise ValueError(
+            f"{info['path']} carries no connectivity flags, so it has no joint "
+            "table to build. It is either a format v1 file or was written with "
+            "MIPT_DIST_CONNECTIVITY=0."
+        )
+    if int(info.get("k", 2)) != 2:
+        raise ValueError(
+            "Pair connectivity is a k=2 diagnostic; this file is k="
+            f"{info.get('k')}."
+        )
+
+    column = _threshold_metric(info["observables"], metric)
+    edges = np.asarray(
+        default_thresholds() if thresholds is None else thresholds, dtype=float
+    )
+    if edges.size == 0:
+        raise ValueError("At least one threshold is needed.")
+
+    geometries = info["geometries"]
+    geometry_count = int(geometries["geometry_id"].max()) + 1
+    cells = (
+        "records",
+        "survive_i",
+        "survive_j",
+        "survive_both",
+        "interior_path",
+        "connected",
+        "connected_positive",
+        "connected_zero",
+        "disconnected_positive",
+        "disconnected_zero",
+    )
+    # Threshold-independent cells are counted once, at index 0, and broadcast.
+    totals = {
+        name: np.zeros((edges.size, geometry_count), dtype=np.int64) for name in cells
+    }
+
+    clusters: dict[str, np.ndarray] | None = None
+    if cluster:
+        realizations = int(info["header"].get("realizations", 0))
+        needed = realizations * geometry_count * len(_CLUSTER_CELLS) * 4
+        if realizations <= 0:
+            cluster = False
+        elif needed > cluster_budget_bytes:
+            raise MemoryError(
+                f"Per-trajectory cluster counts for {realizations} trajectories x "
+                f"{geometry_count} geometries would need {needed / (1 << 20):.0f} MB, "
+                f"over the {cluster_budget_bytes / (1 << 20):.0f} MB budget. Pass "
+                "cluster=False for totals only, raise cluster_budget_bytes, or use a "
+                "file written with MIPT_DIST_RECORD_STRIDE."
+            )
+        else:
+            clusters = {
+                name: np.zeros((realizations, geometry_count), dtype=np.int32)
+                for name in _CLUSTER_CELLS
+            }
+
+    # The threshold the run itself classified at, matched on a log scale --
+    # these span thirteen decades, so a linear nearest-neighbour would snap
+    # almost everything onto the largest edge.
+    stored = float(info.get("pair_zero_tol") or edges[0])
+    primary = int(np.argmin(np.abs(np.log(edges) - np.log(max(stored, 1e-300)))))
+
+    for block in iter_record_chunks(path, chunk_records=chunk_records, info=info):
+        flags = block["flags"]
+        keep = (flags & FLAG_EVALUATED) != 0
+        if not np.any(keep):
+            continue
+        geometry = block["geometry_id"][keep].astype(np.int64)
+        flags = flags[keep]
+        value = block[column][keep]
+        realization = block["realization_id"][keep].astype(np.int64)
+
+        survives_i = (flags & FLAG_SURVIVES_I) != 0
+        survives_j = (flags & FLAG_SURVIVES_J) != 0
+        connected = (flags & FLAG_CONNECTED) != 0
+        interior = (flags & FLAG_INTERIOR_PATH) != 0
+        both = survives_i & survives_j
+
+        def bins(mask: np.ndarray) -> np.ndarray:
+            return np.bincount(geometry[mask], minlength=geometry_count)
+
+        # The marginal cells do not depend on the threshold, so they are
+        # counted once and written to every row.
+        marginals = {
+            "records": bins(np.ones_like(connected)),
+            "survive_i": bins(survives_i),
+            "survive_j": bins(survives_j),
+            "survive_both": bins(both),
+            "interior_path": bins(interior),
+            "connected": bins(connected),
+        }
+        for name, counts in marginals.items():
+            totals[name] += counts[None, :]
+
+        for index, threshold in enumerate(edges):
+            positive = np.asarray(value) > threshold
+            totals["connected_positive"][index] += bins(connected & positive)
+            totals["connected_zero"][index] += bins(connected & ~positive)
+            totals["disconnected_positive"][index] += bins(~connected & positive)
+            totals["disconnected_zero"][index] += bins(~connected & ~positive)
+
+        if clusters is not None:
+            positive = np.asarray(value) > edges[primary]
+            flat = realization * geometry_count + geometry
+            size = clusters["records"].size
+
+            if flat.size and int(flat.max()) >= size:
+                raise ValueError(
+                    f"{info['path']} holds a realization_id of "
+                    f"{int(realization.max())}, but its header declares only "
+                    f"{clusters['records'].shape[0]} trajectories. The header and "
+                    "the payload disagree; pass cluster=False to skip the "
+                    "per-trajectory counts."
+                )
+
+            def scatter(name: str, mask: np.ndarray) -> None:
+                counts = np.bincount(flat[mask], minlength=size)
+                clusters[name].reshape(-1)[:] += counts.astype(np.int32)
+
+            scatter("records", np.ones_like(connected))
+            scatter("survive_both", both)
+            scatter("interior_path", interior)
+            scatter("connected", connected)
+            scatter("connected_positive", connected & positive)
+            scatter("disconnected_positive", ~connected & positive)
+
+    distances = (
+        geometries.set_index("geometry_id")["d"]
+        .reindex(range(geometry_count))
+        .to_numpy(dtype=float)
+    )
+    rows = []
+    for index, threshold in enumerate(edges):
+        frame = pd.DataFrame({name: totals[name][index] for name in cells})
+        frame.insert(0, "threshold", threshold)
+        frame.insert(0, "d", distances)
+        frame.insert(0, "geometry_id", np.arange(geometry_count))
+        rows.append(frame)
+    table = pd.concat(rows, ignore_index=True)
+    table = table.loc[table["records"] > 0].reset_index(drop=True)
+
+    return {
+        "totals": table,
+        "clusters": clusters,
+        "thresholds": edges,
+        "primary_threshold": float(edges[primary]),
+        "metric": column,
+        "info": info,
+        "geometries": geometries,
+    }
+
+
+def conditional_probabilities(table: dict[str, Any]) -> pd.DataFrame:
+    """Turn the raw cells into the probabilities that decide the question.
+
+    The two that matter are ``kappa`` and ``eta``. The rest are the factors of
+
+        P_perc = P(A_i and A_j) * P(C | A_i and A_j)
+
+    which is written that way rather than as a single P(C) so that the
+    endpoint-survival approximation P(A_i and A_j) ~ q^2 can be tested instead
+    of assumed: ``survival_independence`` is the measured ratio of the joint to
+    the product, and it is 1 exactly when the two endpoints are independent.
+    """
+    frame = table["totals"].copy()
+    records = frame["records"].to_numpy(dtype=float)
+    disconnected = records - frame["connected"].to_numpy(dtype=float)
+
+    def ratio(numerator, denominator):
+        numerator = np.asarray(numerator, dtype=float)
+        denominator = np.asarray(denominator, dtype=float)
+        return np.divide(
+            numerator,
+            denominator,
+            out=np.full(numerator.shape, np.nan),
+            where=denominator > 0,
+        )
+
+    frame["q_i"] = ratio(frame["survive_i"], records)
+    frame["q_j"] = ratio(frame["survive_j"], records)
+    frame["q_joint"] = ratio(frame["survive_both"], records)
+    frame["q_product"] = frame["q_i"] * frame["q_j"]
+    # 1 under independent endpoints. They sit in one trajectory and share a
+    # measurement record, so there is no reason for them to be, and this is the
+    # direct test of the q^2 approximation.
+    frame["survival_independence"] = ratio(frame["q_joint"], frame["q_product"])
+    frame["p_interior"] = ratio(frame["interior_path"], records)
+    frame["p_connected_given_survival"] = ratio(frame["connected"], frame["survive_both"])
+    frame["p_perc"] = ratio(frame["connected"], records)
+    frame["p_entangled"] = ratio(
+        frame["connected_positive"] + frame["disconnected_positive"], records
+    )
+    # The decisive pair.
+    frame["kappa"] = ratio(frame["connected_positive"], frame["connected"])
+    frame["eta"] = ratio(frame["disconnected_positive"], disconnected)
+    frame["n_disconnected"] = disconnected
+    return frame
+
+
+def bootstrap_probabilities(
+    table: dict[str, Any],
+    *,
+    resamples: int = 400,
+    seed: int = 0,
+    quantiles: tuple[float, float] = (0.16, 0.84),
+) -> pd.DataFrame:
+    """Trajectory-clustered bootstrap errors on the same probabilities.
+
+    Resamples whole trajectories with replacement, which is the only resampling
+    that respects how the data were taken: a trajectory contributes one record
+    to every geometry, so the points of a curve covary and per-record errors are
+    optimistic. The quantiles default to the central 68%, so the reported
+    interval is directly comparable to a one-sigma error bar.
+    """
+    clusters = table.get("clusters")
+    if clusters is None:
+        raise ValueError(
+            "This table was built with cluster=False, so there are no "
+            "per-trajectory counts to resample."
+        )
+    counts = clusters["records"]
+    trajectories = counts.shape[0]
+    # A run can be interrupted, and a strided file keeps only some
+    # trajectories; either way the empty rows are not clusters.
+    present = np.flatnonzero(counts.sum(axis=1) > 0)
+    if present.size == 0:
+        raise ValueError("The record file holds no trajectories.")
+
+    rng = np.random.default_rng(seed)
+    names = ("p_perc", "kappa", "eta", "q_joint", "p_interior", "p_entangled")
+    geometry_count = counts.shape[1]
+    draws = {name: np.full((resamples, geometry_count), np.nan) for name in names}
+
+    for draw in range(resamples):
+        pick = rng.choice(present, size=present.size, replace=True)
+        totals = {name: clusters[name][pick].sum(axis=0, dtype=np.int64) for name in _CLUSTER_CELLS}
+        records = totals["records"].astype(float)
+        connected = totals["connected"].astype(float)
+        disconnected = records - connected
+        with np.errstate(invalid="ignore", divide="ignore"):
+            draws["p_perc"][draw] = np.where(records > 0, connected / records, np.nan)
+            draws["kappa"][draw] = np.where(
+                connected > 0, totals["connected_positive"] / connected, np.nan
+            )
+            draws["eta"][draw] = np.where(
+                disconnected > 0, totals["disconnected_positive"] / disconnected, np.nan
+            )
+            draws["q_joint"][draw] = np.where(
+                records > 0, totals["survive_both"] / records, np.nan
+            )
+            draws["p_interior"][draw] = np.where(
+                records > 0, totals["interior_path"] / records, np.nan
+            )
+            draws["p_entangled"][draw] = np.where(
+                records > 0,
+                (totals["connected_positive"] + totals["disconnected_positive"]) / records,
+                np.nan,
+            )
+
+    geometries = table["geometries"]
+    distances = (
+        geometries.set_index("geometry_id")["d"]
+        .reindex(range(geometry_count))
+        .to_numpy(dtype=float)
+    )
+    out = pd.DataFrame({"geometry_id": np.arange(geometry_count), "d": distances})
+    out["threshold"] = table["primary_threshold"]
+    out["trajectories"] = present.size
+    for name in names:
+        values = draws[name]
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=RuntimeWarning)
+            out[name] = np.nanmean(values, axis=0)
+            out[f"{name}_stderr"] = np.nanstd(values, axis=0, ddof=1)
+            out[f"{name}_lo"] = np.nanquantile(values, quantiles[0], axis=0)
+            out[f"{name}_hi"] = np.nanquantile(values, quantiles[1], axis=0)
+    return out.loc[np.isfinite(distances)].reset_index(drop=True)
+
+
+def default_contingency_path(record_path: str | Path) -> Path:
+    """``<stem>_contingency.csv`` beside a ``<stem>_records.bin``."""
+    path = Path(record_path)
+    stem = path.with_suffix("")
+    name = stem.name
+    if name.endswith("_records"):
+        name = name[: -len("_records")]
+    return stem.with_name(name + "_contingency.csv")
+
+
+def write_contingency_csv(
+    table: dict[str, Any],
+    path: str | Path,
+    *,
+    bootstrap: pd.DataFrame | None = None,
+) -> Path:
+    """Write the joint table, and the clustered errors, to one small CSV.
+
+    Rows are (geometry, threshold), so the whole threshold sweep is in the
+    file. The bootstrap columns exist only on the primary threshold's rows and
+    are NaN elsewhere -- a clustered resampling has to fix the threshold before
+    it starts, because the cells it resamples are counted at one.
+
+    A production record file is far larger than the machine that plots it, so
+    the point of this file is the same as the summary's: make the expensive
+    streaming pass once.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    frame = conditional_probabilities(table)
+    frame.insert(0, "primary_threshold", table["primary_threshold"])
+    metadata = _metadata_values(table["info"])
+    for key, value in reversed(list(metadata.items())):
+        frame.insert(0, key, value)
+    if bootstrap is not None:
+        # Only the *error* columns are carried over. The bootstrap's own point
+        # estimates duplicate the exact ones already in `frame`, and merging
+        # them in would collide name for name -- which, with the collided
+        # copies then blanked off the primary threshold, would silently empty
+        # the threshold sweep of every probability it touched.
+        errors = [
+            column
+            for column in bootstrap.columns
+            if column.endswith(("_stderr", "_lo", "_hi"))
+        ]
+        frame = frame.merge(
+            bootstrap[["geometry_id", "trajectories", *errors]],
+            on="geometry_id",
+            how="left",
+        )
+        # A clustered resampling fixes the threshold before it starts, so the
+        # errors belong to one row per geometry and are absent elsewhere.
+        primary = np.isclose(frame["threshold"], table["primary_threshold"])
+        frame.loc[~primary, errors] = np.nan
+    info = table["info"]
+    with path.open("w", newline="") as handle:
+        handle.write(
+            f"# dist_scaling joint contingency table of {Path(info['path']).name}\n"
+            f"# metric={table['metric']} primary_threshold={table['primary_threshold']:.17g} "
+            f"record_stride={info['record_stride']} "
+            f"statevector_precision={info.get('statevector_precision')}\n"
+            f"# graph={info.get('connectivity_graph')}\n"
+        )
+        frame.to_csv(handle, index=False, float_format="%.17g")
+    return path
+
+
+def read_contingency_csv(path: str | Path) -> pd.DataFrame:
+    """Read back what :func:`write_contingency_csv` wrote."""
+    return pd.read_csv(path, comment="#")
+
+
+# ---------------------------------------------------------------------------
+# Conditional distributions
+#
+# The contingency table counts records; this describes them. The interesting
+# cell is C=1, E=0 -- graph-connected but carrying no entanglement above
+# threshold -- because it has three quite different explanations, and the counts
+# alone cannot tell them apart:
+#
+#   1. I_occ > 0: connected and classically occupation-correlated, but not
+#      fermionically entangled.
+#   2. I_occ ~ 0 with |G|^2 or |F|^2 above the numerical floor: coherence that
+#      the threshold discarded. These records move when eps moves.
+#   3. I_occ ~ 0 and both channels at the floor: the spanning path exists and
+#      carries no detectable two-mode correlation at all.
+#
+# `rho_n = D - n_i n_j` is reported too, but never on its own: it is signed, so
+# cancellation between records of opposite sign can make its mean small while
+# every record is strongly correlated. That is why the histogram is kept
+# alongside the moments rather than replaced by them.
+# ---------------------------------------------------------------------------
+
+# Quantities the conditional split reports, and whether they live on the shared
+# logarithmic grid (non-negative) or on a signed linear one.
+_CONDITIONAL_SIGNED = {"rho_n"}
+_SIGNED_BIN_COUNT = 201
+_SIGNED_LIMIT = 0.25  # |D - n_i n_j| <= 1/4 for any occupation distribution
+
+
+def signed_histogram_edges() -> np.ndarray:
+    """Linear bin edges for the signed density correlation."""
+    return np.linspace(-_SIGNED_LIMIT, _SIGNED_LIMIT, _SIGNED_BIN_COUNT + 1)
+
+
+CONNECTIVITY_CLASSES = (
+    "connected_entangled",
+    "connected_classical",
+    "disconnected_entangled",
+    "disconnected_classical",
+)
+
+
+def conditional_distributions(
+    path: str | Path,
+    *,
+    threshold: float | None = None,
+    metric: str = "auto",
+    quantities: Sequence[str] | None = None,
+    chunk_records: int = 1_000_000,
+    info: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Distributions of the channel quantities, split by connectivity class.
+
+    Needs a ``channel``-detail (or richer) format v2 file: the occupation data
+    and the squared two-point functions are what the split is made of, and a
+    ``basic`` file carries neither.
+
+    Returns ``moments`` -- count, mean and standard deviation per (class,
+    quantity, geometry) -- and ``histograms``, on the same fixed grids the
+    summary uses so two files are directly comparable and addable.
+    """
+    info = info or record_file_info(path)
+    if not info["has_flags"]:
+        raise ValueError(
+            f"{info['path']} carries no connectivity flags, so its records "
+            "cannot be split by connectivity class."
+        )
+    observables = info["observables"]
+    column = _threshold_metric(observables, metric)
+    if quantities is None:
+        wanted = [column, "fg2", "ff2", "g2", "f2", "rho_n", "i_occ"]
+        quantities = [
+            name
+            for name in wanted
+            if name in observables or name in ("rho_n", "i_occ")
+        ]
+    missing = [
+        name
+        for name in quantities
+        if name not in observables and name not in ("rho_n", "i_occ")
+    ]
+    if missing:
+        raise ValueError(
+            f"{info['path']} has no {missing} column. Derived quantities need a "
+            "record detail level of 'channel' or richer; this file carries "
+            f"{list(observables)}."
+        )
+    derived_needed = {"rho_n", "i_occ"} & set(quantities)
+    if derived_needed and not {"n_i", "n_j", "dnn"} <= set(observables):
+        raise ValueError(
+            f"{sorted(derived_needed)} are derived from n_i, n_j and dnn, which "
+            f"{info['path']} does not carry. Re-run with "
+            "MIPT_DIST_RECORD_DETAIL=channel."
+        )
+
+    eps = float(threshold if threshold is not None else (info.get("pair_zero_tol") or 1e-12))
+    log_edges = histogram_edges()
+    signed_edges = signed_histogram_edges()
+
+    counts: dict[tuple[str, str], int] = {}
+    sums: dict[tuple[str, str], float] = {}
+    squares: dict[tuple[str, str], float] = {}
+    hists: dict[tuple[str, str], np.ndarray] = {}
+    for label in CONNECTIVITY_CLASSES:
+        for name in quantities:
+            key = (label, name)
+            counts[key] = 0
+            sums[key] = 0.0
+            squares[key] = 0.0
+            size = (
+                len(signed_edges) - 1
+                if name in _CONDITIONAL_SIGNED
+                else len(log_edges) - 1
+            )
+            hists[key] = np.zeros(size, dtype=np.int64)
+
+    for block in iter_record_chunks(path, chunk_records=chunk_records, info=info):
+        keep = (block["flags"] & FLAG_EVALUATED) != 0
+        if not np.any(keep):
+            continue
+        flags = block["flags"][keep]
+        connected = (flags & FLAG_CONNECTED) != 0
+        entangled = np.asarray(block[column][keep]) > eps
+
+        values: dict[str, np.ndarray] = {}
+        for name in quantities:
+            if name == "rho_n":
+                values[name] = np.asarray(
+                    block["dnn"][keep] - block["n_i"][keep] * block["n_j"][keep],
+                    dtype=float,
+                )
+            elif name == "i_occ":
+                values[name] = _occupation_mutual_information(
+                    np.asarray(block["n_i"][keep], dtype=float),
+                    np.asarray(block["n_j"][keep], dtype=float),
+                    np.asarray(block["dnn"][keep], dtype=float),
+                )
+            else:
+                values[name] = np.asarray(block[name][keep], dtype=float)
+
+        masks = {
+            "connected_entangled": connected & entangled,
+            "connected_classical": connected & ~entangled,
+            "disconnected_entangled": ~connected & entangled,
+            "disconnected_classical": ~connected & ~entangled,
+        }
+        for label, mask in masks.items():
+            if not np.any(mask):
+                continue
+            for name, array in values.items():
+                selected = array[mask]
+                finite = selected[np.isfinite(selected)]
+                key = (label, name)
+                counts[key] += int(finite.size)
+                sums[key] += float(finite.sum())
+                squares[key] += float(np.square(finite).sum())
+                edges = (
+                    signed_edges if name in _CONDITIONAL_SIGNED else log_edges
+                )
+                target = (
+                    finite if name in _CONDITIONAL_SIGNED else np.abs(finite)
+                )
+                hists[key] += np.histogram(target, bins=edges)[0]
+
+    rows = []
+    for (label, name), count in counts.items():
+        mean = sums[(label, name)] / count if count else np.nan
+        variance = (
+            squares[(label, name)] / count - mean * mean if count > 1 else np.nan
+        )
+        rows.append(
+            {
+                "class": label,
+                "quantity": name,
+                "count": count,
+                "mean": mean,
+                "stddev": float(np.sqrt(max(variance, 0.0))) if count > 1 else np.nan,
+            }
+        )
+    return {
+        "moments": pd.DataFrame(rows),
+        "histograms": hists,
+        "log_edges": log_edges,
+        "signed_edges": signed_edges,
+        "threshold": eps,
+        "metric": column,
+        "info": info,
+    }
+
+
+def _occupation_mutual_information(
+    n_i: np.ndarray, n_j: np.ndarray, dnn: np.ndarray
+) -> np.ndarray:
+    """Vectorised occupation-basis mutual information, in bits.
+
+    Mirrors `occupation_mutual_information` in dist_metrics.hpp exactly, so a
+    value recomputed here from the stored n_i, n_j and D matches the one the
+    run classified on. That is the point of storing those three rather than the
+    MI itself: the threshold can be moved afterwards, and so can this.
+    """
+    p11 = dnn
+    p10 = n_i - dnn
+    p01 = n_j - dnn
+    p00 = 1.0 - n_i - n_j + dnn
+    joint = (p00, p10, p01, p11)
+    product = (
+        (1.0 - n_i) * (1.0 - n_j),
+        n_i * (1.0 - n_j),
+        (1.0 - n_i) * n_j,
+        n_i * n_j,
+    )
+    total = np.zeros_like(np.asarray(n_i, dtype=float))
+    eps = 1.0e-15
+    with np.errstate(invalid="ignore", divide="ignore"):
+        for p, q in zip(joint, product):
+            usable = (p > eps) & (q > eps)
+            total = total + np.where(usable, p * np.log2(np.where(usable, p / q, 1.0)), 0.0)
+    return np.where((total < 0.0) & (total > -1.0e-10), 0.0, total)

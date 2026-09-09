@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import warnings
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping, NamedTuple, Sequence
 
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
@@ -32,7 +32,11 @@ import pandas as pd
 
 from .fitting import _weighted_linear_fit
 from .records import (
+    bootstrap_probabilities as records_bootstrap,
+    conditional_probabilities as records_conditionals,
+    contingency as records_contingency,
     default_summary_path,
+    read_contingency_csv,
     is_record_file,
     is_summary_file,
     read_summary_csv,
@@ -42,6 +46,7 @@ from .records import (
 from .loading import (
     CIRCUIT_DISPLAY_NAMES,
     _parse_circuit_name,
+    _parse_p,
     _parse_size,
     _resolve_files,
     resolve_metadata,
@@ -137,14 +142,36 @@ def _decomposition_source(metric: str) -> str:
 # The paper names L=18 and L=20 for the tail-fitted mutual information and
 # L>=22 for the ranged one, so the boundary sits between them; smaller chains
 # have fewer distance points still and follow the tail rule.
+#
+# The negativity rule carries one more clause: at L=24 the largest-distance
+# point is dropped, and the four largest of what remains are fitted. So a
+# negativity fit uses ranks 1-4 from the top at every size except L=24, where
+# it uses ranks 2-5.
+#
+# **The L=24 exclusion is a quotation; the L<=20 boundary is an inference.**
+# Appendix C states the exclusion outright. It does not say what happens below
+# L=18 for the mutual information, and `_PAPER_MI_TAIL_MAX_SIZE` is the one
+# place to change if the reading here -- that smaller chains, having fewer
+# distance points still, follow the tail rule -- turns out to be wrong.
 # ---------------------------------------------------------------------------
 
 _PAPER_TAIL_POINTS = 4
 _PAPER_MI_TAIL_MAX_SIZE = 20
+_PAPER_NEGATIVITY_DROP_TOP_SIZE = 24
 
 
-def _paper_tail_points(metric: str, size: int, k: int) -> int | None:
-    """How many largest-distance points the paper's protocol fits, if any.
+class _TailSelection(NamedTuple):
+    """A tail fit: drop ``drop_top`` largest points, then take ``points``."""
+
+    points: int
+    drop_top: int = 0
+
+    def label(self) -> str:
+        return f"tail:{self.points}" + (f":drop{self.drop_top}" if self.drop_top else "")
+
+
+def _paper_tail_points(metric: str, size: int, k: int) -> _TailSelection | None:
+    """Which largest-distance points the paper's protocol fits, if any.
 
     ``None`` means "use the range this call was given". A decomposition factor
     follows its source measure, so the two factors and the mean they multiply
@@ -154,9 +181,11 @@ def _paper_tail_points(metric: str, size: int, k: int) -> int | None:
         return None
     stem = _decomposition_source(metric)
     if stem in ("mn", "fmn"):
-        return _PAPER_TAIL_POINTS
+        # The one size where the largest point is thrown away first.
+        drop = 1 if size == _PAPER_NEGATIVITY_DROP_TOP_SIZE else 0
+        return _TailSelection(_PAPER_TAIL_POINTS, drop)
     if stem in ("mi", "fmi") and size <= _PAPER_MI_TAIL_MAX_SIZE:
-        return _PAPER_TAIL_POINTS
+        return _TailSelection(_PAPER_TAIL_POINTS)
     return None
 
 # ---------------------------------------------------------------------------
@@ -940,15 +969,16 @@ def _distance_power_law_fit(
     curve: pd.DataFrame,
     *,
     fit_range: tuple[float | None, float | None] | None,
-    tail_points: int | None = None,
+    tail_points: "_TailSelection | None" = None,
     min_relative_error: float,
 ) -> tuple[dict[str, float], pd.DataFrame]:
     """Fit mean = prefactor * d**(-alpha) in logarithmic coordinates.
 
-    ``tail_points`` selects that many largest-distance points and **replaces**
+    ``tail_points`` selects largest-distance points and **replaces**
     ``fit_range`` rather than narrowing it -- the published protocol asks for
     the four largest distances outright, not for the four largest inside some
-    other window.
+    other window. Its ``drop_top`` discards that many of the very largest
+    first, which is what Appendix C asks for at L=24.
     """
     selected = curve.loc[
         np.isfinite(curve["d"])
@@ -958,7 +988,12 @@ def _distance_power_law_fit(
     ].copy()
 
     if tail_points is not None:
-        selected = selected.sort_values("d", kind="stable").tail(tail_points)
+        selected = selected.sort_values("d", kind="stable")
+        if tail_points.drop_top:
+            # Positional, so it drops the largest distances rather than the
+            # largest values -- and an empty frame stays empty.
+            selected = selected.iloc[: max(0, len(selected) - tail_points.drop_top)]
+        selected = selected.tail(tail_points.points)
     elif fit_range is not None:
         lower, upper = fit_range
         if lower is not None:
@@ -1122,11 +1157,11 @@ def _print_distance_fits(
                     continue
                 window = f"[{row['d_min']:.4g}, {row['d_max']:.4g}]"
                 selection = str(row.get("fit_selection", "range"))
-                marker = (
-                    f"  [tail {selection.split(':')[1]}]"
-                    if selection.startswith("tail:")
-                    else ""
-                )
+                marker = ""
+                if selection.startswith("tail:"):
+                    parts = selection.split(":")
+                    marker = f"  [tail {parts[1]}"
+                    marker += f", drop {parts[2][4:]}]" if len(parts) > 2 else "]"
                 print(
                     f"{head} = {row['alpha']:7.4f} +/- {row['alpha_stderr']:.4f}"
                     f"   d in {window:<18s}"
@@ -1807,9 +1842,7 @@ def dist_scaling(
             if metric not in data[(k_of_file, size)]:
                 continue
             tail_points = resolve_selection(metric, size, k_of_file)
-            selection = (
-                f"tail:{tail_points}" if tail_points is not None else "range"
-            )
+            selection = tail_points.label() if tail_points is not None else "range"
             try:
                 fit, selected = _distance_power_law_fit(
                     data[(k_of_file, size)][metric],
@@ -2690,3 +2723,495 @@ def dist_scaling_comparison(
         "axis_label_fontsize": axis_label_fontsize,
         "source_results": dict(results),
     }
+
+
+# ===========================================================================
+# The percolation diagnostic (`dist_percolation`)
+#
+# What this answers, and what the existing figures cannot
+# -------------------------------------------------------
+# `dist_scaling` plots how the mean negativity decays with distance, and
+# `ent_decomp` splits that mean into how often a pair is entangled at all times
+# how much it is when it is. Neither can say *why* the entangled fraction
+# decays, because neither knows anything about the circuit that produced each
+# record.
+#
+# The spacetime percolation picture -- Avakian, Pereg-Barnea and
+# Witczak-Krempa, arXiv:2404.16095 Sec. VI -- says a pair can only be entangled
+# if a path through the circuit connects them without crossing a measurement,
+# and is explicit that this is *necessary but not sufficient*. Testing that
+# needs the joint distribution of "connected" and "entangled" on the same
+# trajectory, not a comparison of two marginal curves: P(C) and P(E) decaying
+# at similar rates is equally consistent with the picture being exactly right,
+# right up to a constant conversion efficiency, or wrong in a way that happens
+# to look similar.
+#
+# So the decisive quantities are the two conditionals
+#
+#     kappa(eps) = P(fN > eps |  C),      eta(eps) = P(fN > eps | not C)
+#
+# and the incompleteness claim is the specific prediction eta ~ 0, kappa < 1.
+#
+# Everything here is computed from `dist_scaling.exe`'s format v2 per-record
+# binaries, or from the `<stem>_contingency.csv` that `./summarize_records`
+# reduces one to. A production record file does not fit in memory, so the
+# binary is always streamed.
+# ===========================================================================
+
+# How many of the largest distances define the long-distance plateau.
+_PERCOLATION_PLATEAU_POINTS = 3
+
+
+def _percolation_frame_from_records(
+    path: Path,
+    *,
+    thresholds: Sequence[float] | None,
+    metric: str,
+    bootstrap: int,
+    seed: int,
+    cluster: bool,
+    chunk_records: int,
+) -> dict[str, Any]:
+    """One record binary, streamed into its joint table."""
+    info = record_file_info(path)
+    table = records_contingency(
+        path,
+        thresholds=thresholds,
+        metric=metric,
+        chunk_records=chunk_records,
+        info=info,
+        cluster=cluster and bootstrap > 0,
+    )
+    errors = None
+    if bootstrap > 0 and table["clusters"] is not None:
+        errors = records_bootstrap(table, resamples=bootstrap, seed=seed)
+    frame = records_conditionals(table)
+    return {
+        "frame": frame,
+        "bootstrap": errors,
+        "thresholds": table["thresholds"],
+        "primary_threshold": table["primary_threshold"],
+        "metric": table["metric"],
+        "L": info["L"],
+        "p": float(info["header"].get("p", np.nan)),
+        "circuit": info.get("circuit_name") or _parse_circuit_name(path),
+        "trajectories": int(info["header"].get("realizations", 0)),
+        "source": "records",
+    }
+
+
+def _percolation_frame_from_contingency(path: Path) -> dict[str, Any]:
+    """One pre-reduced `<stem>_contingency.csv`."""
+    frame = read_contingency_csv(path)
+    if "primary_threshold" in frame.columns:
+        primary = float(frame["primary_threshold"].iloc[0])
+    else:
+        primary = float(np.nanmin(frame["threshold"]))
+    # A contingency CSV already carries its bootstrap columns inline, on the
+    # primary threshold's rows, so there is nothing to merge in later.
+    has_bands = "kappa_lo" in frame.columns and frame["kappa_lo"].notna().any()
+    return {
+        "frame": frame,
+        # Already inline on the primary threshold's rows; see `has_bands`.
+        "bootstrap": None,
+        "has_bands": has_bands,
+        "thresholds": np.unique(frame["threshold"].to_numpy(dtype=float)),
+        "primary_threshold": primary,
+        "metric": "fmn",
+        "L": int(frame["N"].iloc[0]) if "N" in frame.columns else _parse_size(path),
+        "p": float(frame["p"].iloc[0]) if "p" in frame.columns else _parse_p(path),
+        "circuit": (
+            str(frame["circuit_name"].iloc[0])
+            if "circuit_name" in frame.columns
+            else _parse_circuit_name(path)
+        ),
+        "trajectories": (
+            int(frame["realizations"].iloc[0]) if "realizations" in frame.columns else 0
+        ),
+        "source": "contingency",
+    }
+
+
+def _plateau(
+    frame: pd.DataFrame,
+    column: str,
+    *,
+    points: int = _PERCOLATION_PLATEAU_POINTS,
+) -> tuple[float, float]:
+    """The long-distance value of a probability, and its spread.
+
+    Taken as the unweighted mean over the ``points`` largest distances, with
+    the standard error of that mean as the uncertainty. Deliberately crude: the
+    points come from the same trajectories and so covary, which no per-point
+    error can express, and the clustered bootstrap is what the reported errors
+    should come from where it is available.
+    """
+    usable = frame.loc[np.isfinite(frame["d"]) & np.isfinite(frame[column])]
+    if usable.empty:
+        return float("nan"), float("nan")
+    tail = usable.sort_values("d").tail(points)[column].to_numpy(dtype=float)
+    if tail.size == 0:
+        return float("nan"), float("nan")
+    spread = float(np.std(tail, ddof=1) / np.sqrt(tail.size)) if tail.size > 1 else 0.0
+    return float(np.mean(tail)), spread
+
+
+def fit_p_infinity(
+    table: pd.DataFrame,
+    *,
+    column: str = "p_infinity",
+    fixed_beta: float | None = 3.0,
+) -> dict[str, Any]:
+    """Fit ``P_inf(p) = A (1 - p)^beta`` across measurement rates.
+
+    Returns the free-``beta`` fit and, when ``fixed_beta`` is given, the same
+    fit with the exponent held there, so the two can be compared on the same
+    points. Both are weighted least squares in log-log coordinates.
+
+    **What P_inf is here.** The long-distance plateau of ``P(fN > eps)``: the
+    mean over the largest few distances at one ``(L, p)``. That is a reading of
+    the quantity rather than a quotation -- the natural order parameter for a
+    percolation transition is the probability that a pair at unbounded
+    separation is still entangled, and the plateau is its finite-size estimate.
+    A different definition would change ``A`` and could change ``beta``, so the
+    definition travels with the result rather than being implied by the name.
+    """
+    usable = table.loc[
+        np.isfinite(table["p"])
+        & np.isfinite(table[column])
+        & (table[column] > 0.0)
+        & (table["p"] < 1.0)
+    ].copy()
+    out: dict[str, Any] = {"points": usable, "fixed_beta": fixed_beta}
+    if len(usable) < 3:
+        out["error"] = (
+            f"a {column} fit needs at least three measurement rates; this set has "
+            f"{len(usable)}."
+        )
+        return out
+
+    x = np.log(1.0 - usable["p"].to_numpy(dtype=float))
+    y = np.log(usable[column].to_numpy(dtype=float))
+    stderr = usable.get(f"{column}_stderr")
+    sigma = (
+        np.asarray(stderr, dtype=float) / usable[column].to_numpy(dtype=float)
+        if stderr is not None
+        else np.full(x.shape, np.nan)
+    )
+    # A missing or zero error bar would drop the point entirely, so fall back to
+    # equal weights rather than silently fitting a subset.
+    sigma = np.where(np.isfinite(sigma) & (sigma > 0.0), sigma, 1.0)
+
+    free = _weighted_linear_fit(x, y, sigma)
+    out["beta"] = free["slope"]
+    out["beta_stderr"] = free["slope_stderr"]
+    out["amplitude"] = float(np.exp(free["intercept"]))
+    out["reduced_chi2"] = free["reduced_chi2"]
+
+    if fixed_beta is not None:
+        weights = 1.0 / sigma**2
+        residual = y - fixed_beta * x
+        intercept = float(np.sum(weights * residual) / np.sum(weights))
+        chi2 = float(np.sum(weights * (residual - intercept) ** 2))
+        dof = max(1, x.size - 1)
+        out["fixed_amplitude"] = float(np.exp(intercept))
+        out["fixed_reduced_chi2"] = chi2 / dof
+        # How many sigma the free exponent sits from the fixed one. This is the
+        # comparison the fixed fit exists for; a small value means the data do
+        # not distinguish them, not that beta = 3 is confirmed.
+        out["beta_deviation_sigma"] = (
+            abs(free["slope"] - fixed_beta) / free["slope_stderr"]
+            if free["slope_stderr"] > 0.0
+            else float("nan")
+        )
+    return out
+
+
+def dist_percolation(
+    files: Sequence[str | Path] | str | Path | None = None,
+    *,
+    file_glob: str | Path | None = None,
+    l_by_file: Mapping[str, int] | None = None,
+    thresholds: Sequence[float] | None = None,
+    metric: str = "auto",
+    bootstrap: int = 400,
+    seed: int = 0,
+    plateau_points: int = _PERCOLATION_PLATEAU_POINTS,
+    fixed_beta: float | None = 3.0,
+    chunk_records: int = 1_000_000,
+    cmap: str = "viridis",
+    figsize: tuple[float, float] | None = None,
+    dpi: int = 130,
+    title: str | None = None,
+    show_summary: bool = True,
+    show: bool = True,
+) -> dict[str, Any]:
+    """Joint connectivity/entanglement diagnostics for ``dist_scaling.exe``.
+
+    Takes format v2 record binaries (or the ``*_contingency.csv`` files
+    ``./summarize_records`` reduces them to) and draws four panels:
+
+    1. **Endpoint survival.** ``P(A_i and A_j)`` against the product
+       ``P(A_i)P(A_j)``. The percolation probability is usually written as
+       ``q^2 P(C | A)``; this panel is the direct test of that factorization,
+       and the two endpoints sit in one trajectory, so there is no reason for
+       them to be independent.
+    2. **Marginals.** ``P_perc(d)`` and ``P(fN > eps)(d)`` on one axis. These
+       are the two curves a marginal comparison would stop at.
+    3. **The conditionals.** ``kappa(d)`` and ``eta(d)``. A
+       necessary-but-incomplete percolation picture predicts ``eta ~ 0`` and
+       ``kappa < 1``; this is the panel that can falsify it.
+    4. **The threshold sweep.** ``P(E)`` and ``kappa`` against ``eps``. A
+       probability that is genuinely zero does not move as the threshold falls;
+       one that is merely small does. Since the fermionic negativity is now
+       computed in the cancellation-safe closed form, this sweep is meaningful
+       down to the state vector's own noise floor rather than stopping at the
+       generic partial transpose's.
+
+    Errors are trajectory-clustered bootstraps wherever ``bootstrap > 0``: each
+    trajectory contributes one record to every geometry, so per-record errors
+    on these probabilities are optimistic.
+    """
+    paths = _resolve_files(files, file_glob, description="dist_scaling record files")
+
+    loaded: list[dict[str, Any]] = []
+    for path in paths:
+        if is_record_file(path):
+            entry = _percolation_frame_from_records(
+                path,
+                thresholds=thresholds,
+                metric=metric,
+                bootstrap=bootstrap,
+                seed=seed,
+                cluster=True,
+                chunk_records=chunk_records,
+            )
+        elif path.suffix == ".csv":
+            entry = _percolation_frame_from_contingency(path)
+        else:
+            warnings.warn(
+                f"{path.name} is neither a record binary nor a contingency CSV; "
+                "skipping it.",
+                stacklevel=2,
+            )
+            continue
+        if entry["L"] is None:
+            entry["L"] = _parse_size(path, l_by_file)
+        entry["path"] = str(path)
+        loaded.append(entry)
+
+    if not loaded:
+        raise ValueError(
+            "No usable input. dist_percolation needs format v2 record binaries "
+            "(written by a dist_scaling.exe with connectivity flags) or the "
+            "*_contingency.csv files ./summarize_records reduces them to."
+        )
+    loaded.sort(key=lambda entry: (entry["L"], entry["p"]))
+
+    # --- the per-(L, p) plateau table --------------------------------------
+    rows = []
+    for entry in loaded:
+        frame = entry["frame"]
+        primary = frame.loc[np.isclose(frame["threshold"], entry["primary_threshold"])]
+        p_inf, p_inf_stderr = _plateau(primary, "p_entangled", points=plateau_points)
+        perc, perc_stderr = _plateau(primary, "p_perc", points=plateau_points)
+        kappa, kappa_stderr = _plateau(primary, "kappa", points=plateau_points)
+        rows.append(
+            {
+                "L": entry["L"],
+                "p": entry["p"],
+                "circuit": entry["circuit"],
+                "threshold": entry["primary_threshold"],
+                "trajectories": entry["trajectories"],
+                "p_infinity": p_inf,
+                "p_infinity_stderr": p_inf_stderr,
+                "p_perc_infinity": perc,
+                "p_perc_infinity_stderr": perc_stderr,
+                # The conversion efficiency: how much of the geometric
+                # connectivity actually becomes entanglement at long distance.
+                "conversion_efficiency": kappa,
+                "conversion_efficiency_stderr": kappa_stderr,
+                "q_joint": float(primary["q_joint"].mean()),
+                "survival_independence": float(primary["survival_independence"].mean()),
+                "eta_max": float(np.nanmax(primary["eta"].to_numpy(dtype=float)))
+                if len(primary)
+                else np.nan,
+                "source": entry["source"],
+            }
+        )
+    drift = pd.DataFrame(rows)
+
+    beta_fit = fit_p_infinity(drift, fixed_beta=fixed_beta)
+
+    # --- the figure ---------------------------------------------------------
+    figure, axes = plt.subplots(
+        2, 2, figsize=figsize or (11.0, 8.0), dpi=dpi, constrained_layout=False
+    )
+    # One colour per input file rather than per size: a percolation study
+    # sweeps `p` at fixed `L`, so colouring by `L` alone would draw every curve
+    # of a p scan in the same colour. Each legend entry names both.
+    palette = plt.get_cmap(cmap)
+    colors = {
+        entry["path"]: palette(index / max(1, len(loaded) - 1))
+        for index, entry in enumerate(loaded)
+    }
+
+    survival_axis, marginal_axis, conditional_axis, sweep_axis = axes.ravel()
+
+    for entry in loaded:
+        frame = entry["frame"]
+        primary = frame.loc[
+            np.isclose(frame["threshold"], entry["primary_threshold"])
+        ].sort_values("d")
+        color = colors[entry["path"]]
+        label = rf"$L={entry['L']}$, $p={entry['p']:.3g}$"
+        errors = entry["bootstrap"]
+
+        survival_axis.plot(primary["d"], primary["q_joint"], "o-", color=color, label=label)
+        survival_axis.plot(
+            primary["d"], primary["q_product"], "s--", color=color, alpha=0.5,
+            label="_nolegend_",
+        )
+
+        marginal_axis.plot(primary["d"], primary["p_perc"], "o-", color=color, label=label)
+        marginal_axis.plot(
+            primary["d"], primary["p_entangled"], "^:", color=color, alpha=0.7,
+            label="_nolegend_",
+        )
+
+        # The bootstrap band arrives either alongside (a freshly streamed
+        # record binary) or already inline (a contingency CSV, which stores it
+        # on the primary threshold's rows). Merging in the second case would
+        # collide every column with itself.
+        band = primary
+        if (
+            errors is not None
+            and "kappa_lo" in errors.columns
+            and "kappa_lo" not in primary.columns
+        ):
+            band = primary.merge(
+                errors[["geometry_id", "kappa_lo", "kappa_hi"]],
+                on="geometry_id",
+                how="left",
+            ).sort_values("d")
+        if "kappa_lo" in band.columns and band["kappa_lo"].notna().any():
+            conditional_axis.fill_between(
+                band["d"], band["kappa_lo"], band["kappa_hi"],
+                color=color, alpha=0.2, linewidth=0,
+            )
+        conditional_axis.plot(primary["d"], primary["kappa"], "o-", color=color, label=label)
+        conditional_axis.plot(
+            primary["d"], primary["eta"], "x--", color=color, alpha=0.8, label="_nolegend_"
+        )
+
+        # The sweep is over thresholds at the largest distance available, which
+        # is where a percolation claim is hardest and most interesting.
+        largest = frame["d"].max()
+        sweep = frame.loc[np.isclose(frame["d"], largest)].sort_values("threshold")
+        sweep_axis.plot(sweep["threshold"], sweep["p_entangled"], "o-", color=color, label=label)
+        sweep_axis.plot(
+            sweep["threshold"], sweep["kappa"], "s--", color=color, alpha=0.6,
+            label="_nolegend_",
+        )
+
+    survival_axis.set_xlabel("$d$")
+    survival_axis.set_ylabel("endpoint survival")
+    survival_axis.set_title(
+        r"$P(A_i \cap A_j)$ (circles) vs $P(A_i)P(A_j)$ (squares)", fontsize=9
+    )
+    marginal_axis.set_xlabel("$d$")
+    marginal_axis.set_ylabel("probability")
+    marginal_axis.set_yscale("log")
+    marginal_axis.set_title(
+        r"$P_{\mathrm{perc}}$ (circles) vs $P(\mathcal{N}^f>\epsilon)$ (triangles)",
+        fontsize=9,
+    )
+    conditional_axis.set_xlabel("$d$")
+    conditional_axis.set_ylabel("conditional probability")
+    conditional_axis.set_ylim(-0.05, 1.05)
+    conditional_axis.set_title(
+        r"$\kappa=P(E\mid C)$ (circles) vs $\eta=P(E\mid\neg C)$ (crosses)", fontsize=9
+    )
+    sweep_axis.set_xscale("log")
+    sweep_axis.set_xlabel(r"$\epsilon$")
+    sweep_axis.set_ylabel("probability at the largest $d$")
+    sweep_axis.set_title(
+        r"threshold sweep: $P(E)$ (circles), $\kappa$ (squares)", fontsize=9
+    )
+    for axis in axes.ravel():
+        axis.grid(alpha=0.25)
+        axis.legend(fontsize=7)
+
+    figure.suptitle(
+        title
+        or (
+            f"Spacetime percolation vs entanglement -- {loaded[0]['circuit']} "
+            f"({loaded[0]['metric']})"
+        )
+    )
+    _show(figure, show)
+
+    if show_summary:
+        _print_percolation_summary(drift, beta_fit, loaded)
+
+    return {
+        "figure": figure,
+        "axes": axes,
+        "files": loaded,
+        "drift": drift,
+        "beta_fit": beta_fit,
+        "thresholds": loaded[0]["thresholds"],
+        "metric": loaded[0]["metric"],
+    }
+
+
+def _print_percolation_summary(
+    drift: pd.DataFrame, beta_fit: dict[str, Any], loaded: list[dict[str, Any]]
+) -> None:
+    print("Spacetime percolation vs entanglement:")
+    print(
+        f"  {'L':>4s} {'p':>7s} {'eps':>9s} {'q_joint':>8s} {'q_j/q^2':>8s} "
+        f"{'P_perc':>8s} {'P_inf':>9s} {'kappa':>7s} {'eta_max':>9s}"
+    )
+    for _, row in drift.iterrows():
+        print(
+            f"  {int(row['L']):4d} {row['p']:7.4g} {row['threshold']:9.2g} "
+            f"{row['q_joint']:8.4f} {row['survival_independence']:8.4f} "
+            f"{row['p_perc_infinity']:8.4f} {row['p_infinity']:9.4g} "
+            f"{row['conversion_efficiency']:7.4f} {row['eta_max']:9.2g}"
+        )
+
+    # The claim the whole apparatus is here to test.
+    worst_eta = float(np.nanmax(drift["eta_max"].to_numpy(dtype=float)))
+    worst_kappa = float(np.nanmin(drift["conversion_efficiency"].to_numpy(dtype=float)))
+    print(
+        f"  largest eta over all files: {worst_eta:.3g} "
+        f"(a necessary spanning path predicts 0)"
+    )
+    print(
+        f"  smallest kappa over all files: {worst_kappa:.4f} "
+        f"(a sufficient spanning path predicts 1)"
+    )
+    independence = drift["survival_independence"].to_numpy(dtype=float)
+    if np.any(np.isfinite(independence)):
+        print(
+            f"  endpoint independence P(A_i and A_j)/P(A_i)P(A_j): "
+            f"{np.nanmin(independence):.4f} to {np.nanmax(independence):.4f} "
+            f"(1 exactly when the q^2 approximation holds)"
+        )
+
+    if "error" in beta_fit:
+        print(f"  P_inf(p) = A(1-p)^beta: {beta_fit['error']}")
+        return
+    print(
+        f"  P_inf(p) = A(1-p)^beta: beta = {beta_fit['beta']:.3f} "
+        f"+/- {beta_fit['beta_stderr']:.3f}, A = {beta_fit['amplitude']:.4g}, "
+        f"chi2/dof = {beta_fit['reduced_chi2']:.2f}"
+    )
+    if "fixed_amplitude" in beta_fit:
+        print(
+            f"    with beta fixed at {beta_fit['fixed_beta']:g}: "
+            f"A = {beta_fit['fixed_amplitude']:.4g}, "
+            f"chi2/dof = {beta_fit['fixed_reduced_chi2']:.2f}; the free exponent "
+            f"sits {beta_fit['beta_deviation_sigma']:.1f} sigma away"
+        )

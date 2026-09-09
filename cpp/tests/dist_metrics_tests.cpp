@@ -248,6 +248,76 @@ void test_pair_round_trip(const std::string &directory)
                 {
                     ++bin.fmn_positive;
                 }
+                const double residual = 1.0e-16 * unit(rng);
+                bin.fmn_residual.add(residual);
+                bin.fmn_residual_max = std::max(bin.fmn_residual_max, residual);
+
+                const double n_i = unit(rng);
+                const double n_j = unit(rng);
+                bin.n_i.add(n_i);
+                bin.n_j.add(n_j);
+                const double dnn = n_i * n_j;
+                bin.dnn.add(dnn);
+                bin.rho_n.add(dnn - n_i * n_j);
+                const double i_occ = unit(rng);
+                bin.i_occ.add(i_occ);
+
+                // Drive the contingency exactly the way PairProtocol does, so
+                // that the partition invariants the resume checks are the ones
+                // the run actually produces rather than ones the test invents.
+                const bool survives_i = unit(rng) > 0.3;
+                const bool survives_j = unit(rng) > 0.3;
+                const bool interior = unit(rng) > 0.25;
+                const bool connected = survives_i && survives_j && interior;
+                const bool entangled = fmn > 0.5;
+                ++bin.conn_records;
+                bin.survive_i += survives_i ? 1u : 0u;
+                bin.survive_j += survives_j ? 1u : 0u;
+                bin.survive_both += (survives_i && survives_j) ? 1u : 0u;
+                bin.interior_path += interior ? 1u : 0u;
+                bin.component_size.add(unit(rng) * 100.0);
+                if (interior)
+                {
+                    bin.shortest_path.add(unit(rng) * 10.0);
+                }
+                if (connected)
+                {
+                    ++bin.connected;
+                    bin.ent_given_connected.add(fmn);
+                    if (entangled)
+                    {
+                        ++bin.connected_ent_positive;
+                    }
+                    else
+                    {
+                        ++bin.connected_ent_zero;
+                        bin.i_occ_connected_classical.add(i_occ);
+                        if (i_occ > 0.6)
+                        {
+                            ++bin.classical_occ_correlated;
+                        }
+                        else if (i_occ > 0.3)
+                        {
+                            ++bin.classical_subthreshold;
+                        }
+                        else
+                        {
+                            ++bin.classical_silent;
+                        }
+                    }
+                }
+                else
+                {
+                    bin.ent_given_disconnected.add(fmn);
+                    if (entangled)
+                    {
+                        ++bin.disconnected_ent_positive;
+                    }
+                    else
+                    {
+                        ++bin.disconnected_ent_zero;
+                    }
+                }
             }
         }
     };
@@ -278,6 +348,49 @@ void test_pair_round_trip(const std::string &directory)
         expect_stats_equal(restored[b].ff2, bins[b].ff2, "pair ff2");
         expect(restored[b].mn_positive == bins[b].mn_positive, "pair mn_positive");
         expect(restored[b].fmn_positive == bins[b].fmn_positive, "pair fmn_positive");
+        expect_stats_equal(restored[b].n_i, bins[b].n_i, "pair n_i");
+        expect_stats_equal(restored[b].dnn, bins[b].dnn, "pair dnn");
+        expect_stats_equal(restored[b].rho_n, bins[b].rho_n, "pair rho_n");
+        expect_stats_equal(restored[b].i_occ, bins[b].i_occ, "pair i_occ");
+        expect_stats_equal(restored[b].ent_given_connected, bins[b].ent_given_connected,
+                           "pair ent_given_connected");
+        expect_stats_equal(restored[b].ent_given_disconnected, bins[b].ent_given_disconnected,
+                           "pair ent_given_disconnected");
+        expect_stats_equal(restored[b].component_size, bins[b].component_size,
+                           "pair component_size");
+        expect_stats_equal(restored[b].shortest_path, bins[b].shortest_path,
+                           "pair shortest_path");
+        expect_stats_equal(restored[b].fmn_residual, bins[b].fmn_residual, "pair fmn_residual");
+        expect(restored[b].fmn_residual_max == bins[b].fmn_residual_max,
+               "pair fmn_residual_max");
+        // The whole contingency table, cell by cell. These are the counts the
+        // conditional probabilities are computed from, so a silent loss here
+        // would show up as a plausible-looking kappa rather than as an error.
+        expect(restored[b].conn_records == bins[b].conn_records, "pair conn_records");
+        expect(restored[b].survive_i == bins[b].survive_i, "pair survive_i");
+        expect(restored[b].survive_j == bins[b].survive_j, "pair survive_j");
+        expect(restored[b].survive_both == bins[b].survive_both, "pair survive_both");
+        expect(restored[b].interior_path == bins[b].interior_path, "pair interior_path");
+        expect(restored[b].connected == bins[b].connected, "pair connected");
+        expect(restored[b].connected_ent_positive == bins[b].connected_ent_positive,
+               "pair connected_ent_positive");
+        expect(restored[b].connected_ent_zero == bins[b].connected_ent_zero,
+               "pair connected_ent_zero");
+        expect(restored[b].disconnected_ent_positive == bins[b].disconnected_ent_positive,
+               "pair disconnected_ent_positive");
+        expect(restored[b].disconnected_ent_zero == bins[b].disconnected_ent_zero,
+               "pair disconnected_ent_zero");
+        expect(restored[b].classical_occ_correlated == bins[b].classical_occ_correlated,
+               "pair classical_occ_correlated");
+        expect(restored[b].classical_subthreshold == bins[b].classical_subthreshold,
+               "pair classical_subthreshold");
+        expect(restored[b].classical_silent == bins[b].classical_silent,
+               "pair classical_silent");
+        // Non-vacuity: a partition test passes trivially on all-zero counts.
+        expect(restored[b].connected > 0 && restored[b].connected_ent_positive > 0 &&
+                   restored[b].connected_ent_zero > 0 &&
+                   restored[b].disconnected_ent_positive > 0,
+               "the contingency table must actually be populated");
     }
 
     // Continue both the restored and an uninterrupted copy over the same draws.
@@ -327,6 +440,36 @@ void test_pair_round_trip(const std::string &directory)
     other.n = 12;
     expect(refuses([&]() { auto b = dist::make_pair_bins(other.n); (void)res::load_pairs(other, b); }),
            "a different N must be refused");
+    // Pooling two classification thresholds would silently mix two different
+    // definitions of "entangled" in one contingency table.
+    other = config;
+    other.pair_zero_tol = 1.0e-10;
+    expect(refuses([&]() { auto b = dist::make_pair_bins(config.n); (void)res::load_pairs(other, b); }),
+           "a different pair_zero_tol must be refused");
+    // require_same(double)'s relative slack is 1e-12 * max(1, |x|), which would
+    // accept zero as a match for the 1e-12 default. The text comparison must
+    // not.
+    other = config;
+    other.pair_zero_tol = 0.0;
+    expect(refuses([&]() { auto b = dist::make_pair_bins(config.n); (void)res::load_pairs(other, b); }),
+           "a zero pair_zero_tol must be refused against the 1e-12 default");
+    other = config;
+    other.statevector_precision = config.statevector_precision == 64 ? 32 : 64;
+    expect(refuses([&]() { auto b = dist::make_pair_bins(config.n); (void)res::load_pairs(other, b); }),
+           "a different statevector precision must be refused");
+    // A hand-edited contingency table must not read back as a valid one.
+    {
+        auto broken = bins;
+        ++broken[1].connected_ent_positive;
+        dist::publish_csv(directory + "/broken.csv", dist::render_pair_csv(config, broken));
+        auto broken_config = config;
+        broken_config.output_path = directory + "/broken.csv";
+        expect(refuses([&]() {
+                   auto b = dist::make_pair_bins(config.n);
+                   (void)res::load_pairs(broken_config, b);
+               }),
+               "a contingency table that does not partition must be refused");
+    }
 
     // A missing file is a fresh start, not an error.
     auto absent = config;
@@ -550,6 +693,7 @@ struct Row
     std::uint32_t realization;
     std::uint16_t geometry;
     std::uint16_t embedding;
+    std::uint32_t flags;
     std::vector<double> values;
 };
 
@@ -586,6 +730,10 @@ std::pair<std::string, std::vector<Row>> read_back(const std::string &path,
         std::memcpy(&row.realization, raw.data(), 4);
         std::memcpy(&row.geometry, raw.data() + 4, 2);
         std::memcpy(&row.embedding, raw.data() + 6, 2);
+        std::memcpy(&row.flags, raw.data() + 8, 4);
+        std::uint32_t reserved = 1;
+        std::memcpy(&reserved, raw.data() + 12, 4);
+        expect(reserved == 0, "the reserved alignment word is zero");
         row.values.resize(value_count);
         std::memcpy(row.values.data(), raw.data() + rec::ID_BYTES, value_count * sizeof(double));
         rows.push_back(std::move(row));
@@ -612,8 +760,15 @@ void test_immediate_round_trip(const std::string &directory)
                 {
                     const double values[2] = {0.5 * realization + geometry,
                                               -1.0 * embedding - 0.25 * geometry};
-                    sink.add(realization, geometry, embedding, values);
-                    expected.push_back({realization, geometry, embedding, {values[0], values[1]}});
+                    // A flag mask that varies per record, so a writer that
+                    // dropped or transposed the field could not pass.
+                    const std::uint32_t flags =
+                        mipt::dist::FLAG_EVALUATED |
+                        ((realization % 2) ? mipt::dist::FLAG_SURVIVES_I : 0u) |
+                        ((geometry % 2) ? mipt::dist::FLAG_CONNECTED : 0u);
+                    sink.add(realization, geometry, embedding, flags, values);
+                    expected.push_back(
+                        {realization, geometry, embedding, flags, {values[0], values[1]}});
                 }
             }
         }
@@ -632,6 +787,8 @@ void test_immediate_round_trip(const std::string &directory)
         expect(rows[index].values[0] == expected[index].values[0] &&
                    rows[index].values[1] == expected[index].values[1],
                "record observables round-trip bit for bit");
+        expect(rows[index].flags == expected[index].flags,
+               "record connectivity flags round-trip");
     }
 }
 
@@ -646,12 +803,12 @@ void test_deferred_resolution(const std::string &directory)
 
     // Trajectory 0: one resolved record, then one waiting on a solve.
     const double first[2] = {1.0, 0.0};
-    sink.add(0, 0, 0, first);
+    sink.add(0, 0, 0, 0u, first);
     const double second[2] = {2.0, std::numeric_limits<double>::quiet_NaN()};
-    const std::uint64_t waiting = sink.add_pending(0, 1, 0, second, 1);
+    const std::uint64_t waiting = sink.add_pending(0, 1, 0, 0u, second, 1);
     // Trajectory 1: fully resolved, but it sits behind the pending record.
     const double third[2] = {3.0, 0.0};
-    sink.add(1, 0, 0, third);
+    sink.add(1, 0, 0, 0u, third);
 
     sink.flush();
     expect(sink.written() == 0,
@@ -680,7 +837,7 @@ void test_failed_solve_releases_the_row(const std::string &directory)
     rec::RecordSink sink;
     sink.open(path, "format=test\n", 2, 0);
     const double values[2] = {1.5, std::numeric_limits<double>::quiet_NaN()};
-    const std::uint64_t waiting = sink.add_pending(0, 0, 0, values, 1);
+    const std::uint64_t waiting = sink.add_pending(0, 0, 0, 0u, values, 1);
     sink.resolve(waiting, 1, std::numeric_limits<double>::quiet_NaN());
     sink.close();
 
@@ -705,7 +862,7 @@ void test_resume_trims_to_the_checkpoint(const std::string &directory)
             for (std::uint16_t geometry = 0; geometry < 4; ++geometry)
             {
                 const double values[2] = {static_cast<double>(realization), geometry + 0.5};
-                sink.add(realization, geometry, 0, values);
+                sink.add(realization, geometry, 0, 0u, values);
             }
         }
         sink.close();
@@ -721,7 +878,7 @@ void test_resume_trims_to_the_checkpoint(const std::string &directory)
         expect(sink.truncated_on_open(), "the uncounted trajectories are reported as dropped");
         expect(sink.realizations_in_file() == 4, "the file holds exactly the counted ones");
         const double values[2] = {4.0, 9.0};
-        sink.add(4, 0, 0, values);
+        sink.add(4, 0, 0, 0u, values);
         sink.close();
     }
 
@@ -746,7 +903,7 @@ void test_mismatched_header_refuses(const std::string &directory)
         rec::RecordSink sink;
         sink.open(path, "format=test\nN=12\n", 2, 0);
         const double values[2] = {1.0, 2.0};
-        sink.add(0, 0, 0, values);
+        sink.add(0, 0, 0, 0u, values);
         sink.close();
     }
     expect(refuses([&] {
@@ -769,8 +926,19 @@ void test_header_carries_the_geometry_table()
     config.k = 2;
     config.n = 8;
     config.type = mipt::CircuitType::FermionRPPU;
+    config.record_detail = mipt::dist::RecordDetail::Basic;
     const auto bins = mipt::dist::make_pair_bins(config.n);
-    const std::string header = rec::pair_header_text(config, bins);
+    // (geometry, embedding) -> sites, exactly as PairProtocol builds it.
+    std::vector<std::array<int, 4>> embeddings;
+    for (int i = 0; i < config.n; ++i)
+    {
+        for (int j = i + 1; j < config.n; ++j)
+        {
+            const int separation = mipt::util::periodic_distance(i, j, config.n);
+            embeddings.push_back({separation - 1, 0, i, j});
+        }
+    }
+    const std::string header = rec::pair_header_text(config, bins, embeddings);
 
     expect(header.find("k=2\n") != std::string::npos, "the header names the party count");
     expect(header.find("N=8\n") != std::string::npos, "the header names the system size");
@@ -779,6 +947,24 @@ void test_header_carries_the_geometry_table()
     expect(header.find("[geometry]\ngeometry_id,separation,d,embedding_count\n") !=
                std::string::npos,
            "the geometry table maps a geometry id to its effective distance");
+    expect(header.find("[embedding]\ngeometry_id,embedding_id,site_1,site_2\n") !=
+               std::string::npos,
+           "the embedding table maps a (geometry, embedding) to its two sites");
+    // Provenance: none of the stored flags or negativities can be interpreted
+    // without these, so the header has to carry them.
+    expect(header.find("pair_zero_tol=") != std::string::npos,
+           "the header records the positivity threshold");
+    expect(header.find("connectivity_graph_version=") != std::string::npos &&
+               header.find("connectivity_graph=") != std::string::npos,
+           "the header records which graph convention produced the flags");
+    expect(header.find("statevector_precision=") != std::string::npos,
+           "the header records the arithmetic the negativities came from");
+    expect(header.find("boundary_implementation=") != std::string::npos,
+           "the header records how the periodic bond was implemented");
+    expect(header.find("master_seed=") != std::string::npos,
+           "the header records the seed the trajectories came from");
+    expect(header.find("flags:u4") != std::string::npos,
+           "the field list declares the flag word");
     for (const auto &bin : bins)
     {
         std::string chord;
@@ -788,11 +974,72 @@ void test_header_carries_the_geometry_table()
     }
 
     config.type = mipt::CircuitType::Haar;
-    const std::string qubit_header = rec::pair_header_text(config, bins);
+    const std::string qubit_header = rec::pair_header_text(config, bins, embeddings);
     expect(qubit_header.find("observables=mi,mn\n") != std::string::npos,
            "a qubit ensemble declares two observables, not four");
-    expect(rec::record_bytes(2) == 24 && rec::record_bytes(4) == 40,
-           "the record is its identifiers plus its float64 observables, with no padding");
+    expect(rec::record_bytes(2) == 32 && rec::record_bytes(4) == 48,
+           "a v2 record is a 16-byte identifier block plus its float64 observables");
+}
+
+// The record payload and its declared field names must agree, at every detail
+// level. They are written by two functions in two files -- fill_record_values
+// in dist_scaling.hpp and pair_observable_names here -- so nothing but a test
+// keeps them in step, and a transposition would silently relabel a column.
+void test_record_detail_levels()
+{
+    mipt::dist::RunConfig config;
+    config.k = 2;
+    config.n = 8;
+    config.type = mipt::CircuitType::FermionRPPU;
+
+    config.record_detail = mipt::dist::RecordDetail::Basic;
+    const auto basic = rec::pair_observable_names(config);
+    expect(basic == std::vector<std::string>({"mi", "mn", "fmi", "fmn"}),
+           "basic detail is exactly the format v1 value list");
+
+    config.record_detail = mipt::dist::RecordDetail::Channel;
+    const auto channel = rec::pair_observable_names(config);
+    expect(channel == std::vector<std::string>({"mi", "mn", "fmi", "fmn", "n_i", "n_j", "dnn",
+                                                "g2", "f2", "fg2", "ff2"}),
+           "channel detail appends the occupation data and both traces' correlators");
+
+    config.record_detail = mipt::dist::RecordDetail::Full;
+    const auto full = rec::pair_observable_names(config);
+    expect(full.size() == channel.size() + 4, "full detail adds the four channel phases");
+    expect(std::equal(channel.begin(), channel.end(), full.begin()),
+           "the detail levels are strictly additive, so a prefix is stable");
+    expect(full[full.size() - 4] == "fre_g" && full.back() == "fim_f",
+           "the phase fields name the trace they came from");
+
+    // A qubit ensemble has no fermionic partner, so it carries neither the
+    // fermionic observables nor the fermionic correlators.
+    config.type = mipt::CircuitType::Haar;
+    config.record_detail = mipt::dist::RecordDetail::Channel;
+    const auto qubit = rec::pair_observable_names(config);
+    expect(qubit == std::vector<std::string>({"mi", "mn", "n_i", "n_j", "dnn", "g2", "f2"}),
+           "a qubit ensemble's channel record drops every fermionic field");
+}
+
+// The stride keeps whole trajectories: that is what makes a clustered
+// bootstrap over realization_id valid on a strided file.
+void test_record_stride_keeps_whole_trajectories()
+{
+    expect(rec::stride_selects(1, 0) && rec::stride_selects(1, 7),
+           "a stride of one keeps everything");
+    int kept = 0;
+    for (std::uint64_t realization = 0; realization < 20; ++realization)
+    {
+        kept += rec::stride_selects(4, realization) ? 1 : 0;
+    }
+    expect(kept == 5, "a stride of four keeps one trajectory in four");
+    // Decisive property: the decision depends on the trajectory alone, so every
+    // record of a kept trajectory is kept and no cluster is ever partial.
+    for (std::uint64_t realization = 0; realization < 20; ++realization)
+    {
+        const bool first = rec::stride_selects(3, realization);
+        expect(first == rec::stride_selects(3, realization),
+               "the stride decision is a pure function of the trajectory index");
+    }
 }
 
 void run(const std::string &directory)
@@ -801,6 +1048,8 @@ void run(const std::string &directory)
     test_deferred_resolution(directory);
     test_failed_solve_releases_the_row(directory);
     test_resume_trims_to_the_checkpoint(directory);
+    test_record_detail_levels();
+    test_record_stride_keeps_whole_trajectories();
     test_mismatched_header_refuses(directory);
     test_header_carries_the_geometry_table();
     std::filesystem::remove_all(directory);
@@ -811,6 +1060,302 @@ void test_dist_records()
 {
     dist_record_tests::run(dist_record_tests::scratch_directory());
 }
+
+// ---------------------------------------------------------------------------
+// The two-mode channel: the closed-form fermionic negativity, the occupation
+// diagnostics, and the precision behaviour that motivates both.
+// ---------------------------------------------------------------------------
+namespace dist_channel_tests
+{
+using dist_resume_tests::expect;
+
+// A random parity-preserving two-mode state: positive semidefinite and block
+// diagonal in the local fermion parity, which is what the reduced density
+// matrix of a definite-global-parity state always is. Tracing out the
+// environment can only connect subsystem states of equal parity, so the
+// cross-parity entries are zero exactly rather than approximately.
+Rho random_parity_preserving(std::mt19937 &rng)
+{
+    std::normal_distribution<double> normal(0.0, 1.0);
+    Rho rho{};
+    // {0, 3} is the even block, {1, 2} the odd one.
+    const std::array<std::array<int, 2>, 2> blocks{{{0, 3}, {1, 2}}};
+    for (const auto &block : blocks)
+    {
+        std::array<C, 4> a{};
+        for (C &value : a)
+        {
+            value = C(normal(rng), normal(rng));
+        }
+        for (int i = 0; i < 2; ++i)
+        {
+            for (int j = 0; j < 2; ++j)
+            {
+                C sum(0.0, 0.0);
+                for (int k = 0; k < 2; ++k)
+                {
+                    sum += a[i * 2 + k] * std::conj(a[j * 2 + k]);
+                }
+                rho[block[i] * 4 + block[j]] = sum;
+            }
+        }
+    }
+    double trace = 0.0;
+    for (int i = 0; i < 4; ++i)
+    {
+        trace += rho[i * 4 + i].real();
+    }
+    for (C &value : rho)
+    {
+        value /= trace;
+    }
+    return rho;
+}
+
+// Round an interleaved RDM through float, so a host test can ask what an fp32
+// state vector's reduction would have looked like.
+std::array<double, 32> through_fp32(const std::array<double, 32> &values)
+{
+    std::array<double, 32> out{};
+    for (std::size_t i = 0; i < values.size(); ++i)
+    {
+        out[i] = static_cast<double>(static_cast<float>(values[i]));
+    }
+    return out;
+}
+
+// Closed forms on states whose fermionic negativity is known by hand.
+void test_analytic_states()
+{
+    const double inv_sqrt2 = 1.0 / std::sqrt(2.0);
+
+    // (|01> + |10>)/sqrt(2): one fermion hopping between the modes. All the
+    // weight is in the odd parity sector and |G|^2 = 1/4, so the closed form
+    // reads 2(1/4)/(sqrt(0 + 1) + 0) = 1/2.
+    const auto hop = interleaved(pure_density(std::array<C, 4>{C(0.0, 0.0), C(inv_sqrt2, 0.0), C(inv_sqrt2, 0.0), C(0.0, 0.0)}));
+    const auto hop_metrics = mipt::dist::two_party_metrics(hop.data(), true, true);
+    require_close(hop_metrics.g2, 0.25, 1.0e-12, "hopping |G|^2");
+    require_close(hop_metrics.f2, 0.0, 1.0e-12, "hopping |F|^2");
+    require_close(hop_metrics.parity_even, 0.0, 1.0e-12, "hopping even-parity weight");
+    require_close(hop_metrics.parity_odd, 1.0, 1.0e-12, "hopping odd-parity weight");
+    require_close(hop_metrics.mn_closed, 0.5, 1.0e-12, "hopping closed-form fN");
+    require_close(hop_metrics.mn, 0.5, 1.0e-12, "hopping reported fN");
+
+    // (|00> + |11>)/sqrt(2): the pairing channel instead. |F|^2 = 1/4 and all
+    // the weight is even, so the other term of the sum carries it.
+    const auto pair = interleaved(pure_density(std::array<C, 4>{C(inv_sqrt2, 0.0), C(0.0, 0.0), C(0.0, 0.0), C(inv_sqrt2, 0.0)}));
+    const auto pair_metrics = mipt::dist::two_party_metrics(pair.data(), true, true);
+    require_close(pair_metrics.f2, 0.25, 1.0e-12, "paired |F|^2");
+    require_close(pair_metrics.g2, 0.0, 1.0e-12, "paired |G|^2");
+    require_close(pair_metrics.mn_closed, 0.5, 1.0e-12, "paired closed-form fN");
+
+    // A classical mixture of the same two occupations: no coherence at all, so
+    // both channels vanish and so does the negativity -- while the occupation
+    // mutual information is a full bit, because the two modes are perfectly
+    // correlated. This is exactly the "connected and classically correlated but
+    // not entangled" cell of the contingency table.
+    Rho classical{};
+    classical[0] = 0.5;
+    classical[3 * 4 + 3] = 0.5;
+    const auto classical_ri = interleaved(classical);
+    const auto classical_metrics = mipt::dist::two_party_metrics(classical_ri.data(), true, true);
+    require_close(classical_metrics.mn_closed, 0.0, 1.0e-14, "classical closed-form fN");
+    require_close(classical_metrics.i_occ, 1.0, 1.0e-12, "classical occupation MI");
+    require_close(classical_metrics.rho_n, 0.25, 1.0e-12, "classical density correlation");
+    require_close(classical_metrics.n_i, 0.5, 1.0e-12, "classical <n_i>");
+    require_close(classical_metrics.dnn, 0.5, 1.0e-12, "classical D");
+
+    // A product state: no correlation of any kind.
+    Rho product{};
+    for (int i = 0; i < 4; ++i)
+    {
+        product[i * 4 + i] = 0.25;
+    }
+    const auto product_ri = interleaved(product);
+    const auto product_metrics = mipt::dist::two_party_metrics(product_ri.data(), true, true);
+    require_close(product_metrics.i_occ, 0.0, 1.0e-12, "product occupation MI");
+    require_close(product_metrics.rho_n, 0.0, 1.0e-12, "product density correlation");
+    require_close(product_metrics.mn_closed, 0.0, 1.0e-14, "product closed-form fN");
+}
+
+// The closed form is not an approximation. On states where both routes are
+// well conditioned they must agree to full precision, which is the only reason
+// to trust the surd rearrangement over the intuition about which parity weight
+// pairs with which coherence.
+void test_closed_form_matches_the_generic_path()
+{
+    std::mt19937 rng(20260909);
+    double worst = 0.0;
+    double largest = 0.0;
+    for (int trial = 0; trial < 400; ++trial)
+    {
+        const auto values = interleaved(random_parity_preserving(rng));
+        const auto metrics = mipt::dist::two_party_metrics(values.data(), true, true);
+        worst = std::max(worst, metrics.mn_residual);
+        largest = std::max(largest, metrics.mn_closed);
+        expect(metrics.parity_leakage < 1.0e-15,
+               "a parity-preserving state has no cross-parity weight");
+    }
+    expect(largest > 0.05, "the random states must actually be entangled, or this proves nothing");
+    expect(worst < 1.0e-12,
+           "closed form and generic partial transpose disagree by " + std::to_string(worst));
+}
+
+// The reason the closed form exists. The generic route computes a trace norm
+// that is 1 + O(N) and subtracts 1, so it loses every significant digit once
+// the negativity is small: it is still right at |G|^2 = 1e-14, wrong at 1e-16,
+// and returns *exactly zero* below that. The closed form is a ratio, so it
+// stays accurate at any magnitude.
+//
+// That is what makes the positivity threshold sweepable. Against the generic
+// value, P(fN > eps) would stop moving below eps ~ 1e-16 no matter what the
+// physics did, because every record would have collapsed onto zero.
+void test_small_negativity_precision()
+{
+    // A state with p_e = 0.6 and a tunable hopping coherence, whose exact
+    // negativity is 2|G|^2 / (sqrt(p_e^2 + 4|G|^2) + p_e).
+    const auto build = [](double g) {
+        Rho rho{};
+        rho[0] = 0.3;
+        rho[1 * 4 + 1] = 0.2;
+        rho[2 * 4 + 2] = 0.2;
+        rho[3 * 4 + 3] = 0.3;
+        rho[2 * 4 + 1] = C(g, 0.0);
+        rho[1 * 4 + 2] = C(g, 0.0);
+        return interleaved(rho);
+    };
+
+    bool saw_generic_collapse = false;
+    for (double g : {1.0e-5, 1.0e-7, 1.0e-8, 1.0e-9, 1.0e-10})
+    {
+        const auto values = build(g);
+        const auto metrics = mipt::dist::two_party_metrics(values.data(), true, true);
+        const double exact = 2.0 * g * g / (std::sqrt(0.36 + 4.0 * g * g) + 0.6);
+        expect(std::abs(metrics.mn_closed - exact) <= 1.0e-13 * exact,
+               "the closed form is accurate to full relative precision at |G| = " +
+                   std::to_string(g));
+        if (exact < 1.0e-16 && metrics.mn_generic == 0.0)
+        {
+            saw_generic_collapse = true;
+        }
+    }
+    expect(saw_generic_collapse,
+           "the generic path must be seen to collapse to exactly zero, or this test is "
+           "not measuring the thing it exists for");
+
+    // And the reported value is the closed one, so the aggregate and the
+    // per-record files carry the accurate number.
+    const auto values = build(1.0e-9);
+    const auto metrics = mipt::dist::two_party_metrics(values.data(), true, true);
+    expect(metrics.mn == metrics.mn_closed,
+           "a parity-preserving fermionic trace reports the closed form");
+}
+
+// Matched fp32/fp64 around the threshold.
+//
+// Two separate facts, and conflating them would be a serious mistake:
+//
+//   1. Given the same matrix, the closed form loses nothing to fp32 rounding of
+//      that matrix -- it tracks the rounded input's own exact answer.
+//   2. But an fp32 *state vector* puts ~1e-7 noise into an amplitude that is
+//      algebraically zero, so |G|^2 picks up a ~1e-14 floor. Below roughly that,
+//      a positivity threshold is counting arithmetic noise, whatever formula is
+//      used. The precision therefore has to be recorded alongside the threshold,
+//      and it is: `statevector_precision` is a column in both output files.
+void test_precision_floor()
+{
+    const auto build = [](double g) {
+        Rho rho{};
+        rho[0] = 0.3;
+        rho[1 * 4 + 1] = 0.2;
+        rho[2 * 4 + 2] = 0.2;
+        rho[3 * 4 + 3] = 0.3;
+        rho[2 * 4 + 1] = C(g, 0.0);
+        rho[1 * 4 + 2] = C(g, 0.0);
+        return interleaved(rho);
+    };
+
+    // (1) fp32 rounding of the matrix costs the closed form only the input's
+    // own relative precision. The matched pair is the same state read at the
+    // two precisions: the answers must track each other to ~1e-6 relative, not
+    // diverge, and neither may collapse to zero.
+    const double g = 3.0e-7;
+    const auto exact_input = build(g);
+    const auto rounded_input = through_fp32(exact_input);
+    const auto exact_metrics = mipt::dist::two_party_metrics(exact_input.data(), true, true);
+    const auto rounded_metrics = mipt::dist::two_party_metrics(rounded_input.data(), true, true);
+    expect(exact_metrics.mn_closed > 0.0 && rounded_metrics.mn_closed > 0.0,
+           "neither precision loses the negativity entirely");
+    expect(std::abs(rounded_metrics.mn_closed - exact_metrics.mn_closed) <=
+               1.0e-6 * exact_metrics.mn_closed,
+           "fp32 and fp64 readings of one state agree to the input's own precision");
+    // The same comparison against the generic route, for contrast: at this
+    // magnitude it still works, which is why 1e-12 was a defensible default.
+    expect(std::abs(rounded_metrics.mn_generic - exact_metrics.mn_closed) <=
+               1.0e-3 * exact_metrics.mn_closed,
+           "the generic path is still usable this far above its floor");
+
+    // (2) An algebraically zero coherence carried at fp32 noise still reports a
+    // negativity, and it lands near 1e-14. Anything below that is noise.
+    const double noise = 1.0e-7;
+    const auto noisy = build(noise);
+    const auto noisy_metrics = mipt::dist::two_party_metrics(noisy.data(), true, true);
+    expect(noisy_metrics.mn_closed > 1.0e-15 && noisy_metrics.mn_closed < 1.0e-13,
+           "fp32-scale noise in G produces a negativity around 1e-14, not zero");
+    // The historical default threshold sits two decades above that floor, which
+    // is why it is a safe default and why lowering it is a decision about
+    // precision rather than about physics.
+    expect(noisy_metrics.mn_closed < 1.0e-12,
+           "the 1e-12 default still classifies fp32 noise as unentangled");
+}
+
+// The closed form is derived for parity-preserving states only, and the caller
+// says whether it applies rather than the matrix being sniffed. A state with
+// cross-parity weight must fall back to the generic route and must report the
+// leakage that says so.
+void test_non_parity_states_fall_back()
+{
+    std::mt19937 rng(99);
+    std::normal_distribution<double> normal(0.0, 1.0);
+    std::array<C, 4> psi{};
+    for (C &value : psi)
+    {
+        value = C(normal(rng), normal(rng));
+    }
+    double norm = 0.0;
+    for (const C &value : psi)
+    {
+        norm += std::norm(value);
+    }
+    for (C &value : psi)
+    {
+        value /= std::sqrt(norm);
+    }
+    const auto values = interleaved(pure_density(psi));
+
+    const auto without = mipt::dist::two_party_metrics(values.data(), true, false);
+    expect(without.parity_leakage > 1.0e-3,
+           "a generic pure state has real cross-parity weight");
+    expect(std::isnan(without.mn_closed), "and no closed form is offered for it");
+    expect(without.mn == without.mn_generic, "so the generic value is what is reported");
+
+    // Asked for it anyway, the closed form is simply wrong -- which is the
+    // reason the decision is the caller's and is recorded per run rather than
+    // being inferred from a threshold on the leakage.
+    const auto with = mipt::dist::two_party_metrics(values.data(), true, true);
+    expect(with.mn_residual > 1.0e-3,
+           "forcing the closed form onto a parity-violating state disagrees loudly");
+}
+
+void run()
+{
+    test_analytic_states();
+    test_closed_form_matches_the_generic_path();
+    test_small_negativity_precision();
+    test_precision_floor();
+    test_non_parity_states_fall_back();
+}
+} // namespace dist_channel_tests
 
 int main()
 {
@@ -1014,6 +1559,7 @@ int main()
 
     test_dist_scaling_resume();
     test_dist_records();
+    dist_channel_tests::run();
 
     std::cout << "dist_metrics_tests: PASS\n";
     return 0;

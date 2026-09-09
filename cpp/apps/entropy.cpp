@@ -158,7 +158,7 @@ int main(int argc, char *argv[])
             pause_sentinel.wait();
             const auto trajectory_start = std::chrono::steady_clock::now();
             const auto circuit_start = trajectory_start;
-            auto state = workspace.simulate(n, periods, p, circ_type, "entropy");
+            auto state = std::move(workspace.simulate(n, periods, p, circ_type, "entropy").state);
             const auto circuit_end = std::chrono::steady_clock::now();
 
             std::vector<double> s1_means;

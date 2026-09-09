@@ -47,7 +47,7 @@ NVQXXFLAGS_COMMON := $(CPPFLAGS_COMMON) -std=c++20 -O3 -DNDEBUG -march=native \
   -DMIPT_CUDAQ_BACKEND_NAME=\"$(COMPILED_BACKEND)\" \
   -DMIPT_CUDAQ_PRECISION=$(if $(filter 1,$(FP64)),64,32) -MMD -MP
 CXXFLAGS_COMMON := $(CPPFLAGS_COMMON) -std=c++20 -O3 -DNDEBUG -march=native \
-  -MMD -MP
+  -DMIPT_CUDAQ_PRECISION=$(if $(filter 1,$(FP64)),64,32) -MMD -MP
 CFLAGS_COMMON := $(CPPFLAGS_COMMON) -std=c11 -O3 -DNDEBUG -march=native \
   -MMD -MP
 MOSEK_CPPFLAGS := -I$(MOSEK_INC)
@@ -186,6 +186,7 @@ RING_BIN := $(HOST_BUILD)/ring_inflation.exe
 EXP_VALS_BIN := $(HOST_BUILD)/exp_vals.exe
 CORE_TEST_BIN := $(HOST_BUILD)/core_tests
 DIST_TEST_BIN := $(HOST_BUILD)/dist_metrics_tests
+DIST_CONN_TEST_BIN := $(HOST_BUILD)/dist_connectivity_tests
 SPECTRAL_TEST_BIN := $(HOST_BUILD)/spectral_tests
 FRONT_TEST_BIN := $(HOST_BUILD)/front_metrics_tests
 GMN_SOLVER_TEST_BIN := $(HOST_BUILD)/gmn_solver_tests
@@ -204,6 +205,7 @@ RING_OBJS := $(HOST_BUILD)/ring_inflation_main.o $(HOST_BUILD)/ring_inflation.o 
 EXP_VALS_OBJS := $(HOST_BUILD)/exp_vals_main.o $(HOST_BUILD)/exp_vals_analysis.o
 CORE_TEST_OBJS := $(HOST_BUILD)/core_tests.o
 DIST_TEST_OBJS := $(HOST_BUILD)/dist_metrics_tests.o
+DIST_CONN_TEST_OBJS := $(HOST_BUILD)/dist_connectivity_tests.o
 SPECTRAL_TEST_OBJS := $(HOST_BUILD)/spectral_tests.o
 FRONT_TEST_OBJS := $(HOST_BUILD)/front_metrics_tests.o
 # Exercises both GMN back ends, so it links the C API and the Fusion object.
@@ -234,6 +236,7 @@ endif
 ALL_OBJS := $(MIPT_OBJS) $(MIPT_PROBED_OBJS) $(FREE_ENERGY_OBJS) \
   $(SIM_TMI_OBJS) $(DIST_SCALING_OBJS) $(ENTROPY_OBJS) $(GMN_OBJS) $(FGMN_OBJS) \
   $(RING_OBJS) $(EXP_VALS_OBJS) $(CORE_TEST_OBJS) $(DIST_TEST_OBJS) \
+  $(DIST_CONN_TEST_OBJS) \
   $(SPECTRAL_TEST_OBJS) $(FRONT_TEST_OBJS) $(GMN_SOLVER_TEST_OBJS) \
   $(MIPT_PROBED_FGMN_PIC_OBJ)
 DEPS := $(ALL_OBJS:.o=.d)
@@ -317,6 +320,8 @@ $(EXP_VALS_BIN): $(EXP_VALS_OBJS)
 
 $(CORE_TEST_BIN): $(CORE_TEST_OBJS)
 	$(HOSTCXX) $^ -o $@
+$(DIST_CONN_TEST_BIN): $(DIST_CONN_TEST_OBJS)
+	$(HOSTCXX) $^ -o $@
 $(DIST_TEST_BIN): $(DIST_TEST_OBJS)
 	$(HOSTCXX) $^ -o $@
 $(SPECTRAL_TEST_BIN): $(SPECTRAL_TEST_OBJS)
@@ -328,8 +333,12 @@ $(GMN_SOLVER_TEST_BIN): $(GMN_SOLVER_TEST_OBJS)
 
 test-core: $(CORE_TEST_BIN)
 	$(CORE_TEST_BIN)
-test-dist: $(DIST_TEST_BIN)
+# Both halves of the dist_scaling host surface: the metrics/CSV/record round
+# trips, and the spacetime graph plus the logical layer projection it is built
+# from.
+test-dist: $(DIST_TEST_BIN) $(DIST_CONN_TEST_BIN)
 	$(DIST_TEST_BIN)
+	$(DIST_CONN_TEST_BIN)
 test-spectral: $(SPECTRAL_TEST_BIN)
 	$(SPECTRAL_TEST_BIN)
 test-front: $(FRONT_TEST_BIN)
@@ -478,6 +487,8 @@ $(HOST_BUILD)/exp_vals_analysis.o: src/analysis/exp_vals.cpp | $(HOST_BUILD)
 $(HOST_BUILD)/gmn_mosek.o: src/analysis/gmn_mosek.c | $(HOST_BUILD)
 	$(HOSTCC) $(CFLAGS_COMMON) $(MOSEK_CPPFLAGS) -c $< -o $@
 $(HOST_BUILD)/core_tests.o: tests/core_tests.cpp | $(HOST_BUILD)
+	$(HOSTCXX) $(CPPFLAGS_COMMON) -std=c++20 -O2 -MMD -MP -c $< -o $@
+$(HOST_BUILD)/dist_connectivity_tests.o: tests/dist_connectivity_tests.cpp | $(HOST_BUILD)
 	$(HOSTCXX) $(CPPFLAGS_COMMON) -std=c++20 -O2 -MMD -MP -c $< -o $@
 $(HOST_BUILD)/dist_metrics_tests.o: tests/dist_metrics_tests.cpp | $(HOST_BUILD)
 	$(HOSTCXX) $(CPPFLAGS_COMMON) -std=c++20 -O2 -MMD -MP -c $< -o $@

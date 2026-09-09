@@ -39,6 +39,7 @@
 #include "mipt/analysis/fgmn.hpp"
 #include "mipt/backend.hpp"
 #include "mipt/circuit.hpp"
+#include "mipt/dist_connectivity.hpp"
 #include "mipt/dist_metrics.hpp"
 #include "mipt/dist_records.hpp"
 #include "mipt/dist_scaling_csv.hpp"
@@ -939,9 +940,21 @@ class PairProtocol
 
         if (records::enabled())
         {
-            values_per_record_ = include_fermionic_ ? 4u : 2u;
+            values_per_record_ = records::pair_observable_names(config_).size();
+            record_values_.assign(values_per_record_, 0.0);
+            // (geometry, embedding) -> the two sites it names. Without this a
+            // stored endpoint-survival flag cannot be traced to the endpoints
+            // it is about.
+            std::vector<std::array<int, 4>> embeddings;
+            embeddings.reserve(pairs_.size());
+            for (std::size_t index = 0; index < pairs_.size(); ++index)
+            {
+                embeddings.push_back({static_cast<int>(bin_of_pair_[index]),
+                                      static_cast<int>(embedding_of_pair_[index]),
+                                      pairs_[index][0], pairs_[index][1]});
+            }
             sink_.open(records::records_path_for(config_.output_path),
-                       records::pair_header_text(config_, bins_), values_per_record_,
+                       records::pair_header_text(config_, bins_, embeddings), values_per_record_,
                        static_cast<std::uint64_t>(start_realization_));
         }
     }
@@ -995,7 +1008,11 @@ class PairProtocol
         publish();
     }
 
-    void measure(cudaq::state &state, int realization)
+    // `connectivity` is the spacetime graph of *this* trajectory; an index that
+    // is not ready (connectivity disabled, or a circuit with no layers) makes
+    // every query return `evaluated=false` and the contingency counters simply
+    // do not advance.
+    void measure(cudaq::state &state, int realization, const ConnectivityIndex &connectivity)
     {
         const int n = config_.n;
         if (include_fermionic_)
@@ -1015,6 +1032,12 @@ class PairProtocol
             throw std::runtime_error("Internal fermionic two-site RDM payload-size mismatch.");
         }
 
+        // The stride keeps whole trajectories, so the decision is made once per
+        // trajectory rather than once per pair.
+        const bool write_records =
+            sink_.active() && records::stride_selects(config_.record_stride,
+                                                      static_cast<std::uint64_t>(realization));
+
         for (std::size_t pair_index = 0; pair_index < pairs_.size(); ++pair_index)
         {
             PairBin &bin = bins_[bin_of_pair_[pair_index]];
@@ -1024,33 +1047,116 @@ class PairProtocol
             bin.mn.add(metrics.mn);
             bin.g2.add(metrics.g2);
             bin.f2.add(metrics.f2);
-            // I_2 and N_2 for this record, in the order the header declares.
-            std::array<double, 4> record{metrics.mi, metrics.mn, 0.0, 0.0};
-            if (metrics.mn > 1.0e-12)
+            const bool mn_positive = metrics.mn > config_.pair_zero_tol;
+            if (mn_positive)
             {
                 ++bin.mn_positive;
             }
+            // Diagonal in the occupation basis, so identical under both traces
+            // and taken once. See PairMetrics.
+            bin.n_i.add(metrics.n_i);
+            bin.n_j.add(metrics.n_j);
+            bin.dnn.add(metrics.dnn);
+            bin.rho_n.add(metrics.rho_n);
+            bin.i_occ.add(metrics.i_occ);
+
+            // The measure the contingency table classifies on: the fermionic
+            // negativity wherever it exists, the ordinary one otherwise.
+            // `RunConfig::contingency_measure()` writes which into the CSV.
+            PairMetrics fermion_metrics;
+            double entanglement = metrics.mn;
+            double channel_weight = metrics.g2 + metrics.f2;
             if (include_fermionic_)
             {
                 const double *fermion_rho =
                     rdm_workspace_.fermion_rho_ri.data() + pair_index * RHO2_VALUES;
-                const PairMetrics fermion_metrics = two_party_metrics(fermion_rho, true);
+                // The third argument is what selects the cancellation-safe
+                // closed form over the generic trace-norm route; it is true
+                // exactly when the ensemble conserves computational parity,
+                // which is the condition the closed form is derived under.
+                fermion_metrics = two_party_metrics(fermion_rho, true, true);
                 bin.fmi.add(fermion_metrics.mi);
                 bin.fmn.add(fermion_metrics.mn);
                 bin.fg2.add(fermion_metrics.g2);
                 bin.ff2.add(fermion_metrics.f2);
-                record[2] = fermion_metrics.mi;
-                record[3] = fermion_metrics.mn;
-                if (fermion_metrics.mn > 1.0e-12)
+                if (fermion_metrics.mn > config_.pair_zero_tol)
                 {
                     ++bin.fmn_positive;
                 }
+                bin.fmn_residual.add(fermion_metrics.mn_residual);
+                bin.fmn_residual_max =
+                    std::max(bin.fmn_residual_max, fermion_metrics.mn_residual);
+                entanglement = fermion_metrics.mn;
+                channel_weight = fermion_metrics.g2 + fermion_metrics.f2;
             }
-            if (sink_.active())
+            const bool entangled = entanglement > config_.pair_zero_tol;
+
+            const PairConnectivity conn =
+                connectivity.query(pairs_[pair_index][0], pairs_[pair_index][1]);
+            if (conn.evaluated)
             {
+                ++bin.conn_records;
+                bin.survive_i += conn.survives_i ? 1u : 0u;
+                bin.survive_j += conn.survives_j ? 1u : 0u;
+                bin.survive_both += (conn.survives_i && conn.survives_j) ? 1u : 0u;
+                bin.interior_path += conn.interior_path ? 1u : 0u;
+                bin.component_size.add(static_cast<double>(conn.component_size));
+                if (conn.shortest_path >= 0)
+                {
+                    bin.shortest_path.add(static_cast<double>(conn.shortest_path));
+                }
+                if (conn.connected)
+                {
+                    ++bin.connected;
+                    bin.ent_given_connected.add(entanglement);
+                    if (entangled)
+                    {
+                        ++bin.connected_ent_positive;
+                    }
+                    else
+                    {
+                        // Why a spanning path carried nothing. Exhaustive and
+                        // disjoint by construction, so the three sum back to
+                        // connected_ent_zero.
+                        ++bin.connected_ent_zero;
+                        bin.i_occ_connected_classical.add(metrics.i_occ);
+                        if (metrics.i_occ > config_.occupation_mi_tol)
+                        {
+                            ++bin.classical_occ_correlated;
+                        }
+                        else if (channel_weight > config_.channel_floor)
+                        {
+                            ++bin.classical_subthreshold;
+                        }
+                        else
+                        {
+                            ++bin.classical_silent;
+                        }
+                    }
+                }
+                else
+                {
+                    bin.ent_given_disconnected.add(entanglement);
+                    if (entangled)
+                    {
+                        ++bin.disconnected_ent_positive;
+                    }
+                    else
+                    {
+                        ++bin.disconnected_ent_zero;
+                    }
+                }
+            }
+
+            if (write_records)
+            {
+                std::uint32_t flags = conn.flags();
+                flags |= entangled ? FLAG_FN_POSITIVE : 0u;
+                flags |= mn_positive ? FLAG_MN_POSITIVE : 0u;
+                fill_record_values(metrics, fermion_metrics);
                 sink_.add(static_cast<std::uint32_t>(realization),
                           static_cast<std::uint32_t>(bin_of_pair_[pair_index]),
-                          embedding_of_pair_[pair_index], record.data());
+                          embedding_of_pair_[pair_index], flags, record_values_.data());
             }
             ++processed_;
         }
@@ -1068,6 +1174,45 @@ class PairProtocol
     }
 
   private:
+    // Lay one record out in exactly the order records::pair_observable_names
+    // declares. The two must agree field for field; they are next to each
+    // other in this file and in dist_records.hpp for that reason, and
+    // `make test-dist` pins the pairing by name.
+    void fill_record_values(const PairMetrics &metrics, const PairMetrics &fermion_metrics)
+    {
+        std::size_t slot = 0;
+        record_values_[slot++] = metrics.mi;
+        record_values_[slot++] = metrics.mn;
+        if (include_fermionic_)
+        {
+            record_values_[slot++] = fermion_metrics.mi;
+            record_values_[slot++] = fermion_metrics.mn;
+        }
+        if (config_.record_detail == RecordDetail::Basic)
+        {
+            return;
+        }
+        record_values_[slot++] = metrics.n_i;
+        record_values_[slot++] = metrics.n_j;
+        record_values_[slot++] = metrics.dnn;
+        record_values_[slot++] = metrics.g2;
+        record_values_[slot++] = metrics.f2;
+        if (include_fermionic_)
+        {
+            record_values_[slot++] = fermion_metrics.g2;
+            record_values_[slot++] = fermion_metrics.f2;
+        }
+        if (config_.record_detail != RecordDetail::Full)
+        {
+            return;
+        }
+        const PairMetrics &channel = include_fermionic_ ? fermion_metrics : metrics;
+        record_values_[slot++] = channel.g.real();
+        record_values_[slot++] = channel.g.imag();
+        record_values_[slot++] = channel.f.real();
+        record_values_[slot++] = channel.f.imag();
+    }
+
     RunConfig config_;
     bool include_fermionic_ = false;
     std::vector<Pair> pairs_;
@@ -1076,6 +1221,7 @@ class PairProtocol
     std::vector<std::uint32_t> embedding_of_pair_;
     records::RecordSink sink_;
     std::size_t values_per_record_ = 0;
+    std::vector<double> record_values_;
     RdmWorkspace rdm_workspace_;
     resume::Report checkpoint_;
     int start_realization_ = 0;
@@ -1172,9 +1318,9 @@ class TripleProtocol
 
         if (records::enabled())
         {
-            values_per_record_ = include_fermionic_ ? 4u : 2u;
+            values_per_record_ = records::triple_observable_names(config_).size();
             sink_.open(records::records_path_for(config_.output_path),
-                       records::triple_header_text(config_, bins_, per_geometry_),
+                       records::triple_header_text(config_, bins_, per_geometry_, geometries_),
                        values_per_record_, static_cast<std::uint64_t>(start_realization_));
         }
     }
@@ -1418,7 +1564,11 @@ class TripleProtocol
             // which resolves records already in the buffer. Adding first keeps
             // the sequence number this record is about to be told by valid at
             // the moment the queue could use it.
-            std::uint64_t sequence = 0;
+            // The k=2 diagnostic stride deliberately does not apply here: a
+            // k=3 record file is ~40 bytes per geometry per trajectory, which
+            // is negligible, and skipping rows would mean handing the SDP queue
+            // a sequence number addressing no record.
+            std::uint64_t sequence = records::NO_SEQUENCE;
             if (sink_.active())
             {
                 const int deferred = (gmn_deferred ? 1 : 0) + (fgmn_deferred ? 1 : 0);
@@ -1427,13 +1577,15 @@ class TripleProtocol
                 const std::uint32_t embedding = embedding_of_subsystem_[index];
                 if (deferred == 0)
                 {
-                    sink_.add(static_cast<std::uint32_t>(realization), geometry, embedding,
+                    // No pair connectivity at k=3, so the flag mask is empty
+                    // and its `evaluated` bit stays clear.
+                    sink_.add(static_cast<std::uint32_t>(realization), geometry, embedding, 0u,
                               record.data());
                 }
                 else
                 {
                     sequence = sink_.add_pending(static_cast<std::uint32_t>(realization), geometry,
-                                                 embedding, record.data(), deferred);
+                                                 embedding, 0u, record.data(), deferred);
                 }
             }
             if (gmn_deferred)
@@ -1597,10 +1749,16 @@ inline void run_protocols(const RunConfig &config, PairProtocol *pairs, TriplePr
 
     CircuitWorkspace1D circuit_workspace;
     circuit_workspace.reserve(config.periods);
+    ConnectivityIndex connectivity;
+    // Only the pair protocol asks the graph anything, so a k=3-only run does
+    // not pay for it.
+    const bool want_connectivity = config.connectivity && pairs != nullptr;
 
     util::PauseSentinel pause_sentinel("MIPT_DIST_PAUSE_FILE");
     ProgressLine progress(total, unit, processed);
     bool backend_reported = false;
+    bool connectivity_warned = false;
+    bool precision_warned = false;
 
     auto flush = [&]() {
         if (pairs != nullptr)
@@ -1617,8 +1775,30 @@ inline void run_protocols(const RunConfig &config, PairProtocol *pairs, TriplePr
     {
         progress.absorb_pause(pause_sentinel.wait(flush));
 
-        auto state =
+        // Pin this trajectory's layer draw before it is built, so the whole
+        // run is a function of the master seed the CSV records. Trajectories
+        // stay i.i.d. -- splitmix64 is a bijection, so distinct realizations
+        // get distinct, uncorrelated streams -- but they are now reproducible,
+        // which they were not before.
+        circuit_workspace.seed(config.type, config.periods,
+                               trajectory_seed(config.seed,
+                                               static_cast<std::uint64_t>(realization)));
+        auto trajectory =
             circuit_workspace.simulate(config.n, config.periods, config.p, config.type, "dist_scaling");
+        auto &state = trajectory.state;
+        if (want_connectivity)
+        {
+            // Built from the history that produced *this* state. Comparing an
+            // entanglement against a graph from any other draw would measure
+            // nothing; see TrajectoryResult.
+            connectivity.build(trajectory.history, config.connectivity_paths);
+            if (!connectivity.ready() && !connectivity_warned)
+            {
+                connectivity_warned = true;
+                std::cerr << "WARNING: no logical layer history was available, so the "
+                             "spacetime connectivity columns will stay empty.\n";
+            }
+        }
         if (!backend_reported)
         {
             std::cerr << "state_backend=" << (state.is_on_gpu() ? "gpu" : "host")
@@ -1636,13 +1816,31 @@ inline void run_protocols(const RunConfig &config, PairProtocol *pairs, TriplePr
             std::cerr << '\n';
             backend_reported = true;
         }
+        if (!precision_warned)
+        {
+            const int actual =
+                state.get_precision() == cudaq::SimulationState::precision::fp64 ? 64 : 32;
+            if (actual != config.statevector_precision)
+            {
+                // The output declares a precision, and every positivity count
+                // in it has to be read against the arithmetic that produced it.
+                precision_warned = true;
+                std::cerr << "WARNING: this build declares fp" << config.statevector_precision
+                          << " but the backend returned fp" << actual
+                          << "; the statevector_precision column is wrong for this run.\n";
+            }
+            else
+            {
+                precision_warned = true;
+            }
+        }
 
         // A protocol whose checkpoint is further ahead sits out the shared
         // trajectories it has already been given, so each still receives
         // exactly `realizations` of them in total.
         if (pairs != nullptr && realization >= pairs->start_realization())
         {
-            pairs->measure(state, realization);
+            pairs->measure(state, realization, connectivity);
         }
         if (triples != nullptr && realization >= triples->start_realization())
         {
@@ -1688,6 +1886,82 @@ inline void run_protocols(const RunConfig &config, PairProtocol *pairs, TriplePr
     }
 }
 
+// Fill in every setting that comes from the environment rather than from the
+// command line.
+//
+// Kept out of main() so that k=0's two RunConfig copies and the host tests get
+// the identical resolution; kept out of RunConfig so that a test can build a
+// config without an environment.
+inline void apply_environment(RunConfig &config)
+{
+    // The positivity threshold. Formerly a hard-coded 1e-12 inside
+    // PairProtocol::measure -- the default is unchanged, so an existing run
+    // reproduces, but it is now a named knob because it is a *classification*
+    // and every conditional probability in the output moves with it.
+    config.pair_zero_tol = env::real("MIPT_DIST_PAIR_ZERO_TOL", 1.0e-12, 0.0, 1.0);
+    config.occupation_mi_tol = env::real("MIPT_DIST_OCC_MI_TOL", 1.0e-12, 0.0, 1.0);
+    config.channel_floor = env::real("MIPT_DIST_CHANNEL_FLOOR",
+                                     default_channel_floor(config.statevector_precision),
+                                     0.0, 1.0);
+    config.connectivity = env::boolean("MIPT_DIST_CONNECTIVITY", true);
+    config.connectivity_paths = env::boolean("MIPT_DIST_CONN_PATHS", true);
+    config.record_detail = parse_record_detail(
+        env::text("MIPT_DIST_RECORD_DETAIL", record_detail_name(RecordDetail::Channel)));
+    config.record_stride = env::integer("MIPT_DIST_RECORD_STRIDE", 1, 1, 1000000000);
+    // A pinned seed makes the whole run replayable; an unpinned one is drawn
+    // once here and *written into the output*, which makes it replayable after
+    // the fact too. That is the part random_device alone never gave.
+    const std::string seed_text = env::text("MIPT_DIST_SEED", "");
+    if (!seed_text.empty())
+    {
+        config.seed = std::stoull(seed_text);
+    }
+    else
+    {
+        std::random_device device;
+        config.seed = (static_cast<std::uint64_t>(device()) << 32) ^
+                      static_cast<std::uint64_t>(device());
+    }
+}
+
+// A resumed run adopts the checkpoint's master seed, so that continuing a file
+// keeps its trajectories addressable by the seed it already records.
+inline void adopt_checkpoint_seed(RunConfig &config)
+{
+    if (!resume::enabled() || !file_exists(config.output_path))
+    {
+        return;
+    }
+    const auto table = util::resume::CsvTable::read(config.output_path);
+    if (table.empty())
+    {
+        return;
+    }
+    // A file from before this column existed refuses at require_schema anyway;
+    // reading it here would only produce a less specific error.
+    if (table.has_column("master_seed"))
+    {
+        config.seed = table.counter(0, "master_seed");
+    }
+}
+
+// The seed a k=0 run continues, taken from whichever of its two files already
+// records one. The two are written by the same run, so they agree; if only one
+// exists, it is the one that decides.
+inline void adopt_checkpoint_seed(RunConfig &config, const std::string &pair_path,
+                                  const std::string &triple_path)
+{
+    RunConfig probe = config;
+    probe.output_path = pair_path;
+    adopt_checkpoint_seed(probe);
+    if (probe.seed == config.seed)
+    {
+        probe.output_path = triple_path;
+        adopt_checkpoint_seed(probe);
+    }
+    config.seed = probe.seed;
+}
+
 inline void run_pairs(const RunConfig &config)
 {
     PairProtocol pairs(config);
@@ -1706,15 +1980,24 @@ inline void run_triples(const RunConfig &config)
 // in `k` and the output path, so each writes byte-for-byte the file its
 // exclusive run writes -- including the `k` column of the metadata block.
 // Nothing downstream, the resume path included, can tell the difference.
-inline void run_both(const RunConfig &config)
+inline void run_both(const RunConfig &input)
 {
+    const std::string pair_path = default_output_path(input, 2);
+    const std::string triple_path = default_output_path(input, 3);
+
+    // One seed for the whole run: both files describe the same trajectories,
+    // so they must record the same master seed, and a resume must adopt it
+    // before either protocol is constructed.
+    RunConfig config = input;
+    adopt_checkpoint_seed(config, pair_path, triple_path);
+
     RunConfig pair_config = config;
     pair_config.k = 2;
-    pair_config.output_path = default_output_path(config, 2);
+    pair_config.output_path = pair_path;
 
     RunConfig triple_config = config;
     triple_config.k = 3;
-    triple_config.output_path = default_output_path(config, 3);
+    triple_config.output_path = triple_path;
 
     PairProtocol pairs(pair_config);
     TripleProtocol triples(triple_config);
@@ -1734,6 +2017,7 @@ inline void run(const RunConfig &input)
     {
         config.output_path = default_output_path(config);
     }
+    adopt_checkpoint_seed(config);
     if (config.k == 3)
     {
         run_triples(config);
@@ -1819,6 +2103,37 @@ inline void print_usage(const char *argv0)
         << "    0 disables it. Default: PAUSE_MIPT.\n"
         << "  MIPT_DIST_RECORDS=1 write the per-record binary beside the CSV; 0 skips it.\n"
         << "  MIPT_DIST_RECORDS_FLUSH=8192 resolved records buffered before a write.\n"
+        << "  MIPT_DIST_RECORD_DETAIL=channel how much each record carries:\n"
+        << "    basic   = the observables alone (what format v1 wrote);\n"
+        << "    channel = + n_i, n_j, D=<n_i n_j>, |G|^2, |F|^2. These reconstruct\n"
+        << "              rho^n = D - n_i n_j, the four occupation probabilities, the\n"
+        << "              occupation MI, the parity weights, and the exact negativity,\n"
+        << "              so a positivity threshold can be swept after the run;\n"
+        << "    full    = + Re G, Im G, Re F, Im F.\n"
+        << "  MIPT_DIST_RECORD_STRIDE=1 write records only every this many trajectories\n"
+        << "    (k=2 only). Content-independent, and it keeps each retained trajectory\n"
+        << "    whole so a bootstrap clustered on realization_id stays valid. At 1 the\n"
+        << "    records still reduce to the aggregate exactly; above 1 they cannot.\n"
+        << "  MIPT_DIST_SEED=<u64> master seed. Every trajectory's layer draw is\n"
+        << "    splitmix64-derived from it, so a run is replayable. Unset draws one and\n"
+        << "    writes it into the CSV's master_seed column, which makes a finished run\n"
+        << "    replayable after the fact; a resume adopts the seed already recorded.\n"
+        << "  k=2 pair diagnostics:\n"
+        << "  MIPT_DIST_PAIR_ZERO_TOL=1e-12 negativity above which a pair counts as\n"
+        << "    entangled. This is a classification threshold, not a mathematical zero:\n"
+        << "    every conditional probability in the output moves with it, so it is\n"
+        << "    written into both output files and is meant to be swept.\n"
+        << "  MIPT_DIST_CONNECTIVITY=1 build the spacetime percolation graph of each\n"
+        << "    trajectory and jointly classify endpoint survival, graph connectivity\n"
+        << "    and entanglement. 0 leaves the contingency columns empty.\n"
+        << "  MIPT_DIST_CONN_PATHS=1 also compute shortest spanning-path lengths and\n"
+        << "    component sizes (one BFS per site per trajectory).\n"
+        << "  MIPT_DIST_OCC_MI_TOL=1e-12 below this an occupation mutual information\n"
+        << "    counts as zero when splitting the connected-but-unentangled records.\n"
+        << "  MIPT_DIST_CHANNEL_FLOOR below this |G|^2 and |F|^2 count as zero in that\n"
+        << "    same split. Defaults to 1e-13 for an fp32 build and 1e-28 for fp64,\n"
+        << "    because these are squared amplitudes and the floor is the square of the\n"
+        << "    state vector's own noise. One fixed value cannot serve both.\n"
         << "  MIPT_DIST_MPS_DENSE_MAX_QUBITS=16 bounds exact amplitude reconstruction"
            " when a tensor/MPS backend exposes no dense state tensor.\n"
         << "  k=0 and k=3:\n"

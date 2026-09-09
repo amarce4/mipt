@@ -450,6 +450,24 @@ inline MmsLayer make_mms_layer(int n,
     return layer;
 }
 
+// MMS bonds do not wrap -- apply_mms_layers sweeps `i < n - 1` on both layer
+// parities -- so the ring is open in the graph exactly as it is in the circuit.
+inline LogicalHistory logical_history_from_mms(const std::vector<MmsLayer> &layers, int n)
+{
+    LogicalHistory history;
+    history.reset(n);
+    history.layers.reserve(layers.size());
+    for (const MmsLayer &layer : layers)
+    {
+        LogicalLayer out;
+        append_brickwork_bonds(out, n, layer.start, false, history.mode_at_site);
+        set_measured(out, n, layer.measure_flags, history.mode_at_site);
+        history.layers.push_back(std::move(out));
+    }
+    history.valid = true;
+    return history;
+}
+
 inline void build_mms_layers(std::vector<MmsLayer> &layers,
                            int n,
                            int periods,

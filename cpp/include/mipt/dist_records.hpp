@@ -1,7 +1,8 @@
 #pragma once
 
 // Per-record output for dist_scaling.exe: one row per (trajectory, geometry,
-// embedding) carrying that record's two observables.
+// embedding) carrying that record's observables and, since format v2, the
+// spacetime connectivity flags of the pair it belongs to.
 //
 // Why this exists
 // ---------------
@@ -23,7 +24,7 @@
 //   * They are dependencies. Parquet means Arrow and HDF5 means libhdf5, in a
 //     build that already documents real portability pain over finding one CUDA
 //     toolkit. Neither buys anything here: the payload is a fixed-width table
-//     of two integers and two-to-four float64s, which is precisely the case
+//     of a few integers and a handful of float64s, which is precisely the case
 //     where a columnar container's compression and predicate pushdown have
 //     nothing to work with.
 //
@@ -51,21 +52,44 @@
 // two-byte geometry id, and the header maps that id to the effective chord
 // distance and everything else describing the geometry.
 //
-// Record layout (all little-endian, and every field naturally aligned, so the
-// struct is 24 or 40 bytes with no padding anywhere):
+// Record layout, format v2 (little-endian, every field naturally aligned):
 //
-//     uint32 realization_id
-//     uint16 geometry_id
-//     uint16 embedding_id
-//     float64 I_k
-//     float64 N_k
-//     float64 fI_k     only for parity-preserving ensembles
-//     float64 fN_k     only for parity-preserving ensembles
+//     uint32  realization_id
+//     uint16  geometry_id
+//     uint16  embedding_id
+//     uint32  flags            connectivity bit mask, see dist_connectivity.hpp
+//     uint32  reserved (0)     pads the values to an 8-byte boundary
+//     float64 values[...]      named by the header's `observables` field
 //
-// with (I_k, N_k) = (MI, negativity) at k=2 and (TMI, GMN) at k=3. The
-// fermionic pair is present under exactly the condition that gates the
-// fermionic CSV columns, `RunConfig::fermionic_outputs()`, because the point of
-// reporting both conventions is to compare them on the same records.
+// so the identifier prefix is 16 bytes and the payload is whatever the run's
+// record detail level asked for. Format v1 had a 8-byte prefix, no flags, and
+// a hard cap of four values; the reader still accepts it, but a v1 file cannot
+// be *extended* by this binary and the refusal says so.
+//
+// The value list is no longer fixed. At k=2 it always starts with the v1 set
+// -- (MI, negativity) and, for parity-preserving ensembles, their fermionic
+// partners -- and `MIPT_DIST_RECORD_DETAIL` appends to it:
+//
+//     basic    nothing more
+//     channel  n_i, n_j, D, |G|^2, |F|^2 (+ the fermionic |G|^2, |F|^2)
+//     full     + Re G, Im G, Re F, Im F
+//
+// `channel` is the default and is the set that matters: with the flags beside
+// it, those five numbers reconstruct rho^n_ij = D - n_i n_j, all four
+// occupation probabilities, the occupation mutual information, the two parity
+// weights, and -- through the closed form in dist_metrics.hpp -- the exact
+// fermionic negativity at any threshold. That is what makes a threshold *sweep*
+// possible after the run rather than only during it.
+//
+// At k=3 the values are (TMI, GMN) plus their fermionic partners; the detail
+// levels add nothing there, because the channel data is a two-mode object.
+//
+// The embedding table
+// -------------------
+// v2 carries a second header table mapping (geometry_id, embedding_id) to the
+// actual sites. v1 recorded which *separation* a record belonged to but not
+// which pair realized it, so a record could not be traced back to the endpoints
+// whose survival its flags describe. That is now explicit.
 //
 // A NaN is not a zero. A GMN the schedule did not select, and one MOSEK failed
 // to solve, are both written as NaN -- the same distinction the CSV draws
@@ -106,10 +130,22 @@ namespace mipt::dist::records
 {
 
 inline constexpr char MAGIC[8] = {'M', 'I', 'P', 'T', 'D', 'R', 'E', 'C'};
-inline constexpr std::uint32_t FORMAT_VERSION = 1;
+inline constexpr std::uint32_t FORMAT_VERSION = 2;
+inline constexpr std::uint32_t FORMAT_VERSION_V1 = 1;
 inline constexpr std::size_t PREAMBLE_BYTES = 24;
-inline constexpr std::size_t ID_BYTES = 8;
-inline constexpr std::size_t MAX_VALUES = 4;
+// v2 identifiers: realization(4) + geometry(2) + embedding(2) + flags(4) +
+// reserved(4). The reserved word is not spare capacity, it is alignment: the
+// float64 payload has to start on an 8-byte boundary for a numpy structured
+// dtype to map the file without copying.
+inline constexpr std::size_t ID_BYTES = 16;
+inline constexpr std::size_t ID_BYTES_V1 = 8;
+
+// The sequence number `add_pending` returns when there is no sink to address.
+// Deliberately not 0: the SDP queue submits a solve whether or not records are
+// enabled, and resolves it by sequence number afterwards, so a "no record"
+// answer of 0 would land on the *first* buffered record of an active sink the
+// moment anything else started striding or skipping rows.
+inline constexpr std::uint64_t NO_SEQUENCE = ~std::uint64_t{0};
 
 // Per-record output is on by default: the clustered bootstrap it enables is
 // the only way to put an honest error bar on a decay exponent, and the file is
@@ -145,6 +181,23 @@ inline std::size_t record_bytes(std::size_t value_count)
     return ID_BYTES + value_count * sizeof(double);
 }
 
+inline std::size_t record_bytes_v1(std::size_t value_count)
+{
+    return ID_BYTES_V1 + value_count * sizeof(double);
+}
+
+// Whether trajectory `realization` is one the diagnostic stride keeps.
+//
+// The stride is over trajectories rather than records, so a kept trajectory is
+// kept *whole*. Two reasons, and both matter: nothing about a record's value
+// takes part in the decision, so the retained sample is unbiased; and a
+// bootstrap clustered on realization_id needs complete clusters, which a
+// per-record stride would not leave it.
+inline bool stride_selects(long stride, std::uint64_t realization)
+{
+    return stride <= 1 || realization % static_cast<std::uint64_t>(stride) == 0;
+}
+
 // ---------------------------------------------------------------------------
 // Header text
 // ---------------------------------------------------------------------------
@@ -157,9 +210,64 @@ inline void append_field(std::string &out, const char *key, const std::string &v
     out += '\n';
 }
 
+// The observables one k=2 record carries, in payload order.
+//
+// The first two (or four) entries are exactly what format v1 wrote, so a v2
+// `basic` file is v1's value list with flags and an embedding table added.
+inline std::vector<std::string> pair_observable_names(const RunConfig &config)
+{
+    const bool fermionic = config.fermionic_outputs();
+    std::vector<std::string> names{"mi", "mn"};
+    if (fermionic)
+    {
+        names.push_back("fmi");
+        names.push_back("fmn");
+    }
+    if (config.record_detail == RecordDetail::Basic)
+    {
+        return names;
+    }
+    // Occupation data is diagonal, so it is trace-convention independent and
+    // is written once rather than once per convention.
+    names.push_back("n_i");
+    names.push_back("n_j");
+    names.push_back("dnn");
+    names.push_back("g2");
+    names.push_back("f2");
+    if (fermionic)
+    {
+        names.push_back("fg2");
+        names.push_back("ff2");
+    }
+    if (config.record_detail == RecordDetail::Full)
+    {
+        // The channel phases. Squared magnitudes are enough for the negativity
+        // and for rho^n, so these are the optional half: they only matter for
+        // asking how the phase of G propagates, which is a second-stage
+        // question.
+        const char *prefix = fermionic ? "f" : "";
+        for (const char *field : {"re_g", "im_g", "re_f", "im_f"})
+        {
+            names.push_back(std::string(prefix) + field);
+        }
+    }
+    return names;
+}
+
+inline std::vector<std::string> triple_observable_names(const RunConfig &config)
+{
+    std::vector<std::string> names{"tmi", "gmn"};
+    if (config.fermionic_outputs())
+    {
+        names.push_back("ftmi");
+        names.push_back("fgmn");
+    }
+    return names;
+}
+
 // The `key=value` block every record file carries, whatever its party count.
 inline std::string common_header_fields(const RunConfig &config,
-                                        const std::vector<const char *> &observables)
+                                        const std::vector<std::string> &observables)
 {
     std::string out;
     append_field(out, "format", "mipt_dist_records");
@@ -178,7 +286,31 @@ inline std::string common_header_fields(const RunConfig &config,
     // entropies and carry no unit.
     append_field(out, "entropy_units", "bits");
 
-    std::string fields = "realization_id:u4,geometry_id:u2,embedding_id:u2";
+    // --- provenance --------------------------------------------------------
+    //
+    // Everything a stored flag or a stored negativity has to be interpreted
+    // against. The tolerance and the graph definition are here for the same
+    // reason they are in the CSV: a contingency table means nothing without
+    // the classification that produced it, and the precision decides where the
+    // generic partial transpose stops being able to resolve a negativity.
+    append_field(out, "record_detail", record_detail_name(config.record_detail));
+    append_field(out, "record_stride", std::to_string(config.record_stride));
+    std::string tolerance_text;
+    append_double(tolerance_text, config.pair_zero_tol);
+    append_field(out, "pair_zero_tol", tolerance_text);
+    append_field(out, "statevector_precision", std::to_string(config.statevector_precision));
+    append_field(out, "boundary_implementation", config.boundary_implementation());
+    append_field(out, "master_seed", std::to_string(config.seed));
+    append_field(out, "connectivity", config.connectivity ? "1" : "0");
+    append_field(out, "connectivity_graph_version", std::to_string(CONNECTIVITY_GRAPH_VERSION));
+    append_field(out, "connectivity_graph", CONNECTIVITY_GRAPH_DEFINITION);
+    // One definition of the flag bits, shared by this file, the CSV
+    // documentation, and data_analysis.records.
+    append_field(out, "flag_bits",
+                 "0:evaluated,1:survives_i,2:survives_j,3:interior_path,4:connected");
+
+    std::string fields = "realization_id:u4,geometry_id:u2,embedding_id:u2,flags:u4,"
+                         "reserved:u4";
     std::string names;
     for (std::size_t i = 0; i < observables.size(); ++i)
     {
@@ -196,6 +328,28 @@ inline std::string common_header_fields(const RunConfig &config,
     return out;
 }
 
+// (geometry_id, embedding_id) -> the sites that embedding actually names.
+//
+// v1 could say a record belonged to separation 5 but not which of the N pairs
+// at separation 5 it was, which makes an endpoint-survival flag
+// uninterpretable: the flag is about two specific sites. `sites_per_row` is 2
+// at k=2 and 3 at k=3.
+inline void append_embedding_table(std::string &out, const std::string &rows,
+                                   std::size_t row_count, int sites_per_row)
+{
+    append_field(out, "embedding_rows", std::to_string(row_count));
+    out += "[embedding]\n";
+    out += "geometry_id,embedding_id";
+    for (int site = 0; site < sites_per_row; ++site)
+    {
+        out += ",site_";
+        out += std::to_string(site + 1);
+    }
+    out += '\n';
+    out += rows;
+    out += "[end]\n";
+}
+
 inline void append_geometry_table(std::string &out, const std::string &columns,
                                   const std::string &rows, std::size_t row_count)
 {
@@ -208,16 +362,10 @@ inline void append_geometry_table(std::string &out, const std::string &columns,
 }
 
 // k=2: the geometry is the ring separation, and `d` is its chord length.
-inline std::string pair_header_text(const RunConfig &config, const std::vector<PairBin> &bins)
+inline std::string pair_header_text(const RunConfig &config, const std::vector<PairBin> &bins,
+                                    const std::vector<std::array<int, 4>> &embeddings)
 {
-    const bool fermionic = config.fermionic_outputs();
-    std::vector<const char *> observables{"mi", "mn"};
-    if (fermionic)
-    {
-        observables.push_back("fmi");
-        observables.push_back("fmn");
-    }
-    std::string out = common_header_fields(config, observables);
+    std::string out = common_header_fields(config, pair_observable_names(config));
 
     std::string rows;
     for (std::size_t index = 0; index < bins.size(); ++index)
@@ -232,6 +380,20 @@ inline std::string pair_header_text(const RunConfig &config, const std::vector<P
         rows += '\n';
     }
     append_geometry_table(out, "geometry_id,separation,d,embedding_count", rows, bins.size());
+
+    std::string embedding_rows;
+    for (const std::array<int, 4> &row : embeddings)
+    {
+        embedding_rows += std::to_string(row[0]);
+        embedding_rows += ',';
+        embedding_rows += std::to_string(row[1]);
+        embedding_rows += ',';
+        embedding_rows += std::to_string(row[2]);
+        embedding_rows += ',';
+        embedding_rows += std::to_string(row[3]);
+        embedding_rows += '\n';
+    }
+    append_embedding_table(out, embedding_rows, embeddings.size(), 2);
     return out;
 }
 
@@ -239,16 +401,10 @@ inline std::string pair_header_text(const RunConfig &config, const std::vector<P
 // chords -- the same effective distance the CSV's `d` column carries and the
 // same one three-probe mode 4 writes as `chord_geometric_mean`.
 inline std::string triple_header_text(const RunConfig &config, const std::vector<TripleBin> &bins,
-                                      long embeddings_per_geometry)
+                                      long embeddings_per_geometry,
+                                      const std::vector<probed::ProbeGeometry> &geometries)
 {
-    const bool fermionic = config.fermionic_outputs();
-    std::vector<const char *> observables{"tmi", "gmn"};
-    if (fermionic)
-    {
-        observables.push_back("ftmi");
-        observables.push_back("fgmn");
-    }
-    std::string out = common_header_fields(config, observables);
+    std::string out = common_header_fields(config, triple_observable_names(config));
     std::string balance_text;
     append_double(balance_text, config.triangle_balance_cutoff);
     append_field(out, "b_min", balance_text);
@@ -275,6 +431,27 @@ inline std::string triple_header_text(const RunConfig &config, const std::vector
     append_geometry_table(
         out, "geometry_id,separation_1,separation_2,separation_3,triangle_balance,d,embedding_count",
         rows, bins.size());
+
+    std::string embedding_rows;
+    std::size_t embedding_count = 0;
+    for (std::size_t geometry = 0; geometry < geometries.size(); ++geometry)
+    {
+        const auto &sites = geometries[geometry].embeddings;
+        for (std::size_t index = 0; index < sites.size(); ++index)
+        {
+            embedding_rows += std::to_string(geometry);
+            embedding_rows += ',';
+            embedding_rows += std::to_string(index);
+            for (int site : sites[index])
+            {
+                embedding_rows += ',';
+                embedding_rows += std::to_string(site);
+            }
+            embedding_rows += '\n';
+            ++embedding_count;
+        }
+    }
+    append_embedding_table(out, embedding_rows, embedding_count, 3);
     return out;
 }
 
@@ -318,7 +495,11 @@ inline FileInfo inspect(const std::string &path)
     std::memcpy(&version, preamble + 8, 4);
     std::memcpy(&bytes, preamble + 12, 4);
     std::memcpy(&header_bytes, preamble + 16, 4);
-    if (version != FORMAT_VERSION)
+    // v1 is readable but not extendable: its records have an 8-byte prefix and
+    // no flags, so appending v2 records would produce a file with two layouts
+    // and no way to tell where one ends. RecordSink::open refuses; inspect()
+    // does not, so a tool that only wants to read an archived v1 file can.
+    if (version != FORMAT_VERSION && version != FORMAT_VERSION_V1)
     {
         throw std::runtime_error(path + " was written in record format version " +
                                  std::to_string(version) + ", but this binary writes version " +
@@ -437,9 +618,9 @@ class RecordSink
     void open(const std::string &path, const std::string &header_text, std::size_t value_count,
               std::uint64_t completed)
     {
-        if (value_count == 0 || value_count > MAX_VALUES)
+        if (value_count == 0)
         {
-            throw std::invalid_argument("A record carries between 1 and 4 observables.");
+            throw std::invalid_argument("A record carries at least one observable.");
         }
         path_ = path;
         checkpoint_ = completed;
@@ -455,6 +636,16 @@ class RecordSink
         }
         else
         {
+            if (info.version != FORMAT_VERSION)
+            {
+                throw std::runtime_error(
+                    path_ + " is a format v" + std::to_string(info.version) +
+                    " record file. v" + std::to_string(FORMAT_VERSION) +
+                    " records carry connectivity flags and a wider value list, so the two "
+                    "cannot share a file. Finish it with the binary that wrote it, move it "
+                    "aside, or set MIPT_DIST_RECORDS=0 to run without per-record output. "
+                    "data_analysis reads both formats.");
+            }
             if (info.header_text != header_text)
             {
                 throw std::runtime_error(
@@ -500,27 +691,28 @@ class RecordSink
     // A record whose observables are all known now. Returns nothing: there is
     // nothing left to fill in.
     void add(std::uint32_t realization, std::uint32_t geometry, std::uint32_t embedding,
-             const double *values)
+             std::uint32_t flags, const double *values)
     {
         if (!active_)
         {
             return;
         }
-        push(realization, geometry, embedding, values, 0);
+        push(realization, geometry, embedding, flags, values, 0);
         maybe_flush();
     }
 
     // A record with `pending` observables still to arrive from a background
     // solver. The returned sequence number addresses it until then.
     std::uint64_t add_pending(std::uint32_t realization, std::uint32_t geometry,
-                              std::uint32_t embedding, const double *values, int pending)
+                              std::uint32_t embedding, std::uint32_t flags,
+                              const double *values, int pending)
     {
         if (!active_)
         {
-            return 0;
+            return NO_SEQUENCE;
         }
         const std::uint64_t sequence = next_sequence_;
-        push(realization, geometry, embedding, values, pending);
+        push(realization, geometry, embedding, flags, values, pending);
         return sequence;
     }
 
@@ -529,7 +721,7 @@ class RecordSink
     // stay ignorant of whether a sink exists.
     void resolve(std::uint64_t sequence, std::size_t slot, double value)
     {
-        if (!active_ || sequence < first_sequence_)
+        if (!active_ || sequence == NO_SEQUENCE || sequence < first_sequence_)
         {
             return;
         }
@@ -541,7 +733,7 @@ class RecordSink
         Pending &record = buffer_[static_cast<std::size_t>(offset)];
         if (slot < value_count_)
         {
-            record.values[slot] = value;
+            values_[static_cast<std::size_t>(offset) * value_count_ + slot] = value;
         }
         if (record.unresolved > 0)
         {
@@ -579,7 +771,7 @@ class RecordSink
         bytes_.reserve(resolved * record_bytes_);
         for (std::size_t index = 0; index < resolved; ++index)
         {
-            serialize(buffer_[index]);
+            serialize(buffer_[index], index);
         }
         file_.write(bytes_.data(), static_cast<std::streamsize>(bytes_.size()));
         if (!file_)
@@ -588,6 +780,8 @@ class RecordSink
         }
         file_.flush();
         buffer_.erase(buffer_.begin(), buffer_.begin() + static_cast<std::ptrdiff_t>(resolved));
+        values_.erase(values_.begin(),
+                      values_.begin() + static_cast<std::ptrdiff_t>(resolved * value_count_));
         first_sequence_ += resolved;
         written_ += resolved;
     }
@@ -609,13 +803,18 @@ class RecordSink
     }
 
   private:
+    // The values live in a parallel deque rather than inline, which is what
+    // removes the old fixed cap: a `full`-detail fermionic k=2 record carries
+    // fifteen of them, and a future detail level can carry more without
+    // touching the record struct. The two deques are erased in lockstep, so
+    // record `i` always owns values_[i * value_count_ ...].
     struct Pending
     {
         std::uint32_t realization = 0;
         std::uint16_t geometry = 0;
         std::uint16_t embedding = 0;
+        std::uint32_t flags = 0;
         int unresolved = 0;
-        std::array<double, MAX_VALUES> values{};
     };
 
     void write_new_file(const std::string &header_text)
@@ -645,7 +844,7 @@ class RecordSink
     }
 
     void push(std::uint32_t realization, std::uint32_t geometry, std::uint32_t embedding,
-              const double *values, int pending)
+              std::uint32_t flags, const double *values, int pending)
     {
         if (geometry > std::numeric_limits<std::uint16_t>::max() ||
             embedding > std::numeric_limits<std::uint16_t>::max())
@@ -658,12 +857,10 @@ class RecordSink
         record.realization = realization;
         record.geometry = static_cast<std::uint16_t>(geometry);
         record.embedding = static_cast<std::uint16_t>(embedding);
+        record.flags = flags;
         record.unresolved = pending;
-        for (std::size_t index = 0; index < value_count_; ++index)
-        {
-            record.values[index] = values[index];
-        }
         buffer_.push_back(record);
+        values_.insert(values_.end(), values, values + value_count_);
         ++next_sequence_;
     }
 
@@ -675,14 +872,26 @@ class RecordSink
         }
     }
 
-    void serialize(const Pending &record)
+    void serialize(const Pending &record, std::size_t index)
     {
-        char scratch[ID_BYTES + MAX_VALUES * sizeof(double)];
-        std::memcpy(scratch, &record.realization, 4);
-        std::memcpy(scratch + 4, &record.geometry, 2);
-        std::memcpy(scratch + 6, &record.embedding, 2);
-        std::memcpy(scratch + ID_BYTES, record.values.data(), value_count_ * sizeof(double));
-        bytes_.insert(bytes_.end(), scratch, scratch + record_bytes_);
+        const std::uint32_t reserved = 0;
+        char prefix[ID_BYTES];
+        std::memcpy(prefix, &record.realization, 4);
+        std::memcpy(prefix + 4, &record.geometry, 2);
+        std::memcpy(prefix + 6, &record.embedding, 2);
+        std::memcpy(prefix + 8, &record.flags, 4);
+        std::memcpy(prefix + 12, &reserved, 4);
+        bytes_.insert(bytes_.end(), prefix, prefix + ID_BYTES);
+        // deque is not contiguous, so the payload goes out element by element
+        // rather than as one memcpy.
+        const std::size_t base = index * value_count_;
+        for (std::size_t slot = 0; slot < value_count_; ++slot)
+        {
+            char scratch[sizeof(double)];
+            const double value = values_[base + slot];
+            std::memcpy(scratch, &value, sizeof(double));
+            bytes_.insert(bytes_.end(), scratch, scratch + sizeof(double));
+        }
     }
 
     bool active_ = false;
@@ -692,6 +901,7 @@ class RecordSink
     std::size_t flush_threshold_ = 8192;
     std::ofstream file_;
     std::deque<Pending> buffer_;
+    std::deque<double> values_;
     std::vector<char> bytes_;
     std::uint64_t first_sequence_ = 0;
     std::uint64_t next_sequence_ = 0;

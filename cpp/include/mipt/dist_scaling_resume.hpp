@@ -37,10 +37,19 @@
 // schedule re-offers those slots. Nothing is double-counted: the dropped
 // records contributed no value.
 //
-// Trajectories are i.i.d. draws -- dist_scaling.exe never calls
-// CircuitWorkspace1D::seed, so its circuits come from std::random_device -- and
-// a resumed run simply draws more of them. There is no seed stream to continue
-// the way free_energy.exe continues one, and none is needed.
+// Trajectories are i.i.d. draws and a resumed run simply draws more of them.
+// Since 2026-09-09 they are also *reproducible*: every trajectory's layer draw
+// is splitmix64-derived from a master seed, which is recorded in the CSV's
+// `master_seed` column. So there is a seed stream after all, and a resume
+// adopts the one the checkpoint already carries rather than drawing a fresh
+// one -- otherwise the second half of a file would not be addressable by the
+// seed the first half advertises. `Report::seed` is how it comes back.
+//
+// This does not make a resumed run trajectory-for-trajectory identical to an
+// uninterrupted one under the CUDA-Q fallback path: the layer *history* is
+// pinned but the measurement outcomes are drawn by a runtime stream nothing
+// here controls. The cuStateVec path samples from measure_rng_ and is
+// reproducible throughout.
 //
 // Nothing here depends on CUDA-Q, MOSEK, or a GPU, so it is exercised by
 // `make test-dist`.
@@ -77,8 +86,54 @@ struct Report
     // sampling from here on but cannot recover the lost values: the density
     // matrices they were computed from are long gone.
     double worst_lost_sdp_fraction = 0.0;
+    // The master seed the checkpoint was written with. A resumed run adopts it
+    // rather than drawing a fresh one, so the continuation's trajectories stay
+    // the ones `trajectory_seed(seed, realization)` names -- which is what
+    // makes any single trajectory of a finished, interrupted, resumed run
+    // replayable after the fact.
+    std::uint64_t seed = 0;
+    bool has_seed = false;
     bool loaded = false;
 };
+
+// An exact text comparison, for fields where require_same's relative tolerance
+// is the wrong tool.
+//
+// `pair_zero_tol` is the motivating case and it is not a corner case: the
+// default is 1e-12, and require_same(double) allows an absolute slack of
+// 1e-12 * max(1, |expected|) = 1e-12, which accepts *zero* as a match for it.
+// Both writer and reader render through append_double at 17 digits, so the
+// text round-trips exactly and comparing it is both stricter and cheaper.
+inline void require_same_text(
+    std::string_view field, double expected, const std::string &found,
+    const std::string &path)
+{
+    std::string rendered;
+    append_double(rendered, expected);
+    if (rendered != found)
+    {
+        csv::refuse(
+            path + " was produced with " + std::string(field) + '=' + found +
+            ", but this run uses " + rendered +
+            ". Those are different classifications of the same records, so the "
+            "counts cannot be pooled. Move the existing file aside, or set "
+            "MIPT_DIST_RESUME=0 to overwrite it.");
+    }
+}
+
+inline void require_same_text(
+    std::string_view field, std::string_view expected, const std::string &found,
+    const std::string &path)
+{
+    if (found != expected)
+    {
+        csv::refuse(
+            path + " was produced with " + std::string(field) + '=' + found +
+            ", but this run uses " + std::string(expected) +
+            ". Move the existing file aside, or set MIPT_DIST_RESUME=0 to "
+            "overwrite it.");
+    }
+}
 
 // How many records one trajectory folds into a bin holding `embeddings`
 // lattice embeddings. Mirrors sample_trajectory_triangles exactly.
@@ -162,6 +217,80 @@ inline void require_metadata(
     csv::require_same(
         "periods", static_cast<long>(config.periods), table.integer(row, "periods"), path);
     csv::require_same("k", static_cast<long>(config.k), table.integer(row, "k"), path);
+    // Mixing an fp32 and an fp64 half of one file is exactly what must not
+    // happen: the generic partial transpose loses a negativity to rounding at
+    // a precision-dependent magnitude, so a positivity count pooled across the
+    // two would be measuring the arithmetic rather than the physics.
+    csv::require_same(
+        "statevector_precision", static_cast<long>(config.statevector_precision),
+        table.integer(row, "statevector_precision"), path);
+    require_same_text(
+        "boundary_implementation", config.boundary_implementation(),
+        table.text(row, "boundary_implementation"), path);
+}
+
+// The seed a checkpoint carries, checked for consistency across its rows.
+inline void absorb_seed(
+    const csv::CsvTable &table, std::size_t row, const std::string &path, Report &report)
+{
+    const std::uint64_t stored = table.counter(row, "master_seed");
+    if (report.has_seed && stored != report.seed)
+    {
+        csv::refuse(
+            path + " line " + std::to_string(row + 2) +
+            " records a different master_seed than earlier rows, so the file "
+            "was concatenated from two runs.");
+    }
+    report.seed = stored;
+    report.has_seed = true;
+}
+
+// The contingency table is a partition, so it has exact invariants rather than
+// approximate ones. Checking them is what turns a hand-edited or concatenated
+// file into a refusal instead of a plausible-looking conditional probability.
+inline void check_contingency(const PairBin &bin, const std::string &path, std::size_t row)
+{
+    const std::string where = path + " line " + std::to_string(row + 2);
+    if (bin.conn_records > bin.mi.count)
+    {
+        csv::refuse(where + " evaluated connectivity on more records than it measured.");
+    }
+    const std::uint64_t classified = bin.connected_ent_positive + bin.connected_ent_zero +
+                                     bin.disconnected_ent_positive + bin.disconnected_ent_zero;
+    if (classified != bin.conn_records)
+    {
+        csv::refuse(
+            where + " has a contingency table summing to " + std::to_string(classified) +
+            " against " + std::to_string(bin.conn_records) +
+            " records with connectivity. The four cells partition those records, "
+            "so they must sum to exactly that.");
+    }
+    if (bin.connected_ent_positive + bin.connected_ent_zero != bin.connected)
+    {
+        csv::refuse(where + " has connected_count disagreeing with its two entanglement cells.");
+    }
+    if (bin.classical_occ_correlated + bin.classical_subthreshold + bin.classical_silent !=
+        bin.connected_ent_zero)
+    {
+        csv::refuse(
+            where + " splits the connected-but-unentangled records into cells that do not "
+                    "sum back to connected_ent_zero_count.");
+    }
+    // C = A_i && A_j && interior path, so each factor bounds it from above.
+    if (bin.connected > bin.survive_both || bin.connected > bin.interior_path ||
+        bin.survive_both > bin.survive_i || bin.survive_both > bin.survive_j ||
+        bin.survive_i > bin.conn_records || bin.interior_path > bin.conn_records)
+    {
+        csv::refuse(
+            where + " has endpoint-survival and connectivity counts that violate "
+                    "C = A_i and A_j and interior-path.");
+    }
+    if (bin.ent_given_connected.count + bin.ent_given_disconnected.count != bin.conn_records)
+    {
+        csv::refuse(
+            where + " has conditional negativity sample counts that do not cover every "
+                    "record with connectivity.");
+    }
 }
 
 // --- k=2 -------------------------------------------------------------------
@@ -193,6 +322,21 @@ inline Report load_pairs(const RunConfig &config, std::vector<PairBin> &bins)
     for (std::size_t row = 0; row < bins.size(); ++row)
     {
         require_metadata(table, row, config, path);
+        absorb_seed(table, row, path, report);
+        // Every conditional probability below is defined relative to these
+        // three, so a checkpoint written under different ones describes
+        // different events and cannot be continued.
+        require_same_text(
+            "pair_zero_tol", config.pair_zero_tol, table.text(row, "pair_zero_tol"), path);
+        require_same_text(
+            "contingency_measure", config.contingency_measure(),
+            table.text(row, "contingency_measure"), path);
+        csv::require_same(
+            "connectivity_graph_version", static_cast<long>(CONNECTIVITY_GRAPH_VERSION),
+            table.integer(row, "connectivity_graph_version"), path);
+        require_same_text(
+            "connectivity_graph", CONNECTIVITY_GRAPH_DEFINITION,
+            table.text(row, "connectivity_graph"), path);
         PairBin &bin = bins[row];
         csv::require_same(
             "separation", static_cast<long>(bin.separation),
@@ -248,7 +392,36 @@ inline Report load_pairs(const RunConfig &config, std::vector<PairBin> &bins)
                     "ordinary-trace ones; both conventions are measured on the "
                     "same records.");
             }
+            bin.fmn_residual = table.stats_by_stderr(row, "fmn_residual");
+            bin.fmn_residual_max = table.real(row, "fmn_residual_max");
         }
+
+        bin.n_i = table.stats_by_stderr(row, "n_i");
+        bin.n_j = table.stats_by_stderr(row, "n_j");
+        bin.dnn = table.stats_by_stderr(row, "dnn");
+        bin.rho_n = table.stats_by_stderr(row, "rho_n");
+        bin.i_occ = table.stats_by_stderr(row, "i_occ");
+
+        bin.conn_records = table.counter(row, "conn_records");
+        bin.survive_i = table.counter(row, "survive_i_count");
+        bin.survive_j = table.counter(row, "survive_j_count");
+        bin.survive_both = table.counter(row, "survive_both_count");
+        bin.interior_path = table.counter(row, "interior_path_count");
+        bin.connected = table.counter(row, "connected_count");
+        bin.connected_ent_positive = table.counter(row, "connected_ent_positive_count");
+        bin.connected_ent_zero = table.counter(row, "connected_ent_zero_count");
+        bin.disconnected_ent_positive = table.counter(row, "disconnected_ent_positive_count");
+        bin.disconnected_ent_zero = table.counter(row, "disconnected_ent_zero_count");
+        bin.classical_occ_correlated = table.counter(row, "classical_occ_correlated_count");
+        bin.classical_subthreshold = table.counter(row, "classical_subthreshold_count");
+        bin.classical_silent = table.counter(row, "classical_silent_count");
+        bin.ent_given_connected = table.stats_by_stderr(row, "ent_given_connected");
+        bin.ent_given_disconnected = table.stats_by_stderr(row, "ent_given_disconnected");
+        bin.i_occ_connected_classical =
+            table.stats_by_stderr(row, "i_occ_connected_classical");
+        bin.component_size = table.stats_by_stderr(row, "component_size");
+        bin.shortest_path = table.stats_by_stderr(row, "shortest_path");
+        check_contingency(bin, path, row);
 
         fold_completed(bin.mi.count, bin.embedding_count, path, row, completed);
     }
@@ -343,6 +516,7 @@ inline Report load_triples(
     for (std::size_t row = 0; row < bins.size(); ++row)
     {
         require_metadata(table, row, config, path);
+        absorb_seed(table, row, path, report);
         TripleBin &bin = bins[row];
         csv::require_same(
             "geometry_id", static_cast<long>(row), table.integer(row, "geometry_id"), path);

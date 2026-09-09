@@ -249,6 +249,123 @@ inline bool preserves_computational_parity(CircuitType type)
            type == CircuitType::QubitRPPU;
 }
 
+// ---------------------------------------------------------------------------
+// Logical layer description
+//
+// The *simulated* layer types (MmsLayer, HaarLayer, RppuLayer, RfgsLayer) carry
+// everything a state vector needs and nothing a graph does: gate parameters,
+// Jordan-Wigner corrections, decomposition scaffolding. A LogicalLayer is the
+// projection of one of those onto the only two facts the spacetime percolation
+// graph cares about -- which sites a layer entangles with each other, and which
+// sites it measures.
+//
+// Three conventions, each of which is a modelling choice rather than a
+// transcription, and each of which would silently change the graph if it were
+// made differently:
+//
+//   * An FSWAP is *transport*, not an entangling seed. It exchanges two
+//     fermionic modes exactly, so it permutes worldline labels and creates no
+//     correlation. Emitting a bond for it would fuse every site the historical
+//     RPPU boundary SWAP network passes through into one cluster, which is the
+//     whole ring.
+//
+//   * A direct Jordan-Wigner boundary gate is the *single* logical bond
+//     (0, L-1). The CZ string it carries touches every site in between, but
+//     those are basis-change corrections that undo themselves; the gate
+//     entangles its two endpoints and nothing else. Emitting a bond per crossed
+//     site would, again, connect the whole ring.
+//
+//   * Consequently the FSWAP-network boundary and the JW-string boundary
+//     produce *identical* logical layers, which is correct: they are two
+//     implementations of one nonlocal gate. `boundary_implementation` is
+//     recorded in the output so that identity can be checked rather than
+//     assumed.
+//
+// `measured[m]` is indexed by logical mode, not by qubit position, so a layer
+// that transports modes is still described in the labels its neighbours use.
+// ---------------------------------------------------------------------------
+
+struct LogicalBond
+{
+    int a = 0;
+    int b = 0;
+};
+
+struct LogicalLayer
+{
+    std::vector<LogicalBond> bonds;
+    std::vector<std::uint8_t> measured;
+};
+
+// One trajectory's worth of logical layers, plus the permutation that says
+// which mode each qubit position holds at the end.
+//
+// For every circuit in the registry that permutation is the identity -- the
+// only transport in the tree is the RPPU boundary SWAP network, which is
+// balanced within its layer -- but it is tracked and reported rather than
+// assumed, because a new circuit that ended on a net permutation would
+// otherwise mislabel both endpoints of every pair silently.
+struct LogicalHistory
+{
+    int n = 0;
+    std::vector<LogicalLayer> layers;
+    std::vector<int> mode_at_site; // qubit position -> logical mode, at the end
+    bool valid = false;
+
+    void reset(int sites)
+    {
+        n = sites;
+        layers.clear();
+        mode_at_site.resize(static_cast<std::size_t>(sites));
+        for (int site = 0; site < sites; ++site)
+        {
+            mode_at_site[static_cast<std::size_t>(site)] = site;
+        }
+        valid = false;
+    }
+
+    bool identity_permutation() const
+    {
+        for (int site = 0; site < n; ++site)
+        {
+            if (mode_at_site[static_cast<std::size_t>(site)] != site)
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+};
+
+// A brickwork bond sweep, shared by every circuit whose layer is "pair up
+// sites from `start`, optionally wrapping". Mirrors the bond loops in
+// haar.hpp, mms.hpp and fermion.hpp rather than reimplementing them.
+inline void append_brickwork_bonds(LogicalLayer &layer, int n, int start, bool wraps,
+                                   const std::vector<int> &mode_at_site)
+{
+    const int bond_stop = (wraps && start == 1 && n > 2) ? n : (n - 1);
+    for (int i = start; i < bond_stop; i += 2)
+    {
+        const int j = (i + 1) % n;
+        layer.bonds.push_back({mode_at_site[static_cast<std::size_t>(i)],
+                               mode_at_site[static_cast<std::size_t>(j)]});
+    }
+}
+
+inline void set_measured(LogicalLayer &layer, int n, const std::vector<int> &measure_flags,
+                         const std::vector<int> &mode_at_site)
+{
+    layer.measured.assign(static_cast<std::size_t>(n), 0u);
+    for (int site = 0; site < n; ++site)
+    {
+        if (measure_flags[static_cast<std::size_t>(site)])
+        {
+            layer.measured[static_cast<std::size_t>(
+                mode_at_site[static_cast<std::size_t>(site)])] = 1u;
+        }
+    }
+}
+
 inline bool requires_even_sites(CircuitType type)
 {
     return circuit_info(type).requires_even_sites;
