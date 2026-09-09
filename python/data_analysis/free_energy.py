@@ -311,7 +311,6 @@ def free_energy_ceff(
             warnings.warn("Too few successful c_eff bootstrap fits; using fit errors.")
 
     fig, ax = plt.subplots(figsize=figsize)
-    fig.subplots_adjust(left=0.08, right=0.97, bottom=0.15, top=0.91)
     colors = plt.get_cmap(cmap)(
         np.linspace(0.35, 0.90, max(1, len(fits)))
     )
@@ -693,7 +692,6 @@ def free_energy_equilibration(
     ax_delta.set_ylabel(r"$\Delta F(t)/L$")
     ax_delta.set_title("(b) Initial-state boundary contribution")
     ax_delta.grid(alpha=0.25)
-    fig.tight_layout()
     _show(fig, show)
 
     return {

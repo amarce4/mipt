@@ -343,7 +343,6 @@ def tmi_collapse(
         ha="left",
         bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.85},
     )
-    fig.tight_layout()
     _show(fig, show)
 
     return {

@@ -11,6 +11,8 @@ logarithmic axes, grids, colours, marker encodings and panel layout).
 
 from __future__ import annotations
 
+from collections.abc import Callable
+import warnings
 from typing import Any, Sequence
 
 import matplotlib.pyplot as plt
@@ -101,7 +103,39 @@ def apply_paper_style() -> None:
 apply_paper_style()
 
 
-def _show(fig, show: bool) -> None:
+def _show(
+    fig,
+    show: bool,
+    *,
+    tight_layout_kwargs: dict[str, Any] | None = None,
+    post_tight_adjust: dict[str, float] | None = None,
+    post_tight_callback: Callable[[Any], None] | None = None,
+) -> None:
+    """Apply the suite-wide layout pass and optionally display ``fig``.
+
+    Layout is performed even when ``show=False`` so figures returned to a
+    notebook or saved by the caller have the same geometry as displayed
+    figures.  Shared-axis stacks use ``post_tight_adjust`` or
+    ``post_tight_callback`` to make adjacent frames touch after
+    :meth:`Figure.tight_layout` has fixed the outer margins.
+    """
+    # Figure-level colour bars and inset axes have no SubplotSpec.  Matplotlib
+    # still tightens every compatible subplot correctly, but emits a generic
+    # warning for the auxiliary axes; suppress only that known-safe warning.
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=(
+                "This figure includes Axes that are not compatible with "
+                "tight_layout, so results might be incorrect."
+            ),
+            category=UserWarning,
+        )
+        fig.tight_layout(**(tight_layout_kwargs or {}))
+    if post_tight_adjust:
+        fig.subplots_adjust(**post_tight_adjust)
+    if post_tight_callback is not None:
+        post_tight_callback(fig)
     if show:
         plt.show()
 
@@ -391,7 +425,6 @@ def _paired_axes(
         fig, column = plt.subplots(
             nrows, 1, figsize=figsize, dpi=dpi, squeeze=False,
             sharex=sharex,
-            constrained_layout=True,
         )
         rectangle = _inset_rectangle(inset_corner, inset_size, inset_pad)
         pairs = []
@@ -415,7 +448,6 @@ def _paired_axes(
         # "col", not True: the two columns hold different observables, so only
         # the rows within a column share an x axis.
         sharex="col" if sharex else False,
-        constrained_layout=True,
     )
     return fig, [tuple(row) for row in grid]
 
@@ -424,12 +456,10 @@ def _paired_axes(
 # Flush vertical stacks
 #
 # A stack of panels that share one x axis reads as a single plot only if the
-# rows actually touch. ``constrained_layout`` will not do that: its row
-# spacing is computed from each axes' tight bounding box, which includes the
-# outward tick marks, so even at hspace=0 and h_pad=0 it leaves ~4 pt between
-# frames. The fix is to let it settle the *outer* margins, freeze it, and then
-# re-lay the rows by hand. Inset axes are positioned in their parent's axes
-# fraction, so they follow without any extra work.
+# rows actually touch. A normal tight-layout pass deliberately reserves room
+# between decorated axes. Flush stacks therefore use tight layout for their
+# outer margins and then set ``hspace=0``; the helper below remains available
+# for callers that need to freeze more complicated multi-column geometry.
 # ---------------------------------------------------------------------------
 
 

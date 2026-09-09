@@ -94,7 +94,6 @@ def expvals(
     ax.set_title(title)
     ax.grid(True, alpha=0.25)
     ax.legend(loc="center left", bbox_to_anchor=(1.02, 0.5), frameon=True)
-    fig.tight_layout()
     _show(fig, show)
 
     if show_table:

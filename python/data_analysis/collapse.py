@@ -1203,12 +1203,19 @@ def stacked_bulk_exponent_collapse(
         suptitle if suptitle is not None else metric_specs[0]["suptitle"],
         fontsize=14,
     )
-    # An inset is positioned in its parent's axes fraction and follows it, so
-    # only the gridspec axes of each row are re-laid.
-    _flush_stacked_axes(
-        fig, [list(pair[:1] if collapse_inset else pair) for pair in panels]
+    # Tighten the outer margins first. An inset is positioned in its parent's
+    # axes fraction and follows it, so only the gridspec axes are flushed in
+    # the post-layout callback.
+    flush_rows = [
+        list(pair[:1] if collapse_inset else pair) for pair in panels
+    ]
+    _show(
+        fig,
+        show,
+        post_tight_callback=lambda figure: _flush_stacked_axes(
+            figure, flush_rows
+        ),
     )
-    _show(fig, show)
 
     results = {fit["metric_spec"]["key"]: _panel_result(fit, mi_units) for fit in fits}
     return {

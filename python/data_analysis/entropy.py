@@ -578,10 +578,6 @@ def entropy(
             units=units,
             capsize=inset_capsize,
         )
-    elif not want_extrapolation:
-        # _paired_axes lays its figures out with constrained_layout, which
-        # tight_layout would fight even after the panel has been removed.
-        fig.tight_layout()
     _show(fig, show)
 
     metadata = pd.DataFrame(

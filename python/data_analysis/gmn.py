@@ -157,6 +157,5 @@ def gmn(
             bbox={"boxstyle": "square", "facecolor": "white", "alpha": 0.7},
         )
 
-    fig.tight_layout()
     _show(fig, show)
     return {"figure": fig, "axis": ax, "data": data}

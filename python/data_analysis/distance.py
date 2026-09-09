@@ -767,18 +767,16 @@ def _draw_value_distributions(
     zero_tol: float,
     dpi: int,
     figsize: tuple[float, float] | None,
+    axis_label_fontsize: float | None,
 ) -> Any:
     """The stacked histogram: one measure per row, flush, on a shared x axis."""
     order = [metric for metric, _, _ in _DISTRIBUTION_PANELS if metric in panels]
     if figsize is None:
         figsize = (6.5, 2.05 * len(order) + 0.9)
-    # constrained_layout would override the zero spacing that makes the panel
-    # edges touch, so the margins are set by hand instead.
     fig, axis_grid = plt.subplots(
         len(order), 1, figsize=figsize, dpi=dpi, sharex=True
     )
     axes = np.atleast_1d(axis_grid)
-    fig.subplots_adjust(hspace=0.0, left=0.14, right=0.97, top=0.94, bottom=0.11)
 
     # The panels share an x axis, so a bar at a given position has to mean the
     # same interval in every one of them. The counts arrive on the summary's
@@ -843,6 +841,7 @@ def _draw_value_distributions(
         ax.margins(x=0.01)
 
     axes[-1].set_xlabel("Value")
+    _set_axis_label_fontsize(axes, axis_label_fontsize)
     axes[0].set_title(
         rf"{circuit_name}, $L={size}$, records with $d \geq {d_min:g}$",
         fontsize=11,
@@ -1013,27 +1012,68 @@ def _annotate_distance_fit(
     y_line: np.ndarray,
     alpha: float,
     party_count: int,
+    *,
+    below: bool = False,
 ) -> None:
-    """Place a power-law label clearly above its guide, inside the axes.
+    """Place a power-law label beside its guide, inside the axes.
 
-    The text extends rightward from an interior point.  Since every fitted
-    power law descends to the right, both the guide and its data points then
-    move away from the annotation instead of cutting through its glyphs.
+    The normal placement extends rightward above an interior point.  The
+    dedicated ``below`` placement extends leftward below it, so the descending
+    guide moves away from the text in either case.
     """
     fraction = 0.52 if party_count == 2 else 0.70
     index = int(round(fraction * (len(x_line) - 1)))
+    offset = (-4.0, -11.0) if below else (4.0, 12.0)
     ax.annotate(
         rf"$d^{{-{alpha:.2g}}}$",
         xy=(x_line[index], y_line[index]),
-        xytext=(4.0, 12.0),
+        xytext=offset,
         textcoords="offset points",
-        ha="left",
-        va="bottom",
+        ha="right" if below else "left",
+        va="top" if below else "bottom",
         fontsize=8.0,
         color="black",
         annotation_clip=True,
         zorder=7,
     )
+
+
+_DISTANCE_XLABEL = r"Effective chord distance $d$"
+
+
+def _normalize_axis_label_fontsize(value: float | None) -> float | None:
+    """Validate a shared axis-label font size, or preserve rcParams via None."""
+    if value is None:
+        return None
+    size = float(value)
+    if not np.isfinite(size) or size <= 0.0:
+        raise ValueError("axis_label_fontsize must be positive or None.")
+    return size
+
+
+def _set_axis_label_fontsize(
+    axes: Sequence[Any], fontsize: float | None
+) -> None:
+    """Apply one font size to every x- and y-axis label in ``axes``."""
+    if fontsize is None:
+        return
+    for axis in axes:
+        axis.xaxis.label.set_fontsize(fontsize)
+        axis.yaxis.label.set_fontsize(fontsize)
+
+
+def _set_shared_distance_xlabel(axes: Sequence[Any]) -> None:
+    """Give exactly the bottom panel a visible shared-distance label."""
+    if not axes:
+        return
+    for axis in axes[:-1]:
+        axis.set_xlabel("")
+        axis.tick_params(axis="x", which="both", labelbottom=False)
+    bottom = axes[-1]
+    bottom.set_xlabel(_DISTANCE_XLABEL)
+    bottom.xaxis.set_label_position("bottom")
+    bottom.xaxis.label.set_visible(True)
+    bottom.tick_params(axis="x", which="both", labelbottom=True)
 
 
 def _print_distance_fits(
@@ -1105,6 +1145,7 @@ def _draw_exponent_convergence(
     cmap: str,
     dpi: int,
     figsize: tuple[float, float] | None,
+    axis_label_fontsize: float | None,
 ) -> tuple[Any, Any, pd.DataFrame] | tuple[None, None, pd.DataFrame]:
     """Draw a Fig.-5-style finite-size drift of the distance exponents.
 
@@ -1127,9 +1168,7 @@ def _draw_exponent_convergence(
 
     if figsize is None:
         figsize = (6.6, 4.35)
-    fig, ax = plt.subplots(
-        figsize=figsize, dpi=dpi, constrained_layout=True
-    )
+    fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
     metric_colors = plt.get_cmap(cmap)(
         np.linspace(0.12, 0.88, len(usable_metrics))
     )
@@ -1218,6 +1257,7 @@ def _draw_exponent_convergence(
     ax.set_xticklabels(["0"] + [rf"$1/{size}$" for size in tick_sizes])
     ax.grid(True, axis="x", alpha=0.25)
     ax.legend(loc="best", ncols=2, fontsize=7.5)
+    _set_axis_label_fontsize((ax,), axis_label_fontsize)
     return fig, ax, pd.DataFrame(guide_rows)
 
 
@@ -1245,6 +1285,7 @@ def dist_scaling(
     capsize: float = 2.0,
     cmap: str = "viridis",
     figsize: tuple[float, float] | None = None,
+    axis_label_fontsize: float | None = 9.0,
     show_exponent_convergence: bool = True,
     exponent_figsize: tuple[float, float] | None = None,
     dpi: int = 130,
@@ -1310,6 +1351,9 @@ def dist_scaling(
     stack for backward compatibility, while ``figures`` names every emitted
     stack.  For a qubit ensemble only the ordinary figure is made.  A custom
     ``figsize`` applies to each emitted stack, not to a combined 2x2 canvas.
+    ``axis_label_fontsize`` sets every x- and y-axis label produced by this
+    function, including supplemental figures; pass ``None`` to use the active
+    Matplotlib ``rcParams`` value instead.
 
     Every other measure the file carries -- ``average_mi``, ``min_bipneg``,
     the purities -- is still loaded into ``data`` and still fitted into
@@ -1337,17 +1381,17 @@ def dist_scaling(
             = P_{\mathrm{ent}}(d)\,
               \langle\mathcal{N}\rangle_{\mathrm{ent}}(d)
 
-    -- how often a pair is entangled at all, and how much when it is. The
-    columns are those two factors and the rows the two trace conventions, so
-    the top row multiplies out to the Negativity panel of the default figure
-    and the bottom row to the Fermionic Negativity one:
+    -- how often a pair is entangled at all, and how much when it is.  The
+    factors are vertically stacked in two separate figures: probability on
+    top and conditional magnitude below. ``bosonic_figure`` uses the ordinary
+    trace and ``fermionic_figure`` uses the fermionic trace:
 
     =============== ============================ =============================
-    row              left column                  right column
+    figure          top panel                    bottom panel
     =============== ============================ =============================
-    ordinary trace  ``mn_ent_fraction`` (k=2)    ``mn_ent_magnitude`` (k=2)
+    bosonic         ``mn_ent_fraction`` (k=2)    ``mn_ent_magnitude`` (k=2)
                     ``gmn_ent_fraction`` (k=3)   ``gmn_ent_magnitude`` (k=3)
-    fermionic trace ``fmn_ent_fraction`` (k=2)   ``fmn_ent_magnitude`` (k=2)
+    fermionic       ``fmn_ent_fraction`` (k=2)   ``fmn_ent_magnitude`` (k=2)
                     ``fgmn_ent_fraction`` (k=3)  ``fgmn_ent_magnitude`` (k=3)
     =============== ============================ =============================
 
@@ -1451,6 +1495,7 @@ def dist_scaling(
     ``legacy_entropy_units`` supplies the same information for the older
     row-level files, which carry no such column and are also log2.
     """
+    axis_label_fontsize = _normalize_axis_label_fontsize(axis_label_fontsize)
     if min_relative_error <= 0.0:
         raise ValueError("min_relative_error must be positive.")
     if chunksize <= 0:
@@ -1835,25 +1880,45 @@ def dist_scaling(
         )
 
     colors = _color_map_by_size(unique_sizes, cmap)
-    # Figure 4 is two vertically stacked observables.  The ordinary and
-    # fermionic trace conventions are separate publication figures rather
-    # than columns squeezed into one 2x2 canvas; this keeps both stacks at the
-    # paper's readable single-column width.  The decomposition and correlator
-    # modes have different row/column semantics and retain their native grid.
-    split_trace_figures = not ent_decomp and not correlators
+    # The ordinary distance measures and their entanglement decompositions
+    # both read most clearly as separate bosonic/fermionic vertical stacks.
+    # In the ordinary grid trace convention is the column; in the
+    # decomposition grid it is the row. Correlators retain their native 2x2
+    # semantics and therefore remain combined.
+    split_trace_figures = not correlators
     figures: dict[str, Any] = {}
     figure_slots: dict[str, list[tuple[int, int]]] = {}
     slot_axes: dict[tuple[int, int], Any] = {}
     if split_trace_figures:
-        for column in panel_columns:
-            slots = [
-                (row, column)
-                for row in panel_rows
-                if (row, column) in panel_slots
-            ]
+        trace_groups: list[tuple[str, list[tuple[int, int]]]] = []
+        if ent_decomp:
+            for row in panel_rows:
+                trace_groups.append(
+                    (
+                        "bosonic" if row == 0 else "fermionic",
+                        [
+                            (row, column)
+                            for column in panel_columns
+                            if (row, column) in panel_slots
+                        ],
+                    )
+                )
+        else:
+            for column in panel_columns:
+                trace_groups.append(
+                    (
+                        "bosonic" if column == 0 else "fermionic",
+                        [
+                            (row, column)
+                            for row in panel_rows
+                            if (row, column) in panel_slots
+                        ],
+                    )
+                )
+
+        for trace_name, slots in trace_groups:
             if not slots:
                 continue
-            trace_name = "bosonic" if column == 0 else "fermionic"
             local_figsize = (
                 figsize
                 if figsize is not None
@@ -1866,7 +1931,6 @@ def dist_scaling(
                 dpi=dpi,
                 sharex=len(slots) > 1,
                 squeeze=False,
-                constrained_layout=False,
                 gridspec_kw={"hspace": 0.0},
             )
             local_axes = [local_grid[index, 0] for index in range(len(slots))]
@@ -1885,7 +1949,6 @@ def dist_scaling(
             len(panel_columns),
             figsize=local_figsize,
             dpi=dpi,
-            constrained_layout=True,
             squeeze=False,
         )
         figures["combined"] = combined
@@ -2014,6 +2077,7 @@ def dist_scaling(
             y_line,
             float(row["alpha"]),
             metric_k,
+            below=ent_decomp and metric == "fgmn_ent_magnitude",
         )
 
     from matplotlib.ticker import FuncFormatter
@@ -2045,12 +2109,11 @@ def dist_scaling(
         slots = figure_slots[figure_name]
         ordered_axes = [slot_axes[slot] for slot in slots]
         # In a vertical stack only the last panel owns the shared x label.
+        if split_trace_figures:
+            _set_shared_distance_xlabel(ordered_axes)
         for index, axis in enumerate(ordered_axes):
-            if index < len(ordered_axes) - 1 and split_trace_figures:
-                axis.tick_params(labelbottom=False)
-                axis.set_xlabel("")
-            else:
-                axis.set_xlabel(r"Effective chord distance $d$")
+            if not split_trace_figures:
+                axis.set_xlabel(_DISTANCE_XLABEL)
                 axis.tick_params(labelbottom=True)
             _panel_label(axis, f"{chr(ord('a') + index)})", outside=True)
 
@@ -2123,21 +2186,18 @@ def dist_scaling(
         if title is not None:
             local_fig.suptitle(title, fontsize=12)
         local_fig.align_ylabels(ordered_axes)
+        _set_axis_label_fontsize(ordered_axes, axis_label_fontsize)
         if split_trace_figures:
-            # A literal zero hspace is more reliable than constrained layout,
-            # whose decoration-aware padding leaves a visible strip between
-            # otherwise shared axes.  Reassert the bottom label after the
-            # shared-x tick suppression so both trace figures always own it.
-            ordered_axes[-1].set_xlabel(r"Effective chord distance $d$")
-            ordered_axes[-1].tick_params(labelbottom=True)
-            local_fig.subplots_adjust(
-                left=0.15,
-                right=0.98,
-                bottom=0.105,
-                top=0.93 if title is not None else 0.985,
-                hspace=0.0,
+            # Tight layout fixes the outer margins (including the fermionic
+            # x label), then zero hspace restores the paper's touching frames.
+            _show(
+                local_fig,
+                False,
+                tight_layout_kwargs={"h_pad": 0.0},
+                post_tight_adjust={"hspace": 0.0},
             )
-        _show(local_fig, show)
+        else:
+            _show(local_fig, False)
 
     exponent_figure = None
     exponent_axis = None
@@ -2145,6 +2205,7 @@ def dist_scaling(
     if (
         show_exponent_convergence
         and split_trace_figures
+        and not ent_decomp
         and len(unique_sizes) >= 2
     ):
         (
@@ -2158,9 +2219,10 @@ def dist_scaling(
             cmap=cmap,
             dpi=dpi,
             figsize=exponent_figsize,
+            axis_label_fontsize=axis_label_fontsize,
         )
         if exponent_figure is not None:
-            _show(exponent_figure, show)
+            _show(exponent_figure, False)
 
     # --- the supplemental distribution figure ------------------------------
     #
@@ -2241,8 +2303,21 @@ def dist_scaling(
             zero_tol=dist_zero_tol,
             dpi=dpi,
             figsize=None,
+            axis_label_fontsize=axis_label_fontsize,
         )
-        _show(distribution_figure, show)
+        _show(
+            distribution_figure,
+            False,
+            tight_layout_kwargs={"h_pad": 0.0},
+            post_tight_adjust={"hspace": 0.0},
+        )
+
+    # ``plt.show`` displays every open figure, so it must run only after both
+    # the ordinary and fermionic stacks (and any supplementals) are complete.
+    # Calling it inside the formatting loop displayed the fermionic canvas
+    # before its shared x label had been assigned.
+    if show:
+        plt.show()
 
     summary = pd.DataFrame(
         [
@@ -2315,6 +2390,7 @@ def dist_scaling(
         "paper_fit_ranges": paper_fit_ranges,
         "plotted_fit_sizes": dict(plotted_fit_size),
         "mi_units": mi_units,
+        "axis_label_fontsize": axis_label_fontsize,
         "selected_fit_points": selected_points,
     }
 
@@ -2326,6 +2402,7 @@ def dist_scaling_comparison(
     fit_result: str | None = None,
     cmap: str = "viridis",
     figsize: tuple[float, float] | None = None,
+    axis_label_fontsize: float | None = 9.0,
     dpi: int = 130,
     title: str | None = None,
     show_errorbars: bool = True,
@@ -2346,7 +2423,10 @@ def dist_scaling_comparison(
     ``fit_result`` selects which labelled result supplies the black dashed
     power-law fits and defaults to the last mapping entry, matching the paper's
     convention of fitting the benchmark/open-symbol data.
+    ``axis_label_fontsize`` controls every x- and y-axis label in both stacks;
+    pass ``None`` to inherit the active Matplotlib setting.
     """
+    axis_label_fontsize = _normalize_axis_label_fontsize(axis_label_fontsize)
     if len(results) < 2:
         raise ValueError("dist_scaling_comparison needs at least two results.")
     labels = list(results)
@@ -2443,7 +2523,6 @@ def dist_scaling_comparison(
             dpi=dpi,
             sharex=len(active_rows) > 1,
             squeeze=False,
-            constrained_layout=False,
             gridspec_kw={"hspace": 0.0},
         )
         axes = tuple(raw_axes[index, 0] for index in range(len(active_rows)))
@@ -2571,12 +2650,7 @@ def dist_scaling_comparison(
             ax.xaxis.get_offset_text().set_visible(False)
             ax.grid(False)
             _panel_label(ax, f"{chr(ord('a') + row_index)})", outside=True)
-            if row_index < len(active_rows) - 1:
-                ax.tick_params(labelbottom=False)
-                ax.set_xlabel("")
-            else:
-                ax.set_xlabel(r"Effective chord distance $d$")
-                ax.tick_params(labelbottom=True)
+        _set_shared_distance_xlabel(axes)
 
         # Deduplicate labels when several metrics at one k share a row.
         unique_handles: dict[str, Any] = {}
@@ -2591,16 +2665,16 @@ def dist_scaling_comparison(
         if title is not None:
             fig.suptitle(title, fontsize=12)
         fig.align_ylabels(axes)
-        axes[-1].set_xlabel(r"Effective chord distance $d$")
-        axes[-1].tick_params(labelbottom=True)
-        fig.subplots_adjust(
-            left=0.15,
-            right=0.98,
-            bottom=0.105,
-            top=0.93 if title is not None else 0.985,
-            hspace=0.0,
+        _set_axis_label_fontsize(axes, axis_label_fontsize)
+        _show(
+            fig,
+            False,
+            tight_layout_kwargs={"h_pad": 0.0},
+            post_tight_adjust={"hspace": 0.0},
         )
-        _show(fig, show)
+
+    if show:
+        plt.show()
 
     primary = figures.get("bosonic", next(iter(figures.values())))
     return {
@@ -2613,5 +2687,6 @@ def dist_scaling_comparison(
         "fit_result": fit_result,
         "labels": tuple(labels),
         "mi_units": mi_units,
+        "axis_label_fontsize": axis_label_fontsize,
         "source_results": dict(results),
     }

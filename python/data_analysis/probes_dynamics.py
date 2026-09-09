@@ -1225,7 +1225,6 @@ def probe3_dynamics(
         rf"$p={filename_p:g}$, {filename_circuit}, $L={filename_size}$",
         fontsize=14,
     )
-    fig.tight_layout()
     _show(fig, show)
     return {
         "figure": fig,

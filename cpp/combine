@@ -1,0 +1,680 @@
+#!/usr/bin/env bash
+#
+# combine -- pool CSV output of one MIPT executable into a single "total" file.
+#
+#   ./combine <program> [options]
+#
+# Files under csv/ are eligible to be pooled when their CSV header matches
+# verbatim AND their file names differ only by the realization count.  For
+# `mipt_probed.exe` probes=1 mode=1 and for `sim_tmi.exe` (the p_c scans) an
+# additional rule applies: files at the same L (N) are eligible even when the
+# rest of the name differs, so scans over different p windows pool together.
+#
+# Nothing under csv/ is read-modify-written; every result is a NEW file in
+# cpp/.  The output name carries no realization count -- the count lives in
+# the CSV (the `realizations` column) and in the `_total_meta.csv` sidecar.
+#
+set -euo pipefail
+
+usage() {
+    cat <<'USAGE'
+Usage: ./combine <program> [options]
+
+Programs (the .exe is optional):
+  dist_scaling.exe   entropy.exe    free_energy.exe   mipt_probed.exe
+  sim_tmi.exe        gmn.exe        fgmn.exe          exp_vals.exe
+
+Aliases: probed, tmi, expvals, dist_scaling3
+
+Options:
+  -n, --dry-run      Show the plan; write nothing.
+  -f, --force        Overwrite existing outputs (refused by default).
+      --include-all  Do not skip the unused/oops/old/temp/fit/archive dirs.
+      --root DIR     Where to look for inputs (default: csv).
+      --out DIR      Where to write totals (default: . , i.e. cpp/).
+  -h, --help         This message.
+
+Eligibility is decided per group; a group of one file is reported and skipped.
+Byte-identical duplicates of the same file are detected and counted once.
+USAGE
+}
+
+PROGRAM=""
+export COMBINE_DRYRUN=0 COMBINE_FORCE=0 COMBINE_INCLUDE_ALL=0
+export COMBINE_ROOT="csv" COMBINE_OUT="."
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help)     usage; exit 0 ;;
+        -n|--dry-run)  COMBINE_DRYRUN=1; shift ;;
+        -f|--force)    COMBINE_FORCE=1; shift ;;
+        --include-all) COMBINE_INCLUDE_ALL=1; shift ;;
+        --root)        COMBINE_ROOT="${2:?--root needs a directory}"; shift 2 ;;
+        --out)         COMBINE_OUT="${2:?--out needs a directory}"; shift 2 ;;
+        -*)            echo "combine: unknown option '$1'" >&2; usage >&2; exit 2 ;;
+        *)
+            if [[ -n "$PROGRAM" ]]; then
+                echo "combine: only one program may be given (got '$PROGRAM' and '$1')" >&2
+                exit 2
+            fi
+            PROGRAM="$1"; shift ;;
+    esac
+done
+
+if [[ -z "$PROGRAM" ]]; then
+    echo "combine: no program given." >&2
+    usage >&2
+    exit 2
+fi
+export COMBINE_PROGRAM="$PROGRAM"
+
+# Run from the directory holding this script, so `./combine` behaves the same
+# from anywhere and the default root/out stay relative to cpp/.
+cd "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+command -v python3 >/dev/null 2>&1 || { echo "combine: python3 is required." >&2; exit 1; }
+
+exec python3 - <<'PYEOF'
+import csv, hashlib, math, os, re, sys
+from pathlib import Path
+
+PROGRAM_RAW  = os.environ["COMBINE_PROGRAM"]
+ROOT         = Path(os.environ["COMBINE_ROOT"])
+OUTDIR       = Path(os.environ["COMBINE_OUT"])
+DRYRUN       = os.environ["COMBINE_DRYRUN"] == "1"
+FORCE        = os.environ["COMBINE_FORCE"] == "1"
+INCLUDE_ALL  = os.environ["COMBINE_INCLUDE_ALL"] == "1"
+
+# ---------------------------------------------------------------- programs --
+# Each program is identified by the stem prefix its writer generates.
+PROGRAMS = {
+    "dist_scaling.exe": r"^dist_scaling3?_",
+    "entropy.exe":      r"^entropy_",
+    "free_energy.exe":  r"^free_energy_",
+    "mipt_probed.exe":  r"^probed_\d+_",
+    "sim_tmi.exe":      r"^tmi_",
+    "gmn.exe":          r"^gmn_",
+    "fgmn.exe":         r"^fgmn_",
+    "exp_vals.exe":     r"^expvals_",
+}
+ALIASES = {
+    "dist_scaling": "dist_scaling.exe", "dist_scaling3": "dist_scaling.exe",
+    "entropy": "entropy.exe", "free_energy": "free_energy.exe",
+    "mipt_probed": "mipt_probed.exe", "probed": "mipt_probed.exe",
+    "sim_tmi": "sim_tmi.exe", "tmi": "sim_tmi.exe",
+    "gmn": "gmn.exe", "fgmn": "fgmn.exe",
+    "exp_vals": "exp_vals.exe", "expvals": "exp_vals.exe",
+}
+
+key = PROGRAM_RAW.strip()
+program = key if key in PROGRAMS else ALIASES.get(key) or ALIASES.get(key[:-4] if key.endswith(".exe") else key)
+if program is None:
+    sys.exit(f"combine: unknown program {PROGRAM_RAW!r}.\n"
+             f"  known: {', '.join(sorted(PROGRAMS))}")
+
+STEM_RE = re.compile(PROGRAMS[program])
+
+# Directories whose contents are deliberately set aside in this tree.
+SKIP_DIRS = {"unused", "oops", "old", "temp", "fit", "archive"}
+
+# Derived artefacts, not run output: regenerable / already a sidecar.
+SKIP_SUFFIX = ("_summary.csv", "_meta.csv")
+
+# This script's own output, so a re-run can never pool a total back into itself.
+TOTAL_RE = re.compile(r"_total(_v\d+)?(_samples|_timeseries|_batches)?$")
+
+# ------------------------------------------------------------ name parsing --
+REAL_TOKEN = re.compile(r"_reals?_?(\d+(?:\.\d+)?[kKmM]?)(?=_|$)")
+
+def parse_count(tok):
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)([kKmM]?)", tok)
+    if not m:
+        return None
+    v, s = float(m.group(1)), m.group(2).lower()
+    return int(round(v * {"k": 1e3, "m": 1e6, "": 1.0}[s]))
+
+def filename_realizations(stem):
+    m = REAL_TOKEN.search(stem)
+    return parse_count(m.group(1)) if m else None
+
+# The two protocols that additionally pool across everything but L.
+SAMEL_TMI    = re.compile(r"^(tmi_.+?_n_\d+)(?=_)")
+SAMEL_PROBE1 = re.compile(r"^(probed_1_[A-Za-z]+_n_\d+)(?=_)")
+
+def same_L_key(stem):
+    """Return the same-L pooling key, or None if the rule does not apply."""
+    if program == "sim_tmi.exe":
+        m = SAMEL_TMI.match(stem)
+        return m.group(1) if m else None
+    if program == "mipt_probed.exe" and stem.startswith("probed_1_") \
+       and re.search(r"_mode_1(?=_|$)", stem):
+        m = SAMEL_PROBE1.match(stem)
+        return m.group(1) if m else None
+    return None
+
+TRAILING = ("_samples", "_timeseries", "_batches")
+
+def total_name(base):
+    for t in TRAILING:
+        if base.endswith(t):
+            return base[: -len(t)] + "_total" + t
+    return base + "_total"
+
+# ------------------------------------------------------- column semantics --
+SUM_SUFFIXES = ("_samples", "_positive_count", "_requested_count",
+                "_zero_prefilter_count", "_solver_failure_count")
+SUM_EXACT    = {"realizations", "requested_realizations",
+                "completed_realizations", "S_half_count", "total_subsystems"}
+FRACTION_SUF = "_positive_fraction"
+
+def classify(header):
+    """Split a header into metric bases, summed columns, fractions, group keys."""
+    cols = list(header)
+    metrics, sums, fracs = [], [], []
+    for c in cols:
+        if c.endswith("_mean"):
+            metrics.append(c[:-5])
+        elif c.endswith(FRACTION_SUF):
+            fracs.append(c[: -len(FRACTION_SUF)])
+        elif c in SUM_EXACT or any(c.endswith(s) for s in SUM_SUFFIXES):
+            sums.append(c)
+    consumed = set(sums)
+    for b in metrics:
+        consumed |= {b + s for s in ("_mean", "_stddev", "_stderr", "_samples")}
+    for b in fracs:
+        consumed.add(b + FRACTION_SUF)
+    keys = [c for c in cols if c not in consumed]
+    return metrics, sums, fracs, keys
+
+def fnum(s):
+    try:
+        v = float(s)
+    except (TypeError, ValueError):
+        return None
+    return v
+
+def norm(s):
+    """Normalise a group-key cell so 0.335 and 0.33500000000000002 agree.
+
+    Rounded to 12 significant digits: far tighter than any two distinct points
+    of a physical p or distance grid, and loose enough to absorb the ulp
+    differences between linspace grids and between builds.
+    """
+    v = fnum(s)
+    if v is None:
+        return s
+    return "nan" if math.isnan(v) else repr(float(f"{v:.12g}"))
+
+# ----------------------------------------------------------- accumulators --
+class Welford:
+    __slots__ = ("n", "mean", "m2", "seen")
+    def __init__(self):
+        self.n = 0.0; self.mean = 0.0; self.m2 = 0.0; self.seen = False
+    def merge(self, n, mean, m2):
+        if n <= 0 or mean is None or math.isnan(mean):
+            return
+        self.seen = True
+        if self.n == 0.0:
+            self.n, self.mean, self.m2 = n, mean, m2
+            return
+        tot = self.n + n
+        d = mean - self.mean
+        self.mean += d * n / tot
+        self.m2 += m2 + d * d * self.n * n / tot
+        self.n = tot
+    def stddev(self):
+        return math.sqrt(self.m2 / (self.n - 1.0)) if self.n > 1.0 else 0.0
+    def stderr(self):
+        return self.stddev() / math.sqrt(self.n) if self.n > 0.0 else float("nan")
+
+def metric_n(row, base, header, file_reals):
+    """Sample count backing one metric of one row, most reliable source first."""
+    v = fnum(row.get(base + "_samples"))
+    if v is not None and not math.isnan(v):
+        return v
+    if base + "_samples" not in header:
+        v = fnum(row.get("samples"))
+        if v is not None and not math.isnan(v):
+            return v
+        sd, se = fnum(row.get(base + "_stddev")), fnum(row.get(base + "_stderr"))
+        if sd and se and sd > 0.0 and se > 0.0 and not math.isnan(sd) and not math.isnan(se):
+            return float(round((sd / se) ** 2))
+        for c in ("completed_realizations", "realizations"):
+            v = fnum(row.get(c))
+            if v is not None and not math.isnan(v) and v > 0:
+                return v
+    return float(file_reals) if file_reals else 0.0
+
+def metric_m2(row, base, n):
+    sd = fnum(row.get(base + "_stddev"))
+    if sd is not None and not math.isnan(sd):
+        return sd * sd * (n - 1.0)
+    se = fnum(row.get(base + "_stderr"))
+    if se is not None and not math.isnan(se):
+        return se * se * n * (n - 1.0)
+    return 0.0
+
+def fmt(v):
+    if v is None:
+        return "nan"
+    if isinstance(v, float):
+        if math.isnan(v):
+            return "nan"
+        if v == int(v) and abs(v) < 1e15:
+            return str(int(v))
+        return repr(v)
+    return str(v)
+
+# ------------------------------------------------------------- discovery --
+if not ROOT.is_dir():
+    sys.exit(f"combine: input root {ROOT} does not exist.")
+
+candidates, skipped_dir, skipped_suffix, skipped_total = [], [], [], []
+for p in sorted(ROOT.rglob("*.csv")):
+    if not STEM_RE.match(p.stem):
+        continue
+    if TOTAL_RE.search(p.stem):
+        skipped_total.append(p); continue
+    if p.name.endswith(SKIP_SUFFIX):
+        skipped_suffix.append(p); continue
+    parts = set(p.relative_to(ROOT).parts[:-1])
+    if not INCLUDE_ALL and parts & SKIP_DIRS:
+        skipped_dir.append(p); continue
+    candidates.append(p)
+
+print(f"combine: program   {program}")
+print(f"         inputs    {ROOT}/  ({len(candidates)} candidate file(s))")
+print(f"         outputs   {OUTDIR}/" + ("   [DRY RUN]" if DRYRUN else ""))
+if skipped_dir:
+    print(f"         skipped   {len(skipped_dir)} file(s) in "
+          f"{'/'.join(sorted(SKIP_DIRS))} dirs (--include-all to keep)")
+if skipped_suffix:
+    print(f"         skipped   {len(skipped_suffix)} derived _summary/_meta sidecar(s)")
+if skipped_total:
+    print(f"         skipped   {len(skipped_total)} file(s) this script wrote earlier")
+if not candidates:
+    sys.exit("\ncombine: no files matched. Nothing to do.")
+
+# A header-only file is an aborted run.  It must not reach the pool: its name
+# still claims a realization count that no row backs up.
+def has_data(path):
+    with path.open(newline="") as fh:
+        fh.readline()
+        for line in fh:
+            if line.strip():
+                return True
+    return False
+
+empty = [p for p in candidates if not has_data(p)]
+if empty:
+    candidates = [p for p in candidates if p not in set(empty)]
+    print(f"\ncombine: {len(empty)} file(s) hold a header and no rows -- dropped:")
+    for p in empty:
+        print(f"           {p}")
+if not candidates:
+    sys.exit("\ncombine: every candidate was empty. Nothing to do.")
+
+# Byte-identical copies of one file must be counted once, not pooled twice.
+by_hash, dupes = {}, []
+for p in candidates:
+    h = hashlib.md5(p.read_bytes()).hexdigest()
+    if h in by_hash:
+        dupes.append((p, by_hash[h])); continue
+    by_hash[h] = p
+files = sorted(by_hash.values())
+if dupes:
+    print(f"\ncombine: {len(dupes)} byte-identical duplicate(s) counted once:")
+    for d, keep in dupes:
+        print(f"           dropped {d}\n             same as {keep}")
+
+# ---------------------------------------------------------------- grouping --
+groups = {}
+for p in files:
+    with p.open(newline="") as fh:
+        head = fh.readline().rstrip("\n\r")
+    if not head:
+        continue
+    sl = same_L_key(p.stem)
+    base = sl if sl is not None else REAL_TOKEN.sub("", p.stem)
+    groups.setdefault((head, base, sl is not None), []).append(p)
+
+# Two schema variants can share a stem key (dist_scaling gained g2/f2 columns);
+# disambiguate their output names rather than silently colliding.
+name_users = {}
+for (head, base, _) in groups:
+    name_users.setdefault(total_name(base), set()).add(head)
+# Narrowest schema becomes _v1, so the suffix orders the same way the schema
+# grew; the exact header is pinned by header_md5 in the _meta sidecar.
+variant = {}
+for name, heads in name_users.items():
+    if len(heads) > 1:
+        for i, h in enumerate(sorted(heads, key=lambda x: (x.count(","), x)), 1):
+            variant[(name, h)] = f"_v{i}"
+
+plans = []
+for (head, base, is_sameL), paths in sorted(groups.items(), key=lambda kv: kv[0][1]):
+    name = total_name(base)
+    name += variant.get((name, head), "")
+    plans.append(dict(header=head, base=base, sameL=is_sameL,
+                      paths=paths, out=OUTDIR / (name + ".csv")))
+
+single = [pl for pl in plans if len(pl["paths"]) < 2]
+multi  = [pl for pl in plans if len(pl["paths"]) >= 2]
+
+if single:
+    print(f"\ncombine: {len(single)} group(s) have a single file -- not eligible, skipped:")
+    for pl in single:
+        print(f"           {pl['paths'][0]}")
+
+if not multi:
+    sys.exit("\ncombine: no eligible group had two or more files. Nothing written.")
+
+# ------------------------------------------------------------------ merge --
+def read_rows(path):
+    with path.open(newline="") as fh:
+        r = csv.reader(fh)
+        head = next(r, None)
+        if head is None:
+            return
+        for rec in r:
+            if not rec or len(rec) != len(head) or not any(c.strip() for c in rec):
+                continue
+            yield dict(zip(head, rec))
+
+def completed_counts(paths, header, metrics, file_reals):
+    """True completed trajectories per file.
+
+    `realizations` is the *requested* count in every writer, so an interrupted
+    dist_scaling run reports the full number beside a handful of samples.  The
+    records-per-trajectory multiplicity is inferred from whichever file in the
+    group looks complete, then applied to all of them.
+    """
+    if "realizations" not in header:
+        return None
+    prim = next((b for b in metrics if b + "_samples" in header), None)
+    if prim is None:
+        return None
+    smax, rval = {}, {}
+    for p in paths:
+        s = r = 0.0
+        for row in read_rows(p):
+            v = fnum(row.get(prim + "_samples"))
+            if v and not math.isnan(v):
+                s = max(s, v)
+            v = fnum(row.get("realizations"))
+            if v and not math.isnan(v):
+                r = max(r, v)
+        smax[p], rval[p] = s, r
+    mult = 0.0
+    for p in paths:
+        if rval[p] > 0 and smax[p] > 0:
+            m = smax[p] / rval[p]
+            if m >= 1.0 and abs(m - round(m)) < 1e-6:
+                mult = max(mult, float(round(m)))
+    if mult <= 0.0:
+        return None
+    return {p: int(round(smax[p] / mult)) for p in paths}, mult
+
+def merge_aggregate(pl):
+    header = next(csv.reader([pl["header"]]))
+    metrics, sums, fracs, keys = classify(header)
+    reals = {p: filename_realizations(p.stem) for p in pl["paths"]}
+
+    comp = completed_counts(pl["paths"], header, metrics, reals)
+    completed, mult = (comp if comp else (None, None))
+
+    order, acc, sacc, base_rows = [], {}, {}, {}
+    for p in pl["paths"]:
+        fr = (completed or {}).get(p) or reals.get(p)
+        for row in read_rows(p):
+            k = tuple(norm(row.get(c, "")) for c in keys)
+            if k not in acc:
+                order.append(k)
+                acc[k] = {b: Welford() for b in metrics}
+                sacc[k] = dict.fromkeys(sums, 0.0)
+                base_rows[k] = row
+            for b in metrics:
+                n = metric_n(row, b, header, fr)
+                acc[k][b].merge(n, fnum(row.get(b + "_mean")), metric_m2(row, b, n))
+            for c in sums:
+                if c == "realizations" and completed is not None:
+                    continue
+                v = fnum(row.get(c))
+                if v is not None and not math.isnan(v):
+                    sacc[k][c] += v
+
+    total_completed = sum(completed.values()) if completed else None
+    out = [header]
+    for k in order:
+        row, a, s = base_rows[k], acc[k], sacc[k]
+        rec = []
+        for c in header:
+            if c.endswith("_mean") and c[:-5] in a:
+                w = a[c[:-5]]
+                rec.append(fmt(w.mean if w.seen else float("nan")))
+            elif c.endswith("_stddev") and c[:-7] in a:
+                w = a[c[:-7]]
+                rec.append(fmt(w.stddev() if w.seen else float("nan")))
+            elif c.endswith("_stderr") and c[:-7] in a:
+                w = a[c[:-7]]
+                rec.append(fmt(w.stderr() if w.seen else float("nan")))
+            elif c.endswith("_samples") and c[:-8] in a:
+                rec.append(fmt(a[c[:-8]].n))
+            elif c == "realizations" and total_completed is not None:
+                rec.append(fmt(float(total_completed)))
+            elif c in s:
+                rec.append(fmt(s[c]))
+            elif c.endswith(FRACTION_SUF):
+                b = c[: -len(FRACTION_SUF)]
+                num = s.get(b + "_positive_count")
+                den = a[b].n if b in a and a[b].n > 0 else None
+                rec.append(fmt(num / den) if (num is not None and den) else row.get(c, ""))
+            else:
+                rec.append(row.get(c, ""))
+        out.append(rec)
+    return out, completed, mult
+
+def write_rows(path, rows):
+    with path.open("w", newline="") as fh:
+        w = csv.writer(fh, lineterminator="\n")
+        w.writerows(rows)
+
+def merge_concat(pl, renumber):
+    """Append raw per-sample rows; renumber a per-file index if there is one.
+
+    Rows are also tallied per p, so the realization count can be *measured*
+    rather than taken from the file name -- which matters for the same-L pools,
+    where the sources cover different p windows and a single scalar total would
+    be right only on their overlap.
+    """
+    header = next(csv.reader([pl["header"]]))
+    col = renumber if renumber in header else None
+    # `trajectory` labels one row each, so it renumbers row by row.  `batch_id`
+    # labels a whole replica of the curve spanning many rows: it must be
+    # OFFSET per source, or the batches the sidecar exists to provide are
+    # shredded into one row apiece.
+    by_group = col == "batch_id"
+    remap, group_next = {}, 0
+    pidx = header.index("p") if "p" in header else None
+    total, per_file, malformed = 0, {}, {}
+    per_p = {}                       # p -> {file: rows}
+    width = len(header)
+    tmp = pl["out"].with_suffix(".csv.part")
+    with tmp.open("w", newline="") as out:
+        out.write(pl["header"] + "\n")
+        w = csv.writer(out, lineterminator="\n")
+        for p in pl["paths"]:
+            n = bad = 0
+            with p.open(newline="") as fh:
+                first = fh.readline()                    # header
+                probe = fh.readline()
+                # These files reach hundreds of MB. When no column has to be
+                # renumbered and no field is quoted, copy lines verbatim and
+                # split only far enough to read p -- ~5x faster than a full
+                # CSV parse and re-render, and byte-exact into the bargain.
+                fast = col is None and '"' not in probe
+                fh.seek(0); fh.readline()
+                if fast:
+                    for line in fh:
+                        if not line.strip():
+                            continue
+                        # Wrong arity, or every field blank (a stray ",").
+                        if line.count(",") != width - 1 or not line.strip(", \t\r\n"):
+                            bad += 1
+                            continue
+                        if pidx == 0:
+                            k = norm(line.split(",", 1)[0])
+                            per_p.setdefault(k, {}).setdefault(p, 0)
+                            per_p[k][p] += 1
+                        elif pidx is not None:
+                            k = norm(line.rstrip("\r\n").split(",")[pidx])
+                            per_p.setdefault(k, {}).setdefault(p, 0)
+                            per_p[k][p] += 1
+                        out.write(line if line.endswith("\n") else line + "\n")
+                        n += 1
+                else:
+                    r = csv.reader(fh)
+                    for rec in r:
+                        # A truncated tail or a stray "," is real in this
+                        # archive; it must not reach the combined file.
+                        if not rec or len(rec) != width or not any(c.strip() for c in rec):
+                            if rec:
+                                bad += 1
+                            continue
+                        if col is not None:
+                            ci = header.index(col)
+                            if by_group:
+                                if rec[ci] not in remap:
+                                    remap[rec[ci]] = group_next
+                                    group_next += 1
+                                rec[ci] = str(remap[rec[ci]])
+                            else:
+                                rec[ci] = str(total + n)
+                        if pidx is not None:
+                            k = norm(rec[pidx])
+                            per_p.setdefault(k, {}).setdefault(p, 0)
+                            per_p[k][p] += 1
+                        w.writerow(rec); n += 1
+            per_file[p] = n; total += n
+            remap = {}
+            if bad:
+                malformed[p] = bad
+    tmp.replace(pl["out"])
+    return total, per_file, per_p, malformed, (group_next if by_group else total)
+
+def cycles_per_realization(per_p, per_file, name_reals):
+    """Rows one trajectory contributes at one p, inferred from a source file."""
+    for f, rows in sorted(per_file.items(), key=lambda kv: -kv[1]):
+        r = name_reals.get(f)
+        if not r:
+            continue
+        ppf = [d[f] for d in per_p.values() if f in d]
+        if not ppf:
+            continue
+        c = ppf[0] / r
+        if c >= 1.0 and abs(c - round(c)) < 1e-9 and all(abs(v / r - c) < 1e-9 for v in ppf):
+            return float(round(c))
+    return None
+
+# ------------------------------------------------------------------ drive --
+OUTDIR.mkdir(parents=True, exist_ok=True)
+print(f"\ncombine: {len(multi)} eligible group(s)\n")
+written = 0
+
+for pl in multi:
+    header = next(csv.reader([pl["header"]]))
+    is_batches = pl["base"].endswith("_batches")
+    aggregate = any(c.endswith("_mean") for c in header) and not is_batches
+    kind = "aggregate (Welford merge)" if aggregate else (
+        "batch replicas (concatenate, batch_id offset)" if is_batches
+        else "raw samples (concatenate)")
+
+    dirs = sorted({str(p.parent) for p in pl["paths"]})
+    print(f"  -> {pl['out'].name}")
+    print(f"     rule    : {'same L' if pl['sameL'] else 'name differs only by realizations'}")
+    print(f"     mode    : {kind}")
+    for p in pl["paths"]:
+        fr = filename_realizations(p.stem)
+        print(f"     src     : {p}  ({'reals=' + format(fr, ',') if fr else 'reals=?'})")
+    if len(dirs) > 1:
+        print(f"     WARNING : sources span {len(dirs)} directories -- check they are "
+              f"independent runs, not a snapshot and its continuation.")
+    if pl["sameL"]:
+        print( "     NOTE    : same-L pooling ignores depth (periods), which no "
+               "sim_tmi/probe CSV records. Confirm the runs share it.")
+
+    if pl["out"].exists() and not FORCE:
+        print(f"     SKIPPED : {pl['out']} exists (use --force)\n")
+        continue
+    if DRYRUN:
+        print("     (dry run -- not written)\n")
+        continue
+
+    meta = [["output", "scope", "source", "header_md5", "name_realizations",
+             "realizations_used", "rows"]]
+    hh = hashlib.md5(pl["header"].encode()).hexdigest()[:8]
+
+    if aggregate:
+        rows, completed, mult = merge_aggregate(pl)
+        write_rows(pl["out"], rows)
+        used_total = 0
+        for p in pl["paths"]:
+            fr = filename_realizations(p.stem)
+            used = (completed or {}).get(p, fr)
+            used_total += used or 0
+            meta.append([pl["out"].name, "source", str(p), hh, fmt(fr), fmt(used), ""])
+            if completed and fr and used is not None and used < 0.99 * fr:
+                print(f"     PARTIAL : {p.name} completed {used:,} of the "
+                      f"{fr:,} its name claims (interrupted run).")
+        if mult:
+            print(f"     counts  : {mult:g} record(s) per trajectory; "
+                  f"total completed = {used_total:,}")
+        meta.append([pl["out"].name, "total", "", hh, "", fmt(used_total), len(rows) - 1])
+        print(f"     wrote   : {len(rows) - 1} row(s)")
+    else:
+        renumber = "batch_id" if is_batches else "trajectory"
+        total, per_file, per_p, malformed, groups_seen = merge_concat(pl, renumber)
+        for f, bad in malformed.items():
+            print(f"     DROPPED : {bad} malformed row(s) from {f.name}")
+        name_reals = {p: filename_realizations(p.stem) for p in pl["paths"]}
+        cyc = cycles_per_realization(per_p, per_file, name_reals) if per_p else None
+        used_total = 0
+        for p in pl["paths"]:
+            fr = name_reals[p]
+            got = per_file[p] / cyc if cyc else None
+            used_total += fr or 0
+            meta.append([pl["out"].name, "source", str(p), hh, fmt(fr),
+                         fmt(got if got is not None else fr), per_file[p]])
+            if fr and got is not None and got < 0.99 * fr:
+                print(f"     PARTIAL : {p.name} holds {per_file[p]:,} row(s) = "
+                      f"~{got:,.0f} realizations at one p, not the {fr:,} its "
+                      f"name claims (aborted run).")
+        # With a p column the realization count is per p point, not a grand
+        # total: same-L sources cover different p windows.
+        if per_p and cyc:
+            per_p_reals = {k: sum(v.values()) / cyc for k, v in per_p.items()}
+            for k in sorted(per_p_reals, key=lambda x: (fnum(x) is None, fnum(x) or 0.0, x)):
+                meta.append([pl["out"].name, "p=" + k, "", hh, "",
+                             fmt(per_p_reals[k]), sum(per_p[k].values())])
+            lo, hi = min(per_p_reals.values()), max(per_p_reals.values())
+            print(f"     counts  : {cyc:g} row(s) per trajectory; "
+                  f"{len(per_p_reals)} p point(s) carrying "
+                  + (f"{lo:,.0f} realizations each" if lo == hi
+                     else f"{lo:,.0f}..{hi:,.0f} realizations (windows overlap partially)"))
+            print( "     NOTE    : realizations are per p point, not a grand total; "
+                   "the per-p tally is in the meta sidecar.")
+            meta.append([pl["out"].name, "total", "", hh, "", fmt(max(per_p_reals.values())), total])
+        else:
+            meta.append([pl["out"].name, "total", "", hh, "", fmt(used_total), total])
+        if renumber in header:
+            print(f"     counts  : '{renumber}' renumbered 0..{groups_seen - 1} across "
+                  f"sources ({'independent replicas' if renumber == 'batch_id' else 'rows'})")
+        print(f"     wrote   : {total} row(s)")
+
+    mp = pl["out"].with_name(pl["out"].stem + "_meta.csv")
+    write_rows(mp, meta)
+    print(f"     meta    : {mp.name}\n")
+    written += 1
+
+print(f"combine: {written} file(s) written to {OUTDIR}/. No input was modified.")
+PYEOF

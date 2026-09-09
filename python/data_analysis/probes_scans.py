@@ -1883,7 +1883,6 @@ def _draw_pairwise_collapse_figures(
             figsize=(4.0 * ncols, 3.45 * nrows),
             dpi=dpi,
             squeeze=False,
-            constrained_layout=True,
         )
         axes = np.asarray(raw_grid, dtype=object)
         insets: list[Any] = []
@@ -2091,7 +2090,6 @@ def probe_pc_objective(
         figsize=figsize,
         dpi=dpi,
         squeeze=False,
-        constrained_layout=True,
     )
     surfaces = {}
     for column, metric in enumerate(metrics):
@@ -2454,7 +2452,7 @@ def _draw_probe_pc_extrapolation(
             * (raw_height + ext_height + _EXTRAPOLATION_ROW_MARGIN)
             + _EXTRAPOLATION_SUPTITLE_MARGIN,
         )
-    fig = plt.figure(figsize=figsize, dpi=dpi, constrained_layout=True)
+    fig = plt.figure(figsize=figsize, dpi=dpi)
     # Rows are shared out by requested axes height, and every panel is locked to
     # its requested aspect, so the realized footprints keep the requested ratio
     # even when an explicit `figsize` scales them all.
@@ -3109,9 +3107,7 @@ def probe_entropy_map(
                 )
         selected_p = np.asarray(selected, dtype=float)
 
-    fig, (ax_map, ax_lines) = plt.subplots(
-        1, 2, figsize=figsize, dpi=dpi, constrained_layout=True
-    )
+    fig, (ax_map, ax_lines) = plt.subplots(1, 2, figsize=figsize, dpi=dpi)
     mesh = ax_map.pcolormesh(
         simulated_p,
         simulated_t,

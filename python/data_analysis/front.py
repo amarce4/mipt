@@ -528,7 +528,7 @@ def front_velocity(
             raise ValueError(f"{heatmap_file} is not among the loaded files.")
         heatmap_dataset = matches[0]
 
-    fig, axes = plt.subplots(2, 2, figsize=figsize, dpi=dpi, constrained_layout=True)
+    fig, axes = plt.subplots(2, 2, figsize=figsize, dpi=dpi)
     (ax_classical, ax_quantum), (ax_arrival, ax_band) = axes
 
     # Both panels share one normalization so the two channels can be compared

@@ -773,7 +773,7 @@ def stagger_velocity(
     delta_index = int(np.flatnonzero(heatmap_dataset["delta"] == heatmap_delta)[0])
     r_index = int(np.flatnonzero(heatmap_dataset["r"] == reference_r)[0])
 
-    fig, axes = plt.subplots(3, 2, figsize=figsize, dpi=dpi, constrained_layout=True)
+    fig, axes = plt.subplots(3, 2, figsize=figsize, dpi=dpi)
     (ax_cl_rs, ax_qu_rs), (ax_cl_ds, ax_qu_ds), (ax_breakpoint, ax_gap) = axes
 
     # One normalization for all four heatmaps, so the classical and quantum
