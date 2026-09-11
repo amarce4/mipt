@@ -342,9 +342,12 @@ inline double negativity(const Matrix4 &rho, bool fermionic)
 
     // The ordinary partial transpose stays Hermitian, so its singular values are
     // the absolute eigenvalues; only the fermionic one needs the Gram matrix.
+    // Dilation rather than Gram for the fermionic case: this generic value is
+    // the cross-check the closed form's residual is measured against, and a
+    // ~1e-9 Gram floor would swamp the residual it exists to report.
     double norm = 0.0;
     const bool converged =
-        fermionic ? util::gram_trace_norm<4>(partial_transpose, norm)
+        fermionic ? util::dilation_trace_norm<4>(partial_transpose, norm)
                   : util::hermitian_trace_norm<4>(partial_transpose, norm);
     if (!converged)
     {
@@ -426,19 +429,34 @@ inline double bits_from_nats(double nats)
 // ordinary RDM with `fermionic=false` and the fermionic RDM with `true`,
 // because the sub-traces taken here are the continuation of the same
 // convention, not an independent choice.
+// Every subsystem entropy of a three-mode block, indexed by the retained-mode
+// bit mask (entry 0 unused), in bits, plus the purities three_party_metrics
+// reports. Split out so a caller that needs a combination three_party_metrics
+// does not report -- the conditional mutual information I(a:b|c), say -- takes
+// it from the same partial traces rather than from a second implementation.
+struct TripleEntropies
+{
+    std::array<double, 8> entropy{};
+    std::array<double, 8> purity{};
+};
+
+inline TripleEntropies three_party_entropies(const ancilla::SmallRdm &rho, bool fermionic)
+{
+    TripleEntropies out;
+    for (unsigned mask = 1; mask < 8; ++mask)
+    {
+        const ancilla::SmallRdm reduced = ancilla::partial_trace_fixed(rho, 3, mask, fermionic);
+        out.entropy[mask] = detail::bits_from_nats(ancilla::entropy_from_small_rdm(reduced));
+        out.purity[mask] = ancilla::purity_from_small_rdm(reduced);
+    }
+    return out;
+}
+
 inline TripleMetrics three_party_metrics(const double *rho_ri, bool fermionic)
 {
     const ancilla::SmallRdm rho = normalized_small_rdm(rho_ri, 8);
-
-    std::array<ancilla::SmallRdm, 8> reduced{ancilla::SmallRdm(1), ancilla::SmallRdm(2), ancilla::SmallRdm(2),
-                                             ancilla::SmallRdm(4), ancilla::SmallRdm(2), ancilla::SmallRdm(4),
-                                             ancilla::SmallRdm(4), ancilla::SmallRdm(8)};
-    std::array<double, 8> entropies{};
-    for (unsigned mask = 1; mask < 8; ++mask)
-    {
-        reduced[mask] = ancilla::partial_trace_fixed(rho, 3, mask, fermionic);
-        entropies[mask] = detail::bits_from_nats(ancilla::entropy_from_small_rdm(reduced[mask]));
-    }
+    const TripleEntropies parts = three_party_entropies(rho, fermionic);
+    const std::array<double, 8> &entropies = parts.entropy;
 
     const double i_ab = entropies[1] + entropies[2] - entropies[3];
     const double i_ac = entropies[1] + entropies[4] - entropies[5];
@@ -450,11 +468,8 @@ inline TripleMetrics three_party_metrics(const double *rho_ri, bool fermionic)
         throw std::runtime_error("Three-party information calculation produced a non-finite value.");
     }
 
-    const double mean_single_purity = (ancilla::purity_from_small_rdm(reduced[1]) +
-                                       ancilla::purity_from_small_rdm(reduced[2]) +
-                                       ancilla::purity_from_small_rdm(reduced[4])) /
-                                      3.0;
-    return {tmi, (i_ab + i_ac + i_bc) / 3.0, ancilla::purity_from_small_rdm(reduced[7]), mean_single_purity};
+    const double mean_single_purity = (parts.purity[1] + parts.purity[2] + parts.purity[4]) / 3.0;
+    return {tmi, (i_ab + i_ac + i_bc) / 3.0, parts.purity[7], mean_single_purity};
 }
 
 // `parity_preserving` says whether the ensemble conserves computational parity,

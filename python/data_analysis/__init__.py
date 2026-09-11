@@ -24,6 +24,11 @@ dist_percolation(...) Joint spacetime-connectivity / entanglement diagnostics
                        kappa = P(entangled | connected) and
                        eta = P(entangled | disconnected), swept over the
                        positivity threshold. Also fits P_inf(p) = A(1-p)^beta.
+dist_pair_gap(...)    The connected-zero triple analysis: for graph-connected pairs
+                       with no fermionic negativity, the fraction R_3(d) with an
+                       fGMN-positive third site (trajectory-clustered errors),
+                       the partition of P(C) - P(E_2), and a null comparison
+                       against distance-matched disconnected pairs.
 dist_scaling_comparison(...) Overlay completed distance-scaling results for
                        circuit-ensemble or evolution-depth comparisons.
 expvals(...)           Plot aggregate fermionic observables and Wick residuals.
@@ -65,11 +70,13 @@ probes_collapse    one-, two-, and four-probe bulk-exponent collapses
 probes_dynamics    mode-4 distance-resolved and three-probe dynamics
 probes_scans       mode-1 critical scans, mode-2 entropy maps, mode-3 anisotropy
 front, stagger     mode-5 one-probe fronts and two-probe staggered velocities
+pair_gap           dist_scaling.exe's connected-zero triple analysis
 """
 
 from __future__ import annotations
 
 from .distance import dist_percolation, dist_scaling, dist_scaling_comparison
+from .pair_gap import dist_pair_gap
 from .entropy import entropy
 from .expvals import expvals
 from .free_energy import free_energy_ceff, free_energy_equilibration
@@ -91,6 +98,7 @@ __all__ = [
     "gmn",
     "entropy",
     "dist_percolation",
+    "dist_pair_gap",
     "dist_scaling",
     "dist_scaling_comparison",
     "expvals",

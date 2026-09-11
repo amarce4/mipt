@@ -1,4 +1,5 @@
 #include "mipt/analysis/fgmn.hpp"
+#include "mipt/analysis/cut_negativity.hpp"
 #include "mipt/util/spectral.hpp"
 
 #include <algorithm>
@@ -479,6 +480,40 @@ namespace fgmn
         Expression::t Q_real_mat = Expr::reshape(Q_real_recombined->pick(parity_recollection_pick_table(subsystem)), matrix_shape());
         Expression::t Q_imag_mat = Expr::reshape(Q_imag_recombined->pick(parity_recollection_pick_table(subsystem)), matrix_shape());
 
+        // Move the cut mode to the front of the operator ordering, as the
+        // Shapourian-Shiozaki-Ryu definition requires. The correct transpose
+        // is S . PT_s(S Q S) . S with S = diag((-1)^{n_s * occupied modes below
+        // s}); since S Q S ranges over exactly the same PSD set as Q, the
+        // witness family {P + PT_correct(Q)} equals {P + S . PT_s(Q) . S}, so
+        // the fix is an elementwise +/-1 on the existing transpose. Trivial for
+        // subsystem 0; without it fGMN depended on how the three sites were
+        // labelled (see analysis/cut_negativity.hpp for the measurement).
+        // A fresh shared_ptr per model build: ndarray is atomically
+        // refcounted, so this is safe under concurrent solves where a cached
+        // Matrix::t would not be (see the thread_local note above).
+        if (subsystem > 0)
+        {
+            auto signs = std::make_shared<ndarray<double, 2>>(shape(D, D));
+            const int mask = subsystem_mask(subsystem);
+            const int below = mask - 1;
+            auto reorder = [&](int x) {
+                if ((x & mask) == 0)
+                {
+                    return 1.0;
+                }
+                return (__builtin_popcount(static_cast<unsigned>(x & below)) & 1) ? -1.0 : 1.0;
+            };
+            for (int r = 0; r < D; ++r)
+            {
+                for (int c = 0; c < D; ++c)
+                {
+                    (*signs)(r, c) = reorder(r) * reorder(c);
+                }
+            }
+            Q_real_mat = Expr::mulElm(signs, Q_real_mat);
+            Q_imag_mat = Expr::mulElm(signs, Q_imag_mat);
+        }
+
         // std::printf("Restacking matrix...\n");
         // Block the real and imaginary parts together into a single matrix
         Expression::t Q_fpt = Expr::vstack(Expr::hstack(Q_real_mat, Expr::neg(Q_imag_mat)), Expr::hstack(Q_imag_mat, Q_real_mat));
@@ -925,60 +960,13 @@ namespace fgmn
         }
     }
 
+    // The one implementation lives in analysis/cut_negativity.hpp so that code
+    // which cannot link MOSEK computes the identical number. The partial
+    // transpose, the factor of i, the Gram-vs-Hermitian trace norm and the
+    // clamp all come from there.
     double bipartite_negativity_numeric(const double *rho, int subsystem, bool fermionic)
     {
-        if (rho == nullptr)
-        {
-            return std::numeric_limits<double>::quiet_NaN();
-        }
-        if (subsystem < 0 || subsystem >= PARTIES)
-        {
-            return std::numeric_limits<double>::quiet_NaN();
-        }
-
-        std::array<std::complex<double>, D * D> pt{};
-        const int mask = subsystem_mask(subsystem);
-
-        for (int r = 0; r < D; ++r)
-        {
-            for (int c = 0; c < D; ++c)
-            {
-                const Index2 src = partial_transpose_source_index(r, c, subsystem);
-                std::complex<double> value(
-                    rho[2u * static_cast<std::size_t>(src.r * D + src.c) + 0u],
-                    rho[2u * static_cast<std::size_t>(src.r * D + src.c) + 1u]);
-
-                // Match the existing fermionic_partial_transpose_expr convention:
-                // after the ordinary partial transpose, entries that violate the
-                // local parity of the transposed subsystem acquire a factor of i.
-                const bool parity_violation = ((r & mask) != 0) ^ ((c & mask) != 0);
-                if (fermionic && parity_violation)
-                {
-                    value = std::complex<double>(-value.imag(), value.real());
-                }
-                pt[static_cast<std::size_t>(r * D + c)] = value;
-            }
-        }
-
-        // The ordinary partial transpose of a Hermitian matrix is Hermitian, so
-        // its singular values are just the absolute eigenvalues.  Only the
-        // fermionic partial transpose, which carries the extra factor of i on
-        // parity-violating entries, is non-Hermitian and needs the Gram matrix.
-        double trace_norm = 0.0;
-        const bool converged =
-            fermionic ? mipt::util::gram_trace_norm<D>(pt, trace_norm)
-                      : mipt::util::hermitian_trace_norm<D>(pt, trace_norm);
-        if (!converged)
-        {
-            return std::numeric_limits<double>::quiet_NaN();
-        }
-
-        double negativity = 0.5 * (trace_norm - 1.0);
-        if (negativity < 0.0 && negativity > -1.0e-10)
-        {
-            negativity = 0.0;
-        }
-        return negativity;
+        return mipt::analysis::cut_negativity<PARTIES>(rho, subsystem, fermionic);
     }
 
     double min_bipartite_negativity_numeric(const double *rho, bool fermionic)
@@ -1297,6 +1285,45 @@ namespace fgmn
             // }
             return -M->primalObjValue();
         }
+
+        // The same solve, reporting *why* it did not produce a value instead of
+        // collapsing every failure into a thrown exception. `solve()` asks
+        // Fusion for an Optimal solution and lets primalObjValue() throw
+        // otherwise, which is fine for a mean over thousands of records and
+        // useless for an analysis that must account for every one.
+        double solve_with_status(const double *rho, int &status)
+        {
+            status = FGMN_STATUS_OK;
+            if (rho == nullptr)
+            {
+                status = FGMN_STATUS_NULL_INPUT;
+                return std::numeric_limits<double>::quiet_NaN();
+            }
+            if (is_complex)
+            {
+                fill_upper_objective_coefficients_complex(rho, coeff_values);
+            }
+            else
+            {
+                fill_upper_objective_coefficients(rho, coeff_values);
+            }
+            objective_coeffs->setValue(coeff_values);
+            M->solve();
+
+            const SolutionStatus primal = M->getPrimalSolutionStatus();
+            if (primal != SolutionStatus::Optimal)
+            {
+                status = FGMN_STATUS_NOT_OPTIMAL_BASE + static_cast<int>(primal);
+                return std::numeric_limits<double>::quiet_NaN();
+            }
+            const double value = -M->primalObjValue();
+            if (!std::isfinite(value))
+            {
+                status = FGMN_STATUS_NONFINITE;
+                return std::numeric_limits<double>::quiet_NaN();
+            }
+            return value;
+        }
     };
 
     GmnWorkspace &workspace_fermion()
@@ -1373,6 +1400,45 @@ extern "C" double compute_fgmn_mosek_8x8_cpp( // Implement C linkage version lat
     {
         return std::numeric_limits<double>::quiet_NaN();
     }
+}
+
+extern "C" double compute_fgmn_mosek_8x8_status_cpp(
+    const double *rho_complex_row_major, int *status)
+{
+    int local = FGMN_STATUS_OK;
+    double value = std::numeric_limits<double>::quiet_NaN();
+    try
+    {
+        auto fusion_guard = fgmn::limit_fusion_concurrency();
+        value = fgmn::workspace_fermion().solve_with_status(rho_complex_row_major, local);
+    }
+    catch (...)
+    {
+        local = FGMN_STATUS_EXCEPTION;
+        value = std::numeric_limits<double>::quiet_NaN();
+    }
+    if (status != nullptr)
+    {
+        *status = local;
+    }
+    return value;
+}
+
+extern "C" int compute_fermionic_cut_negativities_8x8_cpp(
+    const double *rho_complex_row_major, double *out_three)
+{
+    if (out_three == nullptr)
+    {
+        return 1;
+    }
+    std::array<double, 3> cuts{};
+    const bool ok =
+        mipt::analysis::cut_negativities<3>(rho_complex_row_major, true, cuts);
+    for (int i = 0; i < 3; ++i)
+    {
+        out_three[i] = cuts[static_cast<std::size_t>(i)];
+    }
+    return ok ? 0 : 1;
 }
 
 extern "C" double compute_gmn_mosek_complex_8x8_cpp(

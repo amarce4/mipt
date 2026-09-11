@@ -41,6 +41,7 @@
 #include "mipt/circuit.hpp"
 #include "mipt/dist_connectivity.hpp"
 #include "mipt/dist_metrics.hpp"
+#include "mipt/dist_pair_gap.hpp"
 #include "mipt/dist_records.hpp"
 #include "mipt/dist_scaling_csv.hpp"
 #include "mipt/dist_scaling_resume.hpp"
@@ -962,6 +963,11 @@ class PairProtocol
     const std::string &output_path() const { return config_.output_path; }
     int start_realization() const { return start_realization_; }
     bool complete() const { return start_realization_ >= config_.realizations; }
+    const std::vector<PairBin> &bins() const { return bins_; }
+    const RunConfig &config() const { return config_; }
+    // Keep every pair's metrics for the trajectory, for the connected-zero
+    // triple analysis to look its other two edges up in.
+    void collect_measurements(bool enabled) { collect_ = enabled; }
     std::uint64_t records_per_trajectory() const { return static_cast<std::uint64_t>(pairs_.size()); }
     std::uint64_t processed() const { return processed_; }
     const char *rdm_backend_name(cudaq::state &state) const { return rho2_backend_name(state, config_.n); }
@@ -1012,9 +1018,21 @@ class PairProtocol
     // is not ready (connectivity disabled, or a circuit with no layers) makes
     // every query return `evaluated=false` and the contingency counters simply
     // do not advance.
-    void measure(cudaq::state &state, int realization, const ConnectivityIndex &connectivity)
+    //
+    // Returns this trajectory's per-pair measurement: every pair's fermionic
+    // metrics, connectivity and class, plus the list of graph-connected
+    // unentangled pairs. It is only filled when collect_measurements(true) was
+    // set, and it stays valid -- including the pointers into this protocol's
+    // RDM buffer -- until the next call.
+    const gap::PairMeasurement &measure(cudaq::state &state, int realization,
+                                        const ConnectivityIndex &connectivity)
     {
         const int n = config_.n;
+        if (collect_)
+        {
+            measurement_.reset(n);
+            measurement_.realization = static_cast<std::uint32_t>(realization);
+        }
         if (include_fermionic_)
         {
             rho2_subsystems_both_from_cudaq_state(state, n, pairs_, rdm_workspace_);
@@ -1058,6 +1076,8 @@ class PairProtocol
             bin.n_j.add(metrics.n_j);
             bin.dnn.add(metrics.dnn);
             bin.rho_n.add(metrics.rho_n);
+            bin.abs_rho_n.add(std::abs(metrics.rho_n));
+            bin.rho_n_sq.add(metrics.rho_n * metrics.rho_n);
             bin.i_occ.add(metrics.i_occ);
 
             // The measure the contingency table classifies on: the fermionic
@@ -1090,9 +1110,28 @@ class PairProtocol
                 channel_weight = fermion_metrics.g2 + fermion_metrics.f2;
             }
             const bool entangled = entanglement > config_.pair_zero_tol;
+            const ZeroClass zero_class = classify_unentangled(
+                metrics.i_occ, channel_weight, config_.occupation_mi_tol, config_.channel_floor);
 
             const PairConnectivity conn =
                 connectivity.query(pairs_[pair_index][0], pairs_[pair_index][1]);
+            if (collect_)
+            {
+                gap::PairSnapshot snapshot;
+                snapshot.i = pairs_[pair_index][0];
+                snapshot.j = pairs_[pair_index][1];
+                snapshot.separation = bin.separation;
+                snapshot.chord = bin.chord;
+                snapshot.fermion = include_fermionic_ ? fermion_metrics : metrics;
+                snapshot.conn = conn;
+                snapshot.entangled = entangled;
+                snapshot.zero_class = zero_class;
+                snapshot.fermion_rho_ri =
+                    include_fermionic_
+                        ? rdm_workspace_.fermion_rho_ri.data() + pair_index * RHO2_VALUES
+                        : rho;
+                measurement_.add(snapshot);
+            }
             if (conn.evaluated)
             {
                 ++bin.conn_records;
@@ -1117,20 +1156,15 @@ class PairProtocol
                     {
                         // Why a spanning path carried nothing. Exhaustive and
                         // disjoint by construction, so the three sum back to
-                        // connected_ent_zero.
+                        // connected_ent_zero -- and the same function labels
+                        // the triple analysis's anchors, so the two agree.
                         ++bin.connected_ent_zero;
                         bin.i_occ_connected_classical.add(metrics.i_occ);
-                        if (metrics.i_occ > config_.occupation_mi_tol)
+                        switch (zero_class)
                         {
-                            ++bin.classical_occ_correlated;
-                        }
-                        else if (channel_weight > config_.channel_floor)
-                        {
-                            ++bin.classical_subthreshold;
-                        }
-                        else
-                        {
-                            ++bin.classical_silent;
+                        case ZeroClass::OccupationCorrelated: ++bin.classical_occ_correlated; break;
+                        case ZeroClass::CoherentSubthreshold: ++bin.classical_subthreshold; break;
+                        case ZeroClass::Silent: ++bin.classical_silent; break;
                         }
                     }
                 }
@@ -1160,6 +1194,7 @@ class PairProtocol
             }
             ++processed_;
         }
+        return measurement_;
     }
 
     void finish(std::ostream &out, double active_seconds)
@@ -1226,6 +1261,80 @@ class PairProtocol
     resume::Report checkpoint_;
     int start_realization_ = 0;
     std::uint64_t processed_ = 0;
+    bool collect_ = false;
+    gap::PairMeasurement measurement_;
+};
+
+// ---------------------------------------------------------------------------
+// The connected-zero triple analysis (MIPT_DIST_PAIR_GAP_TRIPLES=1)
+//
+// A separate protocol rather than a mode of TripleProtocol, because nothing
+// about it is shared: TripleProtocol samples balanced geometries and solves
+// asynchronously; this one enumerates every third site of a content-selected
+// pair set, must account for every outcome, and cannot let its checkpoint trail
+// the pair CSV's. Everything except the GPU reduction and the MOSEK call lives
+// in dist_pair_gap.hpp, where the tests can reach it.
+// ---------------------------------------------------------------------------
+
+class PairGapTripleProtocol
+{
+  public:
+    PairGapTripleProtocol(const RunConfig &config, const PairProtocol &pairs)
+        : analysis_(config, pairs.bins(),
+                    [](const double *rho) {
+                        int status = FGMN_STATUS_EXCEPTION;
+                        const double value = compute_fgmn_mosek_8x8_status_cpp(rho, &status);
+                        return gap::SolveOutcome{value, status};
+                    },
+                    solver_workers(), static_cast<std::uint64_t>(pairs.start_realization()),
+                    resume::enabled()),
+          n_(config.n)
+    {
+    }
+
+    void announce(std::ostream &out) const { analysis_.announce(out); }
+    void publish() { analysis_.publish(); }
+    void finish(std::ostream &out) { analysis_.finish(out); }
+    std::uint64_t rows() const { return analysis_.rows(); }
+    std::uint64_t solves() const { return analysis_.solves(); }
+    std::uint64_t failed_triples() const { return analysis_.failed_triples(); }
+    const std::string &outcome_path() const { return analysis_.outcome_path(); }
+    const gap::PairGapAnalysis &analysis() const { return analysis_; }
+
+    // Called right after PairProtocol::measure, while the same state and the
+    // same connectivity index are still live.
+    gap::TrajectoryStats measure(cudaq::state &state, int realization,
+                                 const gap::PairMeasurement &measurement,
+                                 const ConnectivityIndex &connectivity)
+    {
+        const int n = n_;
+        const gap::RdmBatch batch = [&state, n](const std::vector<std::array<int, 3>> &triples,
+                                                std::vector<double> &raw) {
+            // Every unique triple of the trajectory in one reduction call. The
+            // raw output is kept unnormalized: the trace and Hermiticity errors
+            // are diagnostics, and evaluate_triple normalizes its own copy.
+            std::vector<Subsystem> subsystems(triples.begin(), triples.end());
+            cudaq_three_site_density_matrices(state, n, subsystems, raw.data(), true);
+        };
+        return analysis_.process(static_cast<std::uint32_t>(realization), measurement,
+                                 connectivity, batch);
+    }
+
+  private:
+    // FGMN_MAX_CONCURRENT_MOSEK, after the default the runners apply. The pool
+    // is persistent, so each worker builds its Fusion model once.
+    static int solver_workers()
+    {
+        env::set_if_unset("GMN_MOSEK_NUM_THREADS", "1");
+        env::set_if_unset("FGMN_MAX_CONCURRENT_MOSEK",
+                          analysis::default_sdp_worker_count_text().c_str());
+        env::set_if_unset("GMN_MOSEK_TOL", analysis::DEFAULT_SDP_TOLERANCE_TEXT);
+        return static_cast<int>(
+            env::integer("FGMN_MAX_CONCURRENT_MOSEK", analysis::default_sdp_worker_count(), 1, 256));
+    }
+
+    gap::PairGapAnalysis analysis_;
+    int n_ = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -1650,7 +1759,8 @@ class TripleProtocol
 // state, so measuring both costs one circuit instead of two.
 // ---------------------------------------------------------------------------
 
-inline void run_protocols(const RunConfig &config, PairProtocol *pairs, TripleProtocol *triples)
+inline void run_protocols(const RunConfig &config, PairProtocol *pairs, TripleProtocol *triples,
+                          PairGapTripleProtocol *gap = nullptr)
 {
     const int realizations = config.realizations;
     int start = realizations;
@@ -1692,6 +1802,10 @@ inline void run_protocols(const RunConfig &config, PairProtocol *pairs, TriplePr
     if (pairs != nullptr && !pairs->complete())
     {
         pairs->announce_run(std::cerr);
+        if (gap != nullptr)
+        {
+            gap->announce(std::cerr);
+        }
     }
     if (triples != nullptr && !triples->complete())
     {
@@ -1712,6 +1826,14 @@ inline void run_protocols(const RunConfig &config, PairProtocol *pairs, TriplePr
         if (pairs != nullptr)
         {
             context += "\n  pair output: " + pairs->output_path();
+        }
+        if (gap != nullptr)
+        {
+            context += "\n  pair-gap triples: " + gap->outcome_path() +
+                       " (solved synchronously per trajectory; nothing is in flight between "
+                       "trajectories, so a crash loses at most the current one)";
+            util::crash::watch("gap_solves_in_flight", gap->analysis().pool().in_flight_counter());
+            util::crash::watch("gap_solves_done", gap->analysis().pool().solved_counter());
         }
         if (triples != nullptr)
         {
@@ -1761,6 +1883,14 @@ inline void run_protocols(const RunConfig &config, PairProtocol *pairs, TriplePr
     bool precision_warned = false;
 
     auto flush = [&]() {
+        // The triple analysis first, the pair CSV second. The gap protocol
+        // syncs its rows and publishes a completed count before the pair
+        // checkpoint can move past them, so on resume the gap output is never
+        // behind the pair CSV; see PairGapAnalysis::restore.
+        if (gap != nullptr)
+        {
+            gap->publish();
+        }
         if (pairs != nullptr)
         {
             pairs->publish();
@@ -1781,7 +1911,7 @@ inline void run_protocols(const RunConfig &config, PairProtocol *pairs, TriplePr
         // get distinct, uncorrelated streams -- but they are now reproducible,
         // which they were not before.
         circuit_workspace.seed(config.type, config.periods,
-                               trajectory_seed(config.seed,
+                               seeding::trajectory_seed(config.seed,
                                                static_cast<std::uint64_t>(realization)));
         auto trajectory =
             circuit_workspace.simulate(config.n, config.periods, config.p, config.type, "dist_scaling");
@@ -1840,7 +1970,14 @@ inline void run_protocols(const RunConfig &config, PairProtocol *pairs, TriplePr
         // exactly `realizations` of them in total.
         if (pairs != nullptr && realization >= pairs->start_realization())
         {
-            pairs->measure(state, realization, connectivity);
+            const gap::PairMeasurement &measurement =
+                pairs->measure(state, realization, connectivity);
+            if (gap != nullptr)
+            {
+                // Same state, same connectivity index, same pair metrics: the
+                // triples are reductions of the trajectory the pairs came from.
+                gap->measure(state, realization, measurement, connectivity);
+            }
         }
         if (triples != nullptr && realization >= triples->start_realization())
         {
@@ -1869,6 +2006,15 @@ inline void run_protocols(const RunConfig &config, PairProtocol *pairs, TriplePr
                 suffix = " | sdp " + std::to_string(triples->solved()) + "/" +
                          std::to_string(triples->queued());
             }
+            if (gap != nullptr)
+            {
+                suffix += " | gap rows " + std::to_string(gap->rows()) + ", fGMN " +
+                          std::to_string(gap->solves());
+                if (gap->failed_triples() > 0)
+                {
+                    suffix += " (" + std::to_string(gap->failed_triples()) + " failed)";
+                }
+            }
             progress.report(processed, pause_sentinel.paused_seconds(), suffix);
         }
     }
@@ -1876,6 +2022,10 @@ inline void run_protocols(const RunConfig &config, PairProtocol *pairs, TriplePr
     const double active_seconds =
         std::max(1.0e-12, progress.elapsed_seconds() - pause_sentinel.paused_seconds());
     std::cerr << '\n';
+    if (gap != nullptr && pairs != nullptr && !pairs->complete())
+    {
+        gap->finish(std::cerr);
+    }
     if (pairs != nullptr && !pairs->complete())
     {
         pairs->finish(std::cerr, active_seconds);
@@ -1908,6 +2058,21 @@ inline void apply_environment(RunConfig &config)
     config.record_detail = parse_record_detail(
         env::text("MIPT_DIST_RECORD_DETAIL", record_detail_name(RecordDetail::Channel)));
     config.record_stride = env::integer("MIPT_DIST_RECORD_STRIDE", 1, 1, 1000000000);
+    // The connected-zero triple analysis. Off unless asked for: it runs an
+    // fGMN solve per non-prefiltered triple, synchronously, which dominates
+    // everything else in the run.
+    PairGapSettings &gap = config.pair_gap;
+    gap.enabled = env::boolean("MIPT_DIST_PAIR_GAP_TRIPLES", false);
+    gap.selection = parse_gap_selection(env::text("MIPT_DIST_PAIR_GAP_CLASS", "connected_zero"));
+    gap.output_path = env::text("MIPT_DIST_PAIR_GAP_OUTPUT", "");
+    gap.store_rho3 = env::boolean("MIPT_DIST_PAIR_GAP_STORE_RHO3", false);
+    gap.controls = env::boolean("MIPT_DIST_PAIR_GAP_CONTROLS", false);
+    const double gmn_zero = env::real("MIPT_DIST_GMN_ZERO_TOL", 1.0e-10, 0.0, 1.0);
+    gap.prefilter_tol = env::real("MIPT_DIST_PAIR_GAP_PREFILTER_TOL", gmn_zero, 0.0, 1.0);
+    gap.positive_tol = env::real("MIPT_DIST_PAIR_GAP_POSITIVE_TOL", gmn_zero, 0.0, 1.0);
+    gap.retries = static_cast<int>(env::integer("MIPT_DIST_PAIR_GAP_RETRIES", 2, 0, 20));
+    gap.mosek_tol_text = env::text("GMN_MOSEK_TOL", analysis::DEFAULT_SDP_TOLERANCE_TEXT);
+
     // A pinned seed makes the whole run replayable; an unpinned one is drawn
     // once here and *written into the output*, which makes it replayable after
     // the fact too. That is the part random_device alone never gave.
@@ -1962,10 +2127,26 @@ inline void adopt_checkpoint_seed(RunConfig &config, const std::string &pair_pat
     config.seed = probe.seed;
 }
 
+// Build the connected-zero triple analysis when it is switched on. It is
+// constructed after the pair protocol because it has to cover exactly the
+// trajectories the pair checkpoint counts, and it refuses rather than guesses
+// when it cannot.
+inline std::unique_ptr<PairGapTripleProtocol> make_pair_gap(const RunConfig &config,
+                                                            PairProtocol &pairs)
+{
+    if (!config.pair_gap.enabled)
+    {
+        return nullptr;
+    }
+    pairs.collect_measurements(true);
+    return std::make_unique<PairGapTripleProtocol>(pairs.config(), pairs);
+}
+
 inline void run_pairs(const RunConfig &config)
 {
     PairProtocol pairs(config);
-    run_protocols(config, &pairs, nullptr);
+    auto gap = make_pair_gap(config, pairs);
+    run_protocols(config, &pairs, nullptr, gap.get());
 }
 
 inline void run_triples(const RunConfig &config)
@@ -2001,12 +2182,63 @@ inline void run_both(const RunConfig &input)
 
     PairProtocol pairs(pair_config);
     TripleProtocol triples(triple_config);
-    run_protocols(config, &pairs, &triples);
+    auto gap = make_pair_gap(pair_config, pairs);
+    run_protocols(config, &pairs, &triples, gap.get());
+}
+
+// The triple analysis's preconditions. It is meant to be decisive, so anything
+// that would quietly make it partial is refused rather than tolerated.
+inline void validate_pair_gap(const RunConfig &config)
+{
+    if (!config.pair_gap.enabled)
+    {
+        return;
+    }
+    auto refuse = [](const std::string &why) {
+        throw std::invalid_argument("MIPT_DIST_PAIR_GAP_TRIPLES=1 " + why);
+    };
+    if (!config.fermionic_outputs())
+    {
+        refuse("needs a parity-preserving circuit (circ_type 2, 3 or 4): the trigger and "
+               "every triple measure are fermionic.");
+    }
+    if (config.k != 2 && config.k != 0)
+    {
+        refuse("needs k=2 or k=0: it is triggered by pair records.");
+    }
+    if (!config.connectivity)
+    {
+        refuse("needs MIPT_DIST_CONNECTIVITY=1: the trigger is C_ij=1.");
+    }
+    // Every qualifying triple must get either a solve or a recorded bound. The
+    // GMN schedule knobs thin the ordinary k=3 protocol; in this mode they would
+    // signal a run that is not what it claims to be, so they are refused
+    // outright rather than silently ignored.
+    if (env::integer("MIPT_DIST_GMN_STRIDE", 1, 1, std::numeric_limits<int>::max()) != 1 ||
+        env::integer("MIPT_DIST_GMN_SAMPLES_PER_GEOMETRY", 0, 0,
+                     std::numeric_limits<long>::max()) != 0)
+    {
+        refuse("cannot be combined with MIPT_DIST_GMN_STRIDE or "
+               "MIPT_DIST_GMN_SAMPLES_PER_GEOMETRY: every qualifying triple must receive "
+               "an fGMN solve or a recorded prefilter bound.");
+    }
+    if (!env::boolean("MIPT_DIST_GMN", true))
+    {
+        refuse("cannot run with MIPT_DIST_GMN=0: fGMN is the measurement.");
+    }
+    if (config.statevector_precision < 64)
+    {
+        std::cerr << "WARNING: MIPT_DIST_PAIR_GAP_TRIPLES=1 on an fp32 build. The trigger is "
+                     "fN <= " << config.pair_zero_tol << " and an fp32 state vector puts a "
+                     "~1e-14 floor under |G|^2, so the silent class is partly arithmetic. "
+                     "Build with FP64=1 for a decisive run.\n";
+    }
 }
 
 inline void run(const RunConfig &input)
 {
     validate_args(input);
+    validate_pair_gap(input);
     if (input.k == 0)
     {
         run_both(input);
@@ -2130,6 +2362,28 @@ inline void print_usage(const char *argv0)
         << "    component sizes (one BFS per site per trajectory).\n"
         << "  MIPT_DIST_OCC_MI_TOL=1e-12 below this an occupation mutual information\n"
         << "    counts as zero when splitting the connected-but-unentangled records.\n"
+        << "  k=2 / k=0 connected-zero triple analysis (parity-preserving circuits):\n"
+        << "  MIPT_DIST_PAIR_GAP_TRIPLES=0 set to 1 to analyse every graph-connected pair\n"
+        << "    with fN <= MIPT_DIST_PAIR_ZERO_TOL against every third site k != i, j:\n"
+        << "    the fermionic 3-site RDM, all three pair marginals, the three cut\n"
+        << "    negativities, fTMI, and fGMN. Every (trajectory, i, j; k) outcome is a row\n"
+        << "    of <stem>_connected_zero_thirds.csv; shared triples are solved once.\n"
+        << "    Solved synchronously per trajectory, so nothing is lost in a crash.\n"
+        << "    Refuses MIPT_DIST_GMN_STRIDE, _SAMPLES_PER_GEOMETRY and MIPT_DIST_GMN=0.\n"
+        << "  MIPT_DIST_PAIR_GAP_CLASS=connected_zero which anchors: connected_zero (all),\n"
+        << "    occupation_correlated, coherent_subthreshold, or silent.\n"
+        << "  MIPT_DIST_PAIR_GAP_OUTPUT=<path> outcome CSV (default beside the pair CSV);\n"
+        << "    the aggregate is <outcome stem>_aggregate.csv.\n"
+        << "  MIPT_DIST_PAIR_GAP_CONTROLS=0 set to 1 to also analyse one distance-matched\n"
+        << "    disconnected zero pair per anchor, from the same trajectory.\n"
+        << "  MIPT_DIST_PAIR_GAP_STORE_RHO3=0 set to 1 to keep every unique triple's raw\n"
+        << "    fermionic 8x8 in <outcome stem>_rho3.bin (1040 bytes each).\n"
+        << "  MIPT_DIST_PAIR_GAP_PREFILTER_TOL=MIPT_DIST_GMN_ZERO_TOL a minimum cut at or\n"
+        << "    below this records fGMN as bounded by it instead of solving.\n"
+        << "  MIPT_DIST_PAIR_GAP_POSITIVE_TOL=MIPT_DIST_GMN_ZERO_TOL fGMN above this is\n"
+        << "    counted positive.\n"
+        << "  MIPT_DIST_PAIR_GAP_RETRIES=2 extra attempts for a failed solve, the last one\n"
+        << "    serialized. A solve that still fails stays NaN, never zero.\n"
         << "  MIPT_DIST_CHANNEL_FLOOR below this |G|^2 and |F|^2 count as zero in that\n"
         << "    same split. Defaults to 1e-13 for an fp32 build and 1e-28 for fp64,\n"
         << "    because these are squared amplitudes and the floor is the square of the\n"

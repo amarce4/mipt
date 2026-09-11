@@ -177,9 +177,58 @@ inline bool hermitian_trace_norm(const std::array<std::complex<double>, N * N> &
     return true;
 }
 
+// Trace norm of a general complex matrix via its Hermitian dilation
+//
+//     H = [[0, A], [A^dagger, 0]],
+//
+// whose eigenvalues are exactly +/- the singular values of A. Summing |lambda|
+// over all 2N of them and halving gives the trace norm *without* squaring
+// anything, so the small end of the spectrum keeps its full precision.
+//
+// That is the reason it exists. gram_trace_norm below takes square roots of the
+// eigenvalues of A^dagger A, and an exactly-zero singular value comes back as
+// sqrt(1e-16 roundoff) ~ 1e-8. For a cut negativity that is a ~1e-9 absolute
+// noise floor -- measured: 2.0e-9 on a cut whose exact value is 0, against
+// 2.2e-16 here -- which sits *above* the 1e-10 fGMN prefilter tolerance, so an
+// exactly-separable fermionic cut could never be certified and every such
+// triple went to MOSEK. The cost is a 2N x 2N Jacobi instead of an N x N one,
+// which is nothing beside the SDP it saves.
+template <std::size_t N>
+inline bool dilation_trace_norm(const std::array<std::complex<double>, N * N> &a,
+                                double &trace_norm)
+{
+    constexpr std::size_t M = 2 * N;
+    std::array<std::complex<double>, M * M> dilation{};
+    for (std::size_t r = 0; r < N; ++r)
+    {
+        for (std::size_t c = 0; c < N; ++c)
+        {
+            dilation[r * M + (N + c)] = a[r * N + c];
+            dilation[(N + c) * M + r] = std::conj(a[r * N + c]);
+        }
+    }
+    std::array<double, M> eigenvalues{};
+    if (!hermitian_eigenvalues<M>(dilation, eigenvalues))
+    {
+        return false;
+    }
+    double total = 0.0;
+    for (double lambda : eigenvalues)
+    {
+        total += std::abs(lambda);
+    }
+    trace_norm = 0.5 * total;
+    return true;
+}
+
 // Trace norm of a general (not necessarily Hermitian) complex matrix, via the
-// eigenvalues of the Hermitian Gram matrix A^dagger A.  Required for the
-// fermionic partial transpose, which is not Hermitian.
+// eigenvalues of the Hermitian Gram matrix A^dagger A.
+//
+// Kept for the callers that have not been moved to dilation_trace_norm
+// (ancilla_mi.hpp, front_metrics.hpp). It loses the small singular values to
+// the squaring -- see dilation_trace_norm -- so a negativity computed through it
+// has an absolute floor of ~1e-9, and a positivity count against a smaller
+// threshold is counting that floor.
 template <std::size_t N>
 inline bool gram_trace_norm(const std::array<std::complex<double>, N * N> &a,
                             double &trace_norm)

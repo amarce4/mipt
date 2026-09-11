@@ -227,6 +227,16 @@ inline void require_metadata(
     require_same_text(
         "boundary_implementation", config.boundary_implementation(),
         table.text(row, "boundary_implementation"), path);
+    // Every classification threshold, at both party counts. A checkpoint
+    // written under different ones classifies the same records differently,
+    // so its counts cannot be continued.
+    require_same_text(
+        "pair_zero_tol", config.pair_zero_tol, table.text(row, "pair_zero_tol"), path);
+    require_same_text(
+        "occupation_mi_tol", config.occupation_mi_tol, table.text(row, "occupation_mi_tol"),
+        path);
+    require_same_text(
+        "channel_floor", config.channel_floor, table.text(row, "channel_floor"), path);
 }
 
 // The seed a checkpoint carries, checked for consistency across its rows.
@@ -323,11 +333,10 @@ inline Report load_pairs(const RunConfig &config, std::vector<PairBin> &bins)
     {
         require_metadata(table, row, config, path);
         absorb_seed(table, row, path, report);
-        // Every conditional probability below is defined relative to these
-        // three, so a checkpoint written under different ones describes
-        // different events and cannot be continued.
-        require_same_text(
-            "pair_zero_tol", config.pair_zero_tol, table.text(row, "pair_zero_tol"), path);
+        // Every conditional probability below is defined relative to these,
+        // so a checkpoint written under different ones describes different
+        // events and cannot be continued. (The thresholds themselves are
+        // checked with the rest of the metadata block.)
         require_same_text(
             "contingency_measure", config.contingency_measure(),
             table.text(row, "contingency_measure"), path);
@@ -400,6 +409,8 @@ inline Report load_pairs(const RunConfig &config, std::vector<PairBin> &bins)
         bin.n_j = table.stats_by_stderr(row, "n_j");
         bin.dnn = table.stats_by_stderr(row, "dnn");
         bin.rho_n = table.stats_by_stderr(row, "rho_n");
+        bin.abs_rho_n = table.stats_by_stderr(row, "abs_rho_n");
+        bin.rho_n_sq = table.stats_by_stderr(row, "rho_n_sq");
         bin.i_occ = table.stats_by_stderr(row, "i_occ");
 
         bin.conn_records = table.counter(row, "conn_records");

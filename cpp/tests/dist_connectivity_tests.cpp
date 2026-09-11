@@ -229,6 +229,44 @@ void test_shortest_path_lengths()
     expect(without.query(0, 2).connected, "while the flags are unaffected");
 }
 
+// Menger counts. A 4-cycle joins opposite corners two independent ways; a chain
+// joins its ends one way, through articulation nodes; separate components none.
+void test_disjoint_paths()
+{
+    const LogicalHistory cycle = make_history(4, {{{{0, 1}, {1, 2}, {2, 3}, {3, 0}}, {}}});
+    ConnectivityIndex ring;
+    ring.build(cycle, true);
+    const mipt::dist::DisjointPaths both = ring.disjoint_paths(0, 2);
+    expect(both.edge == 2 && both.vertex == 2,
+           "opposite corners of a cycle have two edge- and vertex-disjoint paths");
+
+    const LogicalHistory chain = make_history(4, {{{{0, 1}, {1, 2}, {2, 3}}, {}}});
+    ConnectivityIndex line;
+    line.build(chain, true);
+    const mipt::dist::DisjointPaths single = line.disjoint_paths(0, 3);
+    expect(single.edge == 1 && single.vertex == 1,
+           "the ends of a chain are joined through a single bottleneck");
+
+    const LogicalHistory split = make_history(4, {{{{0, 1}, {2, 3}}, {}}});
+    ConnectivityIndex apart;
+    apart.build(split, true);
+    const mipt::dist::DisjointPaths none = apart.disjoint_paths(0, 3);
+    expect(none.edge == 0 && none.vertex == 0, "separate components share no path");
+
+    // Through time: two layers where 0 and 2 meet via site 1 in layer 0 and
+    // via site 3 in layer 1 -- two routes that share only the endpoints'
+    // worldlines, which the vertex count may reuse only at the endpoints.
+    const LogicalHistory two_routes = make_history(4, {
+        {{{0, 1}, {1, 2}}, {}},
+        {{{2, 3}, {3, 0}}, {}},
+    });
+    ConnectivityIndex routes;
+    routes.build(two_routes, true);
+    const mipt::dist::DisjointPaths through_time = routes.disjoint_paths(0, 2);
+    expect(through_time.edge == 2, "one route in each layer gives two edge-disjoint paths");
+    expect(through_time.vertex == 2, "and they share no interior node");
+}
+
 // Time since last measurement, the cheap explanatory diagnostic.
 void test_idle_times()
 {
@@ -397,6 +435,7 @@ int main()
     test_connectivity_factorizes();
     test_shortest_path_lengths();
     test_idle_times();
+    test_disjoint_paths();
     test_unbuilt_index_is_inert();
     test_even_layer_bonds();
     test_boundary_implementations_agree();

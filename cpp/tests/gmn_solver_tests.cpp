@@ -23,11 +23,13 @@
 #include "mipt/analysis/gmn.hpp"
 #include "mipt/analysis/fgmn.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <complex>
 #include <cstdlib>
 #include <iostream>
+#include <random>
 #include <vector>
 
 namespace
@@ -217,6 +219,221 @@ void check_paths_agree()
     }
 }
 
+// ---------------------------------------------------------------------------
+// The connected-zero triple analysis leans on three properties of the fGMN
+// path that nothing above pins: that the value does not depend on how the three
+// sites are labelled, that the per-cut negativities it reports are the ones the
+// minimum is taken over, and that the prefilter bound fGMN <= min_s N_s agrees
+// with a direct solve wherever it is used to skip one.
+// ---------------------------------------------------------------------------
+
+// A random three-mode state that is block diagonal in total fermion parity --
+// which every physical RDM of a definite-parity trajectory is, exactly.
+std::vector<Complex> random_parity_preserving(std::mt19937 &rng, int rank)
+{
+    std::normal_distribution<double> normal(0.0, 1.0);
+    std::vector<Complex> rho(64, Complex(0.0, 0.0));
+    const std::array<std::array<int, 4>, 2> sectors{{{0, 3, 5, 6}, {1, 2, 4, 7}}};
+    for (int term = 0; term < rank; ++term)
+    {
+        const auto &sector = sectors[static_cast<std::size_t>(term % 2)];
+        std::array<Complex, 8> v{};
+        for (int index : sector)
+        {
+            v[static_cast<std::size_t>(index)] = Complex(normal(rng), normal(rng));
+        }
+        for (std::size_t i = 0; i < 8; ++i)
+        {
+            for (std::size_t j = 0; j < 8; ++j)
+            {
+                rho[i * 8 + j] += v[i] * std::conj(v[j]);
+            }
+        }
+    }
+    double trace = 0.0;
+    for (std::size_t i = 0; i < 8; ++i)
+    {
+        trace += rho[i * 8 + i].real();
+    }
+    for (auto &value : rho)
+    {
+        value /= trace;
+    }
+    return rho;
+}
+
+// Relabel the three modes by `to[s]` (mode s becomes mode to[s]), carrying the
+// fermionic reordering sign. A basis state is c_0^n0 c_1^n1 c_2^n2 |vac> in
+// ascending mode order; after relabelling, the occupied creation operators have
+// to be sorted back into ascending order, and the parity of that sort is the
+// sign. Getting this wrong would make fGMN look label-dependent even if the
+// solver were perfect, so the sign is computed by counting inversions rather
+// than from any closed form.
+std::vector<Complex> permute_modes(const std::vector<Complex> &rho, const std::array<int, 3> &to)
+{
+    auto relabel = [&](int x, int &sign) {
+        int y = 0;
+        std::vector<int> targets;
+        for (int s = 0; s < 3; ++s)
+        {
+            if ((x >> s) & 1)
+            {
+                y |= 1 << to[static_cast<std::size_t>(s)];
+                targets.push_back(to[static_cast<std::size_t>(s)]);
+            }
+        }
+        int inversions = 0;
+        for (std::size_t a = 0; a < targets.size(); ++a)
+        {
+            for (std::size_t b = a + 1; b < targets.size(); ++b)
+            {
+                inversions += targets[a] > targets[b] ? 1 : 0;
+            }
+        }
+        sign = (inversions & 1) ? -1 : 1;
+        return y;
+    };
+    std::vector<Complex> out(64, Complex(0.0, 0.0));
+    for (int r = 0; r < 8; ++r)
+    {
+        int sr = 1;
+        const int pr = relabel(r, sr);
+        for (int c = 0; c < 8; ++c)
+        {
+            int sc = 1;
+            const int pc = relabel(c, sc);
+            out[static_cast<std::size_t>(pr * 8 + pc)] =
+                static_cast<double>(sr * sc) * rho[static_cast<std::size_t>(r * 8 + c)];
+        }
+    }
+    return out;
+}
+
+std::array<double, 3> cuts_of(const Packed &rho)
+{
+    std::array<double, 3> cuts{};
+    const int status = compute_fermionic_cut_negativities_8x8_cpp(rho.data(), cuts.data());
+    expect_close(static_cast<double>(status), 0.0, 0.0, "cut negativities converge");
+    return cuts;
+}
+
+void check_fgmn_permutation_invariance()
+{
+    std::mt19937 rng(20260911);
+    const std::array<std::array<int, 3>, 6> permutations{{
+        {0, 1, 2}, {0, 2, 1}, {1, 0, 2}, {1, 2, 0}, {2, 0, 1}, {2, 1, 0}}};
+    std::vector<std::vector<Complex>> states{pure(w_amplitudes())};
+    for (int trial = 0; trial < 3; ++trial)
+    {
+        states.push_back(random_parity_preserving(rng, 2 + trial));
+    }
+    for (std::size_t which = 0; which < states.size(); ++which)
+    {
+        const Packed base = pack(states[which]);
+        const double reference = compute_fgmn_mosek_8x8_cpp(base.data());
+        const std::array<double, 3> base_cuts = cuts_of(base);
+        for (const auto &to : permutations)
+        {
+            const Packed moved = pack(permute_modes(states[which], to));
+            const std::string label = "state " + std::to_string(which) + " relabelled " +
+                                      std::to_string(to[0]) + std::to_string(to[1]) +
+                                      std::to_string(to[2]);
+            expect_close(compute_fgmn_mosek_8x8_cpp(moved.data()), reference, 2.0e-4,
+                         ("fGMN is label-independent, " + label).c_str());
+            // The cuts follow the relabelling: what was party s is now to[s].
+            const std::array<double, 3> moved_cuts = cuts_of(moved);
+            for (int s = 0; s < 3; ++s)
+            {
+                expect_close(moved_cuts[static_cast<std::size_t>(to[static_cast<std::size_t>(s)])],
+                             base_cuts[static_cast<std::size_t>(s)], 1.0e-12,
+                             ("cut negativities follow the relabelling, " + label).c_str());
+            }
+        }
+    }
+}
+
+// Known cut negativities, and the minimum being exactly the old helper's value.
+void check_cut_negativities_on_known_states()
+{
+    const Packed product = pack(pure(product_amplitudes()));
+    for (double cut : cuts_of(product))
+    {
+        expect_close(cut, 0.0, 1.0e-12, "a product state has no entangled cut");
+    }
+
+    // |000> + |110>: modes 1 and 2 form a Bell pair, mode 0 is uncoupled. Both
+    // components have even particle number, so the state is parity-definite.
+    const Packed bell = pack(pure(bell_ab_amplitudes()));
+    const std::array<double, 3> bell_cuts = cuts_of(bell);
+    expect_close(bell_cuts[0], 0.0, 1.0e-12, "the uncoupled mode's cut vanishes");
+    expect_close(bell_cuts[1], 0.5, 1.0e-10, "a Bell partner's cut is 1/2");
+    expect_close(bell_cuts[2], 0.5, 1.0e-10, "the other Bell partner's cut is 1/2");
+
+    std::mt19937 rng(7);
+    for (int trial = 0; trial < 5; ++trial)
+    {
+        const Packed rho = pack(random_parity_preserving(rng, 3));
+        const std::array<double, 3> cuts = cuts_of(rho);
+        const double minimum = *std::min_element(cuts.begin(), cuts.end());
+        expect_close(minimum, compute_min_bipartite_fermionic_negativity_8x8_cpp(rho.data()), 0.0,
+                     "the minimum of the three cuts is exactly the prefilter value");
+    }
+}
+
+// fGMN <= min_s N_s is what licenses skipping a solve. Where the bound is zero
+// the direct solve must agree, and everywhere the direct value must sit under
+// the bound.
+void check_prefilter_agrees_with_direct_solves()
+{
+    const std::array<Packed, 2> vanishing{pack(pure(product_amplitudes())),
+                                          pack(pure(bell_ab_amplitudes()))};
+    for (const Packed &rho : vanishing)
+    {
+        const std::array<double, 3> cuts = cuts_of(rho);
+        const double bound = *std::min_element(cuts.begin(), cuts.end());
+        expect_close(bound, 0.0, 1.0e-12, "these states are prefiltered");
+        expect_close(compute_fgmn_mosek_8x8_cpp(rho.data()), 0.0, 1.0e-4,
+                     "a direct solve agrees with the prefilter's zero bound");
+    }
+
+    std::mt19937 rng(99);
+    for (int trial = 0; trial < 6; ++trial)
+    {
+        const Packed rho = pack(random_parity_preserving(rng, 2 + trial % 3));
+        const std::array<double, 3> cuts = cuts_of(rho);
+        const double bound = *std::min_element(cuts.begin(), cuts.end());
+        const double direct = compute_fgmn_mosek_8x8_cpp(rho.data());
+        if (!(direct <= bound + 1.0e-4))
+        {
+            std::cerr << "FAIL fGMN exceeds its prefilter bound: " << direct << " > " << bound
+                      << '\n';
+            ++failures;
+        }
+    }
+}
+
+// The status entry point must agree with the plain one when it succeeds, and
+// must never turn a failure into a number.
+void check_status_entry_point()
+{
+    const Packed ghz = pack(pure(ghz_amplitudes()));
+    int status = -1;
+    const double value = compute_fgmn_mosek_8x8_status_cpp(ghz.data(), &status);
+    expect_close(static_cast<double>(status), FGMN_STATUS_OK, 0.0, "GHZ solves to optimality");
+    expect_close(value, compute_fgmn_mosek_8x8_cpp(ghz.data()), 1.0e-9,
+                 "the status entry point returns the same value");
+
+    status = -1;
+    const double missing = compute_fgmn_mosek_8x8_status_cpp(nullptr, &status);
+    expect_close(static_cast<double>(status), FGMN_STATUS_NULL_INPUT, 0.0,
+                 "a null matrix reports its own status");
+    if (missing == missing)
+    {
+        std::cerr << "FAIL a failed solve returned " << missing << " instead of NaN\n";
+        ++failures;
+    }
+}
+
 } // namespace
 
 int main()
@@ -234,6 +451,10 @@ int main()
     }
     check_pure_state_closed_forms(fermionic);
     check_paths_agree();
+    check_fgmn_permutation_invariance();
+    check_cut_negativities_on_known_states();
+    check_prefilter_agrees_with_direct_solves();
+    check_status_entry_point();
 
     if (failures != 0)
     {

@@ -249,6 +249,30 @@ inline bool preserves_computational_parity(CircuitType type)
            type == CircuitType::QubitRPPU;
 }
 
+// A 64-bit stream splitter. splitmix64 is a bijection, so distinct
+// (master, index) pairs give distinct seeds and the master seed recorded in a
+// run's output is enough to replay any one of its trajectories. Lives here
+// rather than in circuit.hpp so host-only code -- the pair-gap control
+// selection, and its tests -- can derive the same streams without CUDA-Q.
+// In their own namespace because free_energy.exe has an identical splitmix64 of
+// its own (free_energy_resume.hpp) brought in by a using-declaration, and the
+// two would otherwise be ambiguous there.
+namespace seeding
+{
+inline std::uint64_t splitmix64(std::uint64_t value)
+{
+    value += 0x9e3779b97f4a7c15ull;
+    value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ull;
+    value = (value ^ (value >> 27)) * 0x94d049bb133111ebull;
+    return value ^ (value >> 31);
+}
+
+inline std::uint64_t trajectory_seed(std::uint64_t master, std::uint64_t index)
+{
+    return splitmix64(master + 0x2545f4914f6cdd1dull * (index + 1ull));
+}
+} // namespace seeding
+
 // ---------------------------------------------------------------------------
 // Logical layer description
 //

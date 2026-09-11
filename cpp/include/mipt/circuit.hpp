@@ -45,22 +45,6 @@ struct TrajectoryResult
     LogicalHistory history;
 };
 
-// A 64-bit stream splitter. splitmix64 is a bijection, so distinct
-// (master, index) pairs give distinct seeds and the master seed recorded in a
-// run's output is enough to replay any one of its trajectories.
-inline std::uint64_t splitmix64(std::uint64_t value)
-{
-    value += 0x9e3779b97f4a7c15ull;
-    value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ull;
-    value = (value ^ (value >> 27)) * 0x94d049bb133111ebull;
-    return value ^ (value >> 31);
-}
-
-inline std::uint64_t trajectory_seed(std::uint64_t master, std::uint64_t index)
-{
-    return splitmix64(master + 0x2545f4914f6cdd1dull * (index + 1ull));
-}
-
 // |0...0> on n qubits. The cuStateVec engine starts from a CUDA-Q-owned buffer
 // so that the returned cudaq::state is an ordinary state as far as every
 // downstream RDM/entropy consumer is concerned.
@@ -99,7 +83,7 @@ class Circuit1D
                                static_cast<std::uint32_t>(value >> 32)};
         rng_.seed(sequence);
 #ifdef MIPT_ENABLE_CUSV
-        const std::uint64_t measurement = splitmix64(value ^ 0xa0761d0dull);
+        const std::uint64_t measurement = seeding::splitmix64(value ^ 0xa0761d0dull);
         std::seed_seq measure_sequence{static_cast<std::uint32_t>(measurement & 0xffffffffu),
                                        static_cast<std::uint32_t>(measurement >> 32)};
         measure_rng_.seed(measure_sequence);

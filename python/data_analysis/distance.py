@@ -1572,6 +1572,34 @@ def dist_scaling(
 
     paths = _resolve_files(files, file_glob)
 
+    # Sidecar outputs of other analyses sit beside the pair CSV and match the
+    # same globs, but they are not distance curves. Skip them by name, and say
+    # where they are read, rather than failing on an unrecognized layout.
+    sidecars = {
+        "_connected_zero_thirds.csv": "da.dist_pair_gap",
+        "_connected_zero_thirds_aggregate.csv": "da.dist_pair_gap",
+        "_contingency.csv": "da.dist_percolation",
+    }
+    skipped = [
+        (path, reader)
+        for path in paths
+        for suffix, reader in sidecars.items()
+        if path.name.endswith(suffix)
+    ]
+    if skipped:
+        paths = [path for path in paths if path not in {entry[0] for entry in skipped}]
+        if not paths:
+            raise ValueError(
+                "Every input is a sidecar of another analysis ("
+                + ", ".join(sorted({reader for _, reader in skipped}))
+                + " reads these), not a distance-scaling curve."
+            )
+        warnings.warn(
+            f"Skipping {len(skipped)} sidecar file(s) that are not distance curves: "
+            + ", ".join(f"{path.name} (read with {reader})" for path, reader in skipped),
+            stacklevel=2,
+        )
+
     # --- read every file, then reconcile what they say about themselves -----
     #
     # Three input formats reach the same `{metric: DataFrame[d, mean, stderr,

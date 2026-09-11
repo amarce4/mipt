@@ -65,8 +65,10 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <algorithm>
 #include <deque>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace mipt::dist
@@ -176,6 +178,90 @@ class DisjointSets
     std::vector<std::uint32_t> size_;
 };
 
+// How many paths join two final-slice endpoints without sharing an edge, and
+// without sharing an interior node. By Menger's theorem these are the minimum
+// number of edges, and of spacetime nodes, whose removal disconnects the pair.
+//
+// This is the bottleneck diagnostic the shortest path cannot give. A pair joined
+// by one fragile thread and a pair joined by a braid of independent channels can
+// have the same shortest path; `vertex == 1` says the whole connection runs
+// through a single articulation node, which is the classic place for a
+// "connected" pair to carry nothing.
+struct DisjointPaths
+{
+    int edge = 0;
+    int vertex = 0;
+};
+
+// Unit-capacity max flow by breadth-first augmentation. The graph has a few
+// thousand arcs and every node has degree at most three (one bond, two temporal
+// edges), so the flow is at most three and this is a handful of BFS sweeps.
+class UnitFlowNetwork
+{
+  public:
+    explicit UnitFlowNetwork(std::size_t nodes) : arcs_(nodes) {}
+
+    void add(int from, int to, int capacity, int reverse_capacity)
+    {
+        arcs_[static_cast<std::size_t>(from)].push_back(
+            {to, capacity, static_cast<int>(arcs_[static_cast<std::size_t>(to)].size())});
+        arcs_[static_cast<std::size_t>(to)].push_back(
+            {from, reverse_capacity,
+             static_cast<int>(arcs_[static_cast<std::size_t>(from)].size()) - 1});
+    }
+
+    int max_flow(int source, int sink, int limit)
+    {
+        int flow = 0;
+        std::vector<std::pair<int, int>> parent(arcs_.size());
+        std::vector<int> queue;
+        while (flow < limit)
+        {
+            std::fill(parent.begin(), parent.end(), std::make_pair(-1, -1));
+            parent[static_cast<std::size_t>(source)] = {source, -1};
+            queue.assign(1, source);
+            for (std::size_t head = 0; head < queue.size() && parent[static_cast<std::size_t>(sink)].first < 0;
+                 ++head)
+            {
+                const int node = queue[head];
+                const auto &out = arcs_[static_cast<std::size_t>(node)];
+                for (std::size_t slot = 0; slot < out.size(); ++slot)
+                {
+                    const Arc &arc = out[slot];
+                    if (arc.capacity > 0 && parent[static_cast<std::size_t>(arc.to)].first < 0)
+                    {
+                        parent[static_cast<std::size_t>(arc.to)] = {node, static_cast<int>(slot)};
+                        queue.push_back(arc.to);
+                    }
+                }
+            }
+            if (parent[static_cast<std::size_t>(sink)].first < 0)
+            {
+                break;
+            }
+            for (int node = sink; node != source;)
+            {
+                const auto [previous, slot] = parent[static_cast<std::size_t>(node)];
+                Arc &arc = arcs_[static_cast<std::size_t>(previous)][static_cast<std::size_t>(slot)];
+                arc.capacity -= 1;
+                arcs_[static_cast<std::size_t>(node)][static_cast<std::size_t>(arc.reverse)].capacity += 1;
+                node = previous;
+            }
+            ++flow;
+        }
+        return flow;
+    }
+
+  private:
+    struct Arc
+    {
+        int to;
+        int capacity;
+        int reverse;
+    };
+    std::vector<std::vector<Arc>> arcs_;
+};
+
 class ConnectivityIndex
 {
   public:
@@ -273,6 +359,63 @@ class ConnectivityIndex
         {
             out.shortest_path = paths_[i * static_cast<std::size_t>(n_) + j];
         }
+        return out;
+    }
+
+    // Edge- and vertex-disjoint path counts between two final-slice endpoints.
+    // Computed on demand rather than for every pair, because only the pairs an
+    // analysis singles out need it; returns zeros when the index is not ready
+    // or the endpoints share no component.
+    DisjointPaths disjoint_paths(int site_i, int site_j) const
+    {
+        DisjointPaths out;
+        if (!ready_ || site_i == site_j || site_i < 0 || site_j < 0 || site_i >= n_ ||
+            site_j >= n_)
+        {
+            return out;
+        }
+        if (root_[static_cast<std::size_t>(site_i)] != root_[static_cast<std::size_t>(site_j)])
+        {
+            return out;
+        }
+        const std::size_t nodes = static_cast<std::size_t>(layers_) * static_cast<std::size_t>(n_);
+        const int source =
+            static_cast<int>(node_index(layers_ - 1, mode_of_site_[static_cast<std::size_t>(site_i)]));
+        const int sink =
+            static_cast<int>(node_index(layers_ - 1, mode_of_site_[static_cast<std::size_t>(site_j)]));
+        constexpr int limit = 64;
+
+        // Edge-disjoint: every undirected edge carries one unit either way.
+        UnitFlowNetwork edges(nodes);
+        for (std::size_t u = 0; u < nodes; ++u)
+        {
+            for (std::uint32_t slot = offset_[u]; slot < offset_[u + 1u]; ++slot)
+            {
+                const std::uint32_t v = adjacency_[slot];
+                if (u < v)
+                {
+                    edges.add(static_cast<int>(u), static_cast<int>(v), 1, 1);
+                }
+            }
+        }
+        out.edge = edges.max_flow(source, sink, limit);
+
+        // Vertex-disjoint: split every node into in (2u) and out (2u+1) with a
+        // unit arc between them, except the two endpoints, which may be shared.
+        UnitFlowNetwork vertices(2u * nodes);
+        for (std::size_t u = 0; u < nodes; ++u)
+        {
+            const int unbounded = limit;
+            const bool endpoint = static_cast<int>(u) == source || static_cast<int>(u) == sink;
+            vertices.add(static_cast<int>(2u * u), static_cast<int>(2u * u + 1u),
+                         endpoint ? unbounded : 1, 0);
+            for (std::uint32_t slot = offset_[u]; slot < offset_[u + 1u]; ++slot)
+            {
+                const std::uint32_t v = adjacency_[slot];
+                vertices.add(static_cast<int>(2u * u + 1u), static_cast<int>(2u * v), 1, 0);
+            }
+        }
+        out.vertex = vertices.max_flow(2 * source + 1, 2 * sink, limit);
         return out;
     }
 

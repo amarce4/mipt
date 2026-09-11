@@ -298,6 +298,14 @@ inline std::string common_header_fields(const RunConfig &config,
     std::string tolerance_text;
     append_double(tolerance_text, config.pair_zero_tol);
     append_field(out, "pair_zero_tol", tolerance_text);
+    // The other two classification thresholds, so a record file never has to
+    // be interpreted against settings it does not carry.
+    std::string occupation_text;
+    append_double(occupation_text, config.occupation_mi_tol);
+    append_field(out, "occupation_mi_tol", occupation_text);
+    std::string floor_text;
+    append_double(floor_text, config.channel_floor);
+    append_field(out, "channel_floor", floor_text);
     append_field(out, "statevector_precision", std::to_string(config.statevector_precision));
     append_field(out, "boundary_implementation", config.boundary_implementation());
     append_field(out, "master_seed", std::to_string(config.seed));

@@ -114,6 +114,114 @@ inline RecordDetail parse_record_detail(const std::string &text)
         "MIPT_DIST_RECORD_DETAIL must be basic, channel, or full (got \"" + text + "\").");
 }
 
+// Why a pair that carries no entanglement above threshold carries none.
+//
+// Exhaustive and disjoint, and the *single* definition: PairProtocol's
+// aggregate split and the connected-zero triple analysis both call
+// classify_unentangled, so a record counted `silent` in the pair CSV is the same
+// record the triple analysis labels `silent`. Both comparisons are strict, so a
+// value exactly at its tolerance falls into the lower class.
+//
+//   occupation_correlated  I_occ > occupation_mi_tol: classically correlated
+//                          through the occupations, not entangled.
+//   coherent_subthreshold  I_occ at or below tolerance, but |G|^2 + |F|^2 above
+//                          the channel floor: coherence the threshold discarded.
+//   silent                 neither: no detectable two-mode correlation at all.
+enum class ZeroClass : int
+{
+    OccupationCorrelated = 0,
+    CoherentSubthreshold = 1,
+    Silent = 2,
+};
+inline constexpr int ZERO_CLASS_COUNT = 3;
+
+inline const char *zero_class_name(ZeroClass value)
+{
+    switch (value)
+    {
+    case ZeroClass::OccupationCorrelated: return "occupation_correlated";
+    case ZeroClass::CoherentSubthreshold: return "coherent_subthreshold";
+    case ZeroClass::Silent: return "silent";
+    }
+    return "silent";
+}
+
+inline ZeroClass classify_unentangled(double i_occ, double channel_weight,
+                                      double occupation_mi_tol, double channel_floor)
+{
+    if (i_occ > occupation_mi_tol)
+    {
+        return ZeroClass::OccupationCorrelated;
+    }
+    if (channel_weight > channel_floor)
+    {
+        return ZeroClass::CoherentSubthreshold;
+    }
+    return ZeroClass::Silent;
+}
+
+// Which graph-connected, unentangled pairs the triple analysis anchors on.
+enum class GapSelection : int
+{
+    ConnectedZero = -1, // every connected-zero pair, all three classes
+    OccupationCorrelated = 0,
+    CoherentSubthreshold = 1,
+    Silent = 2,
+};
+
+inline const char *gap_selection_name(GapSelection value)
+{
+    return value == GapSelection::ConnectedZero
+               ? "connected_zero"
+               : zero_class_name(static_cast<ZeroClass>(static_cast<int>(value)));
+}
+
+inline GapSelection parse_gap_selection(const std::string &text)
+{
+    if (text == "connected_zero") return GapSelection::ConnectedZero;
+    if (text == "occupation_correlated") return GapSelection::OccupationCorrelated;
+    if (text == "coherent_subthreshold") return GapSelection::CoherentSubthreshold;
+    if (text == "silent") return GapSelection::Silent;
+    throw std::invalid_argument(
+        "MIPT_DIST_PAIR_GAP_CLASS must be connected_zero, occupation_correlated, "
+        "coherent_subthreshold, or silent (got \"" + text + "\").");
+}
+
+inline bool gap_selects(GapSelection selection, ZeroClass value)
+{
+    return selection == GapSelection::ConnectedZero ||
+           static_cast<int>(selection) == static_cast<int>(value);
+}
+
+// The connected-zero triple analysis: for every graph-connected pair (i, j)
+// whose fermionic negativity is at or below pair_zero_tol, every third site k
+// is added and the triple {i, j, k} is analysed in full, fGMN included. See
+// dist_pair_gap.hpp for what it measures and why.
+struct PairGapSettings
+{
+    bool enabled = false;
+    GapSelection selection = GapSelection::ConnectedZero;
+    // Empty means <main stem>_connected_zero_thirds.csv beside the pair CSV.
+    std::string output_path;
+    // Keep every unique triple's raw fermionic 8x8 in a binary companion, so a
+    // future multipartite measure does not need the trajectories rerun.
+    bool store_rho3 = false;
+    // Also analyse one distance-matched *disconnected* zero pair per anchor,
+    // drawn from the same trajectory, as a control group.
+    bool controls = false;
+    // fGMN <= min_s N_s, so a minimum cut at or below this certifies fGMN is
+    // at most this without a solve. Defaults to MIPT_DIST_GMN_ZERO_TOL, the
+    // calibrated SDP prefilter threshold -- seven decades above MOSEK's floor
+    // on exactly-zero states, measured.
+    double prefilter_tol = 1.0e-10;
+    // fGMN above this counts as genuinely tripartite-entangled.
+    double positive_tol = 1.0e-10;
+    // Extra attempts for a failed solve, the last one serialized.
+    int retries = 2;
+    // GMN_MOSEK_TOL as resolved when the run started, recorded verbatim.
+    std::string mosek_tol_text = "1e-5";
+};
+
 // The |G|^2 / |F|^2 floor for a given state-vector precision: one decade above
 // the square of that precision's amplitude noise, so a record sitting at the
 // floor is arithmetic and one above it is not.
@@ -199,6 +307,8 @@ struct RunConfig
     // caller did not pin one.
     std::uint64_t seed = 0;
     int statevector_precision = MIPT_CUDAQ_PRECISION;
+
+    PairGapSettings pair_gap;
 
     // Parity-preserving circuits report both trace conventions. This is
     // deliberately `preserves_computational_parity` and not
@@ -360,6 +470,10 @@ struct PairBin
     RunningStats n_j;
     RunningStats dnn;   // D = <n_i n_j>
     RunningStats rho_n; // D - <n_i><n_j>, signed
+    // The signed mean above can cancel to zero across records of opposite sign
+    // while every record is strongly correlated. These two cannot.
+    RunningStats abs_rho_n;
+    RunningStats rho_n_sq;
     RunningStats i_occ; // occupation-basis mutual information, bits
 
     // The disagreement between the closed-form fermionic negativity and the
@@ -487,9 +601,14 @@ struct TripleBin
 // file's run parameters without parsing its name.
 // ---------------------------------------------------------------------------
 
+// The classification thresholds ride in the shared block at both party counts:
+// a positive count, a contingency cell or a pair class cannot be read without
+// the threshold that produced it, and a file that carried only one of the three
+// (as the 2026-09-09 schema did) left the other two to be remembered.
 inline constexpr const char *METADATA_COLUMNS =
     "N,circ_type,circuit_name,realizations,p,periods,k,entropy_units,"
-    "statevector_precision,boundary_implementation,master_seed";
+    "statevector_precision,boundary_implementation,master_seed,"
+    "pair_zero_tol,occupation_mi_tol,channel_floor";
 
 inline void append_metadata_fields(std::string &out, const RunConfig &config)
 {
@@ -518,6 +637,12 @@ inline void append_metadata_fields(std::string &out, const RunConfig &config)
     out += csv_quote(config.boundary_implementation());
     out += ',';
     append_uint(out, config.seed);
+    out += ',';
+    append_double(out, config.pair_zero_tol);
+    out += ',';
+    append_double(out, config.occupation_mi_tol);
+    out += ',';
+    append_double(out, config.channel_floor);
 }
 
 inline void append_stats(std::string &out, const RunningStats &stats)
@@ -573,7 +698,7 @@ inline std::string pair_csv_header(const RunConfig &config)
     // count below: which threshold decided "entangled", which measure it was
     // applied to, and which graph convention produced the flags.
     header +=
-        ",pair_zero_tol,contingency_measure,connectivity_graph_version,connectivity_graph,"
+        ",contingency_measure,connectivity_graph_version,connectivity_graph,"
         "separation,chord_length,d,embedding_count,"
         "mi_mean,mi_stderr,mi_samples,"
         "mn_mean,mn_stderr,mn_samples,mn_positive_count,mn_positive_fraction,"
@@ -593,6 +718,8 @@ inline std::string pair_csv_header(const RunConfig &config)
         "n_j_mean,n_j_stderr,n_j_samples,"
         "dnn_mean,dnn_stderr,dnn_samples,"
         "rho_n_mean,rho_n_stderr,rho_n_samples,"
+        "abs_rho_n_mean,abs_rho_n_stderr,abs_rho_n_samples,"
+        "rho_n_sq_mean,rho_n_sq_stderr,rho_n_sq_samples,"
         "i_occ_mean,i_occ_stderr,i_occ_samples,"
         "conn_records,"
         "survive_i_count,survive_j_count,survive_both_count,"
@@ -652,8 +779,6 @@ inline std::string render_pair_csv(const RunConfig &config, const std::vector<Pa
         line.clear();
         append_metadata_fields(line, config);
         line += ',';
-        append_double(line, config.pair_zero_tol);
-        line += ',';
         line += config.contingency_measure();
         line += ',';
         line += std::to_string(CONNECTIVITY_GRAPH_VERSION);
@@ -693,6 +818,8 @@ inline std::string render_pair_csv(const RunConfig &config, const std::vector<Pa
         append_stats(line, bin.n_j);
         append_stats(line, bin.dnn);
         append_stats(line, bin.rho_n);
+        append_stats(line, bin.abs_rho_n);
+        append_stats(line, bin.rho_n_sq);
         append_stats(line, bin.i_occ);
         append_counter(line, bin.conn_records);
         append_counter(line, bin.survive_i);

@@ -30,6 +30,33 @@ double compute_min_bipartite_negativity_8x8_cpp(
 double compute_min_bipartite_fermionic_negativity_8x8_cpp(
     const double *rho_ri_row_major);
 
+/*
+ * fGMN with an explicit solver status, for callers that must account for every
+ * individual solve rather than average over thousands of them.  Returns the raw
+ * solver value -- which may be slightly negative -- and writes one of the
+ * FGMN_STATUS_* codes below.  Any status other than FGMN_STATUS_OK comes with a
+ * NaN value: a failed solve is missing, never zero.
+ */
+#define FGMN_STATUS_OK 0
+#define FGMN_STATUS_EXCEPTION 2       /* Fusion threw during the solve */
+#define FGMN_STATUS_NONFINITE 3       /* optimal status, non-finite objective */
+#define FGMN_STATUS_NULL_INPUT 4
+/* 10 + mosek::fusion::SolutionStatus when the primal solution is not Optimal:
+ * 10 Undefined, 11 Unknown, 13 Feasible, 14 Certificate, 15 IllposedCert. */
+#define FGMN_STATUS_NOT_OPTIMAL_BASE 10
+double compute_fgmn_mosek_8x8_status_cpp(const double *rho_ri_row_major, int *status);
+
+/*
+ * All three fermionic one-vs-rest cut negativities, indexed by the party that
+ * is cut off: out_three[s] = N_F(s | rest), party s being basis bit s.  The
+ * minimum is what compute_min_bipartite_fermionic_negativity_8x8_cpp returns;
+ * the other two say which bipartition is the one that keeps fGMN at zero.
+ * Returns 0 on success, nonzero if any cut failed to converge (that entry is
+ * NaN).
+ */
+int compute_fermionic_cut_negativities_8x8_cpp(const double *rho_ri_row_major,
+                                               double *out_three);
+
 /* Non-fermionic helpers retained for validation and comparison. */
 double compute_gmn_mosek_real_8x8_cpp(const double *rho_real_row_major);
 double compute_gmn_mosek_complex_8x8_cpp(const double *rho_ri_row_major);
