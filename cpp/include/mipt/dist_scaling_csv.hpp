@@ -214,8 +214,41 @@ struct PairGapSettings
     // calibrated SDP prefilter threshold -- seven decades above MOSEK's floor
     // on exactly-zero states, measured.
     double prefilter_tol = 1.0e-10;
-    // fGMN above this counts as genuinely tripartite-entangled.
+    // fGMN above this counts as genuinely tripartite-entangled. It is compared
+    // against the *certified lower bound*, so a solve whose interval straddles
+    // it is unresolved rather than negative -- and at the default
+    // GMN_MOSEK_TOL=1e-5 an interval is far wider than 1e-10, so a meaningful
+    // sweep of this threshold wants a tighter solver tolerance too.
     double positive_tol = 1.0e-10;
+    // A product distance ||rho - rho_s (x) rho_sbar||_1 above this counts as
+    // correlation across the cut. It is what separates a *product* cut from a
+    // classically correlated one, both of which have zero negativity.
+    double correlation_tol = 1.0e-10;
+    // Decompose each anchor's spacetime component into backbone, articulation
+    // points and dangling branches. One linear sweep per anchor, negligible
+    // beside a solve, so it is on by default -- MIPT_DIST_PAIR_GAP_ANATOMY=0.
+    bool anatomy = true;
+    // Channel-resolved path strengths. Two Dijkstra sweeps plus a max flow per
+    // anchor, so noticeably dearer than the anatomy but still small beside a
+    // solve; MIPT_DIST_PAIR_GAP_CHANNELS=0 turns it off.
+    bool channels = true;
+    // Four-site analysis for the residue: pairs with no positive third that are
+    // *not* numerically unresolved. Off by default -- it is the one addition
+    // here that costs a second RDM reduction per selected pair.
+    // Assisted (localizable) endpoint negativity under parity-respecting helper
+    // measurements. Cheap on a triple -- two 8x8 projections -- so on by
+    // default; the four-site pass adds the joint two-helper family.
+    bool assisted = true;
+    // A conditional endpoint negativity above this counts as revealed.
+    double assisted_tol = 1.0e-10;
+    bool four_site = false;
+    int four_max_helper_pairs = 12;
+    bool store_rho4 = false;
+    // A one-vs-rest cut negativity above this counts as an entangled cut. It
+    // decides the pair summary's "all cuts entangled but fGMN bounded" class --
+    // the bound-entanglement candidate -- and defaults to prefilter_tol, which
+    // is the threshold that already decides whether a cut certifies fGMN.
+    double cut_positive_tol = 1.0e-10;
     // Extra attempts for a failed solve, the last one serialized.
     int retries = 2;
     // GMN_MOSEK_TOL as resolved when the run started, recorded verbatim.

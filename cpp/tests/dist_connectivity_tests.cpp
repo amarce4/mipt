@@ -21,6 +21,7 @@
 #include "mipt/dist_connectivity.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <iostream>
 #include <random>
 #include <set>
@@ -267,6 +268,248 @@ void test_disjoint_paths()
     expect(through_time.vertex == 2, "and they share no interior node");
 }
 
+// Request 11.6: single-path, braided-path, articulation-point and
+// dangling-branch graphs, against the backbone decomposition.
+//
+// Each shape is chosen so the answer is countable by hand, which is the only
+// way to tell a correct block-cut tree from a plausible one.
+void test_component_anatomy()
+{
+    using mipt::dist::ComponentAnatomy;
+
+    // A single path 0-1-2-3 in one layer. Every interior vertex is an
+    // articulation point separating the ends, nothing dangles, and the whole
+    // component is backbone.
+    {
+        const LogicalHistory chain = make_history(4, {{{{0, 1}, {1, 2}, {2, 3}}, {}}});
+        ConnectivityIndex index;
+        index.build(chain, true);
+        const ComponentAnatomy a = index.anatomy(0, 3);
+        expect(a.evaluated, "11.6 single path: the anatomy is evaluated");
+        expect(a.backbone_nodes == 4 && a.dangling_nodes == 0,
+               "11.6 single path: every vertex is on the only path");
+        expect(a.articulation_nodes == 2,
+               "11.6 single path: the two interior vertices each separate the ends");
+        expect(a.branches == 0 && a.max_branch_size == 0,
+               "11.6 single path: nothing hangs off it");
+        expect(a.min_edge_cut == 1 && a.min_vertex_cut == 1,
+               "11.6 single path: a one-edge, one-vertex bottleneck");
+        expect(a.degree_i == 1 && a.degree_j == 1, "11.6 single path: the ends have degree 1");
+        expect(a.final_sites_in_component == 4, "11.6 single path: all four sites share it");
+    }
+
+    // A braid: a 4-cycle between opposite corners. Two independent routes, so
+    // no vertex separates them and the whole cycle is backbone.
+    {
+        const LogicalHistory cycle = make_history(4, {{{{0, 1}, {1, 2}, {2, 3}, {3, 0}}, {}}});
+        ConnectivityIndex index;
+        index.build(cycle, true);
+        const ComponentAnatomy a = index.anatomy(0, 2);
+        expect(a.backbone_nodes == 4, "11.6 braid: both routes are backbone");
+        expect(a.articulation_nodes == 0, "11.6 braid: no single vertex separates the ends");
+        expect(a.dangling_nodes == 0 && a.branches == 0, "11.6 braid: nothing dangles");
+        expect(a.min_vertex_cut == 2, "11.6 braid: two vertex-disjoint routes");
+    }
+
+    // A dangling branch: the path 0-1-2 carries the pair, and site 3 hangs off
+    // site 1. Site 3's worldline is in the component but on no 0-2 path.
+    {
+        const LogicalHistory tree = make_history(4, {{{{0, 1}, {1, 2}, {1, 3}}, {}}});
+        ConnectivityIndex index;
+        index.build(tree, true);
+        const ComponentAnatomy a = index.anatomy(0, 2);
+        expect(a.backbone_nodes == 3, "11.6 dangling: the backbone is 0-1-2 only");
+        expect(a.dangling_nodes == 1, "11.6 dangling: site 3 is in the component, off the path");
+        expect(a.branches == 1 && a.max_branch_size == 1 && a.mean_branch_size == 1.0,
+               "11.6 dangling: exactly one branch of one vertex");
+        expect(a.articulation_nodes == 1, "11.6 dangling: site 1 separates the ends");
+        expect(a.component_nodes == 4, "11.6 dangling: the component holds all four");
+    }
+
+    // An articulation point between two braids: 0 and 1 are doubly joined, so
+    // are 2 and 3, and the two halves meet at a single vertex. Exactly one
+    // vertex separates the ends, and every vertex is still on some path.
+    {
+        const LogicalHistory history = make_history(4, {
+            {{{0, 1}, {1, 2}}, {}},
+            {{{0, 1}, {2, 3}}, {}},
+        });
+        ConnectivityIndex index;
+        index.build(history, true);
+        const ComponentAnatomy a = index.anatomy(0, 3);
+        expect(a.evaluated && a.min_vertex_cut >= 1,
+               "11.6 articulation: the ends are joined");
+        expect(a.backbone_nodes + a.dangling_nodes == a.component_nodes,
+               "11.6 articulation: backbone and dangling partition the component");
+    }
+
+    // The gate / temporal split of a shortest path. Sites 0 and 1 are joined by
+    // a gate in layer 0; site 0 then waits two layers. The 0-1 path is one
+    // gate and no waiting; a pair that has to wait shows the waiting.
+    {
+        const LogicalHistory history = make_history(3, {
+            {{{0, 1}}, {}},
+            {{{1, 2}}, {}},
+            {{}, {}},
+        });
+        ConnectivityIndex index;
+        index.build(history, true);
+        const ComponentAnatomy direct = index.anatomy(0, 1);
+        expect(direct.shortest_path_gates + direct.shortest_path_temporal ==
+                   index.query(0, 1).shortest_path,
+               "11.6: the gate and temporal counts sum to the shortest path length");
+        expect(direct.shortest_path_gates >= 1,
+               "11.6: a path between two sites crosses at least one gate");
+        const ComponentAnatomy far = index.anatomy(0, 2);
+        expect(far.shortest_path_gates + far.shortest_path_temporal ==
+                   index.query(0, 2).shortest_path,
+               "11.6: and so do they for a path that has to wait a layer");
+        expect(far.shortest_path_temporal >= 1,
+               "11.6: reaching site 2 needs a temporal edge, since its gate is a layer later");
+    }
+
+    // Disconnected endpoints have no anatomy at all rather than a zeroed one.
+    {
+        const LogicalHistory split = make_history(4, {{{{0, 1}, {2, 3}}, {}}});
+        ConnectivityIndex index;
+        index.build(split, true);
+        expect(!index.anatomy(0, 3).evaluated, "11.6: separate components have no anatomy");
+    }
+}
+
+// Request 11.7: F-only, G-only, diagonal and generic gates, weighted.
+//
+// The binary graph cannot tell these apart -- every one of them is an edge. The
+// point of the weighted diagnostic is that it can.
+void test_channel_weights()
+{
+    using mipt::dist::ChannelConnectivity;
+
+    // A history whose single bond carries the given parity-block weights.
+    auto weighted = [](double pair_weight, double hop_weight) {
+        LogicalHistory history;
+        history.reset(2);
+        LogicalLayer layer;
+        layer.measured.assign(2, 0u);
+        layer.bonds.push_back({0, 1, pair_weight, hop_weight});
+        history.layers.push_back(std::move(layer));
+        history.valid = true;
+        return history;
+    };
+
+    // A diagonal gate: an edge in the binary graph, transmitting nothing in
+    // either sector. This is the case the whole diagnostic exists for.
+    {
+        ConnectivityIndex index;
+        const LogicalHistory history = weighted(0.0, 0.0);
+        index.build(history, true);
+        expect(index.query(0, 1).connected,
+               "11.7 diagonal: the binary graph still calls it connected");
+        const ChannelConnectivity c = index.channels(0, 1);
+        expect(c.evaluated, "11.7 diagonal: the channel query is evaluated");
+        expect(c.pair_bottleneck == 0.0 && c.hop_bottleneck == 0.0,
+               "11.7 diagonal: neither channel carries anything");
+        expect(c.pair_multiplicity == 0 && c.hop_multiplicity == 0,
+               "11.7 diagonal: and no channel of any width exists");
+        expect(std::isinf(c.hop_log_weight) && c.hop_log_weight < 0.0,
+               "11.7 diagonal: the log weight is -inf, not a small number");
+    }
+
+    // G-only: the odd block mixes maximally, the even block not at all. The
+    // hopping channel is perfect and the pairing channel is dead.
+    {
+        ConnectivityIndex index;
+        const LogicalHistory history = weighted(0.0, 1.0);
+        index.build(history, true);
+        const ChannelConnectivity c = index.channels(0, 1);
+        expect(c.hop_bottleneck == 1.0 && c.hop_log_weight == 0.0,
+               "11.7 G-only: the hopping channel is perfect");
+        expect(c.hop_multiplicity == 1, "11.7 G-only: through one thread");
+        expect(c.pair_bottleneck == 0.0, "11.7 G-only: the pairing channel is dead");
+    }
+
+    // F-only is the mirror image, which is what makes the two labels
+    // meaningful rather than interchangeable.
+    {
+        ConnectivityIndex index;
+        const LogicalHistory history = weighted(1.0, 0.0);
+        index.build(history, true);
+        const ChannelConnectivity c = index.channels(0, 1);
+        expect(c.pair_bottleneck == 1.0 && c.hop_bottleneck == 0.0,
+               "11.7 F-only: exactly the opposite of G-only");
+    }
+
+    // A generic weak gate: the log weight is the log of the product, so a path
+    // of two weak gates is twice the log of one.
+    {
+        LogicalHistory history;
+        history.reset(3);
+        LogicalLayer layer;
+        layer.measured.assign(3, 0u);
+        layer.bonds.push_back({0, 1, 0.5, 0.25});
+        layer.bonds.push_back({1, 2, 0.5, 0.25});
+        history.layers.push_back(std::move(layer));
+        history.valid = true;
+        ConnectivityIndex index;
+        index.build(history, true);
+        const ChannelConnectivity one = index.channels(0, 1);
+        expect(std::abs(one.hop_log_weight - std::log(0.25)) < 1e-12,
+               "11.7 generic: one gate is its own log weight");
+        const ChannelConnectivity two = index.channels(0, 2);
+        expect(std::abs(two.hop_log_weight - 2.0 * std::log(0.25)) < 1e-12,
+               "11.7 generic: two gates in series multiply, so the logs add");
+        expect(std::abs(two.hop_bottleneck - 0.25) < 1e-12,
+               "11.7 generic: the bottleneck is the weakest link, not the product");
+        expect(two.pair_bottleneck > two.hop_bottleneck,
+               "11.7 generic: the two channels are resolved separately");
+    }
+
+    // A braid: two routes of equal weight between the endpoints, so the
+    // multiplicity is 2 where a single route would give 1. Two layers, one
+    // route each, as in the Menger test above.
+    {
+        LogicalHistory history;
+        history.reset(4);
+        for (const auto &pair : std::vector<std::vector<std::pair<int, int>>>{
+                 {{0, 1}, {1, 2}}, {{2, 3}, {3, 0}}})
+        {
+            LogicalLayer layer;
+            layer.measured.assign(4, 0u);
+            for (const auto &[a, b] : pair)
+            {
+                layer.bonds.push_back({a, b, 0.5, 0.5});
+            }
+            history.layers.push_back(std::move(layer));
+        }
+        history.valid = true;
+        ConnectivityIndex index;
+        index.build(history, true);
+        const ChannelConnectivity c = index.channels(0, 2);
+        expect(c.hop_multiplicity == 2,
+               "11.7 braid: two routes of equal weight give multiplicity 2");
+    }
+
+    // The percolation event is untouched by any of this.
+    {
+        ConnectivityIndex index;
+        const LogicalHistory history = weighted(0.0, 0.0);
+        index.build(history, true);
+        expect(index.query(0, 1).connected && index.query(0, 1).interior_path,
+               "11.7: weights are diagnostics beside the percolation event, not a redefinition");
+    }
+
+    // A circuit that supplies no weights (the default 1.0) degenerates to the
+    // unweighted graph rather than reporting a dead channel.
+    {
+        const LogicalHistory plain = make_history(3, {{{{0, 1}, {1, 2}}, {}}});
+        ConnectivityIndex index;
+        index.build(plain, true);
+        const ChannelConnectivity c = index.channels(0, 2);
+        expect(c.hop_log_weight == 0.0 && c.hop_bottleneck == 1.0,
+               "11.7: unweighted bonds are fully transmitting, so the weighted view degenerates");
+    }
+}
+
 // Time since last measurement, the cheap explanatory diagnostic.
 void test_idle_times()
 {
@@ -436,6 +679,8 @@ int main()
     test_shortest_path_lengths();
     test_idle_times();
     test_disjoint_paths();
+    test_component_anatomy();
+    test_channel_weights();
     test_unbuilt_index_is_inert();
     test_even_layer_bonds();
     test_boundary_implementations_agree();

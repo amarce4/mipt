@@ -325,7 +325,14 @@ inline LogicalLayer logical_layer_from_rppu(const RppuLayer &layer, int n,
             std::swap(mode_at_site[q0], mode_at_site[q1]);
             continue;
         }
-        out.bonds.push_back({mode_at_site[q0], mode_at_site[q1]});
+        // U3(theta, phi, lambda) has |off-diagonal| = sin(theta/2), so the
+        // squared off-diagonal weight of each parity block is sin^2(theta/2)
+        // exactly -- no reconstruction of the 2x2 needed.
+        const double pair_amplitude = std::sin(0.5 * gate.even.theta);
+        const double hop_amplitude = std::sin(0.5 * gate.odd.theta);
+        out.bonds.push_back({mode_at_site[q0], mode_at_site[q1],
+                             pair_amplitude * pair_amplitude,
+                             hop_amplitude * hop_amplitude});
     }
     set_measured(out, n, layer.measure_flags, mode_at_site);
     return out;

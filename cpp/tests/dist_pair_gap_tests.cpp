@@ -21,6 +21,8 @@
 //   10 interruption and resume without missing or duplicated outcomes
 //   11 exact reconciliation between the outcome CSV and the aggregate
 
+#include "mipt/dist_gap_audit.hpp"
+#include "mipt/dist_replay.hpp"
 #include "mipt/dist_pair_gap.hpp"
 
 #include <algorithm>
@@ -30,7 +32,9 @@
 #include <iostream>
 #include <memory>
 #include <random>
+#include <map>
 #include <set>
+#include <tuple>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -381,11 +385,13 @@ gap::RdmBatch reference_batch(const Trajectory &trajectory)
 }
 
 // fGMN stand-in: half the minimum cut, which respects fGMN <= min_s N_s.
+// SolveOutcome::exact stands in for a solver that certifies its own answer, so
+// the driver tests exercise the certified path with a degenerate interval.
 gap::SolveOutcome fake_solver(const double *rho)
 {
     std::array<double, 3> cuts{};
     mipt::analysis::cut_negativities<3>(rho, true, cuts);
-    return {0.5 * *std::min_element(cuts.begin(), cuts.end()), FGMN_STATUS_OK};
+    return gap::SolveOutcome::exact(0.5 * *std::min_element(cuts.begin(), cuts.end()));
 }
 
 // ---------------------------------------------------------------------------
@@ -802,6 +808,152 @@ void test_prefilter_decision(const std::string &directory)
 }
 
 // ---------------------------------------------------------------------------
+// Certified classification (request 11.1 and 11.2)
+// ---------------------------------------------------------------------------
+
+void test_certified_classification(const std::string &directory)
+{
+    using gap::CertifiedClass;
+    const double tol = 1.0e-6;
+
+    // 11.1: the three ways an interval can sit relative to the threshold, plus
+    // the failure that is none of them.
+    expect(gap::classify_certified(2.0e-6, 3.0e-6, tol, true) == CertifiedClass::Positive,
+           "11.1: an interval entirely above the threshold is positive");
+    expect(gap::classify_certified(1.0e-9, 9.0e-7, tol, true) ==
+               CertifiedClass::BoundedBelowThreshold,
+           "11.1: an interval entirely below the threshold is bounded-small");
+    expect(gap::classify_certified(1.0e-9, 3.0e-6, tol, true) == CertifiedClass::Unresolved,
+           "11.1: an interval straddling the threshold is unresolved, not negative");
+    expect(gap::classify_certified(2.0e-6, 3.0e-6, tol, false) == CertifiedClass::Failed,
+           "11.1: a failed solve is failed whatever its numbers say");
+
+    // The boundary is strict on both sides, so no value is both.
+    expect(gap::classify_certified(tol, 2.0 * tol, tol, true) == CertifiedClass::Unresolved,
+           "11.1: a lower bound exactly at the threshold does not certify positivity");
+    expect(gap::classify_certified(0.0, tol, tol, true) == CertifiedClass::Unresolved,
+           "11.1: an upper bound exactly at the threshold does not certify smallness");
+
+    // A missing bound is not a bound. This is the case that matters when MOSEK
+    // returns an Optimal primal with no usable dual: without a ceiling the
+    // state cannot be called small, however tiny the point value is.
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    expect(gap::classify_certified(1.0e-30, nan, tol, true) == CertifiedClass::Unresolved,
+           "11.1: a tiny value with no upper bound is unresolved, not bounded-small");
+    expect(gap::classify_certified(nan, 1.0e-30, tol, true) ==
+               CertifiedClass::BoundedBelowThreshold,
+           "11.1: a ceiling below the threshold certifies smallness with no lower bound");
+
+    // 11.2: the prefilter records a bound, and is classified from that bound
+    // rather than being written down as an exact zero.
+    const dist::RunConfig config = test_config(directory);
+    const auto trajectory = make_trajectory(0, config);
+    const std::vector<double> product_cut = reference_rdm(trajectory->psi, N, {0, 3, 4}, true);
+    dist::PairGapSettings settings = config.pair_gap;
+    const gap::TripleResult bounded = gap::evaluate_triple(
+        product_cut.data(), {0, 3, 4}, gap::triple_rank(0, 3, 4), trajectory->measurement,
+        settings);
+    expect(bounded.method == gap::FgmnMethod::PrefilterBound, "11.2: the fixture is prefiltered");
+    expect(bounded.lower_bound == 0.0 &&
+               bounded.upper_bound == bounded.min_cut + bounded.input_uncertainty,
+           "11.2: a prefiltered triple is certified to [0, min_cut + the matrix's own error]");
+    expect(bounded.input_uncertainty < 1e-12,
+           "11.2: and a first-principles RDM carries essentially no such error");
+    expect(bounded.fgmn_raw != bounded.fgmn_raw,
+           "11.2: and carries no raw solver value, because none was computed");
+    expect(bounded.certified == CertifiedClass::BoundedBelowThreshold,
+           "11.2: at the default threshold the prefilter bound certifies smallness");
+    expect(!bounded.positive, "11.2: a prefiltered triple is never positive");
+
+    // The honest consequence: below the prefilter tolerance the same bound
+    // certifies nothing, and the triple becomes unresolved rather than
+    // silently negative. This is exactly what a threshold sweep has to see.
+    settings.positive_tol = bounded.min_cut;
+    const gap::TripleResult at_bound = gap::evaluate_triple(
+        product_cut.data(), {0, 3, 4}, 0, trajectory->measurement, settings);
+    expect(at_bound.certified == CertifiedClass::Unresolved,
+           "11.2: a positivity threshold at the recorded bound leaves the triple unresolved");
+    expect(at_bound.fgmn == 0.0,
+           "11.2: it still enters averages at 0 -- the class, not the value, carries the caveat");
+
+    // A solved triple: the min-cut bound tightens MOSEK's ceiling when it is
+    // the better of the two, since fGMN <= min_s N_s holds regardless.
+    const std::vector<double> entangled = reference_rdm(trajectory->psi, N, {0, 1, 2}, true);
+    gap::TripleResult solved = gap::evaluate_triple(entangled.data(), {0, 1, 2}, 0,
+                                                    trajectory->measurement, config.pair_gap);
+    gap::SolveJob job;
+    job.attempts = 1;
+    // A solver that certifies its own answer: the interval collapses to the
+    // point, which then sits above the threshold.
+    job.outcome = gap::SolveOutcome::exact(0.5 * solved.min_cut);
+    gap::apply_solve(solved, job, config.pair_gap.positive_tol);
+    expect(std::abs(solved.lower_bound - 0.5 * solved.min_cut) <= solved.input_uncertainty &&
+               std::abs(solved.upper_bound - 0.5 * solved.min_cut) <= solved.input_uncertainty,
+           "11.2: a zero-uncertainty solve gives an interval as tight as the matrix allows");
+    expect(solved.certified == CertifiedClass::Positive,
+           "11.2: and a point above the threshold certifies positivity");
+
+    // The exact cut bound caps the ceiling whenever it is the tighter one.
+    gap::TripleResult capped = gap::evaluate_triple(entangled.data(), {0, 1, 2}, 0,
+                                                    trajectory->measurement, config.pair_gap);
+    gap::SolveJob loose;
+    loose.attempts = 1;
+    loose.outcome = gap::SolveOutcome::exact(0.5 * capped.min_cut);
+    loose.outcome.upper_bound = 10.0 * capped.min_cut;
+    gap::apply_solve(capped, loose, config.pair_gap.positive_tol);
+    expect(capped.upper_bound == capped.min_cut,
+           "11.2: fGMN <= min_s N_s caps the ceiling whatever the solver claims");
+
+    // The case that actually bites on real data. At GMN_MOSEK_TOL=1e-5 MOSEK's
+    // primal and dual objectives cross -- the "upper" bound lands *below* the
+    // lower one, often below zero. Taking the minimum of the two ceilings there
+    // would invent a tight bound out of a failure to converge and certify the
+    // triple small. The crossed dual ceiling must be discarded, leaving the
+    // exact cut bound, which for a solved triple is above the prefilter
+    // tolerance and therefore resolves nothing.
+    gap::TripleResult crossed = gap::evaluate_triple(entangled.data(), {0, 1, 2}, 0,
+                                                     trajectory->measurement, config.pair_gap);
+    gap::SolveJob bad;
+    bad.attempts = 1;
+    bad.outcome = gap::SolveOutcome::exact(0.0);
+    bad.outcome.upper_bound = -1.4e-4; // the measured median on real RPPU triples
+    bad.outcome.solver_gap = -1.4e-4;
+    gap::apply_solve(crossed, bad, config.pair_gap.positive_tol);
+    expect(crossed.solver_gap < 0.0,
+           "11.2: the negative duality gap is reported rather than hidden");
+    expect(crossed.lower_bound == 0.0 && std::abs(crossed.upper_bound - 1.4e-4) < 1e-12,
+           "11.2: a crossed bracket becomes an uncertainty, so the interval is [0, |gap|]");
+    expect(crossed.certified == CertifiedClass::Unresolved,
+           "11.2: which at a 1e-10 threshold resolves nothing");
+    // The same crossed bracket against a threshold wider than the crossing
+    // *does* resolve, which is the case the audit's re-solve depends on: a
+    // near-zero fGMN whose uncertainty is far below the threshold is certified
+    // small rather than left unresolved forever.
+    gap::TripleResult wide = crossed;
+    gap::apply_solve(wide, bad, 1.0e-2);
+    expect(wide.certified == CertifiedClass::BoundedBelowThreshold,
+           "11.2: and a threshold above the crossing certifies smallness");
+
+    // A primal value above the exact cut ceiling. fGMN <= min_s N_s is a
+    // theorem, so this is proof the solver's point is not feasible enough to
+    // bound anything -- measured on real near-separable control triples at
+    // GMN_MOSEK_TOL=1e-10 (1.8e-8 returned against a 1.3e-8 ceiling). Believing
+    // it would certify tripartite entanglement in an exact product.
+    gap::TripleResult impossible = gap::evaluate_triple(entangled.data(), {0, 1, 2}, 0,
+                                                        trajectory->measurement, config.pair_gap);
+    gap::SolveJob over;
+    over.attempts = 1;
+    over.outcome = gap::SolveOutcome::exact(1.5 * impossible.min_cut);
+    gap::apply_solve(impossible, over, config.pair_gap.positive_tol);
+    expect(impossible.lower_bound != impossible.lower_bound,
+           "11.2: a solver value above the exact cut ceiling is discarded as a bound");
+    expect(impossible.certified == CertifiedClass::Unresolved,
+           "11.2: and the triple is unresolved, not certified positive from an empty interval");
+    expect(impossible.fgmn == 1.5 * impossible.min_cut,
+           "11.2: the value is still reported -- it just stops being a bound");
+}
+
+// ---------------------------------------------------------------------------
 // The driver: 9, 10, 11
 // ---------------------------------------------------------------------------
 
@@ -901,7 +1053,8 @@ void test_driver_resume_and_reconciliation(const std::string &base)
     {
         gap::GapAggregate rebuilt;
         rebuilt.reset(N);
-        gap::scan_outcomes(ref_config.pair_gap.output_path, 1000000, rebuilt);
+        gap::scan_outcomes(ref_config.pair_gap.output_path, 1000000, rebuilt,
+                           ref_config.pair_gap);
         const std::string live = gap::render_aggregate_csv(
             ref_config, reference->analysis->aggregate(), reference->bins, 6);
         const std::string replayed = gap::render_aggregate_csv(ref_config, rebuilt, reference->bins, 6);
@@ -997,7 +1150,11 @@ void test_solver_failures(const std::string &base)
     // Always fails, so every solved triple must end up missing.
     auto run = open_run(config, 0, dist::make_pair_bins(N), [&calls](const double *) {
         ++calls;
-        return gap::SolveOutcome{0.123, FGMN_STATUS_NOT_OPTIMAL_BASE + 1};
+        // A plausible-looking value alongside a non-OK status: the point is
+        // that it is discarded rather than trusted.
+        gap::SolveOutcome out = gap::SolveOutcome::exact(0.123);
+        out.status = FGMN_STATUS_NOT_OPTIMAL_BASE + 1;
+        return out;
     });
     process_range(*run, 0, 3, true);
     run->analysis->finish(std::cerr);
@@ -1049,6 +1206,518 @@ void test_solver_failures(const std::string &base)
            "test 9: pairs whose solves failed are undetermined, not negative");
 }
 
+// ---------------------------------------------------------------------------
+// The per-pair summary, and the offline audit that regenerates it
+// ---------------------------------------------------------------------------
+
+void test_pair_summary(const std::string &base)
+{
+    const std::string dir = base + "/summary";
+    std::filesystem::create_directories(dir);
+    dist::RunConfig config = test_config(dir);
+    config.pair_gap.controls = true;
+    config.realizations = 6;
+    auto run = open_run(config, 0, dist::make_pair_bins(N));
+    process_range(*run, 0, 6, false);
+    run->analysis->finish(std::cerr);
+
+    const std::string summary_path = run->analysis->summary_path();
+    expect(summary_path == gap::pair_summary_path_for(config.pair_gap.output_path),
+           "the summary sits beside the outcome CSV under the documented name");
+
+    // One row per qualifying pair, with exactly the declared columns.
+    std::ifstream file(summary_path);
+    std::string line;
+    std::getline(file, line);
+    expect(line + "\n" == gap::pair_summary_csv_header(), "the summary header is the column list");
+    const std::size_t columns = gap::pair_summary_columns().size();
+    std::size_t rows = 0;
+    std::map<std::string, std::size_t> by_explanation;
+    std::set<std::tuple<std::string, std::string, std::string, std::string>> identities;
+    std::size_t thirds_total = 0;
+    auto at = [&](const std::vector<std::string> &fields, const char *name) {
+        const auto &all = gap::pair_summary_columns();
+        return fields[static_cast<std::size_t>(std::find(all.begin(), all.end(), name) -
+                                               all.begin())];
+    };
+    while (std::getline(file, line))
+    {
+        const auto fields = mipt::util::resume::split_csv_row(line);
+        expect(fields.size() == columns, "every summary row has the declared column count");
+        if (fields.size() != columns)
+        {
+            break;
+        }
+        ++rows;
+        ++by_explanation[at(fields, "explanatory_class")];
+        // Request 10: the identity is (realization, i, j) -- and the role, so a
+        // control matched to an anchor at the same sites stays distinct.
+        identities.insert({at(fields, "realization_id"), at(fields, "pair_i"),
+                           at(fields, "pair_j"), at(fields, "anchor_role")});
+        thirds_total += static_cast<std::size_t>(std::stoul(at(fields, "thirds")));
+        expect(at(fields, "thirds") == std::to_string(N - 2),
+               "every pair reports N-2 possible third sites");
+        const std::size_t split =
+            static_cast<std::size_t>(std::stoul(at(fields, "thirds_positive"))) +
+            static_cast<std::size_t>(std::stoul(at(fields, "thirds_bounded_below_threshold"))) +
+            static_cast<std::size_t>(std::stoul(at(fields, "thirds_unresolved"))) +
+            static_cast<std::size_t>(std::stoul(at(fields, "thirds_failed")));
+        expect(split == static_cast<std::size_t>(N - 2),
+               "the four certified classes partition the thirds exactly");
+        const bool robust = at(fields, "robust_fgmn") == "1";
+        expect(robust == (std::stoul(at(fields, "thirds_positive")) > 0),
+               "robust_fgmn is exactly 'some third is certified positive'");
+        expect(robust == (at(fields, "explanatory_class") == "three_site_fgmn"),
+               "and it agrees with the explanatory class");
+    }
+    expect(rows > 0, "the summary is not empty");
+    expect(identities.size() == rows, "request 10: every (realization, i, j, role) appears once");
+    expect(thirds_total == rows * static_cast<std::size_t>(N - 2),
+           "the summary's thirds account for every outcome row");
+
+    // The explanatory classes are mutually exclusive by construction; this
+    // checks they also cover every pair the aggregate counted.
+    std::uint64_t qualifying = 0;
+    std::array<std::uint64_t, gap::EXPLANATORY_CLASS_COUNT> aggregated{};
+    for (int r = 0; r < gap::ROLE_COUNT; ++r)
+        for (int c = 0; c < dist::ZERO_CLASS_COUNT; ++c)
+            for (int s = 1; s <= N / 2; ++s)
+            {
+                const gap::GapCell &cell = run->analysis->aggregate().cell(r, c, s);
+                qualifying += cell.qualifying_pairs;
+                for (std::size_t e = 0; e < gap::EXPLANATORY_CLASS_COUNT; ++e)
+                {
+                    aggregated[e] += cell.pairs_by_explanation[e];
+                }
+            }
+    expect(qualifying == rows, "the summary has one row per pair the aggregate counted");
+    for (std::size_t e = 0; e < gap::EXPLANATORY_CLASS_COUNT; ++e)
+    {
+        const char *name = gap::explanatory_class_name(static_cast<gap::ExplanatoryClass>(e));
+        const std::size_t found = by_explanation.count(name) ? by_explanation.at(name) : 0u;
+        expect(aggregated[e] == found,
+               std::string("the aggregate's pairs_") + name + " matches the summary rows");
+    }
+
+    // Request 10 again, and the reason the summary is rewritten rather than
+    // trimmed: after a kill and resume it must be byte-identical.
+    const std::string before = read_file(summary_path);
+    {
+        std::vector<dist::PairBin> bins = dist::make_pair_bins(N);
+        for (std::uint32_t t = 0; t < 6; ++t)
+        {
+            const auto trajectory = make_trajectory(t, config);
+            bin_trajectory(bins, trajectory->measurement);
+        }
+        auto resumed = open_run(config, 6, bins);
+        resumed->analysis->finish(std::cerr);
+    }
+    expect(read_file(summary_path) == before,
+           "request 10: the summary rebuilt on resume is byte-identical");
+
+    // The audit reads the finished run and, at the thresholds the file itself
+    // records, must reproduce the live classification exactly -- otherwise a
+    // swept threshold would be measuring the reader, not the physics.
+    {
+        namespace audit = mipt::dist::gap::audit;
+        const audit::OutcomeMeta meta = audit::read_outcome_meta(config.pair_gap.output_path);
+        expect(meta.n == N && meta.gap_format_version == gap::GAP_FORMAT_VERSION,
+               "the audit recovers the run's identity from the outcome CSV");
+        audit::AuditSettings settings;
+        settings.pair_tols = {meta.pair_zero_tol};
+        settings.fgmn_tols = {meta.positive_tol};
+        settings.cut_tol = meta.cut_positive_tol;
+        audit::SweepTable table(1, 1, meta.n);
+        gap::GapAggregate rebuilt;
+        rebuilt.reset(meta.n);
+        std::string rebuilt_summary = gap::pair_summary_csv_header();
+        dist::RunConfig audit_config = config;
+        const gap::RowPrefix prefix = gap::row_prefix(audit_config);
+        const audit::SweepResult swept = audit::sweep_outcomes(
+            config.pair_gap.output_path, settings, meta, table, rebuilt,
+            [&](const gap::PairSummaryRow &row) {
+                gap::append_pair_summary_row(rebuilt_summary, prefix, meta.run_id, row);
+            });
+        expect(swept.pairs == rows, "the audit sees every pair the run wrote");
+        expect(rebuilt_summary == before,
+               "the audit regenerates the pair summary byte-identically at the recorded "
+               "thresholds");
+        const std::string live = gap::render_aggregate_csv(
+            config, run->analysis->aggregate(), run->bins, 6);
+        expect(gap::render_aggregate_csv(config, rebuilt, run->bins, 6) == live,
+               "and the aggregate it rebuilds is the live one");
+
+        // Tightening the fGMN threshold can only move pairs out of `positive`,
+        // never into it: the certified lower bound is fixed and the test is
+        // monotone. A sweep that violated this would be reclassifying wrongly.
+        audit::AuditSettings tight = settings;
+        tight.fgmn_tols = {meta.positive_tol, 1.0e-3, 1.0};
+        audit::SweepTable swept_table(1, 3, meta.n);
+        gap::GapAggregate ignored;
+        ignored.reset(meta.n);
+        audit::sweep_outcomes(config.pair_gap.output_path, tight, meta, swept_table, ignored,
+                              gap::PairSummarySink());
+        std::array<std::uint64_t, 3> positives{};
+        for (std::size_t ft = 0; ft < 3; ++ft)
+            for (int r = 0; r < gap::ROLE_COUNT; ++r)
+                for (int c = 0; c < dist::ZERO_CLASS_COUNT; ++c)
+                    for (int s = 1; s <= meta.n / 2; ++s)
+                    {
+                        positives[ft] += swept_table.cell(ft == 0 ? 0 : 0, ft, r, c, s)
+                                             .pairs_with_positive_third;
+                    }
+        expect(positives[0] >= positives[1] && positives[1] >= positives[2],
+               "raising the fGMN threshold never creates a positive pair");
+
+        // And the audit leaves its inputs alone.
+        expect(read_file(config.pair_gap.output_path).size() > 0 &&
+                   read_file(summary_path) == before,
+               "the audit does not modify the files it reads");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Request 11.3, 11.4, 11.5, 11.8: named states, named answers
+// ---------------------------------------------------------------------------
+
+std::vector<double> pack_density(const std::vector<Complex> &rho)
+{
+    std::vector<double> out(2u * rho.size());
+    for (std::size_t e = 0; e < rho.size(); ++e)
+    {
+        out[2 * e] = rho[e].real();
+        out[2 * e + 1] = rho[e].imag();
+    }
+    return out;
+}
+
+std::vector<Complex> pure_density(const std::vector<Complex> &psi)
+{
+    const std::size_t d = psi.size();
+    std::vector<Complex> rho(d * d);
+    for (std::size_t r = 0; r < d; ++r)
+        for (std::size_t c = 0; c < d; ++c) rho[r * d + c] = psi[r] * std::conj(psi[c]);
+    return rho;
+}
+
+mipt::ancilla::SmallRdm small_of(const std::vector<Complex> &rho, int dim)
+{
+    mipt::ancilla::SmallRdm out(dim);
+    for (int r = 0; r < dim; ++r)
+        for (int c = 0; c < dim; ++c) out(r, c) = rho[static_cast<std::size_t>(r * dim + c)];
+    return out;
+}
+
+void test_named_triple_states()
+{
+    namespace an = mipt::analysis;
+    const double s2 = 1.0 / std::sqrt(2.0);
+    const double s3 = 1.0 / std::sqrt(3.0);
+
+    auto diagnostics = [](const std::vector<Complex> &rho) {
+        const std::vector<double> packed = pack_density(rho);
+        const auto entropies = mipt::dist::three_party_entropies(small_of(rho, 8), true);
+        return an::triple_separability(packed.data(), entropies.entropy, 1e-9, 1e-9);
+    };
+
+    // 11.3 product: no correlation across any cut.
+    {
+        std::vector<Complex> psi(8, Complex(0, 0));
+        psi[0] = 1.0;
+        const auto sep = diagnostics(pure_density(psi));
+        for (int s = 0; s < 3; ++s)
+        {
+            expect(sep.character[static_cast<std::size_t>(s)] == an::CutCharacter::Product,
+                   "11.3 product: every cut is a product cut");
+            expect(std::abs(sep.realignment[static_cast<std::size_t>(s)] - 1.0) < 1e-9,
+                   "11.3 product: the realignment norm of a pure product is exactly 1");
+        }
+    }
+
+    // 11.3 classically correlated: (|000><000| + |110><110|)/2. Zero
+    // negativity across every cut, but cuts 1 and 2 carry a full bit of
+    // mutual information -- the case a negativity threshold alone cannot
+    // distinguish from a product, which is why the product distance exists.
+    {
+        std::vector<Complex> rho(64, Complex(0, 0));
+        rho[0 * 8 + 0] = 0.5;
+        rho[6 * 8 + 6] = 0.5;
+        const auto sep = diagnostics(rho);
+        expect(sep.character[0] == an::CutCharacter::Product,
+               "11.3 classical: the spectator mode is a product cut");
+        for (int s : {1, 2})
+        {
+            expect(sep.character[static_cast<std::size_t>(s)] ==
+                       an::CutCharacter::ClassicallyCorrelated,
+                   "11.3 classical: the correlated cuts are classical, not entangled");
+            expect(std::abs(sep.mutual_information[static_cast<std::size_t>(s)] - 1.0) < 1e-9,
+                   "11.3 classical: and carry exactly one bit");
+            expect(sep.qubit_cut[static_cast<std::size_t>(s)] <= 1e-12,
+                   "11.3 classical: with no negativity at all");
+        }
+    }
+
+    // 11.3 Bell pair with a spectator: cut 0 is a product, cuts 1 and 2 are
+    // entangled. Biseparable, so no genuine tripartite entanglement.
+    {
+        std::vector<Complex> psi(8, Complex(0, 0));
+        psi[0] = s2;
+        psi[6] = s2; // |110>: a Bell pair on modes 1 and 2, mode 0 idle
+        const auto sep = diagnostics(pure_density(psi));
+        expect(sep.character[0] == an::CutCharacter::Product,
+               "11.3 Bell+spectator: the spectator's cut is a product");
+        expect(sep.character[1] == an::CutCharacter::Entangled &&
+                   sep.character[2] == an::CutCharacter::Entangled,
+               "11.3 Bell+spectator: the other two cuts are entangled");
+        expect(std::abs(sep.qubit_cut[1] - 0.5) < 1e-9,
+               "11.3 Bell+spectator: at the Bell value 1/2");
+    }
+
+    // 11.3 W and GHZ: every cut entangled, at the published values.
+    {
+        std::vector<Complex> w(8, Complex(0, 0));
+        w[1] = s3;
+        w[2] = s3;
+        w[4] = s3;
+        const auto sep = diagnostics(pure_density(w));
+        for (int s = 0; s < 3; ++s)
+        {
+            expect(std::abs(sep.qubit_cut[static_cast<std::size_t>(s)] - 0.4714045) < 1e-6,
+                   "11.3 W: every cut is the known 0.4714");
+            expect(sep.character[static_cast<std::size_t>(s)] == an::CutCharacter::Entangled,
+                   "11.3 W: and is classified entangled");
+        }
+    }
+    {
+        std::vector<Complex> ghz(8, Complex(0, 0));
+        ghz[0] = s2;
+        ghz[7] = s2;
+        const auto sep = diagnostics(pure_density(ghz));
+        for (int s = 0; s < 3; ++s)
+        {
+            expect(std::abs(sep.qubit_cut[static_cast<std::size_t>(s)] - 0.5) < 1e-9,
+                   "11.3 GHZ: every cut is 1/2");
+            expect(std::abs(sep.realignment[static_cast<std::size_t>(s)] - 2.0) < 1e-9,
+                   "11.3 GHZ: and its realignment norm is 2");
+        }
+    }
+
+    // 11.4 A biseparable mixture entangled across every fixed cut.
+    //
+    //   rho = (1/3) sum_p |Bell>_p<Bell| (x) |0>_q<0|
+    //
+    // over the three ways to choose which mode sits out. Every term is
+    // biseparable, so the mixture is a PPT mixture and its genuine tripartite
+    // negativity is exactly zero -- yet every one-vs-rest cut is entangled,
+    // because two of the three terms straddle any given cut.
+    //
+    // This is why `three_site_all_cuts_entangled_fgmn_zero` is a *candidate*
+    // class and not a conclusion: a state can populate it with no genuine
+    // tripartite entanglement whatsoever.
+    {
+        auto bell_on = [&](int a, int b) {
+            std::vector<Complex> psi(8, Complex(0, 0));
+            psi[0] = s2;
+            psi[(1 << a) | (1 << b)] = s2;
+            return pure_density(psi);
+        };
+        std::vector<Complex> rho(64, Complex(0, 0));
+        for (const auto &pair : std::vector<std::pair<int, int>>{{0, 1}, {0, 2}, {1, 2}})
+        {
+            const auto term = bell_on(pair.first, pair.second);
+            for (std::size_t e = 0; e < rho.size(); ++e)
+            {
+                rho[e] += term[e] / 3.0;
+            }
+        }
+        const auto sep = diagnostics(rho);
+        for (int s = 0; s < 3; ++s)
+        {
+            expect(sep.qubit_cut[static_cast<std::size_t>(s)] > 1e-6,
+                   "11.4: the biseparable mixture is entangled across every fixed cut");
+            expect(sep.character[static_cast<std::size_t>(s)] == an::CutCharacter::Entangled,
+                   "11.4: and every cut is classified entangled");
+        }
+        const std::vector<double> packed = pack_density(rho);
+        std::array<double, 3> fermionic{};
+        mipt::analysis::cut_negativities<3>(packed.data(), true, fermionic);
+        const double smallest = *std::min_element(fermionic.begin(), fermionic.end());
+        expect(smallest > 1e-6,
+               "11.4: so is the fermionic minimum cut, which means the prefilter cannot "
+               "settle it and the solver has to");
+    }
+}
+
+// 11.5: a four-mode GHZ whose pair and three-site marginals are all separable.
+void test_four_mode_ghz()
+{
+    const double s2 = 1.0 / std::sqrt(2.0);
+    std::vector<Complex> psi(16, Complex(0, 0));
+    psi[0] = s2;
+    psi[15] = s2;
+    const std::vector<double> rho = pack_density(pure_density(psi));
+    const gap::FourResult result = gap::evaluate_four(rho.data(), {0, 1, 2, 3}, 1e-9, true, 1e-10);
+
+    for (int s = 0; s < 4; ++s)
+    {
+        expect(std::abs(result.single_cuts[static_cast<std::size_t>(s)] - 0.5) < 1e-9,
+               "11.5: every one-versus-three cut of a four-mode GHZ is 1/2");
+    }
+    for (int d = 0; d < 3; ++d)
+    {
+        expect(std::abs(result.double_cuts[static_cast<std::size_t>(d)] - 0.5) < 1e-9,
+               "11.5: and so is every two-versus-two cut");
+    }
+    expect(result.max_pair_marginal_fn <= 1e-12,
+           "11.5: while every pair marginal is separable");
+    expect(result.max_triple_marginal_min_cut <= 1e-12,
+           "11.5: and every three-mode marginal is separable too");
+    expect(result.globally_entangled_locally_separable,
+           "11.5: which is exactly the signature the four-site pass looks for");
+
+    // Two Bell pairs are the discriminator: globally entangled, but the cut
+    // that separates the pairs is not, and the pair marginals are.
+    std::vector<Complex> bells(16, Complex(0, 0));
+    bells[0b0000] = 0.5;
+    bells[0b0011] = 0.5;
+    bells[0b1100] = 0.5;
+    bells[0b1111] = 0.5;
+    const std::vector<double> paired = pack_density(pure_density(bells));
+    const gap::FourResult two = gap::evaluate_four(paired.data(), {0, 1, 2, 3}, 1e-9, true, 1e-10);
+    expect(!two.globally_entangled_locally_separable,
+           "11.5: two Bell pairs do not carry the signature");
+    expect(two.max_pair_marginal_fn > 0.4,
+           "11.5: because their pair marginals are entangled");
+
+    // 11.8: parity-respecting assisted negativity. A four-mode GHZ has no
+    // endpoint entanglement at all, and no single-mode occupation measurement
+    // can produce any -- but a *joint* measurement inside a parity sector
+    // localizes a full Bell pair. That gap between the two families is the
+    // reason they are reported separately.
+    const std::size_t helpers = gap::pair_slot_of(2, 3);
+    const auto &occupation = result.assisted_occupation[helpers];
+    const auto &parity = result.assisted_parity[helpers];
+    expect(parity.unconditional <= 1e-12,
+           "11.8: the four-mode GHZ's endpoint pair is separable to begin with");
+    expect(std::abs(parity.maximum - 0.5) < 1e-9,
+           "11.8: a joint parity-sector measurement localizes a Bell pair");
+    expect(std::abs(parity.positive_probability - 1.0) < 1e-9,
+           "11.8: and does so whatever the outcome");
+    expect(!occupation.evaluated,
+           "11.8: the single-mode family does not apply to two helpers at once");
+
+    // And nothing can assist a product state into entanglement.
+    std::vector<Complex> product(16, Complex(0, 0));
+    product[0] = 1.0;
+    const auto flat = small_of(pure_density(product), 16);
+    const auto assisted = mipt::analysis::assisted_negativity(
+        flat, 4, 0b0011, 0b1100, mipt::analysis::parity_sector_family(), 1e-10);
+    expect(assisted.maximum <= 1e-12,
+           "11.8: no measurement creates entanglement in a product state");
+}
+
+// 11.9: fp64 against high precision on the same forced measurement record.
+void test_high_precision_replay()
+{
+    namespace replay = mipt::dist::replay;
+    constexpr int n = 8;
+    std::vector<mipt::RppuLayer> layers;
+    std::mt19937 layer_rng(20260913u);
+    mipt::build_rppu_layers(layers, n, 6, 0.25, true, layer_rng, false);
+
+    // Pass 1 samples the record; pass 2 forces it.
+    replay::MeasurementRecord record;
+    std::mt19937 measure_rng(99u);
+    const auto fp64 = replay::run_trajectory<double>(layers, n, nullptr, record, measure_rng);
+    replay::MeasurementRecord unused;
+    std::mt19937 idle(1u);
+    const auto high = replay::run_trajectory<long double>(layers, n, &record, unused, idle);
+
+    expect(!record.empty(), "11.9: the circuit measured something to force");
+
+    // Both states are normalized and confined to the even parity sector, which
+    // is the invariant that says the replay simulated an RPPU trajectory
+    // rather than something that merely ran.
+    auto norm_and_parity = [&](const auto &state) {
+        long double norm = 0.0L;
+        long double odd = 0.0L;
+        const auto &amps = state.amplitudes();
+        for (std::size_t x = 0; x < amps.size(); ++x)
+        {
+            const long double weight = static_cast<long double>(std::norm(amps[x]));
+            norm += weight;
+            if (__builtin_popcountll(static_cast<unsigned long long>(x)) & 1)
+            {
+                odd += weight;
+            }
+        }
+        return std::pair<long double, long double>(norm, odd);
+    };
+    const auto a = norm_and_parity(fp64);
+    const auto b = norm_and_parity(high);
+    expect(std::abs(a.first - 1.0L) < 1e-12L && std::abs(b.first - 1.0L) < 1e-15L,
+           "11.9: both replays stay normalized");
+    expect(a.second < 1e-24L && b.second < 1e-30L,
+           "11.9: and both stay in the even parity sector, exactly");
+
+    // The same forced record means the same trajectory, so the two precisions
+    // must agree to the weaker of them. If they did not, the comparison would
+    // be measuring a diverged trajectory rather than roundoff.
+    bool nonzero_somewhere = false;
+    double worst = 0.0;
+    for (int i = 0; i < n; ++i)
+    {
+        for (int j = i + 1; j < n; ++j)
+        {
+            const std::vector<int> pair{i, j};
+            const auto low = replay::pair_observables(
+                replay::reduce_modes<double>(fp64.amplitudes(), n, pair, true));
+            const auto hp = replay::pair_observables(
+                replay::reduce_modes<long double>(high.amplitudes(), n, pair, true));
+            const long double scale = std::max(std::fabs(low.fn), std::fabs(hp.fn));
+            if (scale > 1e-6L)
+            {
+                nonzero_somewhere = true;
+                worst = std::max(worst, static_cast<double>(std::fabs(low.fn - hp.fn) / scale));
+            }
+            // A structural zero is zero at both precisions, not merely small.
+            if (low.g2 == 0.0L)
+            {
+                expect(hp.g2 == 0.0L,
+                       "11.9: a structurally zero channel is zero at every precision");
+            }
+        }
+    }
+    expect(nonzero_somewhere, "11.9 is not vacuous: some pair carries negativity");
+    expect(worst < 1e-12,
+           "11.9: on the same forced record the two precisions agree to double's own floor");
+
+    // The verdict vocabulary, on the values it is meant to describe.
+    expect(std::string(replay::replay_verdict(0.0L, 0.0L)) == "structural_zero",
+           "11.9: exact zeros at both precisions are structural");
+    expect(std::string(replay::replay_verdict(0.25L, 0.25L + 1e-17L)) == "converged",
+           "11.9: agreement far below the double floor is convergence");
+    expect(std::string(replay::replay_verdict(1e-16L, 3e-16L)) == "roundoff",
+           "11.9: a floor-sized value that moves by its own size is roundoff");
+    expect(std::string(replay::replay_verdict(0.25L, 0.5L)) == "diverged",
+           "11.9: a large value that moves is not roundoff -- the comparison is broken");
+
+    // A record from a different circuit is refused rather than replayed.
+    replay::MeasurementRecord truncated(record.begin(), record.begin() + 1);
+    bool refused = false;
+    try
+    {
+        replay::MeasurementRecord ignored;
+        std::mt19937 rng(2u);
+        replay::run_trajectory<long double>(layers, n, &truncated, ignored, rng);
+    }
+    catch (const std::runtime_error &)
+    {
+        refused = true;
+    }
+    expect(refused, "11.9: a measurement record that does not fit the circuit is refused");
+}
+
 } // namespace
 
 int main()
@@ -1060,8 +1729,13 @@ int main()
     test_marginals_reproduce_pairs();
     test_cut_negativities();
     test_prefilter_decision(directory);
+    test_certified_classification(directory);
     test_driver_resume_and_reconciliation(directory);
     test_solver_failures(directory);
+    test_pair_summary(directory);
+    test_named_triple_states();
+    test_four_mode_ghz();
+    test_high_precision_replay();
 
     if (failures != 0)
     {

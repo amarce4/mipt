@@ -53,6 +53,9 @@
 // whole protocol with first-principles RDMs and a fake solver.
 
 #include "mipt/analysis/cut_negativity.hpp"
+#include "mipt/analysis/assisted.hpp"
+#include "mipt/analysis/separability.hpp"
+#include "mipt/dist_pair_four.hpp"
 #include "mipt/analysis/fgmn.hpp"
 #include "mipt/dist_connectivity.hpp"
 #include "mipt/dist_metrics.hpp"
@@ -85,9 +88,78 @@
 namespace mipt::dist::gap
 {
 
-inline constexpr int GAP_FORMAT_VERSION = 1;
+// 2: certified fGMN intervals (lower/upper bound, residuals, solver gap, the
+// four-way fgmn_class) and the per-pair summary file. Version 1 rows recorded a
+// single fGMN value and a bare positive/failed flag, which cannot be
+// reclassified at another threshold, so they are not readable here.
+inline constexpr int GAP_FORMAT_VERSION = 2;
 // FGMN_STATUS_* are the solver's own codes; this one is ours.
 inline constexpr int STATUS_PREFILTERED = -1;
+
+// ---------------------------------------------------------------------------
+// Certified classification
+//
+// A value is not "zero" or "nonzero"; it is an interval compared against a
+// threshold, and the comparison has four outcomes rather than two. This is the
+// whole point of the certified solve: at MOSEK's default tolerance the interval
+// around a separable state is ~1e-5 wide, so a 1e-10 positivity threshold
+// resolves *nothing*, and saying "not positive" there would be a claim the
+// numbers do not support.
+// ---------------------------------------------------------------------------
+
+enum class CertifiedClass : int
+{
+    Positive = 0,              // lower bound is above the threshold
+    BoundedBelowThreshold = 1, // upper bound is below the threshold
+    Unresolved = 2,            // the interval straddles the threshold
+    Failed = 3,                // no interval: the solve did not converge
+};
+inline constexpr int CERTIFIED_CLASS_COUNT = 4;
+
+inline const char *certified_class_name(CertifiedClass value)
+{
+    switch (value)
+    {
+    case CertifiedClass::Positive: return "positive";
+    case CertifiedClass::BoundedBelowThreshold: return "bounded_below_threshold";
+    case CertifiedClass::Unresolved: return "unresolved";
+    case CertifiedClass::Failed: break;
+    }
+    return "failed";
+}
+
+inline bool parse_certified_class(const std::string &text, CertifiedClass &out)
+{
+    for (int c = 0; c < CERTIFIED_CLASS_COUNT; ++c)
+    {
+        if (text == certified_class_name(static_cast<CertifiedClass>(c)))
+        {
+            out = static_cast<CertifiedClass>(c);
+            return true;
+        }
+    }
+    return false;
+}
+
+// A NaN bound is no bound: it can neither certify positivity nor certify
+// smallness, so it leaves the state unresolved. `ok` is false for a solve that
+// failed outright, which is a distinct outcome from an inconclusive one.
+inline CertifiedClass classify_certified(double lower, double upper, double threshold, bool ok)
+{
+    if (!ok)
+    {
+        return CertifiedClass::Failed;
+    }
+    if (lower == lower && lower > threshold)
+    {
+        return CertifiedClass::Positive;
+    }
+    if (upper == upper && upper < threshold)
+    {
+        return CertifiedClass::BoundedBelowThreshold;
+    }
+    return CertifiedClass::Unresolved;
+}
 inline constexpr std::size_t RHO3_DOUBLES = 128;
 inline constexpr std::size_t RHO2_DOUBLES = 32;
 
@@ -414,10 +486,36 @@ struct TripleResult
     // position pairs (0,1), (0,2), (1,2). This is the sign-ordering check: the
     // fermionic partial trace of the triple has to reproduce the pair.
     std::array<double, 3> marginal_residual{};
+    // Per-cut separability diagnostics: what kind of PPT a zero cut is. The
+    // ordinary-trace members are labelled `qubit_` in the CSV and are a
+    // comparison observable, never a statement about fermionic separability.
+    analysis::TripleSeparability separability;
+    // Assisted endpoint negativity, indexed by which sorted position acts as
+    // the measured helper. One triple serves several anchors with different
+    // (i, j, k) assignments, so all three are precomputed here and the row
+    // picks the one its own k names.
+    std::array<analysis::AssistedNegativity, 3> assisted{};
 
     FgmnMethod method = FgmnMethod::PrefilterBound;
     double fgmn_raw = std::numeric_limits<double>::quiet_NaN();
     double fgmn = std::numeric_limits<double>::quiet_NaN();
+    // The certified interval. On the prefilter path lower is 0 (fGMN >= 0 is a
+    // theorem) and upper is the minimum cut, so a prefiltered triple is a
+    // *bound*, never an exact zero. On the solver path they come from MOSEK's
+    // primal and dual objectives.
+    double lower_bound = 0.0;
+    double upper_bound = std::numeric_limits<double>::quiet_NaN();
+    // How far the *input* matrix is from being a density matrix. An fGMN can
+    // never be certified below the accuracy of the matrix it was computed from,
+    // and on an fp32 state vector that is ~1e-7 -- far above a 1e-10 threshold.
+    // Leaving it out is how a control triple whose true fGMN is exactly zero
+    // came back "certified positive" at 1.8e-8, which is fp32 noise and nothing
+    // else.
+    double input_uncertainty = 0.0;
+    double primal_residual = std::numeric_limits<double>::quiet_NaN();
+    double dual_residual = std::numeric_limits<double>::quiet_NaN();
+    double solver_gap = std::numeric_limits<double>::quiet_NaN();
+    CertifiedClass certified = CertifiedClass::Unresolved;
     bool positive = false;
     int status = STATUS_PREFILTERED;
     int attempts = 0;
@@ -518,6 +616,24 @@ inline TripleResult evaluate_triple(const double *raw, const std::array<int, 3> 
         }
     }
 
+    out.separability = analysis::triple_separability(out.rho_ri.data(), out.parts.entropy,
+                                                     settings.cut_positive_tol,
+                                                     settings.correlation_tol);
+    if (settings.assisted)
+    {
+        // Single-mode occupation measurement on each candidate helper. It is
+        // the only single-mode family a fermionic experiment can realize
+        // without an external parity reference; see analysis/assisted.hpp.
+        for (int helper = 0; helper < 3; ++helper)
+        {
+            const unsigned helper_mask = 1u << helper;
+            const unsigned endpoints = 7u & ~helper_mask;
+            out.assisted[static_cast<std::size_t>(helper)] = analysis::assisted_negativity(
+                rho, 3, endpoints, helper_mask, analysis::occupation_family(),
+                settings.assisted_tol);
+        }
+    }
+
     std::array<double, 8> eigenvalues{};
     out.min_eigenvalue = util::hermitian_eigenvalues<8>(dense, eigenvalues)
                              ? *std::min_element(eigenvalues.begin(), eigenvalues.end())
@@ -541,6 +657,16 @@ inline TripleResult evaluate_triple(const double *raw, const std::array<int, 3> 
             max_difference(marginal, detail::normalized_hermitian_rho(pair.fermion_rho_ri));
     }
 
+    // The matrix's own error, from the two diagnostics that measure it: how far
+    // its trace is from 1 and how negative its smallest eigenvalue is. Both are
+    // zero for an exact RDM and both are ~1e-7 on an fp32 state vector.
+    out.input_uncertainty = std::max(out.trace_error, 0.0);
+    if (out.min_eigenvalue == out.min_eigenvalue && out.min_eigenvalue < 0.0)
+    {
+        out.input_uncertainty = std::max(out.input_uncertainty, -out.min_eigenvalue);
+    }
+    out.input_uncertainty = std::max(out.input_uncertainty, out.hermiticity_error);
+
     // The prefilter decision. A NaN minimum is never prefiltered: without a
     // converged bound there is nothing to certify, so the SDP decides.
     if (out.min_cut == out.min_cut && out.min_cut <= settings.prefilter_tol)
@@ -548,8 +674,20 @@ inline TripleResult evaluate_triple(const double *raw, const std::array<int, 3> 
         out.method = FgmnMethod::PrefilterBound;
         out.status = STATUS_PREFILTERED;
         out.fgmn_raw = std::numeric_limits<double>::quiet_NaN();
+        // fGMN <= min_s N_s is the bound the prefilter rests on, and 0 <= fGMN
+        // is a theorem, so the triple is certified to lie in [0, min_cut]. It
+        // enters averages at 0 -- the best point estimate inside that interval
+        // -- but it is classified from the interval, so a positivity threshold
+        // below min_cut leaves it unresolved instead of silently negative.
         out.fgmn = 0.0;
-        out.positive = false;
+        out.lower_bound = 0.0;
+        // The cut bound is only as good as the matrix it came from, so the
+        // ceiling carries the input error too.
+        out.upper_bound = out.min_cut + out.input_uncertainty;
+        out.solver_gap = out.min_cut;
+        out.certified =
+            classify_certified(out.lower_bound, out.upper_bound, settings.positive_tol, true);
+        out.positive = out.certified == CertifiedClass::Positive;
     }
     else
     {
@@ -565,7 +703,39 @@ inline TripleResult evaluate_triple(const double *raw, const std::array<int, 3> 
 struct SolveOutcome
 {
     double value = std::numeric_limits<double>::quiet_NaN();
+    // The certified interval, as FgmnCertificate defines it. A solver that
+    // supplies no bounds leaves these NaN, and the triple is then unresolved at
+    // every threshold -- except that `value` itself is taken as the lower bound
+    // (see apply_solve), because for this model -primalObjValue() is attained
+    // at a primal-feasible point and is a lower bound on fGMN by construction.
+    double lower_bound = std::numeric_limits<double>::quiet_NaN();
+    double upper_bound = std::numeric_limits<double>::quiet_NaN();
+    // How far the *input* matrix is from being a density matrix. An fGMN can
+    // never be certified below the accuracy of the matrix it was computed from,
+    // and on an fp32 state vector that is ~1e-7 -- far above a 1e-10 threshold.
+    // Leaving it out is how a control triple whose true fGMN is exactly zero
+    // came back "certified positive" at 1.8e-8, which is fp32 noise and nothing
+    // else.
+    double input_uncertainty = 0.0;
+    double primal_residual = std::numeric_limits<double>::quiet_NaN();
+    double dual_residual = std::numeric_limits<double>::quiet_NaN();
+    double solver_gap = std::numeric_limits<double>::quiet_NaN();
     int status = FGMN_STATUS_EXCEPTION;
+
+    // An exactly-known value: the interval collapses to a point. Used by tests
+    // and by any solver that certifies its own answer some other way.
+    static SolveOutcome exact(double value, int status = FGMN_STATUS_OK)
+    {
+        SolveOutcome out;
+        out.value = value;
+        out.lower_bound = value;
+        out.upper_bound = value;
+        out.solver_gap = 0.0;
+        out.primal_residual = 0.0;
+        out.dual_residual = 0.0;
+        out.status = status;
+        return out;
+    }
 };
 
 using FgmnSolver = std::function<SolveOutcome(const double *rho_ri)>;
@@ -710,21 +880,92 @@ class SolverPool
 
 inline void apply_solve(TripleResult &result, const SolveJob &job, double positive_tol)
 {
+    const double nan = std::numeric_limits<double>::quiet_NaN();
     result.attempts = job.attempts;
     result.status = job.outcome.status;
     result.fgmn_raw = job.outcome.value;
-    if (result.status == FGMN_STATUS_OK && std::isfinite(result.fgmn_raw))
+    result.primal_residual = job.outcome.primal_residual;
+    result.dual_residual = job.outcome.dual_residual;
+    const bool ok = result.status == FGMN_STATUS_OK && std::isfinite(result.fgmn_raw);
+    if (ok)
     {
         // The SDP optimum can sit a hair below zero on a separable state; the
-        // raw value keeps that, the classified one clamps it.
+        // raw value keeps that, the classified one clamps it. fGMN >= 0 is a
+        // theorem, so clamping is tightening a valid bound, not hiding a sign.
         result.fgmn = std::max(0.0, result.fgmn_raw);
-        result.positive = result.fgmn > positive_tol;
+        result.lower_bound = std::isfinite(job.outcome.lower_bound)
+                                 ? std::max(0.0, job.outcome.lower_bound)
+                                 : result.fgmn;
+        // MOSEK's own duality gap, kept as the solver diagnostic it is. It can
+        // be *negative*: at GMN_MOSEK_TOL=1e-5 the returned primal and dual
+        // points are each infeasible by ~1e-5, so the two objectives routinely
+        // cross by ~1e-4. Measured on real RPPU triples, median -1.4e-4.
+        result.solver_gap = std::isfinite(job.outcome.solver_gap)
+                                ? job.outcome.solver_gap
+                                : job.outcome.upper_bound - result.lower_bound;
+
+        // The certified interval.
+        //
+        // The solver's answer is `value` with an uncertainty, and MOSEK reports
+        // three things that bound it: the duality gap and the two feasibility
+        // residuals. The widest of them is how far the returned point can be
+        // from the true optimum, so the interval is value +- that.
+        //
+        // Taking the *gap* as an uncertainty rather than as a bracket is what
+        // makes a crossed bracket usable. At any tolerance the primal and dual
+        // objectives routinely cross -- both points are only feasible to
+        // ~GMN_MOSEK_TOL -- and reading -dualObj literally would put the
+        // ceiling *below* zero, which fGMN >= 0 forbids. Discarding it entirely
+        // was the first fix and it was too blunt: it threw away the very
+        // information that says the optimum is pinned, and left near-separable
+        // triples permanently unresolved. The crossing magnitude *is* the
+        // uncertainty, and using it as one resolves them correctly.
+        double uncertainty = result.input_uncertainty;
+        for (double candidate : {job.outcome.solver_gap, job.outcome.primal_residual,
+                                 job.outcome.dual_residual,
+                                 job.outcome.upper_bound - result.fgmn_raw})
+        {
+            if (std::isfinite(candidate))
+            {
+                uncertainty = std::max(uncertainty, std::abs(candidate));
+            }
+        }
+        result.lower_bound = std::max(0.0, result.fgmn_raw - uncertainty);
+        double upper = result.fgmn_raw + uncertainty;
+        if (upper < 0.0)
+        {
+            upper = 0.0; // fGMN >= 0 is a theorem
+        }
+        // fGMN <= min_s N_s is a theorem too, evaluated from eigenvalues with
+        // no solver in it, so it tightens the ceiling whenever it is smaller.
+        if (result.min_cut == result.min_cut && result.min_cut < upper)
+        {
+            upper = result.min_cut;
+        }
+        result.upper_bound = upper;
+
+        // ...and the same theorem is a consistency check. A floor above that
+        // exact ceiling is proof the primal point is not feasible enough to
+        // bound anything: at GMN_MOSEK_TOL=1e-10 this fires on near-separable
+        // *control* triples, where the solver returns 1.8e-8 against an exact
+        // ceiling of 1.3e-8. Without it, the empty interval would read as
+        // certified positive and manufacture tripartite entanglement out of an
+        // exact product state. The value is still reported; it stops being a
+        // bound.
+        if (result.lower_bound > upper)
+        {
+            result.lower_bound = std::numeric_limits<double>::quiet_NaN();
+        }
     }
     else
     {
-        result.fgmn = std::numeric_limits<double>::quiet_NaN();
-        result.positive = false;
+        result.fgmn = nan;
+        result.lower_bound = nan;
+        result.upper_bound = nan;
+        result.solver_gap = nan;
     }
+    result.certified = classify_certified(result.lower_bound, result.upper_bound, positive_tol, ok);
+    result.positive = result.certified == CertifiedClass::Positive;
 }
 
 // ---------------------------------------------------------------------------
@@ -748,7 +989,7 @@ inline const std::vector<std::string> &outcome_columns()
             "boundary_implementation", "connectivity_graph_version", "gap_format_version",
             // thresholds
             "pair_zero_tol", "occupation_mi_tol", "channel_floor", "fgmn_positive_tol",
-            "prefilter_tol", "mosek_tol",
+            "prefilter_tol", "cut_positive_tol", "correlation_tol", "mosek_tol",
             // anchor pair
             "separation", "chord", "pair_class", "pair_fn", "pair_fn_generic", "pair_fmi", "pair_g2",
             "pair_f2", "pair_re_g", "pair_im_g", "pair_re_f", "pair_im_f", "pair_n_i", "pair_n_j",
@@ -758,6 +999,17 @@ inline const std::vector<std::string> &outcome_columns()
             "survives_i", "survives_j", "interior_path_ij", "connected_ij", "component_size_ij",
             "shortest_path_ij", "idle_i", "idle_j", "edge_disjoint_paths_ij",
             "vertex_disjoint_paths_ij",
+            // Component anatomy: how much of the component carries the pair.
+            // min_edge_cut and min_vertex_cut equal the disjoint-path counts
+            // above by Menger, so they are not repeated.
+            "final_sites_in_component", "backbone_nodes", "articulation_nodes",
+            "dangling_nodes", "branches", "mean_branch_size", "max_branch_size",
+            "endpoint_degree_i", "endpoint_degree_j", "shortest_path_gates",
+            "shortest_path_temporal",
+            // Channel-resolved connectivity. Diagnostics beside the percolation
+            // event, never a redefinition of it.
+            "f_channel_log_weight", "g_channel_log_weight", "f_channel_bottleneck",
+            "g_channel_bottleneck", "f_channel_multiplicity", "g_channel_multiplicity",
             // third-site graph
             "survives_k", "idle_k", "interior_path_ik", "connected_ik", "shortest_path_ik",
             "interior_path_jk", "connected_jk", "shortest_path_jk", "same_component_ijk"};
@@ -773,9 +1025,28 @@ inline const std::vector<std::string> &outcome_columns()
              {// triple
               "ftmi", "average_fmi", "joint_purity", "mean_single_purity", "cut_i", "cut_j", "cut_k",
               "min_cut", "min_cut_site", "cmi_ij_given_k", "mi_ij_k",
-              // fGMN
-              "fgmn_method", "fgmn_raw", "fgmn_upper_bound", "fgmn", "fgmn_positive", "fgmn_status",
-              "fgmn_attempts",
+              // Per-cut separability. `qubit_` is the ordinary trace: a
+              // comparison observable for a fermionic ensemble, never a claim
+              // about fermionic separability.
+              "mi_i_rest", "mi_j_rest", "mi_k_rest",
+              "product_distance_i", "product_distance_j", "product_distance_k",
+              "qubit_cut_i", "qubit_cut_j", "qubit_cut_k",
+              "qubit_pt_min_eig_i", "qubit_pt_min_eig_j", "qubit_pt_min_eig_k",
+              "ccnr_i", "ccnr_j", "ccnr_k",
+              "cut_character_i", "cut_character_j", "cut_character_k",
+              "qubit_ppt_ccnr_candidate",
+              // Assisted (localizable) endpoint negativity under an occupation
+              // measurement of k. Parity-respecting by construction.
+              "assisted_fn_avg", "assisted_fn_max", "assisted_fn_positive_probability",
+              "assisted_fn_outcomes", "assisted_fn_best_outcome", "assisted_family",
+              // fGMN: the certified interval, then the point value derived from
+              // it. fgmn_class is what R_3 is counted from; fgmn_positive is
+              // exactly (fgmn_class == positive), kept so a reader that only
+              // wants the boolean does not have to know the vocabulary.
+              "fgmn_method", "fgmn_raw", "fgmn_lower_bound", "fgmn_upper_bound",
+              "fgmn_primal_residual", "fgmn_dual_residual", "fgmn_solver_gap",
+              "fgmn_input_uncertainty", "fgmn_class",
+              "fgmn_min_cut_bound", "fgmn", "fgmn_positive", "fgmn_status", "fgmn_attempts",
               // numerical checks
               "trace_error", "hermiticity_error", "min_eigenvalue", "triple_parity_leakage",
               "marginal_residual_ij", "marginal_residual_ik", "marginal_residual_jk"})
@@ -900,6 +1171,10 @@ inline RowPrefix row_prefix(const RunConfig &config)
     append_double(t, config.pair_gap.positive_tol);
     t += ',';
     append_double(t, config.pair_gap.prefilter_tol);
+    t += ',';
+    append_double(t, config.pair_gap.cut_positive_tol);
+    t += ',';
+    append_double(t, config.pair_gap.correlation_tol);
     t += ',' + csv_quote(config.pair_gap.mosek_tol_text);
     return out;
 }
@@ -912,7 +1187,9 @@ inline void append_outcome_row(std::string &out, const RowPrefix &prefix,
                                std::uint64_t outcome_id, const Anchor &anchor,
                                const PairSnapshot &pair, const PairMeasurement &measurement,
                                const ConnectivityIndex &connectivity, const DisjointPaths &paths,
-                               const TriplePlan::Third &third, const TripleResult &result)
+                               const ComponentAnatomy &anatomy, const ChannelConnectivity &channels,
+                               const TriplePlan::Third &third,
+                               const TripleResult &result)
 {
     const int i = pair.i;
     const int j = pair.j;
@@ -980,6 +1257,23 @@ inline void append_outcome_row(std::string &out, const RowPrefix &prefix,
     field(out, static_cast<long long>(c.idle_j));
     field(out, static_cast<long long>(paths.edge));
     field(out, static_cast<long long>(paths.vertex));
+    field(out, static_cast<long long>(anatomy.final_sites_in_component));
+    field(out, static_cast<long long>(anatomy.backbone_nodes));
+    field(out, static_cast<long long>(anatomy.articulation_nodes));
+    field(out, static_cast<long long>(anatomy.dangling_nodes));
+    field(out, static_cast<long long>(anatomy.branches));
+    field(out, anatomy.mean_branch_size);
+    field(out, static_cast<long long>(anatomy.max_branch_size));
+    field(out, static_cast<long long>(anatomy.degree_i));
+    field(out, static_cast<long long>(anatomy.degree_j));
+    field(out, static_cast<long long>(anatomy.shortest_path_gates));
+    field(out, static_cast<long long>(anatomy.shortest_path_temporal));
+    field(out, channels.pair_log_weight);
+    field(out, channels.hop_log_weight);
+    field(out, channels.pair_bottleneck);
+    field(out, channels.hop_bottleneck);
+    field(out, static_cast<long long>(channels.pair_multiplicity));
+    field(out, static_cast<long long>(channels.hop_multiplicity));
 
     field_flag(out, conn_ik.survives_j);
     field(out, static_cast<long long>(conn_ik.idle_j));
@@ -1023,8 +1317,42 @@ inline void append_outcome_row(std::string &out, const RowPrefix &prefix,
     field(out, S[bi | bk] + S[bj | bk] - S[bk] - S[7]);
     field(out, S[bi | bj] + S[bk] - S[7]);
 
+    {
+        const analysis::TripleSeparability &sep = result.separability;
+        const std::array<int, 3> order{pos.i, pos.j, pos.k};
+        for (int p : order) { field(out, sep.mutual_information[static_cast<std::size_t>(p)]); }
+        for (int p : order) { field(out, sep.product_distance[static_cast<std::size_t>(p)]); }
+        for (int p : order) { field(out, sep.qubit_cut[static_cast<std::size_t>(p)]); }
+        for (int p : order)
+        {
+            field(out, sep.qubit_pt_min_eigenvalue[static_cast<std::size_t>(p)]);
+        }
+        for (int p : order) { field(out, sep.realignment[static_cast<std::size_t>(p)]); }
+        for (int p : order)
+        {
+            field(out, std::string(analysis::cut_character_name(
+                           sep.character[static_cast<std::size_t>(p)])));
+        }
+        field_flag(out, sep.qubit_ppt_ccnr_candidate);
+        const analysis::AssistedNegativity &assisted =
+            result.assisted[static_cast<std::size_t>(pos.k)];
+        field(out, assisted.average);
+        field(out, assisted.maximum);
+        field(out, assisted.positive_probability);
+        field(out, static_cast<long long>(assisted.outcomes));
+        field(out, static_cast<long long>(assisted.best_outcome));
+        field(out, std::string(assisted.evaluated ? "occupation" : "off"));
+    }
+
     field(out, std::string(method_name(result.method)));
     field(out, result.fgmn_raw);
+    field(out, result.lower_bound);
+    field(out, result.upper_bound);
+    field(out, result.primal_residual);
+    field(out, result.dual_residual);
+    field(out, result.solver_gap);
+    field(out, result.input_uncertainty);
+    field(out, std::string(certified_class_name(result.certified)));
     field(out, result.min_cut);
     field(out, result.fgmn);
     field_flag(out, result.positive);
@@ -1049,6 +1377,13 @@ inline void append_outcome_row(std::string &out, const RowPrefix &prefix,
 // accumulated live are the same computation over the same inputs.
 // ---------------------------------------------------------------------------
 
+// One outcome row, reduced to what the aggregate and the pair summary need.
+//
+// Everything here is either written to the outcome CSV or derived from columns
+// that are, and `scan_outcomes` parses exactly these fields back, so an
+// aggregate accumulated live and one rebuilt after a kill are the same
+// computation over the same inputs. That is what makes the pair summary
+// regenerable offline -- the audit mode reuses this struct verbatim.
 struct RowSummary
 {
     std::uint32_t realization = 0;
@@ -1057,12 +1392,266 @@ struct RowSummary
     int separation = 0;
     int pair_i = 0;
     int pair_j = 0;
+    int third_k = 0;
     bool prefiltered = false;
     bool failed = false;
     bool positive = false;
     bool first_use = false;
+    CertifiedClass certified = CertifiedClass::Unresolved;
     double fgmn = std::numeric_limits<double>::quiet_NaN();
+    double lower_bound = std::numeric_limits<double>::quiet_NaN();
+    double upper_bound = std::numeric_limits<double>::quiet_NaN();
+    double min_cut = std::numeric_limits<double>::quiet_NaN();
+    double cmi_ij_given_k = std::numeric_limits<double>::quiet_NaN();
+    double mi_ij_k = std::numeric_limits<double>::quiet_NaN();
+    bool same_component = false;
+    bool all_cuts_entangled = false;
+    // Which of the anchor's three parties owns the minimum cut: 0 = i, 1 = j,
+    // 2 = the added third, -1 when the cut did not converge. This is the
+    // bipartition that holds fGMN down, so it is the diagnostic for *why* a
+    // triple is not genuinely entangled.
+    int min_cut_role = -1;
+
+    // Constant across a pair's rows; carried on every row so a group can be
+    // summarized without a second source.
+    double chord = 0.0;
+    double pair_fn = 0.0;
+    double pair_fmi = 0.0;
+    double pair_g2 = 0.0;
+    double pair_f2 = 0.0;
+    double pair_rho_n = 0.0;
+    double pair_i_occ = 0.0;
+    long long component_size = 0;
+    long long shortest_path = 0;
+    long long edge_disjoint = 0;
+    long long vertex_disjoint = 0;
+    ComponentAnatomy anatomy;
+    ChannelConnectivity channels;
+    bool survives_i = false;
+    bool survives_j = false;
+    bool interior_path = false;
+    bool connected = false;
 };
+
+// ---------------------------------------------------------------------------
+// The per-pair summary
+//
+// The individual-outcome CSV carries one row per (pair, third), which is the
+// right record to keep and the wrong one to read: a single anchor appears N-2
+// times and its verdict is spread across all of them. This reduces each anchor
+// to one row ending in a single mutually exclusive explanatory class, which is
+// what makes "are there any all-cuts-entangled, fGMN-zero candidates?"
+// answerable by a grep rather than a groupby.
+// ---------------------------------------------------------------------------
+
+enum class ExplanatoryClass : int
+{
+    // Some third site carries certified tripartite entanglement.
+    ThreeSiteFgmn = 0,
+    // No positive third, but some third is entangled across every cut while
+    // its fGMN is certified below threshold. This is the bound-entanglement
+    // candidate -- a PPT-mixture-decomposable state with no separable cut --
+    // and the reason the summary exists.
+    ThreeSiteAllCutsEntangledFgmnZero = 1,
+    // Every in-component third has a separable cut, so a vanishing fGMN is
+    // already explained by the cut structure and needs no further mechanism.
+    ThreeSiteSeparableCut = 2,
+    // No third shares a spacetime component with the pair: the triples are
+    // products and the question does not arise.
+    NoSameComponentThird = 3,
+    // No positive third, but at least one third's interval straddles the
+    // threshold or failed. Nothing is being claimed here.
+    NumericallyUnresolved = 4,
+    // Everything resolved and bounded, thirds in the component, no cut
+    // structure to explain it: the residue four-site or channel work targets.
+    HigherOrderOrGraph = 5,
+};
+inline constexpr int EXPLANATORY_CLASS_COUNT = 6;
+
+inline const char *explanatory_class_name(ExplanatoryClass value)
+{
+    switch (value)
+    {
+    case ExplanatoryClass::ThreeSiteFgmn: return "three_site_fgmn";
+    case ExplanatoryClass::ThreeSiteAllCutsEntangledFgmnZero:
+        return "three_site_all_cuts_entangled_fgmn_zero";
+    case ExplanatoryClass::ThreeSiteSeparableCut: return "three_site_separable_cut";
+    case ExplanatoryClass::NoSameComponentThird: return "no_same_component_third";
+    case ExplanatoryClass::NumericallyUnresolved: return "numerically_unresolved";
+    case ExplanatoryClass::HigherOrderOrGraph: break;
+    }
+    return "higher_order_or_graph";
+}
+
+struct PairSummaryRow
+{
+    std::uint32_t realization = 0;
+    int role = 0;
+    int zero_class = 0;
+    int separation = 0;
+    int pair_i = 0;
+    int pair_j = 0;
+    double chord = 0.0;
+
+    double pair_fn = 0.0;
+    double pair_fmi = 0.0;
+    double pair_g2 = 0.0;
+    double pair_f2 = 0.0;
+    double pair_rho_n = 0.0;
+    double pair_i_occ = 0.0;
+    long long component_size = 0;
+    long long shortest_path = 0;
+    long long edge_disjoint = 0;
+    long long vertex_disjoint = 0;
+    ComponentAnatomy anatomy;
+    ChannelConnectivity channels;
+    bool survives_i = false;
+    bool survives_j = false;
+    bool interior_path = false;
+    bool connected = false;
+
+    std::uint32_t thirds = 0;
+    std::uint32_t thirds_same_component = 0;
+    std::uint32_t thirds_positive = 0;
+    std::uint32_t thirds_bounded = 0;
+    std::uint32_t thirds_unresolved = 0;
+    std::uint32_t thirds_failed = 0;
+    std::uint32_t thirds_all_cuts_entangled = 0;
+    // How often each party owns the minimum cut over this pair's thirds.
+    std::uint32_t blocked_by_i = 0;
+    std::uint32_t blocked_by_j = 0;
+    std::uint32_t blocked_by_k = 0;
+
+    double max_min_cut = std::numeric_limits<double>::quiet_NaN();
+    double max_lower_bound = std::numeric_limits<double>::quiet_NaN();
+    double max_upper_bound = std::numeric_limits<double>::quiet_NaN();
+    double max_cmi = std::numeric_limits<double>::quiet_NaN();
+    double max_mi_ij_k = std::numeric_limits<double>::quiet_NaN();
+    int best_k = -1; // the third with the largest certified lower bound
+
+    bool robust_fgmn = false;
+    ExplanatoryClass explanation = ExplanatoryClass::HigherOrderOrGraph;
+};
+
+// The largest of a set that may contain NaN, with NaN meaning "no value" rather
+// than poisoning the maximum.
+inline void keep_max(double &best, double candidate)
+{
+    if (candidate == candidate && (!(best == best) || candidate > best))
+    {
+        best = candidate;
+    }
+}
+
+// Reduce one anchor's N-2 rows to a verdict.
+//
+// The class order is a precedence, and it is deliberate: a factual finding
+// (something is positive) outranks an inconclusive one, which outranks every
+// structural explanation, because a structural explanation offered over an
+// unresolved interval would be a claim the numbers do not support.
+inline PairSummaryRow summarize_pair(const RowSummary *rows, std::size_t count)
+{
+    PairSummaryRow out;
+    if (count == 0)
+    {
+        return out;
+    }
+    const RowSummary &head = rows[0];
+    out.realization = head.realization;
+    out.role = head.role;
+    out.zero_class = head.zero_class;
+    out.separation = head.separation;
+    out.pair_i = head.pair_i;
+    out.pair_j = head.pair_j;
+    out.chord = head.chord;
+    out.pair_fn = head.pair_fn;
+    out.pair_fmi = head.pair_fmi;
+    out.pair_g2 = head.pair_g2;
+    out.pair_f2 = head.pair_f2;
+    out.pair_rho_n = head.pair_rho_n;
+    out.pair_i_occ = head.pair_i_occ;
+    out.component_size = head.component_size;
+    out.shortest_path = head.shortest_path;
+    out.edge_disjoint = head.edge_disjoint;
+    out.vertex_disjoint = head.vertex_disjoint;
+    out.anatomy = head.anatomy;
+    out.channels = head.channels;
+    out.survives_i = head.survives_i;
+    out.survives_j = head.survives_j;
+    out.interior_path = head.interior_path;
+    out.connected = head.connected;
+    out.thirds = static_cast<std::uint32_t>(count);
+
+    double best_lower = std::numeric_limits<double>::quiet_NaN();
+    bool candidate_all_cuts = false;
+    bool separable_cut_everywhere = true;
+    for (std::size_t r = 0; r < count; ++r)
+    {
+        const RowSummary &row = rows[r];
+        out.thirds_same_component += row.same_component ? 1u : 0u;
+        switch (row.certified)
+        {
+        case CertifiedClass::Positive: ++out.thirds_positive; break;
+        case CertifiedClass::BoundedBelowThreshold: ++out.thirds_bounded; break;
+        case CertifiedClass::Unresolved: ++out.thirds_unresolved; break;
+        case CertifiedClass::Failed: ++out.thirds_failed; break;
+        }
+        switch (row.min_cut_role)
+        {
+        case 0: ++out.blocked_by_i; break;
+        case 1: ++out.blocked_by_j; break;
+        case 2: ++out.blocked_by_k; break;
+        default: break;
+        }
+        if (row.all_cuts_entangled)
+        {
+            ++out.thirds_all_cuts_entangled;
+            separable_cut_everywhere = false;
+            if (row.certified == CertifiedClass::BoundedBelowThreshold)
+            {
+                candidate_all_cuts = true;
+            }
+        }
+        keep_max(out.max_min_cut, row.min_cut);
+        keep_max(out.max_upper_bound, row.upper_bound);
+        keep_max(out.max_cmi, row.cmi_ij_given_k);
+        keep_max(out.max_mi_ij_k, row.mi_ij_k);
+        const double before = best_lower;
+        keep_max(best_lower, row.lower_bound);
+        if (!(before == best_lower))
+        {
+            out.best_k = row.third_k;
+        }
+    }
+    out.max_lower_bound = best_lower;
+    out.robust_fgmn = out.thirds_positive > 0;
+
+    if (out.thirds_positive > 0)
+    {
+        out.explanation = ExplanatoryClass::ThreeSiteFgmn;
+    }
+    else if (out.thirds_unresolved > 0 || out.thirds_failed > 0)
+    {
+        out.explanation = ExplanatoryClass::NumericallyUnresolved;
+    }
+    else if (candidate_all_cuts)
+    {
+        out.explanation = ExplanatoryClass::ThreeSiteAllCutsEntangledFgmnZero;
+    }
+    else if (out.thirds_same_component == 0)
+    {
+        out.explanation = ExplanatoryClass::NoSameComponentThird;
+    }
+    else if (separable_cut_everywhere)
+    {
+        out.explanation = ExplanatoryClass::ThreeSiteSeparableCut;
+    }
+    else
+    {
+        out.explanation = ExplanatoryClass::HigherOrderOrGraph;
+    }
+    return out;
+}
 
 struct GapCell
 {
@@ -1077,6 +1666,11 @@ struct GapCell
     std::uint64_t pairs_with_positive_third = 0;
     std::uint64_t pairs_undetermined = 0;
     std::vector<std::uint64_t> positive_third_hist; // index = positive thirds, 0..n-2
+    // The four-way certified split of every outcome, and the pair-level
+    // explanatory split. Summing either over the cells of a separation gives
+    // that separation's total, which is what makes the decomposition add up.
+    std::array<std::uint64_t, CERTIFIED_CLASS_COUNT> outcomes_by_class{};
+    std::array<std::uint64_t, EXPLANATORY_CLASS_COUNT> pairs_by_explanation{};
     RunningStats max_fgmn_over_k;
     RunningStats mean_fgmn_over_k;
     RunningStats fgmn;
@@ -1120,18 +1714,21 @@ class GapAggregate
         return cells_[index(role, zero_class, separation)];
     }
 
-    // Every row of one (trajectory, role, pair), in k order.
-    void absorb_pair(const RowSummary *rows, std::size_t count)
+    // Every row of one (trajectory, role, pair), in k order. Returns the pair
+    // summary it computed, so the live path and the resume path build the
+    // summary file and the aggregate from one reduction rather than two.
+    PairSummaryRow absorb_pair(const RowSummary *rows, std::size_t count)
     {
+        PairSummaryRow summary = summarize_pair(rows, count);
         if (count == 0)
         {
-            return;
+            return summary;
         }
         const RowSummary &head = rows[0];
         GapCell &target = cell(head.role, head.zero_class, head.separation);
         ++target.qualifying_pairs;
+        target.pairs_by_explanation[static_cast<std::size_t>(summary.explanation)] += 1u;
         std::size_t positives = 0;
-        std::size_t failures = 0;
         double largest = -std::numeric_limits<double>::infinity();
         double sum = 0.0;
         std::size_t valued = 0;
@@ -1140,6 +1737,7 @@ class GapAggregate
             const RowSummary &row = rows[r];
             ++target.outcomes;
             ++rows_;
+            target.outcomes_by_class[static_cast<std::size_t>(row.certified)] += 1u;
             if (row.prefiltered)
             {
                 ++target.outcomes_prefiltered;
@@ -1151,7 +1749,6 @@ class GapAggregate
             if (row.failed)
             {
                 ++target.outcomes_failed;
-                ++failures;
             }
             else
             {
@@ -1191,8 +1788,12 @@ class GapAggregate
         {
             ++target.pairs_with_positive_third;
         }
-        else if (failures > 0)
+        else if (summary.explanation == ExplanatoryClass::NumericallyUnresolved)
         {
+            // A pair with no positive third but an interval that straddles the
+            // threshold -- or a solve that failed -- is undetermined, not
+            // negative. `failures` alone used to decide this; an unresolved
+            // interval is the same kind of ignorance and now counts the same.
             ++target.pairs_undetermined;
         }
         target.positive_third_hist[std::min(positives, target.positive_third_hist.size() - 1u)] += 1u;
@@ -1201,6 +1802,7 @@ class GapAggregate
             target.max_fgmn_over_k.add(largest);
             target.mean_fgmn_over_k.add(sum / static_cast<double>(valued));
         }
+        return summary;
     }
 
   private:
@@ -1222,6 +1824,147 @@ class GapAggregate
     std::uint64_t failed_triples_ = 0;
 };
 
+// ---------------------------------------------------------------------------
+// The pair-summary CSV
+// ---------------------------------------------------------------------------
+
+inline const std::vector<std::string> &pair_summary_columns()
+{
+    static const std::vector<std::string> columns{
+        // identity
+        "run_id", "realization_id", "anchor_role", "pair_i", "pair_j", "separation", "d",
+        "pair_class",
+        // provenance
+        "N", "periods", "p", "circ_type", "circuit_name", "master_seed", "statevector_precision",
+        "boundary_implementation", "connectivity_graph_version", "gap_format_version",
+        // thresholds
+        "pair_zero_tol", "occupation_mi_tol", "channel_floor", "fgmn_positive_tol", "prefilter_tol",
+        "cut_positive_tol", "correlation_tol", "mosek_tol",
+        // the pair itself
+        "pair_fn", "pair_fmi", "pair_g2", "pair_f2", "pair_rho_n", "pair_abs_rho_n", "pair_i_occ",
+        // graph diagnostics
+        "survives_i", "survives_j", "interior_path_ij", "connected_ij", "component_size_ij",
+        "shortest_path_ij", "edge_disjoint_paths_ij", "vertex_disjoint_paths_ij",
+        "final_sites_in_component", "backbone_nodes", "articulation_nodes", "dangling_nodes",
+        "branches", "mean_branch_size", "max_branch_size", "endpoint_degree_i",
+        "endpoint_degree_j", "shortest_path_gates", "shortest_path_temporal",
+        "f_channel_log_weight", "g_channel_log_weight", "f_channel_bottleneck",
+        "g_channel_bottleneck", "f_channel_multiplicity", "g_channel_multiplicity",
+        // the thirds
+        "thirds", "thirds_same_component", "thirds_positive", "thirds_bounded_below_threshold",
+        "thirds_unresolved", "thirds_failed", "thirds_all_cuts_entangled",
+        "thirds_blocked_by_i", "thirds_blocked_by_j", "thirds_blocked_by_k",
+        "max_min_cut_fn", "max_fgmn_lower_bound", "max_fgmn_upper_bound", "max_cmi_ij_given_k",
+        "max_mi_ij_k", "best_third_k", "robust_fgmn", "explanatory_class"};
+    return columns;
+}
+
+inline std::string pair_summary_csv_header()
+{
+    std::string header;
+    const auto &columns = pair_summary_columns();
+    for (std::size_t i = 0; i < columns.size(); ++i)
+    {
+        if (i > 0)
+        {
+            header += ',';
+        }
+        header += columns[i];
+    }
+    header += '\n';
+    return header;
+}
+
+inline void append_pair_summary_row(std::string &out, const RowPrefix &prefix,
+                                    const std::string &run, const PairSummaryRow &row)
+{
+    out += run;
+    field(out, static_cast<long long>(row.realization));
+    field(out, std::string(role_name(static_cast<AnchorRole>(row.role))));
+    field(out, static_cast<long long>(row.pair_i));
+    field(out, static_cast<long long>(row.pair_j));
+    field(out, static_cast<long long>(row.separation));
+    field(out, row.chord);
+    field(out, std::string(zero_class_name(static_cast<ZeroClass>(row.zero_class))));
+
+    out += ',';
+    out += prefix.provenance;
+    out += ',';
+    out += prefix.thresholds;
+
+    field(out, row.pair_fn);
+    field(out, row.pair_fmi);
+    field(out, row.pair_g2);
+    field(out, row.pair_f2);
+    field(out, row.pair_rho_n);
+    field(out, std::abs(row.pair_rho_n));
+    field(out, row.pair_i_occ);
+
+    field_flag(out, row.survives_i);
+    field_flag(out, row.survives_j);
+    field_flag(out, row.interior_path);
+    field_flag(out, row.connected);
+    field(out, row.component_size);
+    field(out, row.shortest_path);
+    field(out, row.edge_disjoint);
+    field(out, row.vertex_disjoint);
+    field(out, static_cast<long long>(row.anatomy.final_sites_in_component));
+    field(out, static_cast<long long>(row.anatomy.backbone_nodes));
+    field(out, static_cast<long long>(row.anatomy.articulation_nodes));
+    field(out, static_cast<long long>(row.anatomy.dangling_nodes));
+    field(out, static_cast<long long>(row.anatomy.branches));
+    field(out, row.anatomy.mean_branch_size);
+    field(out, static_cast<long long>(row.anatomy.max_branch_size));
+    field(out, static_cast<long long>(row.anatomy.degree_i));
+    field(out, static_cast<long long>(row.anatomy.degree_j));
+    field(out, static_cast<long long>(row.anatomy.shortest_path_gates));
+    field(out, static_cast<long long>(row.anatomy.shortest_path_temporal));
+    field(out, row.channels.pair_log_weight);
+    field(out, row.channels.hop_log_weight);
+    field(out, row.channels.pair_bottleneck);
+    field(out, row.channels.hop_bottleneck);
+    field(out, static_cast<long long>(row.channels.pair_multiplicity));
+    field(out, static_cast<long long>(row.channels.hop_multiplicity));
+
+    field(out, static_cast<long long>(row.thirds));
+    field(out, static_cast<long long>(row.thirds_same_component));
+    field(out, static_cast<long long>(row.thirds_positive));
+    field(out, static_cast<long long>(row.thirds_bounded));
+    field(out, static_cast<long long>(row.thirds_unresolved));
+    field(out, static_cast<long long>(row.thirds_failed));
+    field(out, static_cast<long long>(row.thirds_all_cuts_entangled));
+    field(out, static_cast<long long>(row.blocked_by_i));
+    field(out, static_cast<long long>(row.blocked_by_j));
+    field(out, static_cast<long long>(row.blocked_by_k));
+    field(out, row.max_min_cut);
+    field(out, row.max_lower_bound);
+    field(out, row.max_upper_bound);
+    field(out, row.max_cmi);
+    field(out, row.max_mi_ij_k);
+    field(out, static_cast<long long>(row.best_k));
+    field_flag(out, row.robust_fgmn);
+    field(out, std::string(explanatory_class_name(row.explanation)));
+    out += '\n';
+}
+
+inline std::string pair_summary_path_for(const std::string &outcome_csv)
+{
+    std::filesystem::path path(outcome_csv);
+    path.replace_extension();
+    std::string stem = path.string();
+    // The outcome file is <main>_connected_zero_thirds.csv; the summary sits
+    // beside it as <main>_connected_zero_pair_summary.csv, so the two names
+    // share a prefix and glob apart.
+    static const std::string suffix = "_connected_zero_thirds";
+    if (stem.size() >= suffix.size() &&
+        stem.compare(stem.size() - suffix.size(), suffix.size(), suffix) == 0)
+    {
+        stem.resize(stem.size() - suffix.size());
+        return stem + "_connected_zero_pair_summary.csv";
+    }
+    return stem + "_pair_summary.csv";
+}
+
 // The aggregate CSV: one row per (role, pair class, separation), carrying the
 // pair-level partition beside it so
 //
@@ -1234,11 +1977,17 @@ class GapAggregate
 inline std::string aggregate_csv_header(const RunConfig &config)
 {
     std::string header(METADATA_COLUMNS);
-    header += ",fgmn_positive_tol,prefilter_tol,mosek_tol,gap_selection,controls,"
+    header += ",fgmn_positive_tol,prefilter_tol,cut_positive_tol,correlation_tol,mosek_tol,"
+              "gap_selection,controls,"
               "gap_format_version,completed_realizations,run_complete,unresolved_failed_triples,"
               "anchor_role,pair_class,separation,d,"
               "qualifying_pairs,outcomes,outcomes_prefiltered,outcomes_mosek,outcomes_positive,"
-              "outcomes_failed,pairs_with_positive_third,pairs_undetermined,r3_fraction";
+              "outcomes_failed,outcomes_bounded_below_threshold,outcomes_unresolved,"
+              "pairs_with_positive_third,pairs_undetermined,r3_fraction";
+    for (int c = 0; c < EXPLANATORY_CLASS_COUNT; ++c)
+    {
+        header += ",pairs_" + std::string(explanatory_class_name(static_cast<ExplanatoryClass>(c)));
+    }
     for (int m = 0; m <= config.n - 2; ++m)
     {
         header += ",positive_thirds_eq_" + std::to_string(m);
@@ -1276,6 +2025,8 @@ inline std::string render_aggregate_csv(const RunConfig &config, const GapAggreg
                 append_metadata_fields(line, pair_config);
                 field(line, settings.positive_tol);
                 field(line, settings.prefilter_tol);
+                field(line, settings.cut_positive_tol);
+                field(line, settings.correlation_tol);
                 field(line, csv_quote(settings.mosek_tol_text));
                 field(line, std::string(gap_selection_name(settings.selection)));
                 field_flag(line, settings.controls);
@@ -1293,9 +2044,19 @@ inline std::string render_aggregate_csv(const RunConfig &config, const GapAggreg
                 field(line, static_cast<long long>(cell.outcomes_mosek));
                 field(line, static_cast<long long>(cell.outcomes_positive));
                 field(line, static_cast<long long>(cell.outcomes_failed));
+                field(line, static_cast<long long>(
+                                cell.outcomes_by_class[static_cast<std::size_t>(
+                                    CertifiedClass::BoundedBelowThreshold)]));
+                field(line, static_cast<long long>(
+                                cell.outcomes_by_class[static_cast<std::size_t>(
+                                    CertifiedClass::Unresolved)]));
                 field(line, static_cast<long long>(cell.pairs_with_positive_third));
                 field(line, static_cast<long long>(cell.pairs_undetermined));
                 field(line, positive_fraction(cell.pairs_with_positive_third, cell.qualifying_pairs));
+                for (std::uint64_t count : cell.pairs_by_explanation)
+                {
+                    field(line, static_cast<long long>(count));
+                }
                 for (std::uint64_t count : cell.positive_third_hist)
                 {
                     field(line, static_cast<long long>(count));
@@ -1365,9 +2126,22 @@ class DurableAppender
 
     void write(const void *data, std::size_t bytes)
     {
-        if (bytes == 0 || file_ == nullptr)
+        if (bytes == 0)
         {
+            // An empty block is how a disabled companion reports "nothing to
+            // write", so it is not an error.
             return;
+        }
+        if (file_ == nullptr)
+        {
+            // Bytes for a file nobody opened. This used to be a silent no-op,
+            // and it cost a debugging session: the four-site pass reported 120
+            // rows written while the file did not exist, because its appender
+            // had never been opened. A caller that genuinely has nothing to say
+            // passes zero bytes; anything else is a wiring bug.
+            throw std::runtime_error(
+                "Tried to append " + std::to_string(bytes) +
+                " byte(s) to a pair-gap output that was never opened.");
         }
         if (std::fwrite(data, 1, bytes, file_) != bytes || std::fflush(file_) != 0)
         {
@@ -1496,8 +2270,192 @@ struct OutcomeScan
 {
     std::uint64_t rows_kept = 0;
     std::uint64_t bytes_kept = 0;
+    std::uint64_t pairs_kept = 0;
     bool trimmed = false;
 };
+
+// Column positions in the outcome CSV, resolved once by name.
+//
+// The reader addresses columns by name and the writer renders them from the
+// same list, so neither can drift into the other's positions. `scan_outcomes`
+// and the offline audit share this, which is what makes the audit's
+// reconstruction identical to the resume's rather than merely similar.
+struct OutcomeColumns
+{
+    std::size_t realization = 0, outcome = 0, role = 0, pair_i = 0, pair_j = 0, third_k = 0;
+    std::size_t separation = 0, chord = 0, zero_class = 0, method = 0, fgmn = 0, lower = 0;
+    std::size_t upper = 0, certified = 0, status = 0, first_use = 0, min_cut = 0;
+    std::size_t cut_i = 0, cut_j = 0, cut_k = 0, cmi = 0, mi_ij_k = 0, same_component = 0;
+    std::size_t pair_fn = 0, pair_fmi = 0, pair_g2 = 0, pair_f2 = 0, pair_rho_n = 0, pair_i_occ = 0;
+    std::size_t survives_i = 0, survives_j = 0, interior = 0, connected = 0, component_size = 0;
+    std::size_t shortest_path = 0, edge_disjoint = 0, vertex_disjoint = 0, min_cut_site = 0;
+    std::size_t final_sites = 0, backbone = 0, articulations = 0, dangling = 0, branches = 0;
+    std::size_t mean_branch = 0, max_branch = 0, degree_i = 0, degree_j = 0;
+    std::size_t path_gates = 0, path_temporal = 0;
+    std::size_t f_log = 0, g_log = 0, f_bottleneck = 0, g_bottleneck = 0, f_mult = 0, g_mult = 0;
+
+    static OutcomeColumns resolve()
+    {
+        const auto &columns = outcome_columns();
+        auto at = [&](const char *name) {
+            const auto it = std::find(columns.begin(), columns.end(), name);
+            if (it == columns.end())
+            {
+                throw std::logic_error(std::string("outcome column '") + name + "' does not exist.");
+            }
+            return static_cast<std::size_t>(it - columns.begin());
+        };
+        OutcomeColumns c;
+        c.realization = at("realization_id");
+        c.outcome = at("outcome_id");
+        c.role = at("anchor_role");
+        c.pair_i = at("pair_i");
+        c.pair_j = at("pair_j");
+        c.third_k = at("third_k");
+        c.separation = at("separation");
+        c.chord = at("chord");
+        c.zero_class = at("pair_class");
+        c.method = at("fgmn_method");
+        c.fgmn = at("fgmn");
+        c.lower = at("fgmn_lower_bound");
+        c.upper = at("fgmn_upper_bound");
+        c.certified = at("fgmn_class");
+        c.status = at("fgmn_status");
+        c.first_use = at("triple_first_use");
+        c.min_cut = at("min_cut");
+        c.cut_i = at("cut_i");
+        c.cut_j = at("cut_j");
+        c.cut_k = at("cut_k");
+        c.cmi = at("cmi_ij_given_k");
+        c.mi_ij_k = at("mi_ij_k");
+        c.same_component = at("same_component_ijk");
+        c.pair_fn = at("pair_fn");
+        c.pair_fmi = at("pair_fmi");
+        c.pair_g2 = at("pair_g2");
+        c.pair_f2 = at("pair_f2");
+        c.pair_rho_n = at("pair_rho_n");
+        c.pair_i_occ = at("pair_i_occ");
+        c.survives_i = at("survives_i");
+        c.survives_j = at("survives_j");
+        c.interior = at("interior_path_ij");
+        c.connected = at("connected_ij");
+        c.component_size = at("component_size_ij");
+        c.shortest_path = at("shortest_path_ij");
+        c.edge_disjoint = at("edge_disjoint_paths_ij");
+        c.vertex_disjoint = at("vertex_disjoint_paths_ij");
+        c.min_cut_site = at("min_cut_site");
+        c.final_sites = at("final_sites_in_component");
+        c.backbone = at("backbone_nodes");
+        c.articulations = at("articulation_nodes");
+        c.dangling = at("dangling_nodes");
+        c.branches = at("branches");
+        c.mean_branch = at("mean_branch_size");
+        c.max_branch = at("max_branch_size");
+        c.degree_i = at("endpoint_degree_i");
+        c.degree_j = at("endpoint_degree_j");
+        c.path_gates = at("shortest_path_gates");
+        c.path_temporal = at("shortest_path_temporal");
+        c.f_log = at("f_channel_log_weight");
+        c.g_log = at("g_channel_log_weight");
+        c.f_bottleneck = at("f_channel_bottleneck");
+        c.g_bottleneck = at("g_channel_bottleneck");
+        c.f_mult = at("f_channel_multiplicity");
+        c.g_mult = at("g_channel_multiplicity");
+        return c;
+    }
+};
+
+// Rebuild one RowSummary from a parsed outcome row.
+//
+// `positive_tol` and `cut_positive_tol` are applied here rather than taken from
+// the row's own recorded fgmn_class, which is what lets the offline audit
+// reclassify a finished run at another threshold without re-solving: the
+// certified interval is the datum, the class is a reading of it.
+inline RowSummary row_summary_from_fields(const std::vector<std::string> &fields,
+                                          const OutcomeColumns &c, const std::string &path,
+                                          double positive_tol, double cut_positive_tol)
+{
+    auto number = [&](std::size_t index, const char *name) {
+        return util::resume::parse_double_field(fields[index], path + " " + name);
+    };
+    auto flag = [&](std::size_t index) { return fields[index] == "1"; };
+    auto integer = [&](std::size_t index) { return std::stol(fields[index]); };
+
+    RowSummary row;
+    row.realization = static_cast<std::uint32_t>(integer(c.realization));
+    row.role = fields[c.role] == "control" ? 1 : 0;
+    row.separation = static_cast<int>(integer(c.separation));
+    row.pair_i = static_cast<int>(integer(c.pair_i));
+    row.pair_j = static_cast<int>(integer(c.pair_j));
+    row.third_k = static_cast<int>(integer(c.third_k));
+    row.chord = number(c.chord, "chord");
+    row.prefiltered = fields[c.method] == "prefilter_bound";
+    row.first_use = flag(c.first_use);
+    row.fgmn = number(c.fgmn, "fgmn");
+    row.lower_bound = number(c.lower, "fgmn_lower_bound");
+    row.upper_bound = number(c.upper, "fgmn_upper_bound");
+    row.min_cut = number(c.min_cut, "min_cut");
+    row.cmi_ij_given_k = number(c.cmi, "cmi_ij_given_k");
+    row.mi_ij_k = number(c.mi_ij_k, "mi_ij_k");
+    row.same_component = flag(c.same_component);
+    row.failed = !row.prefiltered && fields[c.status] != "ok";
+    row.certified =
+        classify_certified(row.lower_bound, row.upper_bound, positive_tol, !row.failed);
+    row.positive = row.certified == CertifiedClass::Positive;
+
+    // Every cut strictly above the threshold: no bipartition of the triple is
+    // separable, so a vanishing fGMN cannot be explained by a product cut.
+    // A NaN cut is not "entangled" -- it is not anything.
+    bool all_cuts = true;
+    for (std::size_t index : {c.cut_i, c.cut_j, c.cut_k})
+    {
+        const double cut = number(index, "cut");
+        all_cuts = all_cuts && cut == cut && cut > cut_positive_tol;
+    }
+    row.all_cuts_entangled = all_cuts;
+    {
+        const std::string &site = fields[c.min_cut_site];
+        row.min_cut_role = site == "i" ? 0 : (site == "j" ? 1 : (site == "k" ? 2 : -1));
+    }
+
+    row.pair_fn = number(c.pair_fn, "pair_fn");
+    row.pair_fmi = number(c.pair_fmi, "pair_fmi");
+    row.pair_g2 = number(c.pair_g2, "pair_g2");
+    row.pair_f2 = number(c.pair_f2, "pair_f2");
+    row.pair_rho_n = number(c.pair_rho_n, "pair_rho_n");
+    row.pair_i_occ = number(c.pair_i_occ, "pair_i_occ");
+    row.component_size = integer(c.component_size);
+    row.shortest_path = integer(c.shortest_path);
+    row.edge_disjoint = integer(c.edge_disjoint);
+    row.vertex_disjoint = integer(c.vertex_disjoint);
+    row.anatomy.evaluated = true;
+    row.anatomy.component_nodes = static_cast<std::uint32_t>(integer(c.component_size));
+    row.anatomy.final_sites_in_component = static_cast<std::uint32_t>(integer(c.final_sites));
+    row.anatomy.backbone_nodes = static_cast<std::uint32_t>(integer(c.backbone));
+    row.anatomy.articulation_nodes = static_cast<std::uint32_t>(integer(c.articulations));
+    row.anatomy.dangling_nodes = static_cast<std::uint32_t>(integer(c.dangling));
+    row.anatomy.branches = static_cast<std::uint32_t>(integer(c.branches));
+    row.anatomy.mean_branch_size = number(c.mean_branch, "mean_branch_size");
+    row.anatomy.max_branch_size = static_cast<std::uint32_t>(integer(c.max_branch));
+    row.anatomy.degree_i = static_cast<std::uint32_t>(integer(c.degree_i));
+    row.anatomy.degree_j = static_cast<std::uint32_t>(integer(c.degree_j));
+    row.anatomy.shortest_path_gates = static_cast<std::int32_t>(integer(c.path_gates));
+    row.anatomy.shortest_path_temporal = static_cast<std::int32_t>(integer(c.path_temporal));
+    row.anatomy.min_edge_cut = static_cast<int>(row.edge_disjoint);
+    row.anatomy.min_vertex_cut = static_cast<int>(row.vertex_disjoint);
+    row.channels.evaluated = true;
+    row.channels.pair_log_weight = number(c.f_log, "f_channel_log_weight");
+    row.channels.hop_log_weight = number(c.g_log, "g_channel_log_weight");
+    row.channels.pair_bottleneck = number(c.f_bottleneck, "f_channel_bottleneck");
+    row.channels.hop_bottleneck = number(c.g_bottleneck, "g_channel_bottleneck");
+    row.channels.pair_multiplicity = static_cast<int>(integer(c.f_mult));
+    row.channels.hop_multiplicity = static_cast<int>(integer(c.g_mult));
+    row.survives_i = flag(c.survives_i);
+    row.survives_j = flag(c.survives_j);
+    row.interior_path = flag(c.interior);
+    row.connected = flag(c.connected);
+    return row;
+}
 
 // Stream the outcome CSV, rebuilding the aggregate from every row whose
 // realization is below `completed`, and report where the kept prefix ends.
@@ -1507,8 +2465,11 @@ struct OutcomeScan
 // kill it can hold trajectories the pair checkpoint does not. The outcome rows
 // are the record of what was measured; the aggregate is recomputed from them,
 // which is also what makes the two reconcile exactly.
+using PairSummarySink = std::function<void(const PairSummaryRow &)>;
+
 inline OutcomeScan scan_outcomes(const std::string &path, std::uint64_t completed,
-                                 GapAggregate &aggregate)
+                                 GapAggregate &aggregate, const PairGapSettings &settings,
+                                 const PairSummarySink &sink = PairSummarySink())
 {
     std::ifstream file(path, std::ios::binary);
     if (!file)
@@ -1524,22 +2485,7 @@ inline OutcomeScan scan_outcomes(const std::string &path, std::uint64_t complete
                    "the binary that wrote it, move it aside, or set MIPT_DIST_RESUME=0.");
     }
     const auto &columns = outcome_columns();
-    auto column = [&](const char *name) {
-        const auto it = std::find(columns.begin(), columns.end(), name);
-        return static_cast<std::size_t>(it - columns.begin());
-    };
-    const std::size_t c_realization = column("realization_id");
-    const std::size_t c_outcome = column("outcome_id");
-    const std::size_t c_role = column("anchor_role");
-    const std::size_t c_i = column("pair_i");
-    const std::size_t c_j = column("pair_j");
-    const std::size_t c_separation = column("separation");
-    const std::size_t c_class = column("pair_class");
-    const std::size_t c_method = column("fgmn_method");
-    const std::size_t c_fgmn = column("fgmn");
-    const std::size_t c_positive = column("fgmn_positive");
-    const std::size_t c_status = column("fgmn_status");
-    const std::size_t c_first = column("triple_first_use");
+    const OutcomeColumns c = OutcomeColumns::resolve();
 
     OutcomeScan scan;
     scan.bytes_kept = expected.size();
@@ -1558,7 +2504,12 @@ inline OutcomeScan scan_outcomes(const std::string &path, std::uint64_t complete
                     "exactly N-2 = " + std::to_string(aggregate.n() - 2) + ". The file is "
                     "damaged.");
             }
-            aggregate.absorb_pair(group.data(), group.size());
+            const PairSummaryRow summary = aggregate.absorb_pair(group.data(), group.size());
+            ++scan.pairs_kept;
+            if (sink)
+            {
+                sink(summary);
+            }
             group.clear();
         }
     };
@@ -1594,34 +2545,25 @@ inline OutcomeScan scan_outcomes(const std::string &path, std::uint64_t complete
             break;
         }
         const std::uint32_t realization =
-            static_cast<std::uint32_t>(parse_int(fields[c_realization]));
+            static_cast<std::uint32_t>(parse_int(fields[c.realization]));
         if (realization < last_realization)
         {
             util::resume::refuse(path + " is not in trajectory order at outcome " +
-                                 fields[c_outcome] + ".");
+                                 fields[c.outcome] + ".");
         }
         if (realization >= completed)
         {
             scan.trimmed = true;
             break;
         }
-        if (static_cast<std::uint64_t>(parse_int(fields[c_outcome])) != scan.rows_kept)
+        if (static_cast<std::uint64_t>(parse_int(fields[c.outcome])) != scan.rows_kept)
         {
             util::resume::refuse(path + " skips or repeats an outcome_id near row " +
                                  std::to_string(scan.rows_kept + 2) + ".");
         }
-        RowSummary row;
-        row.realization = realization;
-        row.role = fields[c_role] == "control" ? 1 : 0;
-        row.zero_class = class_of(fields[c_class]);
-        row.separation = static_cast<int>(parse_int(fields[c_separation]));
-        row.pair_i = static_cast<int>(parse_int(fields[c_i]));
-        row.pair_j = static_cast<int>(parse_int(fields[c_j]));
-        row.prefiltered = fields[c_method] == "prefilter_bound";
-        row.failed = !row.prefiltered && fields[c_status] != "ok";
-        row.positive = fields[c_positive] == "1";
-        row.first_use = fields[c_first] == "1";
-        row.fgmn = util::resume::parse_double_field(fields[c_fgmn], path + " fgmn");
+        RowSummary row = row_summary_from_fields(fields, c, path, settings.positive_tol,
+                                                 settings.cut_positive_tol);
+        row.zero_class = class_of(fields[c.zero_class]);
 
         if (!group.empty() &&
             (group.front().realization != row.realization || group.front().role != row.role ||
@@ -1711,6 +2653,158 @@ inline std::string rho3_path_for(const std::string &outcome_csv)
     return path.string() + "_rho3.bin";
 }
 
+// Ordinary-PPT-but-CCNR-positive triples, in the same record format as the
+// companion. Always written, because these are the conventional
+// bound-entanglement candidates and they are rare enough that keeping all of
+// them costs nothing next to keeping every triple.
+inline std::string ppt_ccnr_path_for(const std::string &outcome_csv)
+{
+    std::filesystem::path path(outcome_csv);
+    path.replace_extension();
+    return path.string() + "_ppt_ccnr.bin";
+}
+
+// Which explanatory classes earn a four-site pass.
+//
+// "No positive third, and not numerically unresolved" -- a pair with a positive
+// third is already explained, and a pair whose intervals straddle the threshold
+// is not a residue but an unanswered question, which a larger Hilbert space
+// does not answer.
+// Stated as the exclusion rather than the list, so a class added later is
+// selected by default: the rule is a property of the verdict, not an
+// enumeration that can silently fall behind. In particular
+// `three_site_all_cuts_entangled_fgmn_zero` -- the bound-entanglement candidate
+// -- qualifies: it has no positive third and is fully resolved, which is
+// exactly the residue a four-body object would explain.
+inline bool four_site_selects(ExplanatoryClass value)
+{
+    return value != ExplanatoryClass::ThreeSiteFgmn &&
+           value != ExplanatoryClass::NumericallyUnresolved;
+}
+
+// One four-site row, rendered.
+inline void append_four_site_row(std::string &out, const RowPrefix &prefix, const std::string &run,
+                                 std::uint32_t realization, std::uint64_t four_id,
+                                 const PairSummaryRow &summary, const HelperPair &helper,
+                                 const FourResult &result)
+{
+    // Sorted position of each role, so a cut named "i" really is site i's.
+    std::array<int, 4> role{};
+    const std::array<int, 4> sites{summary.pair_i, summary.pair_j, helper.k, helper.l};
+    for (std::size_t r = 0; r < 4; ++r)
+    {
+        for (int p = 0; p < 4; ++p)
+        {
+            if (result.sites[static_cast<std::size_t>(p)] == sites[r])
+            {
+                role[r] = p;
+            }
+        }
+    }
+    const auto &S = result.parts.entropy;
+    const int bi = 1 << role[0];
+    const int bj = 1 << role[1];
+    const int bk = 1 << role[2];
+    const int bl = 1 << role[3];
+
+    out += run;
+    field(out, static_cast<long long>(realization));
+    field(out, static_cast<long long>(four_id));
+    field(out, std::string(role_name(static_cast<AnchorRole>(summary.role))));
+    field(out, static_cast<long long>(summary.pair_i));
+    field(out, static_cast<long long>(summary.pair_j));
+    field(out, static_cast<long long>(helper.k));
+    field(out, static_cast<long long>(helper.l));
+    field_flag(out, helper.control);
+    field(out, static_cast<long long>(helper.same_component));
+    field(out, static_cast<long long>(helper.on_backbone));
+    field(out, static_cast<long long>(helper.distance));
+    field(out, static_cast<long long>(summary.separation));
+    field(out, summary.chord);
+    field(out, std::string(zero_class_name(static_cast<ZeroClass>(summary.zero_class))));
+    field(out, std::string(explanatory_class_name(summary.explanation)));
+    out += ',';
+    out += prefix.provenance;
+    out += ',';
+    out += prefix.thresholds;
+
+    for (std::size_t r = 0; r < 4; ++r)
+    {
+        field(out, result.single_cuts[static_cast<std::size_t>(role[r])]);
+    }
+    field(out, result.min_single_cut);
+    // The two-vs-two cut naming: which pair of roles sits together. The stored
+    // masks are by sorted position, so the role masks are looked up rather than
+    // assumed to line up.
+    for (const std::array<int, 2> &together : std::array<std::array<int, 2>, 3>{
+             {{0, 1}, {0, 2}, {0, 3}}})
+    {
+        const int mask = (1 << role[static_cast<std::size_t>(together[0])]) |
+                         (1 << role[static_cast<std::size_t>(together[1])]);
+        // double_cuts is indexed by the mask containing sorted position 0.
+        const std::array<int, 3> masks{0b0011, 0b0101, 0b1001};
+        const int canonical = (mask & 1) != 0 ? mask : (15 & ~mask);
+        double value = std::numeric_limits<double>::quiet_NaN();
+        for (std::size_t d = 0; d < 3; ++d)
+        {
+            if (masks[d] == canonical)
+            {
+                value = result.double_cuts[d];
+            }
+        }
+        field(out, value);
+    }
+    field(out, result.min_double_cut);
+
+    for (const std::array<int, 2> &pair : std::array<std::array<int, 2>, 6>{
+             {{0, 1}, {0, 2}, {0, 3}, {1, 2}, {1, 3}, {2, 3}}})
+    {
+        field(out, result.pair_marginal_fn[pair_slot_of(role[static_cast<std::size_t>(pair[0])],
+                                                        role[static_cast<std::size_t>(pair[1])])]);
+    }
+    field(out, result.max_pair_marginal_fn);
+    // A triple marginal is named by the role it *drops*, in the order ijk, ijl,
+    // ikl, jkl -- so dropping l, k, j, i respectively.
+    for (int dropped_role : {3, 2, 1, 0})
+    {
+        field(out, result.triple_marginal_min_cut[static_cast<std::size_t>(
+                       role[static_cast<std::size_t>(dropped_role)])]);
+    }
+    field(out, result.max_triple_marginal_min_cut);
+
+    field(out, S[bi] + S[bj] - S[bi | bj]);
+    field(out, S[bk] + S[bl] - S[bk | bl]);
+    field(out, S[bi | bj] + S[bk | bl] - S[15]);
+    field(out, S[bi | bk | bl] + S[bj | bk | bl] - S[bk | bl] - S[15]);
+    field(out, result.joint_purity);
+    for (int bit : {bi, bj, bk, bl})
+    {
+        field(out, result.parts.purity[static_cast<std::size_t>(bit)]);
+    }
+
+    field_flag(out, result.globally_entangled_locally_separable);
+    {
+        // The helpers are roles 2 and 3, so the assisted entry is the slot for
+        // that pair of sorted positions -- the same indexing the marginals use.
+        const std::size_t slot = pair_slot_of(role[2], role[3]);
+        const analysis::AssistedNegativity &occ = result.assisted_occupation[slot];
+        const analysis::AssistedNegativity &par = result.assisted_parity[slot];
+        field(out, occ.average);
+        field(out, occ.maximum);
+        field(out, occ.positive_probability);
+        field(out, par.average);
+        field(out, par.maximum);
+        field(out, par.positive_probability);
+        field(out, static_cast<long long>(par.best_outcome));
+        field(out, par.unconditional);
+    }
+    field(out, result.trace_error);
+    field(out, result.hermiticity_error);
+    field(out, result.min_eigenvalue);
+    field(out, result.parity_leakage);
+    out += '\n';
+}
+
 // Fills `raw` with one raw fermionic 8x8 per triple, interleaved, 128 doubles
 // each, in the order given.
 using RdmBatch = std::function<void(const std::vector<std::array<int, 3>> &triples,
@@ -1718,8 +2812,10 @@ using RdmBatch = std::function<void(const std::vector<std::array<int, 3>> &tripl
 
 struct TrajectoryStats
 {
+    std::size_t four_site_rows = 0;
     std::size_t anchors = 0;
     std::size_t controls = 0;
+    std::size_t pairs = 0;
     std::size_t rows = 0;
     std::size_t unique_triples = 0;
     std::size_t solves = 0;
@@ -1742,7 +2838,11 @@ class PairGapAnalysis
         outcome_path_ = settings_.output_path.empty() ? default_gap_output(config_.output_path)
                                                       : settings_.output_path;
         aggregate_path_ = aggregate_path_for(outcome_path_);
+        summary_path_ = pair_summary_path_for(outcome_path_);
         rho3_path_ = rho3_path_for(outcome_path_);
+        ppt_ccnr_path_ = ppt_ccnr_path_for(outcome_path_);
+        four_site_path_ = four_site_path_for(outcome_path_);
+        rho4_path_ = rho4_path_for(outcome_path_);
         aggregate_.reset(config_.n);
         completed_ = completed;
         restore(resume);
@@ -1750,6 +2850,7 @@ class PairGapAnalysis
 
     const std::string &outcome_path() const { return outcome_path_; }
     const std::string &aggregate_path() const { return aggregate_path_; }
+    const std::string &summary_path() const { return summary_path_; }
     const std::string &rho3_path() const { return rho3_path_; }
     std::uint64_t rows() const { return aggregate_.rows(); }
     std::uint64_t solves() const { return solves_; }
@@ -1763,7 +2864,8 @@ class PairGapAnalysis
     // write, absorb -- in that order, and nothing written until everything is
     // solved.
     TrajectoryStats process(std::uint32_t realization, const PairMeasurement &measurement,
-                            const ConnectivityIndex &connectivity, const RdmBatch &rdm_batch)
+                            const ConnectivityIndex &connectivity, const RdmBatch &rdm_batch,
+                            const Rdm4Batch &rdm4_batch = Rdm4Batch())
     {
         TrajectoryStats stats;
         const std::vector<Anchor> anchors = select_anchors(measurement, settings_, config_.seed);
@@ -1812,18 +2914,26 @@ class PairGapAnalysis
 
             block_.clear();
             rho3_block_.clear();
+            ppt_block_.clear();
+            summary_block_.clear();
             summaries_.clear();
             for (std::size_t a = 0; a < anchors.size(); ++a)
             {
                 const Anchor &anchor = anchors[a];
                 const PairSnapshot &pair = measurement.pairs[anchor.pair_index];
                 const DisjointPaths paths = connectivity.disjoint_paths(pair.i, pair.j);
+                const ComponentAnatomy anatomy =
+                    settings_.anatomy ? connectivity.anatomy(pair.i, pair.j) : ComponentAnatomy{};
+                const ChannelConnectivity channels =
+                    settings_.channels ? connectivity.channels(pair.i, pair.j)
+                                       : ChannelConnectivity{};
                 summaries_.clear();
                 for (const TriplePlan::Third &third : plan.thirds[a])
                 {
                     const TripleResult &result = results_[third.triple];
                     append_outcome_row(block_, prefix_, run_, realization, next_outcome_id_,
-                                       anchor, pair, measurement, connectivity, paths, third, result);
+                                       anchor, pair, measurement, connectivity, paths, anatomy,
+                                       channels, third, result);
                     ++next_outcome_id_;
                     RowSummary row;
                     row.realization = realization;
@@ -1832,23 +2942,85 @@ class PairGapAnalysis
                     row.separation = pair.separation;
                     row.pair_i = pair.i;
                     row.pair_j = pair.j;
+                    row.third_k = third.k;
                     row.prefiltered = result.method == FgmnMethod::PrefilterBound;
                     row.failed = result.failed();
                     row.positive = result.positive;
+                    row.certified = result.certified;
                     row.first_use = third.first_use;
                     row.fgmn = result.fgmn;
+                    row.lower_bound = result.lower_bound;
+                    row.upper_bound = result.upper_bound;
+                    row.min_cut = result.min_cut;
+                    {
+                        const RolePositions pos = role_positions(result.sites, pair.i, pair.j, third.k);
+                        const auto &S = result.parts.entropy;
+                        const int bi = 1 << pos.i;
+                        const int bj = 1 << pos.j;
+                        const int bk = 1 << pos.k;
+                        row.cmi_ij_given_k = S[bi | bk] + S[bj | bk] - S[bk] - S[7];
+                        row.mi_ij_k = S[bi | bj] + S[bk] - S[7];
+                        bool all_cuts = true;
+                        for (int p = 0; p < 3; ++p)
+                        {
+                            const double cut = result.cuts[static_cast<std::size_t>(p)];
+                            all_cuts = all_cuts && cut == cut && cut > settings_.cut_positive_tol;
+                        }
+                        row.all_cuts_entangled = all_cuts;
+                        const int p = result.min_cut_position;
+                        row.min_cut_role = result.min_cut != result.min_cut
+                                               ? -1
+                                               : (p == pos.i ? 0 : (p == pos.j ? 1 : 2));
+                    }
+                    row.same_component =
+                        pair.conn.interior_path && connectivity.query(pair.i, third.k).interior_path;
+                    row.chord = pair.chord;
+                    row.pair_fn = pair.fermion.mn;
+                    row.pair_fmi = pair.fermion.mi;
+                    row.pair_g2 = pair.fermion.g2;
+                    row.pair_f2 = pair.fermion.f2;
+                    row.pair_rho_n = pair.fermion.rho_n;
+                    row.pair_i_occ = pair.fermion.i_occ;
+                    row.component_size = pair.conn.component_size;
+                    row.shortest_path = pair.conn.shortest_path;
+                    row.edge_disjoint = paths.edge;
+                    row.vertex_disjoint = paths.vertex;
+                    row.anatomy = anatomy;
+                    row.channels = channels;
+                    row.survives_i = pair.conn.survives_i;
+                    row.survives_j = pair.conn.survives_j;
+                    row.interior_path = pair.conn.interior_path;
+                    row.connected = pair.conn.connected;
                     summaries_.push_back(row);
                     if (third.first_use && rho3_.active())
                     {
                         append_rho3_record(rho3_block_, realization, result.id, result.sites,
                                            raw_.data() + third.triple * RHO3_DOUBLES);
                     }
+                    if (third.first_use && result.separability.qubit_ppt_ccnr_candidate)
+                    {
+                        append_rho3_record(ppt_block_, realization, result.id, result.sites,
+                                           raw_.data() + third.triple * RHO3_DOUBLES);
+                        ++ppt_ccnr_candidates_;
+                    }
                 }
-                aggregate_.absorb_pair(summaries_.data(), summaries_.size());
+                const PairSummaryRow summary =
+                    aggregate_.absorb_pair(summaries_.data(), summaries_.size());
+                append_pair_summary_row(summary_block_, prefix_, run_, summary);
                 stats.rows += summaries_.size();
+                ++stats.pairs;
+                if (settings_.four_site && rdm4_batch && four_site_selects(summary.explanation))
+                {
+                    pending_four_.push_back(summary);
+                }
             }
+            run_four_site(realization, connectivity, rdm4_batch, stats);
             outcomes_.write(block_.data(), block_.size());
+            summaries_file_.write(summary_block_.data(), summary_block_.size());
+            four_site_file_.write(four_block_.data(), four_block_.size());
+            rho4_.write(rho4_block_.data(), rho4_block_.size());
             rho3_.write(rho3_block_.data(), rho3_block_.size());
+            ppt_ccnr_.write(ppt_block_.data(), ppt_block_.size());
         }
         completed_ = static_cast<std::uint64_t>(realization) + 1u;
         return stats;
@@ -1861,7 +3033,11 @@ class PairGapAnalysis
     void publish()
     {
         outcomes_.sync();
+        summaries_file_.sync();
         rho3_.sync();
+        ppt_ccnr_.sync();
+        four_site_file_.sync();
+        rho4_.sync();
         publish_atomically(aggregate_path_,
                            render_aggregate_csv(config_, aggregate_, pair_bins_, completed_));
     }
@@ -1870,9 +3046,32 @@ class PairGapAnalysis
     {
         publish();
         outcomes_.close();
+        summaries_file_.close();
         rho3_.close();
+        ppt_ccnr_.close();
+        four_site_file_.close();
+        rho4_.close();
         out << "Pair-gap triples: " << aggregate_.rows() << " outcome row(s), " << solves_
             << " fGMN solve(s) -> " << outcome_path_ << '\n';
+        out << "  per-pair summary -> " << summary_path_ << '\n';
+        if (settings_.four_site)
+        {
+            out << "  four-site analysis: " << four_rows_ << " row(s) -> " << four_site_path_
+                << '\n';
+            if (four_site_signatures_ > 0)
+            {
+                out << "  " << four_site_signatures_
+                    << " four-mode RDM(s) entangled across every cut with every pair and "
+                       "triple marginal separable -- the GHZ-like signature.\n";
+            }
+        }
+        if (ppt_ccnr_candidates_ > 0)
+        {
+            out << "  " << ppt_ccnr_candidates_
+                << " ordinary-PPT but CCNR-positive triple(s) -> " << ppt_ccnr_path_
+                << ". Both criteria are one-sided, so these are candidates for offline "
+                   "study, not bound-entangled states.\n";
+        }
         if (aggregate_.failed_triples() > 0)
         {
             out << "  WARNING: " << aggregate_.failed_triples()
@@ -1903,6 +3102,93 @@ class PairGapAnalysis
     }
 
   private:
+    // The four-site pass for one trajectory's selected anchors.
+    //
+    // It runs after every summary is known, because the selection *is* the
+    // summary's verdict, and before anything is written, so a trajectory's
+    // four-site rows land in the same durable block as the outcome rows they
+    // belong to. That is what makes the resume trim cut both at the same place.
+    void run_four_site(std::uint32_t realization, const ConnectivityIndex &connectivity,
+                       const Rdm4Batch &rdm4_batch, TrajectoryStats &stats)
+    {
+        four_block_.clear();
+        rho4_block_.clear();
+        if (pending_four_.empty())
+        {
+            return;
+        }
+        quads_.clear();
+        helpers_.clear();
+        owner_.clear();
+        std::vector<std::uint8_t> same_component;
+        std::vector<std::uint8_t> on_backbone;
+        std::vector<std::int32_t> distance;
+        for (std::size_t a = 0; a < pending_four_.size(); ++a)
+        {
+            const PairSummaryRow &summary = pending_four_[a];
+            connectivity.site_roles(summary.pair_i, summary.pair_j, same_component, on_backbone,
+                                    distance);
+            // Seeded on the run, the trajectory and the pair, so a pair's
+            // helper set is the same however the run was scheduled or resumed.
+            const std::uint64_t seed = seeding::splitmix64(
+                config_.seed ^ (static_cast<std::uint64_t>(realization) << 20) ^
+                (static_cast<std::uint64_t>(summary.pair_i) << 8) ^
+                static_cast<std::uint64_t>(summary.pair_j));
+            const std::vector<HelperPair> chosen = select_helper_pairs(
+                config_.n, summary.pair_i, summary.pair_j, same_component, on_backbone, distance,
+                settings_.four_max_helper_pairs, seed);
+            for (const HelperPair &helper : chosen)
+            {
+                std::array<int, 4> quad{summary.pair_i, summary.pair_j, helper.k, helper.l};
+                std::sort(quad.begin(), quad.end());
+                quads_.push_back(quad);
+                helpers_.push_back(helper);
+                owner_.push_back(a);
+            }
+        }
+        if (quads_.empty())
+        {
+            return;
+        }
+        raw4_.assign(quads_.size() * RHO4_DOUBLES, 0.0);
+        rdm4_batch(quads_, raw4_);
+        for (std::size_t q = 0; q < quads_.size(); ++q)
+        {
+            const FourResult result =
+                evaluate_four(raw4_.data() + q * RHO4_DOUBLES, quads_[q],
+                              settings_.cut_positive_tol, settings_.assisted,
+                              settings_.assisted_tol);
+            append_four_site_row(four_block_, prefix_, run_, realization, next_four_id_,
+                                 pending_four_[owner_[q]], helpers_[q], result);
+            ++next_four_id_;
+            ++stats.four_site_rows;
+            four_rows_ += 1u;
+            if (result.globally_entangled_locally_separable)
+            {
+                ++four_site_signatures_;
+            }
+            if (rho4_.active())
+            {
+                append_rho4_record(rho4_block_, realization, quads_[q],
+                                   raw4_.data() + q * RHO4_DOUBLES);
+            }
+        }
+        pending_four_.clear();
+    }
+
+    static void append_rho4_record(std::string &out, std::uint32_t realization,
+                                   const std::array<int, 4> &sites, const double *raw)
+    {
+        char head[16] = {};
+        std::memcpy(head, &realization, 4);
+        for (int s = 0; s < 4; ++s)
+        {
+            head[8 + s] = static_cast<char>(sites[static_cast<std::size_t>(s)]);
+        }
+        out.append(head, 16);
+        out.append(reinterpret_cast<const char *>(raw), RHO4_DOUBLES * sizeof(double));
+    }
+
     void restore(bool resume)
     {
         namespace fs = std::filesystem;
@@ -1966,7 +3252,15 @@ class PairGapAnalysis
             return;
         }
 
-        const OutcomeScan scan = scan_outcomes(outcome_path_, completed_, aggregate_);
+        // The summary is a pure function of the kept rows, so it is rewritten
+        // from them rather than trimmed: a summary row and the N-2 outcome rows
+        // behind it then cannot disagree, whatever the kill interrupted.
+        std::string rebuilt = pair_summary_csv_header();
+        const OutcomeScan scan =
+            scan_outcomes(outcome_path_, completed_, aggregate_, settings_,
+                          [&](const PairSummaryRow &summary) {
+                              append_pair_summary_row(rebuilt, prefix_, run_, summary);
+                          });
         restored_rows_ = scan.rows_kept;
         restored_trimmed_ = scan.trimmed;
         next_outcome_id_ = scan.rows_kept;
@@ -1976,7 +3270,51 @@ class PairGapAnalysis
             throw std::runtime_error("Could not trim " + outcome_path_ + ": " + error.message());
         }
         reconcile();
+        publish_atomically(summary_path_, rebuilt);
         outcomes_.open(outcome_path_);
+        summaries_file_.open(summary_path_);
+
+        if (settings_.four_site)
+        {
+            // A row-per-(pair, helper) CSV in trajectory order, so the trim is
+            // a line scan: keep every row whose realization is below the pair
+            // checkpoint. Far fewer rows than the outcome file, so a scan is
+            // cheaper than maintaining an index for it.
+            if (fs::exists(four_site_path_, error))
+            {
+                trim_four_site(four_site_path_, completed_, next_four_id_);
+            }
+            else
+            {
+                create_four_site_header();
+            }
+            four_site_file_.open(four_site_path_);
+            if (settings_.store_rho4)
+            {
+                if (fs::exists(rho4_path_, error))
+                {
+                    trim_rho4(rho4_path_, rho3_header, completed_);
+                }
+                else
+                {
+                    write_rho3_header(rho4_path_, rho3_header);
+                }
+                rho4_.open(rho4_path_);
+            }
+        }
+
+        // The candidate companion is always written, so it is always trimmed.
+        // Missing is not an error: it is rare for one to exist at all, and a
+        // run with no candidates yet legitimately has only a header.
+        if (fs::exists(ppt_ccnr_path_, error))
+        {
+            trim_rho3(ppt_ccnr_path_, rho3_header, completed_);
+        }
+        else
+        {
+            write_rho3_header(ppt_ccnr_path_, rho3_header);
+        }
+        ppt_ccnr_.open(ppt_ccnr_path_);
 
         if (settings_.store_rho3)
         {
@@ -2004,30 +3342,147 @@ class PairGapAnalysis
     void start_fresh(const std::string &rho3_header)
     {
         ensure_output_parent_directory(outcome_path_);
-        {
-            std::FILE *file = std::fopen(outcome_path_.c_str(), "wb");
+        auto create_with_header = [](const std::string &path, const std::string &header) {
+            std::FILE *file = std::fopen(path.c_str(), "wb");
             if (file == nullptr)
             {
-                throw std::runtime_error("Could not create " + outcome_path_ + ".");
+                throw std::runtime_error("Could not create " + path + ".");
             }
-            const std::string header = outcome_csv_header();
             std::fwrite(header.data(), 1, header.size(), file);
             std::fclose(file);
-        }
+        };
+        create_with_header(outcome_path_, outcome_csv_header());
+        create_with_header(summary_path_, pair_summary_csv_header());
         outcomes_.open(outcome_path_);
+        summaries_file_.open(summary_path_);
+        write_rho3_header(ppt_ccnr_path_, rho3_header);
+        ppt_ccnr_.open(ppt_ccnr_path_);
         if (settings_.store_rho3)
         {
             write_rho3_header(rho3_header);
             rho3_.open(rho3_path_);
         }
+        if (settings_.four_site)
+        {
+            create_four_site_header();
+            four_site_file_.open(four_site_path_);
+            if (settings_.store_rho4)
+            {
+                write_rho3_header(rho4_path_, rho3_header);
+                rho4_.open(rho4_path_);
+            }
+        }
     }
 
-    void write_rho3_header(const std::string &header)
+    void create_four_site_header()
     {
-        std::FILE *file = std::fopen(rho3_path_.c_str(), "wb");
+        std::FILE *file = std::fopen(four_site_path_.c_str(), "wb");
         if (file == nullptr)
         {
-            throw std::runtime_error("Could not create " + rho3_path_ + ".");
+            throw std::runtime_error("Could not create " + four_site_path_ + ".");
+        }
+        const std::string header = four_site_csv_header();
+        std::fwrite(header.data(), 1, header.size(), file);
+        std::fclose(file);
+    }
+
+    // Keep the prefix whose realization is below `completed`, and report how
+    // many rows survived so four_id stays contiguous across the restart.
+    static void trim_four_site(const std::string &path, std::uint64_t completed,
+                               std::uint64_t &rows_kept)
+    {
+        std::ifstream file(path, std::ios::binary);
+        if (!file)
+        {
+            throw std::runtime_error("Could not open " + path + " for reading.");
+        }
+        std::string line;
+        if (!std::getline(file, line) || line + '\n' != four_site_csv_header())
+        {
+            util::resume::refuse(path + " has a different column layout than this binary "
+                                        "writes. Move it aside, or set MIPT_DIST_RESUME=0.");
+        }
+        const auto &columns = four_site_columns();
+        const std::size_t realization_column = static_cast<std::size_t>(
+            std::find(columns.begin(), columns.end(), "realization_id") - columns.begin());
+        std::uint64_t bytes = four_site_csv_header().size();
+        rows_kept = 0;
+        while (true)
+        {
+            const std::streampos start = file.tellg();
+            if (!std::getline(file, line) || file.eof())
+            {
+                break;
+            }
+            const std::vector<std::string> fields = util::resume::split_csv_row(line);
+            if (fields.size() != columns.size())
+            {
+                break;
+            }
+            if (static_cast<std::uint64_t>(std::stoul(fields[realization_column])) >= completed)
+            {
+                break;
+            }
+            ++rows_kept;
+            bytes = static_cast<std::uint64_t>(start) + line.size() + 1u;
+        }
+        file.close();
+        std::error_code error;
+        std::filesystem::resize_file(path, bytes, error);
+        if (error)
+        {
+            throw std::runtime_error("Could not trim " + path + ": " + error.message());
+        }
+    }
+
+    static void trim_rho4(const std::string &path, const std::string &header,
+                          std::uint64_t completed)
+    {
+        // Same fixed-width layout as the triple companion, only wider.
+        std::ifstream file(path, std::ios::binary);
+        char preamble[RHO3_PREAMBLE];
+        file.read(preamble, RHO3_PREAMBLE);
+        if (!file || std::memcmp(preamble, RHO3_MAGIC, 8) != 0)
+        {
+            util::resume::refuse(path + " is not a pair-gap RDM companion.");
+        }
+        std::uint32_t header_bytes = 0;
+        std::memcpy(&header_bytes, preamble + 16, 4);
+        std::string stored(header_bytes, '\0');
+        file.read(stored.data(), header_bytes);
+        if (stored != header)
+        {
+            util::resume::refuse(path + " describes a different run.");
+        }
+        constexpr std::size_t record = 16 + RHO4_DOUBLES * sizeof(double);
+        const std::uint64_t offset = RHO3_PREAMBLE + header_bytes;
+        const std::uint64_t size = std::filesystem::file_size(path);
+        const std::uint64_t count = size > offset ? (size - offset) / record : 0;
+        std::uint64_t keep = 0;
+        for (std::uint64_t index = 0; index < count; ++index)
+        {
+            file.clear();
+            file.seekg(static_cast<std::streamoff>(offset + index * record));
+            std::uint32_t value = 0;
+            file.read(reinterpret_cast<char *>(&value), 4);
+            if (value >= completed)
+            {
+                break;
+            }
+            keep = index + 1u;
+        }
+        file.close();
+        std::filesystem::resize_file(path, offset + keep * record);
+    }
+
+    void write_rho3_header(const std::string &header) { write_rho3_header(rho3_path_, header); }
+
+    void write_rho3_header(const std::string &path, const std::string &header)
+    {
+        std::FILE *file = std::fopen(path.c_str(), "wb");
+        if (file == nullptr)
+        {
+            throw std::runtime_error("Could not create " + path + ".");
         }
         const std::string bytes = rho3_preamble(header);
         std::fwrite(bytes.data(), 1, bytes.size(), file);
@@ -2057,6 +3512,8 @@ class PairGapAnalysis
         same_text("channel_floor", number(config_.channel_floor));
         same_text("fgmn_positive_tol", number(settings_.positive_tol));
         same_text("prefilter_tol", number(settings_.prefilter_tol));
+        same_text("cut_positive_tol", number(settings_.cut_positive_tol));
+        same_text("correlation_tol", number(settings_.correlation_tol));
         same_text("gap_selection", gap_selection_name(settings_.selection));
         same_text("controls", settings_.controls ? "1" : "0");
         same_text("master_seed", std::to_string(config_.seed));
@@ -2103,14 +3560,26 @@ class PairGapAnalysis
     std::string run_;
     std::string outcome_path_;
     std::string aggregate_path_;
+    std::string summary_path_;
     std::string rho3_path_;
+    std::string ppt_ccnr_path_;
+    std::string four_site_path_;
+    std::string rho4_path_;
     GapAggregate aggregate_;
     DurableAppender outcomes_;
+    DurableAppender summaries_file_;
     DurableAppender rho3_;
+    DurableAppender ppt_ccnr_;
+    DurableAppender four_site_file_;
+    DurableAppender rho4_;
     std::uint64_t completed_ = 0;
     std::uint64_t next_outcome_id_ = 0;
     std::uint64_t solves_ = 0;
     std::uint64_t restored_rows_ = 0;
+    std::uint64_t ppt_ccnr_candidates_ = 0;
+    std::uint64_t next_four_id_ = 0;
+    std::uint64_t four_rows_ = 0;
+    std::uint64_t four_site_signatures_ = 0;
     bool restored_trimmed_ = false;
 
     std::vector<double> raw_;
@@ -2119,7 +3588,16 @@ class PairGapAnalysis
     std::vector<std::size_t> job_of_;
     std::vector<RowSummary> summaries_;
     std::string block_;
+    std::string summary_block_;
     std::string rho3_block_;
+    std::string ppt_block_;
+    std::string four_block_;
+    std::string rho4_block_;
+    std::vector<PairSummaryRow> pending_four_;
+    std::vector<std::array<int, 4>> quads_;
+    std::vector<HelperPair> helpers_;
+    std::vector<std::size_t> owner_;
+    std::vector<double> raw4_;
 };
 
 } // namespace mipt::dist::gap

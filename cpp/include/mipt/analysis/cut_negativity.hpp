@@ -52,6 +52,89 @@
 namespace mipt::analysis
 {
 
+// The reordering sign that moves every mode of `mask` to the front of the
+// operator ordering, keeping the relative order within the subsystem and within
+// its complement: for each occupied mode of the subsystem, the occupied modes
+// *outside* it that sit below have to be anticommuted past.
+//
+// For a single-mode mask this is exactly the sign the one-party routine below
+// applies, which is what makes the general routine a generalization rather than
+// a second convention.
+inline double subsystem_reorder_sign(int x, int mask)
+{
+    int crossings = 0;
+    int remaining = x & mask;
+    while (remaining != 0)
+    {
+        const int lowest = remaining & -remaining;
+        const int below = lowest - 1;
+        crossings += __builtin_popcount(static_cast<unsigned>(x & ~mask & below));
+        remaining ^= lowest;
+    }
+    return (crossings & 1) ? -1.0 : 1.0;
+}
+
+// Fermionic (SSR) or ordinary partial transpose across an arbitrary subsystem
+// `mask`, and the negativity that follows.
+//
+// The single-mode case is `cut_negativity` below and is the validated
+// reference; this reduces to it exactly, which `make test-dist` checks mode by
+// mode before trusting any two-versus-two value.
+//
+// The phase is i^(n_mask(row) + n_mask(col)) on the *target* indices, which for
+// a one-mode subsystem is the `multiply by i when the occupations disagree`
+// rule the single-mode routine applies, up to an overall factor that cannot
+// change a singular value.
+template <int Parties>
+inline double cut_negativity_mask(const double *rho_ri, int mask, bool fermionic)
+{
+    constexpr int D = 1 << Parties;
+    constexpr int FULL = D - 1;
+    if (rho_ri == nullptr || mask <= 0 || mask >= FULL + 1 || (mask & FULL) == 0 ||
+        (mask & FULL) == FULL)
+    {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+    std::array<std::complex<double>, static_cast<std::size_t>(D * D)> pt{};
+    for (int r = 0; r < D; ++r)
+    {
+        for (int c = 0; c < D; ++c)
+        {
+            const int source_row = (r & ~mask) | (c & mask);
+            const int source_col = (c & ~mask) | (r & mask);
+            const std::size_t source = 2u * static_cast<std::size_t>(source_row * D + source_col);
+            std::complex<double> value(rho_ri[source], rho_ri[source + 1u]);
+            if (fermionic)
+            {
+                value *= subsystem_reorder_sign(source_row, mask) *
+                         subsystem_reorder_sign(source_col, mask);
+                const int phase = (__builtin_popcount(static_cast<unsigned>(r & mask)) +
+                                   __builtin_popcount(static_cast<unsigned>(c & mask))) &
+                                  3;
+                for (int step = 0; step < phase; ++step)
+                {
+                    value = std::complex<double>(-value.imag(), value.real());
+                }
+            }
+            pt[static_cast<std::size_t>(r * D + c)] = value;
+        }
+    }
+    double trace_norm = 0.0;
+    const bool converged =
+        fermionic ? util::dilation_trace_norm<static_cast<std::size_t>(D)>(pt, trace_norm)
+                  : util::hermitian_trace_norm<static_cast<std::size_t>(D)>(pt, trace_norm);
+    if (!converged)
+    {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+    double negativity = 0.5 * (trace_norm - 1.0);
+    if (negativity < 0.0 && negativity > -1.0e-10)
+    {
+        negativity = 0.0;
+    }
+    return negativity;
+}
+
 template <int Parties>
 inline double cut_negativity(const double *rho_ri, int subsystem, bool fermionic)
 {

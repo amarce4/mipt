@@ -76,7 +76,7 @@ pair_gap           dist_scaling.exe's connected-zero triple analysis
 from __future__ import annotations
 
 from .distance import dist_percolation, dist_scaling, dist_scaling_comparison
-from .pair_gap import dist_pair_gap
+from .pair_gap import dist_pair_gap, read_four_site, read_pair_summary
 from .entropy import entropy
 from .expvals import expvals
 from .free_energy import free_energy_ceff, free_energy_equilibration
@@ -99,6 +99,8 @@ __all__ = [
     "entropy",
     "dist_percolation",
     "dist_pair_gap",
+    "read_pair_summary",
+    "read_four_site",
     "dist_scaling",
     "dist_scaling_comparison",
     "expvals",

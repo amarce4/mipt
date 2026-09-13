@@ -434,6 +434,104 @@ void check_status_entry_point()
     }
 }
 
+// The certified interval, against the states whose fGMN is known.
+//
+// The point is not that the interval is tight -- MOSEK's own tolerance sets
+// that -- but that it *brackets* the answer and that the bracket is honest:
+// the lower bound never exceeds the truth and the upper bound never falls
+// below it. A bound that failed either way would silently turn an unresolved
+// state into a certified one.
+void check_certified_interval()
+{
+    struct Case
+    {
+        const char *name;
+        Packed rho;
+        double expected;
+    };
+    const std::vector<Case> cases{
+        {"GHZ", pack(pure(ghz_amplitudes())), 0.5},
+        {"W", pack(pure(w_amplitudes())), W_GMN},
+        {"biseparable", pack(pure(bell_ab_amplitudes())), 0.0},
+        {"product", pack(pure(product_amplitudes())), 0.0},
+    };
+    for (const Case &item : cases)
+    {
+        FgmnCertificate cert{};
+        const int status = compute_fgmn_mosek_8x8_certified_cpp(item.rho.data(), &cert);
+        expect_close(static_cast<double>(status), FGMN_STATUS_OK, 0.0,
+                     (std::string(item.name) + " solves to optimality").c_str());
+        if (status != FGMN_STATUS_OK)
+        {
+            continue;
+        }
+        // The bracket holds, with a slack for the solver's own tolerance --
+        // the returned points are feasible only to ~GMN_MOSEK_TOL, which is
+        // exactly what the residual fields report.
+        const double slack = 1.0e-4;
+        if (!(cert.lower_bound <= item.expected + slack))
+        {
+            std::cerr << "FAIL " << item.name << " lower bound " << cert.lower_bound
+                      << " exceeds the known fGMN " << item.expected << '\n';
+            ++failures;
+        }
+        if (cert.upper_bound == cert.upper_bound &&
+            !(cert.upper_bound >= item.expected - slack))
+        {
+            std::cerr << "FAIL " << item.name << " upper bound " << cert.upper_bound
+                      << " falls below the known fGMN " << item.expected << '\n';
+            ++failures;
+        }
+        if (!(cert.lower_bound >= 0.0))
+        {
+            std::cerr << "FAIL " << item.name << " lower bound " << cert.lower_bound
+                      << " is negative; fGMN >= 0 is a theorem\n";
+            ++failures;
+        }
+        expect_close(cert.value, compute_fgmn_mosek_8x8_cpp(item.rho.data()), 1.0e-6,
+                     (std::string(item.name) + ": certified value matches the plain solve").c_str());
+        // The residuals are the reason the bracket is only as good as it is,
+        // so they have to be present and small rather than absent.
+        if (!(cert.primal_residual == cert.primal_residual) ||
+            !(cert.dual_residual == cert.dual_residual))
+        {
+            std::cerr << "FAIL " << item.name << ": MOSEK reported no feasibility residual\n";
+            ++failures;
+        }
+    }
+
+    // Classification around the threshold, which is what the analysis does
+    // with the interval. GHZ at 0.5 is resolvable at any sane threshold; a
+    // separable state is not resolvable at 1e-10, and that is the finding, not
+    // a defect: the interior-point tolerance is orders of magnitude wider.
+    FgmnCertificate ghz{};
+    compute_fgmn_mosek_8x8_certified_cpp(pack(pure(ghz_amplitudes())).data(), &ghz);
+    if (!(ghz.lower_bound > 1.0e-3))
+    {
+        std::cerr << "FAIL GHZ is not certified positive at 1e-3 (lower bound " << ghz.lower_bound
+                  << ")\n";
+        ++failures;
+    }
+    FgmnCertificate product{};
+    compute_fgmn_mosek_8x8_certified_cpp(pack(pure(product_amplitudes())).data(), &product);
+    if (!(product.lower_bound <= 1.0e-3))
+    {
+        std::cerr << "FAIL a product state is certified positive at 1e-3 (lower bound "
+                  << product.lower_bound << ")\n";
+        ++failures;
+    }
+
+    FgmnCertificate missing{};
+    const int status = compute_fgmn_mosek_8x8_certified_cpp(nullptr, &missing);
+    expect_close(static_cast<double>(status), FGMN_STATUS_NULL_INPUT, 0.0,
+                 "a null matrix reports its own status");
+    if (missing.lower_bound == missing.lower_bound || missing.upper_bound == missing.upper_bound)
+    {
+        std::cerr << "FAIL a failed solve returned a bound instead of NaN\n";
+        ++failures;
+    }
+}
+
 } // namespace
 
 int main()
@@ -455,6 +553,7 @@ int main()
     check_cut_negativities_on_known_states();
     check_prefilter_agrees_with_direct_solves();
     check_status_entry_point();
+    check_certified_interval();
 
     if (failures != 0)
     {

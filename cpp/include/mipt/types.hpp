@@ -313,6 +313,20 @@ struct LogicalBond
 {
     int a = 0;
     int b = 0;
+    // How much amplitude this gate actually moves in each parity sector, as
+    // the squared off-diagonal weight of that sector's 2x2 block.
+    //
+    //   pair_weight (even block, |00> <-> |11>) carries the pairing channel F;
+    //   hop_weight  (odd block,  |01> <-> |10>) carries the hopping channel G.
+    //
+    // The binary graph treats every gate as an equally usable edge, which is
+    // exactly the approximation under suspicion: a gate whose odd block is
+    // nearly diagonal percolates just as well as one that mixes maximally, yet
+    // transmits almost no parity-odd coherence. 1.0 is "fully transmitting" and
+    // is what a circuit with no parity-block structure reports, so the weighted
+    // analysis then degenerates to the unweighted one rather than lying.
+    double pair_weight = 1.0;
+    double hop_weight = 1.0;
 };
 
 struct LogicalLayer

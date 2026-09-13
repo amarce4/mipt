@@ -41,6 +41,7 @@
 #include "mipt/circuit.hpp"
 #include "mipt/dist_connectivity.hpp"
 #include "mipt/dist_metrics.hpp"
+#include "mipt/ancilla_rdm.hpp"
 #include "mipt/dist_pair_gap.hpp"
 #include "mipt/dist_records.hpp"
 #include "mipt/dist_scaling_csv.hpp"
@@ -1282,9 +1283,20 @@ class PairGapTripleProtocol
     PairGapTripleProtocol(const RunConfig &config, const PairProtocol &pairs)
         : analysis_(config, pairs.bins(),
                     [](const double *rho) {
-                        int status = FGMN_STATUS_EXCEPTION;
-                        const double value = compute_fgmn_mosek_8x8_status_cpp(rho, &status);
-                        return gap::SolveOutcome{value, status};
+                        // The certified entry point: the interval, not a point.
+                        // A triple is called positive only when MOSEK's own
+                        // primal bound clears the threshold.
+                        FgmnCertificate cert{};
+                        compute_fgmn_mosek_8x8_certified_cpp(rho, &cert);
+                        gap::SolveOutcome out;
+                        out.value = cert.value;
+                        out.lower_bound = cert.lower_bound;
+                        out.upper_bound = cert.upper_bound;
+                        out.primal_residual = cert.primal_residual;
+                        out.dual_residual = cert.dual_residual;
+                        out.solver_gap = cert.solver_gap;
+                        out.status = cert.status;
+                        return out;
                     },
                     solver_workers(), static_cast<std::uint64_t>(pairs.start_realization()),
                     resume::enabled()),
@@ -1316,8 +1328,64 @@ class PairGapTripleProtocol
             std::vector<Subsystem> subsystems(triples.begin(), triples.end());
             cudaq_three_site_density_matrices(state, n, subsystems, raw.data(), true);
         };
+        // Four-mode RDMs go through the *host* reducer, once per quadruple over
+        // one host copy of the state vector.
+        //
+        // Not the CUDA path: `mipt_cuda_rho4_complex_*` is declared in
+        // ancilla_rdm.hpp but implemented nowhere -- src/cuda/ancilla_rdm4.cu
+        // provides only the `_tail_` variants, which require the four retained
+        // modes to be the last four qubits. An arbitrary quadruple is not, so
+        // calling reduced_density_matrix_four here is a link error. The host
+        // sweep is O(2^N) per quadruple, which is why the four-site pass is off
+        // by default and gated to the residue pairs.
+        const gap::Rdm4Batch batch4 =
+            [&state, n](const std::vector<std::array<int, 4>> &quads, std::vector<double> &raw) {
+                if (quads.empty())
+                {
+                    return;
+                }
+                // One host copy per trajectory, at the simulation's own
+                // precision. `get_tensor().data` is a *device* pointer on the
+                // GPU backend, so it cannot be dereferenced here, and to_host
+                // refuses an fp64 buffer for an fp32 state -- the buffer type
+                // has to match.
+                const std::size_t dimension = std::size_t{1} << n;
+                std::vector<std::complex<double>> wide;
+                std::vector<std::complex<float>> narrow;
+                const bool fp64 = state.get_precision() == cudaq::SimulationState::precision::fp64;
+                if (fp64)
+                {
+                    wide.resize(dimension);
+                    state.to_host(wide.data(), wide.size());
+                }
+                else
+                {
+                    narrow.resize(dimension);
+                    state.to_host(narrow.data(), narrow.size());
+                }
+                auto reduce = [&](const std::array<int, 4> &quad) {
+                    return fp64
+                               ? ancilla::from_host_statevector_four(wide.data(), n, quad, true)
+                               : ancilla::from_host_statevector_four(narrow.data(), n, quad, true);
+                };
+                for (std::size_t q = 0; q < quads.size(); ++q)
+                {
+                    const ancilla::Rdm4 rho = reduce(quads[q]);
+                    double *out = raw.data() + q * gap::RHO4_DOUBLES;
+                    for (int r = 0; r < 16; ++r)
+                    {
+                        for (int c = 0; c < 16; ++c)
+                        {
+                            const std::complex<double> value =
+                                rho(static_cast<std::size_t>(r), static_cast<std::size_t>(c));
+                            out[2u * static_cast<std::size_t>(r * 16 + c)] = value.real();
+                            out[2u * static_cast<std::size_t>(r * 16 + c) + 1u] = value.imag();
+                        }
+                    }
+                }
+            };
         return analysis_.process(static_cast<std::uint32_t>(realization), measurement,
-                                 connectivity, batch);
+                                 connectivity, batch, batch4);
     }
 
   private:
@@ -2070,6 +2138,19 @@ inline void apply_environment(RunConfig &config)
     const double gmn_zero = env::real("MIPT_DIST_GMN_ZERO_TOL", 1.0e-10, 0.0, 1.0);
     gap.prefilter_tol = env::real("MIPT_DIST_PAIR_GAP_PREFILTER_TOL", gmn_zero, 0.0, 1.0);
     gap.positive_tol = env::real("MIPT_DIST_PAIR_GAP_POSITIVE_TOL", gmn_zero, 0.0, 1.0);
+    gap.cut_positive_tol =
+        env::real("MIPT_DIST_PAIR_GAP_CUT_TOL", gap.prefilter_tol, 0.0, 1.0);
+    gap.anatomy = env::boolean("MIPT_DIST_PAIR_GAP_ANATOMY", true);
+    gap.channels = env::boolean("MIPT_DIST_PAIR_GAP_CHANNELS", true);
+    gap.assisted = env::boolean("MIPT_DIST_PAIR_GAP_ASSISTED", true);
+    gap.assisted_tol =
+        env::real("MIPT_DIST_PAIR_GAP_ASSISTED_TOL", gap.cut_positive_tol, 0.0, 1.0);
+    gap.four_site = env::boolean("MIPT_DIST_PAIR_GAP_FOUR_SITE", false);
+    gap.four_max_helper_pairs = static_cast<int>(
+        env::integer("MIPT_DIST_PAIR_GAP_FOUR_MAX_HELPER_PAIRS", 12, 0, 4096));
+    gap.store_rho4 = env::boolean("MIPT_DIST_PAIR_GAP_STORE_RHO4", false);
+    gap.correlation_tol =
+        env::real("MIPT_DIST_PAIR_GAP_CORRELATION_TOL", gap.cut_positive_tol, 0.0, 1.0);
     gap.retries = static_cast<int>(env::integer("MIPT_DIST_PAIR_GAP_RETRIES", 2, 0, 20));
     gap.mosek_tol_text = env::text("GMN_MOSEK_TOL", analysis::DEFAULT_SDP_TOLERANCE_TEXT);
 
@@ -2264,7 +2345,24 @@ inline void print_usage(const char *argv0)
         << "Usage:\n"
         << "  " << argv0
         << " [k = 2] [N = 10] [periods = 10] [p = 0.17] [realizations = 10]"
-           " [circ_type = 0] [output.csv = auto] [B_min = 0.5]\n\n"
+           " [circ_type = 0] [output.csv = auto] [B_min = 0.5]\n"
+        << "  " << argv0
+        << " --gap-audit <outcome.csv> [rho3.bin] [pair_records.bin]\n\n"
+        << "Offline gap audit (--gap-audit):\n"
+        << "  Re-reads a finished connected-zero triple run and re-applies thresholds\n"
+        << "  without simulating anything. Writes <outcome stem>_audit_*.csv and never\n"
+        << "  modifies its inputs. Reclassifying needs only the outcome CSV, whose rows\n"
+        << "  carry the certified fGMN interval; the record binary adds P(fN>eps | C)\n"
+        << "  against the disconnected false-positive floor.\n"
+        << "  MIPT_DIST_AUDIT_PAIR_TOLS=<list> pair fN thresholds, comma separated. Only\n"
+        << "    values at or below the run's own select a population the run measured;\n"
+        << "    a larger one is reported as unreachable rather than silently truncated.\n"
+        << "  MIPT_DIST_AUDIT_FGMN_TOLS=<list> fGMN positivity thresholds.\n"
+        << "  MIPT_DIST_AUDIT_CUT_TOL=<recorded> cut threshold for 'entangled across\n"
+        << "    every cut'.\n"
+        << "  MIPT_DIST_AUDIT_MOSEK_TOL=1e-8 interior-point tolerance for a re-solve.\n"
+        << "  MIPT_DIST_AUDIT_RESOLVE=0 re-solve selected RDMs from the companion.\n"
+        << "  MIPT_DIST_AUDIT_PREFIX=<stem> where to write, instead of beside the input.\n\n"
         << "Arguments:\n"
         << "  k          2 = every unordered site pair; 3 = every balanced site triangle;\n"
         << "             0 = both, measured on the same trajectories and written to the\n"
@@ -2380,8 +2478,39 @@ inline void print_usage(const char *argv0)
         << "    fermionic 8x8 in <outcome stem>_rho3.bin (1040 bytes each).\n"
         << "  MIPT_DIST_PAIR_GAP_PREFILTER_TOL=MIPT_DIST_GMN_ZERO_TOL a minimum cut at or\n"
         << "    below this records fGMN as bounded by it instead of solving.\n"
-        << "  MIPT_DIST_PAIR_GAP_POSITIVE_TOL=MIPT_DIST_GMN_ZERO_TOL fGMN above this is\n"
-        << "    counted positive.\n"
+        << "  MIPT_DIST_PAIR_GAP_POSITIVE_TOL=MIPT_DIST_GMN_ZERO_TOL a certified fGMN lower\n"
+        << "    bound above this is counted positive; an upper bound below it is counted\n"
+        << "    bounded-small; an interval straddling it is unresolved, never negative.\n"
+        << "    MOSEK's interval is ~GMN_MOSEK_TOL wide, so resolving a threshold this\n"
+        << "    small needs a tighter GMN_MOSEK_TOL than the 1e-5 default.\n"
+        << "  MIPT_DIST_PAIR_GAP_CUT_TOL=MIPT_DIST_PAIR_GAP_PREFILTER_TOL a one-vs-rest cut\n"
+        << "    above this counts as an entangled cut, which is what decides the pair\n"
+        << "    summary's all-cuts-entangled bound-entanglement candidates.\n"
+        << "  MIPT_DIST_PAIR_GAP_CORRELATION_TOL=MIPT_DIST_PAIR_GAP_CUT_TOL a product\n"
+        << "    distance ||rho - rho_s (x) rho_sbar||_1 above this counts as correlation,\n"
+        << "    which is what separates a product cut from a classically correlated one.\n"
+        << "  MIPT_DIST_REPLAY_IDS=<file> replay the listed records at high precision instead\n"
+        << "    of simulating. The file is `realization_id,pair_i,pair_j` per line; the\n"
+        << "    circuit is regenerated from MIPT_DIST_SEED and the realization index, the\n"
+        << "    measurement record is sampled once at double and then *forced* through a\n"
+        << "    long-double pass, and <ids stem>_replay.csv compares the two. Nothing else\n"
+        << "    runs and no run output is touched. RPPU (circ_type 2) only.\n"
+        << "  MIPT_DIST_REPLAY_THIRD=-1 which third site to add for the triple cuts;\n"
+        << "    negative picks the lowest index that is not an endpoint.\n"
+        << "  MIPT_DIST_PAIR_GAP_ASSISTED=1 assisted (localizable) endpoint negativity under\n"
+        << "    parity-respecting helper measurements. Single-mode X/Y is deliberately not\n"
+        << "    offered: it mixes local fermion parity and is not a fermionic measurement.\n"
+        << "  MIPT_DIST_PAIR_GAP_ANATOMY=1 decompose each anchor's spacetime component into\n"
+        << "    backbone, articulation points and dangling branches.\n"
+        << "  MIPT_DIST_PAIR_GAP_CHANNELS=1 F- and G-channel path weights beside the binary\n"
+        << "    graph. Diagnostics only; the percolation event is unchanged.\n"
+        << "  MIPT_DIST_PAIR_GAP_FOUR_SITE=0 set to 1 to add a fourth site pair for anchors\n"
+        << "    with no positive third that are not numerically unresolved, and write\n"
+        << "    <main stem>_connected_zero_four_site.csv. Off by default: it is a second\n"
+        << "    RDM reduction per selected pair.\n"
+        << "  MIPT_DIST_PAIR_GAP_FOUR_MAX_HELPER_PAIRS=12 helper pairs per selected anchor,\n"
+        << "    ranked deterministically by graph relevance with a seeded control sample.\n"
+        << "  MIPT_DIST_PAIR_GAP_STORE_RHO4=0 keep every four-mode 16x16 in <stem>_rho4.bin.\n"
         << "  MIPT_DIST_PAIR_GAP_RETRIES=2 extra attempts for a failed solve, the last one\n"
         << "    serialized. A solve that still fails stays NaN, never zero.\n"
         << "  MIPT_DIST_CHANNEL_FLOOR below this |G|^2 and |F|^2 count as zero in that\n"

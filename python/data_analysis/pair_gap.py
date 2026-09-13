@@ -71,7 +71,11 @@ _OUTCOME_COLUMNS = (
     "fgmn_method",
     "fgmn",
     "fgmn_positive",
+    "fgmn_class",
     "fgmn_status",
+    "fgmn_lower_bound",
+    "fgmn_upper_bound",
+    "fgmn_input_uncertainty",
     "min_cut_site",
     "min_cut",
     "marginal_residual_ij",
@@ -83,6 +87,98 @@ _GROUP_KEYS = ["realization_id", "anchor_role", "pair_i", "pair_j"]
 def aggregate_path_for(outcome_csv: str | Path) -> Path:
     path = Path(outcome_csv)
     return path.with_name(path.stem + "_aggregate.csv")
+
+
+def four_site_path_for(outcome_csv: str | Path) -> Path:
+    """The four-site CSV beside an outcome CSV, when the pass was enabled."""
+    path = Path(outcome_csv)
+    stem = path.stem
+    suffix = "_connected_zero_thirds"
+    if stem.endswith(suffix):
+        return path.with_name(stem[: -len(suffix)] + "_connected_zero_four_site.csv")
+    return path.with_name(stem + "_four_site.csv")
+
+
+def read_four_site(path: str | Path) -> pd.DataFrame:
+    """The four-site CSV, as written.
+
+    One row per (anchor, helper pair). ``globally_entangled_locally_separable``
+    is the four-mode GHZ signature: entangled across all seven cuts while every
+    pair and triple marginal is separable. ``assisted_parity_max`` is the
+    localizable endpoint negativity under a joint parity-sector measurement of
+    the two helpers -- the family that can localize a Bell pair out of a state
+    with no endpoint entanglement at all, which the single-mode occupation
+    family provably cannot.
+    """
+    return pd.read_csv(path)
+
+
+def pair_summary_path_for(outcome_csv: str | Path) -> Path:
+    """The per-pair summary beside an outcome CSV.
+
+    ``<main>_connected_zero_thirds.csv`` -> ``<main>_connected_zero_pair_summary.csv``,
+    matching ``gap::pair_summary_path_for`` in dist_pair_gap.hpp.
+    """
+    path = Path(outcome_csv)
+    stem = path.stem
+    suffix = "_connected_zero_thirds"
+    if stem.endswith(suffix):
+        return path.with_name(stem[: -len(suffix)] + "_connected_zero_pair_summary.csv")
+    return path.with_name(stem + "_pair_summary.csv")
+
+
+# The summary's own columns, renamed to the names the rest of this module uses.
+# The C++ writes one row per qualifying pair already reduced, so reading it is
+# the same reduction without the streaming -- and on a production run that is a
+# few megabytes against a few gigabytes.
+_SUMMARY_RENAME = {
+    "d": "d",
+    "thirds": "thirds",
+    "thirds_positive": "positive_thirds",
+    "thirds_failed": "failed_thirds",
+    "thirds_unresolved": "unresolved_thirds",
+    "thirds_bounded_below_threshold": "bounded_thirds",
+    "thirds_all_cuts_entangled": "all_cuts_entangled_thirds",
+    "thirds_same_component": "same_component_thirds",
+    "thirds_blocked_by_i": "blocked_by_i",
+    "backbone_nodes": "backbone_nodes",
+    "dangling_nodes": "dangling_nodes",
+    "articulation_nodes": "articulation_nodes",
+    "component_size_ij": "component_size",
+    "f_channel_log_weight": "f_channel_log_weight",
+    "g_channel_log_weight": "g_channel_log_weight",
+    "f_channel_bottleneck": "f_channel_bottleneck",
+    "g_channel_bottleneck": "g_channel_bottleneck",
+    "thirds_blocked_by_j": "blocked_by_j",
+    "thirds_blocked_by_k": "blocked_by_k",
+    "max_fgmn_lower_bound": "max_fgmn",
+    "max_fgmn_upper_bound": "max_fgmn_upper",
+    "max_min_cut_fn": "max_min_cut",
+    "max_cmi_ij_given_k": "max_cmi",
+    "explanatory_class": "explanatory_class",
+}
+
+
+def read_pair_summary(path: str | Path) -> pd.DataFrame:
+    """The per-pair summary CSV, in this module's column vocabulary.
+
+    One row per ``(realization_id, anchor_role, pair_i, pair_j)``, already
+    carrying the certified four-way split of its thirds and the single
+    explanatory class. ``r3`` and ``undetermined`` are derived here so a table
+    from this path and one reduced from the outcome rows are interchangeable.
+    """
+    frame = pd.read_csv(path)
+    out = frame.rename(columns=_SUMMARY_RENAME)
+    out["r3"] = out["positive_thirds"] > 0
+    # No positive third, but something the solver could not resolve: the pair's
+    # R_3 is unknown and it belongs in neither the numerator nor the
+    # denominator. Unresolved counts here as well as failed -- that is the
+    # whole point of the certified classification.
+    out["undetermined"] = (~out["r3"]) & (
+        (out["failed_thirds"] > 0) | (out["unresolved_thirds"] > 0)
+    )
+    out["prefiltered_thirds"] = out["bounded_thirds"]
+    return out
 
 
 def outcome_path_for(aggregate_csv: str | Path) -> Path:
@@ -101,8 +197,17 @@ def read_pair_gap_aggregate(path: str | Path) -> pd.DataFrame:
 def _reduce_groups(frame: pd.DataFrame) -> pd.DataFrame:
     """One row per (trajectory, role, pair) from its L-2 outcome rows."""
     failed = (frame["fgmn_method"] == "mosek") & (frame["fgmn_status"] != "ok")
+    # A certified interval that straddles the threshold resolves nothing, so it
+    # keeps its pair out of the R_3 denominator exactly as a failed solve does.
+    # Gap format v1 had no such column; there every non-failure was resolved.
+    unresolved = (
+        (frame["fgmn_class"] == "unresolved")
+        if "fgmn_class" in frame.columns
+        else pd.Series(False, index=frame.index)
+    )
     work = frame.assign(
         _failed=failed.astype(np.int64),
+        _unresolved=unresolved.astype(np.int64),
         _positive=frame["fgmn_positive"].astype(np.int64),
         _prefiltered=(frame["fgmn_method"] == "prefilter_bound").astype(np.int64),
         _block_i=(frame["min_cut_site"] == "i").astype(np.int64),
@@ -117,6 +222,7 @@ def _reduce_groups(frame: pd.DataFrame) -> pd.DataFrame:
         thirds=("third_k", "size"),
         positive_thirds=("_positive", "sum"),
         failed_thirds=("_failed", "sum"),
+        unresolved_thirds=("_unresolved", "sum"),
         prefiltered_thirds=("_prefiltered", "sum"),
         max_fgmn=("fgmn", "max"),
         mean_fgmn=("fgmn", "mean"),
@@ -128,7 +234,9 @@ def _reduce_groups(frame: pd.DataFrame) -> pd.DataFrame:
     out["r3"] = out["positive_thirds"] > 0
     # No positive k, but at least one k whose solve failed: the pair's R_3 is
     # unknown, and it is kept out of both the numerator and the denominator.
-    out["undetermined"] = (~out["r3"]) & (out["failed_thirds"] > 0)
+    out["undetermined"] = (~out["r3"]) & (
+        (out["failed_thirds"] > 0) | (out["unresolved_thirds"] > 0)
+    )
     return out
 
 
@@ -136,14 +244,25 @@ def pair_level_table(
     outcome_csv: str | Path,
     *,
     chunksize: int = 500_000,
+    use_summary: bool = True,
 ) -> pd.DataFrame:
-    """Stream the outcome CSV into one row per (trajectory, role, pair).
+    """One row per (trajectory, role, pair).
 
-    Rows of one pair are written consecutively, so a group can only straddle a
-    chunk boundary at its end; the trailing group of each chunk is carried into
-    the next. The result is small -- one row per qualifying pair -- whatever the
-    size of the file.
+    Prefers the per-pair summary written beside the outcome CSV, which is the
+    same reduction performed by the C++ as the rows were written -- a few
+    megabytes against the outcome file's few gigabytes. Falls back to streaming
+    the outcome CSV for a run written before the summary existed, or when
+    ``use_summary=False``.
+
+    Streaming: rows of one pair are written consecutively, so a group can only
+    straddle a chunk boundary at its end; the trailing group of each chunk is
+    carried into the next. The result is small -- one row per qualifying pair --
+    whatever the size of the file.
     """
+    if use_summary:
+        summary = pair_summary_path_for(outcome_csv)
+        if summary.exists():
+            return read_pair_summary(summary)
     columns = list(_OUTCOME_COLUMNS)
     pieces: list[pd.DataFrame] = []
     carry: pd.DataFrame | None = None

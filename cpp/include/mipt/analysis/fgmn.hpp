@@ -47,6 +47,47 @@ double compute_min_bipartite_fermionic_negativity_8x8_cpp(
 double compute_fgmn_mosek_8x8_status_cpp(const double *rho_ri_row_major, int *status);
 
 /*
+ * The same solve, reporting a *certified interval* rather than one number.
+ *
+ * The model minimizes <c, W> and fGMN is -min<c, W>, so the sign flips and the
+ * two solver objectives swap roles:
+ *
+ *   primalObjValue() is attained at a primal-feasible point, hence an upper
+ *   bound on the minimum, hence -primalObjValue() is a LOWER bound on fGMN.
+ *   dualObjValue()   is attained at a dual-feasible point, hence a lower bound
+ *   on the minimum, hence -dualObjValue()   is an UPPER bound on fGMN.
+ *
+ * Both bounds hold only to the extent that the returned points are feasible,
+ * which is what primal_residual and dual_residual report (MOSEK's
+ * intpntPrimalFeas / intpntDualFeas).  They are part of the answer, not
+ * diagnostics: at the default GMN_MOSEK_TOL=1e-5 the interval is far wider
+ * than a 1e-10 positivity threshold, so nothing is resolved at that threshold
+ * and the caller must say so instead of reporting a zero.
+ *
+ * lower_bound is clamped at 0 because fGMN >= 0 is a theorem, so it is a valid
+ * bound however far below zero the solver lands; `value` keeps the unclamped
+ * -primalObjValue() that compute_fgmn_mosek_8x8_status_cpp returns, so the two
+ * entry points never disagree about the reported fGMN.
+ *
+ * A non-OK status leaves every field NaN except the residuals, which are read
+ * whenever MOSEK has them.  A failed solve is missing, never zero.
+ */
+struct FgmnCertificate
+{
+    double value;           /* -primalObjValue(), unclamped: the legacy raw value */
+    double lower_bound;     /* max(0, -primalObjValue()) */
+    double upper_bound;     /* -dualObjValue() */
+    double primal_residual; /* intpntPrimalFeas; NaN when MOSEK does not report it */
+    double dual_residual;   /* intpntDualFeas */
+    double solver_gap;      /* upper_bound - lower_bound */
+    int status;             /* FGMN_STATUS_* */
+};
+
+/* Returns cert->status, and fills *cert. Safe to call with a null matrix. */
+int compute_fgmn_mosek_8x8_certified_cpp(const double *rho_ri_row_major,
+                                         struct FgmnCertificate *cert);
+
+/*
  * All three fermionic one-vs-rest cut negativities, indexed by the party that
  * is cut off: out_three[s] = N_F(s | rest), party s being basis bit s.  The
  * minimum is what compute_min_bipartite_fermionic_negativity_8x8_cpp returns;

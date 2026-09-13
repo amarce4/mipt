@@ -139,6 +139,7 @@ ifeq ($(CUDA_RHO),1)
   # cuSOLVER is for the von Neumann (S1) spectrum; the Renyi-2 path needs only
   # the cuBLAS batched GEMM.
   ENTROPY_CUDA_LIBS := -lcublas -lcusolver
+  DIST_SCALING_CUDA_LIBS := -lcublas
 endif
 
 # Direct cuStateVec circuit engine (mipt/cusv). Replaces CUDA-Q's gate-by-gate
@@ -231,6 +232,8 @@ ifeq ($(CUDA_RHO),1)
   FREE_ENERGY_OBJS += $(BUILD)/free_energy_measure.o $(BUILD)/tmi_cuda_svd.o
   SIM_TMI_OBJS += $(BUILD)/rho_reduce.o $(BUILD)/tmi_cuda_svd.o $(BUILD)/tmi_cuda_rdm.o
   # k=2 uses the batched two-site reduction, k=3 the batched three-site one.
+  # The connected-zero four-site pass reduces on the host -- see the batch4
+  # lambda in dist_scaling.hpp for why there is no device path to link.
   DIST_SCALING_OBJS += $(BUILD)/rho2_reduce.o $(BUILD)/rho_reduce.o
   ENTROPY_OBJS += $(BUILD)/rho_reduce.o $(BUILD)/entropy_cuda.o
 endif
@@ -305,10 +308,11 @@ $(FREE_ENERGY_BIN): $(FREE_ENERGY_OBJS)
 $(SIM_TMI_BIN): $(SIM_TMI_OBJS)
 	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $^ $(MIPT_CUDA_LIBS) $(SIM_TMI_CUDA_LIBS) $(CUSV_LIBS) $(DL_LIBS) -o $@
 # k=3 solves GMN/fGMN, so this links the same MOSEK shim mipt_probed uses.
+# ancilla_rdm4.o's tail reduction is a cuBLAS gemm, so this links cuBLAS too.
 $(DIST_SCALING_BIN): $(DIST_SCALING_OBJS) $(MIPT_PROBED_FGMN_LIB)
 	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $(HOST_LDFLAGS) $(DIST_SCALING_OBJS) \
-	  $(MIPT_CUDA_LIBS) $(CUSV_LIBS) -L$(BUILD) -Wl,-rpath,'$$ORIGIN' -lmipt_fgmn \
-	  $(DL_LIBS) -o $@
+	  $(MIPT_CUDA_LIBS) $(DIST_SCALING_CUDA_LIBS) $(CUSV_LIBS) -L$(BUILD) \
+	  -Wl,-rpath,'$$ORIGIN' -lmipt_fgmn $(DL_LIBS) -o $@
 $(ENTROPY_BIN): $(ENTROPY_OBJS)
 	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $^ $(MIPT_CUDA_LIBS) $(ENTROPY_CUDA_LIBS) $(CUSV_LIBS) $(DL_LIBS) -o $@
 $(GMN_BIN): $(GMN_OBJS)
@@ -459,6 +463,10 @@ $(BUILD)/rho_reduce.o: src/cuda/rho_reduce.cu $(MIPT_CUDA_HEADERS) | $(BUILD)
 $(BUILD)/rho2_reduce.o: src/cuda/rho2_reduce.cu $(MIPT_CUDA_HEADERS) | $(BUILD)
 	$(CUDA_CU_COMPILER) $(CUDA_CU_FLAGS) -c $< -o $@
 $(BUILD)/ancilla_rdm.o: src/cuda/ancilla_rdm.cu $(MIPT_CUDA_HEADERS) | $(BUILD)
+	$(CUDA_CU_COMPILER) $(CUDA_CU_FLAGS) -c $< -o $@
+# Was outside the build graph until 2026-09-13; the four-site pass of the
+# connected-zero analysis is its first caller in this executable.
+$(BUILD)/ancilla_rdm4.o: src/cuda/ancilla_rdm4.cu $(MIPT_CUDA_HEADERS) | $(BUILD)
 	$(CUDA_CU_COMPILER) $(CUDA_CU_FLAGS) -c $< -o $@
 $(BUILD)/free_energy_measure.o: src/cuda/free_energy_measure.cu $(MIPT_CUDA_HEADERS) | $(BUILD)
 	$(CUDA_CU_COMPILER) $(CUDA_CU_FLAGS) -c $< -o $@

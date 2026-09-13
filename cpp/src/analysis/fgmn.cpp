@@ -1324,6 +1324,90 @@ namespace fgmn
             }
             return value;
         }
+
+        // One MOSEK solution-information item, or NaN if this optimizer did not
+        // set it. MOSEK reports -1 for an interior-point measure when the
+        // problem was not solved by the interior-point optimizer; a feasibility
+        // residual is a norm and cannot be negative, so that sentinel becomes
+        // NaN rather than a plausible-looking number.
+        double info_or_nan(const char *name)
+        {
+            try
+            {
+                const double value = M->getSolverDoubleInfo(name);
+                if (!std::isfinite(value) || value < 0.0)
+                {
+                    return std::numeric_limits<double>::quiet_NaN();
+                }
+                return value;
+            }
+            catch (...)
+            {
+                return std::numeric_limits<double>::quiet_NaN();
+            }
+        }
+
+        // The certified-interval solve. See FgmnCertificate in fgmn.hpp for the
+        // sign convention; the short version is that minimizing <c, W> to get
+        // -fGMN swaps the roles of the two objectives.
+        void solve_certified(const double *rho, FgmnCertificate &cert)
+        {
+            const double nan = std::numeric_limits<double>::quiet_NaN();
+            cert = {nan, nan, nan, nan, nan, nan, FGMN_STATUS_OK};
+            if (rho == nullptr)
+            {
+                cert.status = FGMN_STATUS_NULL_INPUT;
+                return;
+            }
+            if (is_complex)
+            {
+                fill_upper_objective_coefficients_complex(rho, coeff_values);
+            }
+            else
+            {
+                fill_upper_objective_coefficients(rho, coeff_values);
+            }
+            objective_coeffs->setValue(coeff_values);
+            M->solve();
+
+            // Read the residuals before the status gate: a solve that stopped
+            // short is exactly the one whose distance from feasibility the
+            // caller needs, and they are the only fields a failure keeps.
+            cert.primal_residual = info_or_nan("intpntPrimalFeas");
+            cert.dual_residual = info_or_nan("intpntDualFeas");
+
+            const SolutionStatus primal = M->getPrimalSolutionStatus();
+            if (primal != SolutionStatus::Optimal)
+            {
+                cert.status = FGMN_STATUS_NOT_OPTIMAL_BASE + static_cast<int>(primal);
+                return;
+            }
+            const double value = -M->primalObjValue();
+            if (!std::isfinite(value))
+            {
+                cert.status = FGMN_STATUS_NONFINITE;
+                return;
+            }
+            cert.value = value;
+            cert.lower_bound = std::max(0.0, value);
+
+            // The dual point can be absent or unusable even when the primal is
+            // Optimal. Without it there is no upper bound, and NaN says so --
+            // the caller then classifies the triple unresolved rather than
+            // inventing a ceiling.
+            try
+            {
+                const double dual = -M->dualObjValue();
+                if (std::isfinite(dual))
+                {
+                    cert.upper_bound = dual;
+                    cert.solver_gap = dual - cert.lower_bound;
+                }
+            }
+            catch (...)
+            {
+            }
+        }
     };
 
     GmnWorkspace &workspace_fermion()
@@ -1422,6 +1506,26 @@ extern "C" double compute_fgmn_mosek_8x8_status_cpp(
         *status = local;
     }
     return value;
+}
+
+extern "C" int compute_fgmn_mosek_8x8_certified_cpp(
+    const double *rho_complex_row_major, FgmnCertificate *cert)
+{
+    if (cert == nullptr)
+    {
+        return FGMN_STATUS_NULL_INPUT;
+    }
+    try
+    {
+        auto fusion_guard = fgmn::limit_fusion_concurrency();
+        fgmn::workspace_fermion().solve_certified(rho_complex_row_major, *cert);
+    }
+    catch (...)
+    {
+        const double nan = std::numeric_limits<double>::quiet_NaN();
+        *cert = {nan, nan, nan, nan, nan, nan, FGMN_STATUS_EXCEPTION};
+    }
+    return cert->status;
 }
 
 extern "C" int compute_fermionic_cut_negativities_8x8_cpp(

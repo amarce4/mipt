@@ -66,7 +66,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <algorithm>
+#include <cmath>
 #include <deque>
+#include <limits>
 #include <string>
 #include <utility>
 #include <vector>
@@ -193,6 +195,93 @@ struct DisjointPaths
     int vertex = 0;
 };
 
+// Channel-resolved connectivity: how much parity-odd (G, hopping) and
+// parity-even (F, pairing) amplitude the graph's paths can actually carry.
+//
+// **This does not redefine the percolation event.** `connected` stays exactly
+// what it was; these are diagnostics beside it. The suspicion they test is that
+// binary percolation over-counts because it treats a nearly-diagonal gate --
+// which transmits almost nothing in a given parity sector -- as an edge just as
+// good as a maximally mixing one. If connected-zero pairs systematically have
+// tiny channel weights, the gap is that counting artefact and not a physical
+// incompleteness.
+//
+// Three numbers per channel, all from the same edge weights:
+//
+//   * `log_weight`: the largest achievable sum of log weights over a path,
+//     i.e. the log of the most transmissive path's product. Logs rather than
+//     products because a 50-layer path multiplies 50 numbers below 1 and
+//     underflows; the log stays finite and additive. 0 is a perfect channel,
+//     -inf is no channel at all.
+//   * `bottleneck`: the largest achievable *minimum* edge weight over a path --
+//     the widest-path value. A path can have a good product and one terrible
+//     link; this is the terrible link.
+//   * `multiplicity`: how many edge-disjoint paths survive if every edge weaker
+//     than that bottleneck is deleted. 1 means the best channel is a single
+//     thread, more means a braid.
+struct ChannelConnectivity
+{
+    bool evaluated = false;
+    double pair_log_weight = -std::numeric_limits<double>::infinity();
+    double hop_log_weight = -std::numeric_limits<double>::infinity();
+    double pair_bottleneck = 0.0;
+    double hop_bottleneck = 0.0;
+    int pair_multiplicity = 0;
+    int hop_multiplicity = 0;
+};
+
+// How much of a pair's spacetime component actually carries the connection.
+//
+// Percolation asks a yes/no question, and a "yes" carried by one fragile thread
+// through a large component is a very different object from a "yes" carried by
+// a broad braid -- yet both are `connected = 1`. This decomposes the component
+// into the part that can carry information between the endpoints and the part
+// that cannot:
+//
+//   * the **backbone** is every spacetime vertex lying on *some* path between
+//     the two endpoints. Computed exactly, from the block-cut tree: a vertex is
+//     on some s-t path iff its biconnected block lies on the tree path between
+//     the endpoints' blocks. (Inside a 2-connected block, any two vertices are
+//     joined by a path through any third, so a block on the path contributes
+//     all of its vertices.)
+//   * the **articulation** count is the number of cut vertices strictly between
+//     the endpoints -- vertices whose removal alone disconnects them. `0` means
+//     the connection is 2-connected; `k > 0` means it passes single-file
+//     through k separate places.
+//   * **dangling** vertices are the rest of the component: reachable, but not on
+//     any endpoint-to-endpoint path. They are where a "parasitic" component
+//     shares the endpoints' information with sites that are not the partner.
+//
+// A large component with a small backbone and many dangling vertices is exactly
+// the shape the percolation picture is accused of over-counting.
+struct ComponentAnatomy
+{
+    bool evaluated = false;
+    std::uint32_t component_nodes = 0;
+    // Final-slice sites sharing the component, endpoints included. The
+    // competition for the endpoints' correlations is with these, since only a
+    // final-slice site is a site anything is measured on.
+    std::uint32_t final_sites_in_component = 0;
+    std::uint32_t backbone_nodes = 0;
+    std::uint32_t articulation_nodes = 0;
+    std::uint32_t dangling_nodes = 0;
+    std::uint32_t branches = 0;
+    double mean_branch_size = 0.0;
+    std::uint32_t max_branch_size = 0;
+    std::uint32_t degree_i = 0;
+    std::uint32_t degree_j = 0;
+    // One shortest path, split by edge kind. Which shortest path is the BFS
+    // tree's, so the split is a representative rather than an invariant when
+    // several shortest paths of different composition exist; the total is the
+    // invariant already reported as `shortest_path`.
+    std::int32_t shortest_path_gates = -1;
+    std::int32_t shortest_path_temporal = -1;
+    // By Menger these equal the edge- and vertex-disjoint path counts exactly,
+    // so they are the same numbers under the name the cut question asks for.
+    int min_edge_cut = 0;
+    int min_vertex_cut = 0;
+};
+
 // Unit-capacity max flow by breadth-first augmentation. The graph has a few
 // thousand arcs and every node has degree at most three (one bond, two temporal
 // edges), so the flow is at most three and this is a handful of BFS sweeps.
@@ -285,7 +374,7 @@ class ConnectivityIndex
         // than N*T little vectors.
         degree_.assign(nodes + 1u, 0u);
         edges_ = 0;
-        auto count_edge = [&](std::uint32_t a, std::uint32_t b) {
+        auto count_edge = [&](std::uint32_t a, std::uint32_t b, bool, double, double) {
             ++degree_[a];
             ++degree_[b];
             ++edges_;
@@ -298,9 +387,22 @@ class ConnectivityIndex
             offset_[i + 1u] = offset_[i] + degree_[i];
         }
         adjacency_.assign(static_cast<std::size_t>(edges_) * 2u, 0u);
+        edge_kind_.assign(static_cast<std::size_t>(edges_) * 2u, 0u);
+        edge_from_.assign(static_cast<std::size_t>(edges_) * 2u, 0u);
+        weight_pair_.assign(static_cast<std::size_t>(edges_) * 2u, 1.0);
+        weight_hop_.assign(static_cast<std::size_t>(edges_) * 2u, 1.0);
         cursor_ = offset_;
-        auto add_edge = [&](std::uint32_t a, std::uint32_t b) {
+        auto add_edge = [&](std::uint32_t a, std::uint32_t b, bool gate, double pair_weight,
+                            double hop_weight) {
+            edge_kind_[cursor_[a]] = gate ? 1u : 0u;
+            edge_from_[cursor_[a]] = a;
+            weight_pair_[cursor_[a]] = pair_weight;
+            weight_hop_[cursor_[a]] = hop_weight;
             adjacency_[cursor_[a]++] = b;
+            edge_kind_[cursor_[b]] = gate ? 1u : 0u;
+            edge_from_[cursor_[b]] = b;
+            weight_pair_[cursor_[b]] = pair_weight;
+            weight_hop_[cursor_[b]] = hop_weight;
             adjacency_[cursor_[b]++] = a;
             sets_.unite(a, b);
         };
@@ -331,6 +433,11 @@ class ConnectivityIndex
         {
             fill_shortest_paths();
         }
+        // One biconnected decomposition serves every pair of the trajectory:
+        // the blocks do not depend on which endpoints are asked about, only the
+        // tree path between them does. Doing it here rather than per anchor is
+        // what keeps the anatomy affordable at 200k anchors.
+        build_block_cut_tree();
         ready_ = true;
     }
 
@@ -419,7 +526,273 @@ class ConnectivityIndex
         return out;
     }
 
+    // The component anatomy for one final-slice pair. Cheap: a walk of the
+    // block-cut tree plus one sweep of the component, both linear.
+    ComponentAnatomy anatomy(int site_i, int site_j) const
+    {
+        ComponentAnatomy out;
+        if (!ready_ || site_i == site_j || site_i < 0 || site_j < 0 || site_i >= n_ ||
+            site_j >= n_)
+        {
+            return out;
+        }
+        const std::size_t i = static_cast<std::size_t>(site_i);
+        const std::size_t j = static_cast<std::size_t>(site_j);
+        if (root_[i] != root_[j])
+        {
+            return out;
+        }
+        out.evaluated = true;
+        const std::uint32_t source = node_index(layers_ - 1, mode_of_site_[i]);
+        const std::uint32_t sink = node_index(layers_ - 1, mode_of_site_[j]);
+        out.component_nodes = component_size_[i];
+        out.degree_i = offset_[source + 1u] - offset_[source];
+        out.degree_j = offset_[sink + 1u] - offset_[sink];
+        for (int site = 0; site < n_; ++site)
+        {
+            out.final_sites_in_component +=
+                root_[static_cast<std::size_t>(site)] == root_[i] ? 1u : 0u;
+        }
+
+        const DisjointPaths cuts = disjoint_paths(site_i, site_j);
+        out.min_edge_cut = cuts.edge;
+        out.min_vertex_cut = cuts.vertex;
+
+        split_shortest_path(source, sink, out.shortest_path_gates, out.shortest_path_temporal);
+
+        // Mark the backbone: every vertex of every block on the block-cut-tree
+        // path between the endpoints' tree nodes.
+        const std::size_t nodes = static_cast<std::size_t>(layers_) * static_cast<std::size_t>(n_);
+        std::vector<std::uint8_t> backbone(nodes, 0u);
+        mark_backbone(source, sink, backbone, out.articulation_nodes);
+        for (std::uint8_t flag : backbone)
+        {
+            out.backbone_nodes += flag != 0u ? 1u : 0u;
+        }
+        out.dangling_nodes = out.component_nodes > out.backbone_nodes
+                                 ? out.component_nodes - out.backbone_nodes
+                                 : 0u;
+
+        // Branches: connected components of the component minus the backbone.
+        std::vector<std::uint8_t> seen(nodes, 0u);
+        std::vector<std::uint32_t> stack;
+        std::uint64_t total = 0;
+        std::vector<std::uint32_t> component;
+        collect_component(source, component);
+        for (std::uint32_t start : component)
+        {
+            if (backbone[start] != 0u || seen[start] != 0u)
+            {
+                continue;
+            }
+            std::uint32_t size = 0;
+            stack.assign(1, start);
+            seen[start] = 1u;
+            while (!stack.empty())
+            {
+                const std::uint32_t node = stack.back();
+                stack.pop_back();
+                ++size;
+                for (std::uint32_t slot = offset_[node]; slot < offset_[node + 1u]; ++slot)
+                {
+                    const std::uint32_t next = adjacency_[slot];
+                    if (backbone[next] == 0u && seen[next] == 0u)
+                    {
+                        seen[next] = 1u;
+                        stack.push_back(next);
+                    }
+                }
+            }
+            ++out.branches;
+            total += size;
+            out.max_branch_size = std::max(out.max_branch_size, size);
+        }
+        out.mean_branch_size =
+            out.branches > 0 ? static_cast<double>(total) / static_cast<double>(out.branches) : 0.0;
+        return out;
+    }
+
+    // Per final-slice site: does its worldline's last node lie on the i-j
+    // backbone, is it in the same component, and how far is it from the nearer
+    // endpoint. This is what the four-site helper ranking selects on, so it is
+    // exposed rather than recomputed there.
+    void site_roles(int site_i, int site_j, std::vector<std::uint8_t> &same_component,
+                    std::vector<std::uint8_t> &on_backbone,
+                    std::vector<std::int32_t> &distance) const
+    {
+        same_component.assign(static_cast<std::size_t>(std::max(0, n_)), 0u);
+        on_backbone.assign(static_cast<std::size_t>(std::max(0, n_)), 0u);
+        distance.assign(static_cast<std::size_t>(std::max(0, n_)), -1);
+        if (!ready_ || site_i < 0 || site_j < 0 || site_i >= n_ || site_j >= n_)
+        {
+            return;
+        }
+        const std::size_t i = static_cast<std::size_t>(site_i);
+        const std::size_t j = static_cast<std::size_t>(site_j);
+        for (int site = 0; site < n_; ++site)
+        {
+            same_component[static_cast<std::size_t>(site)] =
+                root_[static_cast<std::size_t>(site)] == root_[i] ? 1u : 0u;
+            if (!paths_.empty())
+            {
+                const std::int32_t di =
+                    paths_[i * static_cast<std::size_t>(n_) + static_cast<std::size_t>(site)];
+                const std::int32_t dj =
+                    paths_[j * static_cast<std::size_t>(n_) + static_cast<std::size_t>(site)];
+                if (di >= 0 && dj >= 0)
+                {
+                    distance[static_cast<std::size_t>(site)] = std::min(di, dj);
+                }
+                else
+                {
+                    distance[static_cast<std::size_t>(site)] = std::max(di, dj);
+                }
+            }
+        }
+        if (root_[i] != root_[j])
+        {
+            return;
+        }
+        const std::size_t nodes = static_cast<std::size_t>(layers_) * static_cast<std::size_t>(n_);
+        std::vector<std::uint8_t> backbone(nodes, 0u);
+        std::uint32_t ignored = 0;
+        mark_backbone(node_index(layers_ - 1, mode_of_site_[i]),
+                      node_index(layers_ - 1, mode_of_site_[j]), backbone, ignored);
+        for (int site = 0; site < n_; ++site)
+        {
+            const std::uint32_t node =
+                node_index(layers_ - 1, mode_of_site_[static_cast<std::size_t>(site)]);
+            on_backbone[static_cast<std::size_t>(site)] = backbone[node];
+        }
+    }
+
+    // Channel-resolved path strengths between two final-slice endpoints.
+    //
+    // A temporal edge is weight 1 in both channels: an idle mode transmits
+    // whatever it holds, perfectly, in either parity sector. Only gates
+    // attenuate.
+    ChannelConnectivity channels(int site_i, int site_j) const
+    {
+        ChannelConnectivity out;
+        if (!ready_ || site_i == site_j || site_i < 0 || site_j < 0 || site_i >= n_ ||
+            site_j >= n_ || weight_pair_.empty())
+        {
+            return out;
+        }
+        if (root_[static_cast<std::size_t>(site_i)] != root_[static_cast<std::size_t>(site_j)])
+        {
+            return out;
+        }
+        out.evaluated = true;
+        const std::uint32_t source =
+            node_index(layers_ - 1, mode_of_site_[static_cast<std::size_t>(site_i)]);
+        const std::uint32_t sink =
+            node_index(layers_ - 1, mode_of_site_[static_cast<std::size_t>(site_j)]);
+        strongest_path(weight_pair_, source, sink, out.pair_log_weight, out.pair_bottleneck,
+                       out.pair_multiplicity);
+        strongest_path(weight_hop_, source, sink, out.hop_log_weight, out.hop_bottleneck,
+                       out.hop_multiplicity);
+        return out;
+    }
+
   private:
+    // Maximum-product path (via logs), widest path, and how many edge-disjoint
+    // paths survive at the widest path's bottleneck.
+    void strongest_path(const std::vector<double> &weight, std::uint32_t source,
+                        std::uint32_t sink, double &log_weight, double &bottleneck,
+                        int &multiplicity) const
+    {
+        const std::size_t nodes = static_cast<std::size_t>(layers_) * static_cast<std::size_t>(n_);
+        constexpr double NEG_INF = -std::numeric_limits<double>::infinity();
+
+        // Max-product: Dijkstra on the additive log weight, maximizing.
+        std::vector<double> best(nodes, NEG_INF);
+        std::vector<std::uint8_t> done(nodes, 0u);
+        best[source] = 0.0;
+        for (std::size_t step = 0; step < nodes; ++step)
+        {
+            std::uint32_t node = UNSET;
+            double value = NEG_INF;
+            for (std::size_t v = 0; v < nodes; ++v)
+            {
+                if (done[v] == 0u && best[v] > value)
+                {
+                    value = best[v];
+                    node = static_cast<std::uint32_t>(v);
+                }
+            }
+            if (node == UNSET)
+            {
+                break;
+            }
+            done[node] = 1u;
+            for (std::uint32_t slot = offset_[node]; slot < offset_[node + 1u]; ++slot)
+            {
+                const double w = weight[slot];
+                const double next = w > 0.0 ? best[node] + std::log(w) : NEG_INF;
+                if (next > best[adjacency_[slot]])
+                {
+                    best[adjacency_[slot]] = next;
+                }
+            }
+        }
+        log_weight = best[sink];
+
+        // Widest path: the same sweep maximizing the minimum edge instead.
+        std::vector<double> widest(nodes, 0.0);
+        std::fill(done.begin(), done.end(), 0u);
+        widest[source] = std::numeric_limits<double>::infinity();
+        for (std::size_t step = 0; step < nodes; ++step)
+        {
+            std::uint32_t node = UNSET;
+            double value = 0.0;
+            for (std::size_t v = 0; v < nodes; ++v)
+            {
+                if (done[v] == 0u && widest[v] > value)
+                {
+                    value = widest[v];
+                    node = static_cast<std::uint32_t>(v);
+                }
+            }
+            if (node == UNSET)
+            {
+                break;
+            }
+            done[node] = 1u;
+            for (std::uint32_t slot = offset_[node]; slot < offset_[node + 1u]; ++slot)
+            {
+                const double next = std::min(widest[node], weight[slot]);
+                if (next > widest[adjacency_[slot]])
+                {
+                    widest[adjacency_[slot]] = next;
+                }
+            }
+        }
+        bottleneck = widest[sink];
+
+        multiplicity = 0;
+        if (!(bottleneck > 0.0))
+        {
+            return;
+        }
+        // How many independent channels are at least this wide. Edges below the
+        // bottleneck are deleted, so a braid of equally good paths counts as
+        // many and a single thread counts as one.
+        UnitFlowNetwork flow(nodes);
+        for (std::size_t u = 0; u < nodes; ++u)
+        {
+            for (std::uint32_t slot = offset_[u]; slot < offset_[u + 1u]; ++slot)
+            {
+                const std::uint32_t v = adjacency_[slot];
+                if (u < v && weight[slot] >= bottleneck)
+                {
+                    flow.add(static_cast<int>(u), static_cast<int>(v), 1, 1);
+                }
+            }
+        }
+        multiplicity = flow.max_flow(static_cast<int>(source), static_cast<int>(sink), 64);
+    }
+
     std::uint32_t node_index(int layer, int mode) const
     {
         return static_cast<std::uint32_t>(layer) * static_cast<std::uint32_t>(n_) +
@@ -441,7 +814,8 @@ class ConnectivityIndex
                 {
                     continue;
                 }
-                on_edge(node_index(layer, bond.a), node_index(layer, bond.b));
+                on_edge(node_index(layer, bond.a), node_index(layer, bond.b), true,
+                        bond.pair_weight, bond.hop_weight);
             }
             if (layer + 1 >= layers_)
             {
@@ -451,7 +825,8 @@ class ConnectivityIndex
             {
                 if (!current.measured[static_cast<std::size_t>(mode)])
                 {
-                    on_edge(node_index(layer, mode), node_index(layer + 1, mode));
+                    // An idle mode transmits perfectly in both parity sectors.
+                    on_edge(node_index(layer, mode), node_index(layer + 1, mode), false, 1.0, 1.0);
                 }
             }
         }
@@ -509,6 +884,323 @@ class ConnectivityIndex
         }
     }
 
+    // Every vertex reachable from `start`, the endpoint's component.
+    void collect_component(std::uint32_t start, std::vector<std::uint32_t> &out) const
+    {
+        const std::size_t nodes = static_cast<std::size_t>(layers_) * static_cast<std::size_t>(n_);
+        std::vector<std::uint8_t> seen(nodes, 0u);
+        out.assign(1, start);
+        seen[start] = 1u;
+        for (std::size_t head = 0; head < out.size(); ++head)
+        {
+            const std::uint32_t node = out[head];
+            for (std::uint32_t slot = offset_[node]; slot < offset_[node + 1u]; ++slot)
+            {
+                const std::uint32_t next = adjacency_[slot];
+                if (seen[next] == 0u)
+                {
+                    seen[next] = 1u;
+                    out.push_back(next);
+                }
+            }
+        }
+    }
+
+    // Walk one BFS shortest path back from sink to source, counting edges by
+    // kind. `parent_slot_` records which adjacency slot reached each node, and
+    // the slot's kind is the edge's kind.
+    void split_shortest_path(std::uint32_t source, std::uint32_t sink, std::int32_t &gates,
+                             std::int32_t &temporal) const
+    {
+        gates = -1;
+        temporal = -1;
+        const std::size_t nodes = static_cast<std::size_t>(layers_) * static_cast<std::size_t>(n_);
+        std::vector<std::uint32_t> parent(nodes, UNSET);
+        std::vector<std::uint32_t> parent_slot(nodes, UNSET);
+        std::vector<std::uint32_t> queue;
+        queue.reserve(nodes);
+        queue.push_back(source);
+        parent[source] = source;
+        for (std::size_t head = 0; head < queue.size(); ++head)
+        {
+            const std::uint32_t node = queue[head];
+            if (node == sink)
+            {
+                break;
+            }
+            for (std::uint32_t slot = offset_[node]; slot < offset_[node + 1u]; ++slot)
+            {
+                const std::uint32_t next = adjacency_[slot];
+                if (parent[next] == UNSET)
+                {
+                    parent[next] = node;
+                    parent_slot[next] = slot;
+                    queue.push_back(next);
+                }
+            }
+        }
+        if (parent[sink] == UNSET)
+        {
+            return;
+        }
+        gates = 0;
+        temporal = 0;
+        for (std::uint32_t node = sink; node != source;)
+        {
+            const std::uint32_t slot = parent_slot[node];
+            (edge_kind_[slot] != 0u ? gates : temporal) += 1;
+            node = parent[node];
+        }
+    }
+
+    // Tarjan's biconnected components, iteratively -- a spacetime graph is
+    // T*N deep and a recursive DFS would be a stack overflow waiting for a
+    // large N. Fills `block_of_edge_` (per adjacency slot) and the block-cut
+    // tree in `bct_*`.
+    void build_block_cut_tree()
+    {
+        const std::size_t nodes = static_cast<std::size_t>(layers_) * static_cast<std::size_t>(n_);
+        block_of_node_.assign(nodes, UNSET);
+        blocks_ = 0;
+        consumed_parent_.assign(nodes, 0u);
+        bct_of_node_.assign(nodes, UNSET);
+        is_articulation_.assign(nodes, 0u);
+        std::vector<std::uint32_t> discovery(nodes, UNSET);
+        std::vector<std::uint32_t> low(nodes, 0u);
+        std::vector<std::uint32_t> parent(nodes, UNSET);
+        std::vector<std::uint32_t> next_slot(nodes, 0u);
+        std::vector<std::uint32_t> edge_stack; // adjacency slots
+        std::vector<std::uint32_t> stack;
+        std::vector<std::vector<std::uint32_t>> block_vertices;
+        std::uint32_t timer = 0;
+
+        auto close_block = [&](std::uint32_t until_slot) {
+            std::vector<std::uint32_t> members;
+            while (!edge_stack.empty())
+            {
+                const std::uint32_t slot = edge_stack.back();
+                edge_stack.pop_back();
+                members.push_back(edge_from_[slot]);
+                members.push_back(adjacency_[slot]);
+                if (slot == until_slot)
+                {
+                    break;
+                }
+            }
+            std::sort(members.begin(), members.end());
+            members.erase(std::unique(members.begin(), members.end()), members.end());
+            block_vertices.push_back(std::move(members));
+            ++blocks_;
+        };
+
+        for (std::uint32_t start = 0; start < nodes; ++start)
+        {
+            if (discovery[start] != UNSET)
+            {
+                continue;
+            }
+            stack.assign(1, start);
+            discovery[start] = low[start] = timer++;
+            next_slot[start] = offset_[start];
+            std::uint32_t root_children = 0;
+            while (!stack.empty())
+            {
+                const std::uint32_t node = stack.back();
+                if (next_slot[node] < offset_[node + 1u])
+                {
+                    const std::uint32_t slot = next_slot[node]++;
+                    const std::uint32_t next = adjacency_[slot];
+                    if (next == parent[node] && consumed_parent_[node] == 0u)
+                    {
+                        // Skip the edge back to the parent exactly once, so a
+                        // genuine multi-edge would still close a cycle. This
+                        // graph has none, but the guard is what makes that an
+                        // assumption rather than a silent requirement.
+                        consumed_parent_[node] = 1u;
+                        continue;
+                    }
+                    if (discovery[next] == UNSET)
+                    {
+                        edge_stack.push_back(slot);
+                        parent[next] = node;
+                        discovery[next] = low[next] = timer++;
+                        next_slot[next] = offset_[next];
+                        consumed_parent_[next] = 0u;
+                        stack.push_back(next);
+                        root_children += node == start ? 1u : 0u;
+                    }
+                    else if (discovery[next] < discovery[node])
+                    {
+                        edge_stack.push_back(slot);
+                        low[node] = std::min(low[node], discovery[next]);
+                    }
+                    continue;
+                }
+                stack.pop_back();
+                if (stack.empty())
+                {
+                    continue;
+                }
+                const std::uint32_t up = stack.back();
+                low[up] = std::min(low[up], low[node]);
+                if (low[node] >= discovery[up])
+                {
+                    // `up` separates `node`'s subtree from the rest. The DFS
+                    // root is the exception and is settled after the sweep,
+                    // when its child count is final.
+                    if (up != start)
+                    {
+                        is_articulation_[up] = 1u;
+                    }
+                    close_block(slot_between(up, node));
+                }
+            }
+            // A DFS root is a cut vertex exactly when it has more than one
+            // child in the DFS tree.
+            if (root_children > 1u)
+            {
+                is_articulation_[start] = 1u;
+            }
+            if (!edge_stack.empty())
+            {
+                close_block(edge_stack.front());
+            }
+        }
+
+        // The block-cut tree: one node per block, one per articulation vertex.
+        bct_adjacency_.assign(blocks_ + articulation_count(), {});
+        bct_block_vertices_ = std::move(block_vertices);
+        std::uint32_t next_cut_node = blocks_;
+        cut_node_of_.assign(nodes, UNSET);
+        cut_node_vertex_.clear();
+        for (std::uint32_t v = 0; v < nodes; ++v)
+        {
+            if (is_articulation_[v] != 0u)
+            {
+                cut_node_of_[v] = next_cut_node++;
+                cut_node_vertex_.push_back(v);
+            }
+        }
+        for (std::uint32_t b = 0; b < blocks_; ++b)
+        {
+            for (std::uint32_t v : bct_block_vertices_[b])
+            {
+                if (is_articulation_[v] != 0u)
+                {
+                    bct_adjacency_[b].push_back(cut_node_of_[v]);
+                    bct_adjacency_[cut_node_of_[v]].push_back(b);
+                }
+                else
+                {
+                    block_of_node_[v] = b;
+                }
+            }
+        }
+        for (std::uint32_t v = 0; v < nodes; ++v)
+        {
+            bct_of_node_[v] = is_articulation_[v] != 0u ? cut_node_of_[v] : block_of_node_[v];
+        }
+    }
+
+    std::uint32_t articulation_count() const
+    {
+        std::uint32_t count = 0;
+        for (std::uint8_t flag : is_articulation_)
+        {
+            count += flag != 0u ? 1u : 0u;
+        }
+        return count;
+    }
+
+    // The adjacency slot carrying the tree edge up -> node.
+    std::uint32_t slot_between(std::uint32_t up, std::uint32_t node) const
+    {
+        for (std::uint32_t slot = offset_[up]; slot < offset_[up + 1u]; ++slot)
+        {
+            if (adjacency_[slot] == node)
+            {
+                return slot;
+            }
+        }
+        return UNSET;
+    }
+
+    // Mark every vertex on some source-sink path, and count the cut vertices
+    // strictly between them.
+    void mark_backbone(std::uint32_t source, std::uint32_t sink,
+                       std::vector<std::uint8_t> &backbone,
+                       std::uint32_t &articulations) const
+    {
+        articulations = 0;
+        if (bct_of_node_.empty() || bct_of_node_[source] == UNSET ||
+            bct_of_node_[sink] == UNSET)
+        {
+            // No decomposition (an isolated vertex, say): the endpoints are
+            // their own backbone and nothing is claimed about branches.
+            backbone[source] = 1u;
+            backbone[sink] = 1u;
+            return;
+        }
+        const std::uint32_t from = bct_of_node_[source];
+        const std::uint32_t to = bct_of_node_[sink];
+        const std::size_t tree_nodes = bct_adjacency_.size();
+        std::vector<std::uint32_t> parent(tree_nodes, UNSET);
+        std::vector<std::uint32_t> queue{from};
+        parent[from] = from;
+        for (std::size_t head = 0; head < queue.size() && parent[to] == UNSET; ++head)
+        {
+            for (std::uint32_t next : bct_adjacency_[queue[head]])
+            {
+                if (parent[next] == UNSET)
+                {
+                    parent[next] = queue[head];
+                    queue.push_back(next);
+                }
+            }
+        }
+        if (parent[to] == UNSET)
+        {
+            backbone[source] = 1u;
+            backbone[sink] = 1u;
+            return;
+        }
+        for (std::uint32_t node = to;; node = parent[node])
+        {
+            if (node < blocks_)
+            {
+                for (std::uint32_t v : bct_block_vertices_[node])
+                {
+                    backbone[v] = 1u;
+                }
+            }
+            else
+            {
+                // A cut node on the path is a vertex whose removal separates
+                // the endpoints -- unless it is an endpoint itself.
+                const std::uint32_t vertex = vertex_of_cut_node(node);
+                backbone[vertex] = 1u;
+                if (vertex != source && vertex != sink)
+                {
+                    ++articulations;
+                }
+            }
+            if (node == from)
+            {
+                break;
+            }
+        }
+        backbone[source] = 1u;
+        backbone[sink] = 1u;
+    }
+
+    std::uint32_t vertex_of_cut_node(std::uint32_t tree_node) const
+    {
+        const std::size_t index = static_cast<std::size_t>(tree_node - blocks_);
+        return index < cut_node_vertex_.size() ? cut_node_vertex_[index] : UNSET;
+    }
+
+    static constexpr std::uint32_t UNSET = ~std::uint32_t{0};
+
     bool ready_ = false;
     int n_ = 0;
     int layers_ = 0;
@@ -518,12 +1210,30 @@ class ConnectivityIndex
     std::vector<std::uint32_t> offset_;
     std::vector<std::uint32_t> cursor_;
     std::vector<std::uint32_t> adjacency_;
+    // Parallel to `adjacency_`: 1 for a unitary bond, 0 for a temporal edge,
+    // and which node the slot belongs to. The kind is what lets a shortest path
+    // be reported as gates and waiting separately -- a path of five gates and
+    // one of five idle layers are very different objects with the same length.
+    std::vector<std::uint8_t> edge_kind_;
+    std::vector<std::uint32_t> edge_from_;
+    std::vector<double> weight_pair_;
+    std::vector<double> weight_hop_;
     std::vector<int> mode_of_site_;
     std::vector<std::uint32_t> root_;
     std::vector<std::uint32_t> component_size_;
     std::vector<std::uint8_t> survives_;
     std::vector<std::int32_t> idle_;
     std::vector<std::int32_t> paths_;
+    // The biconnected decomposition, built once per trajectory.
+    std::uint32_t blocks_ = 0;
+    std::vector<std::uint32_t> block_of_node_;
+    std::vector<std::uint32_t> bct_of_node_;
+    std::vector<std::uint32_t> cut_node_of_;
+    std::vector<std::uint32_t> cut_node_vertex_;
+    std::vector<std::uint8_t> is_articulation_;
+    std::vector<std::uint8_t> consumed_parent_;
+    std::vector<std::vector<std::uint32_t>> bct_adjacency_;
+    std::vector<std::vector<std::uint32_t>> bct_block_vertices_;
 };
 
 } // namespace mipt::dist
