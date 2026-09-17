@@ -259,7 +259,7 @@ MIPT_CUDA_HEADERS := $(shell find include -name '*.cuh' 2>/dev/null) $(MIPT_HEAD
 
 .PHONY: all simulation analysis clean cpu gpu print-config format test-core test-dist test-front \
   test-spectral test-gmn test-rdm-gram test-rho-reduce test-cusv test-cusv-gates \
-  test-mode3 test-cusv-parity bench-cusv \
+  test-mode3 test-cusv-parity test-probed-parity bench-cusv \
   mipt.exe mipt_probed.exe free_energy.exe sim_tmi.exe dist_scaling.exe \
   entropy.exe gmn.exe fgmn.exe ring_inflation.exe exp_vals.exe
 
@@ -390,6 +390,7 @@ CUSV_GATE_TEST_BIN := $(HOST_BUILD)/cusv_gate_tests
 DUMP_BOND_BIN := $(BUILD)/dump_bond
 CUSV_EQUIV_BIN := $(BUILD)/cusv_equiv
 CUSV_PARITY_TEST_BIN := $(BUILD)/cusv_parity_tests
+PROBED_PARITY_TEST_BIN := $(BUILD)/probed_parity_tests
 MODE3_EQUIV_BIN := $(BUILD)/mode3_equiv
 CUSV_BENCH_BIN := $(BUILD)/cusv_bench
 CUSV_GROUND_TRUTH := $(BUILD)/cusv_ground_truth.txt
@@ -414,6 +415,10 @@ $(CUSV_PARITY_TEST_BIN): tests/cusv_parity_tests.cpp $(BUILD)/cusv_diag.o $(BUIL
 	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $(NVQXXFLAGS_COMMON) $< $(BUILD)/cusv_diag.o $(BUILD)/cusv_parity.o \
 	  $(MIPT_CUDA_LIBS) $(CUSV_LIBS) $(DL_LIBS) -o $@
 
+$(PROBED_PARITY_TEST_BIN): tests/probed_parity_tests.cpp $(BUILD)/cusv_diag.o $(BUILD)/cusv_parity.o $(MIPT_HEADERS) | $(BUILD)
+	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $(NVQXXFLAGS_COMMON) $< $(BUILD)/cusv_diag.o $(BUILD)/cusv_parity.o \
+	  $(MIPT_CUDA_LIBS) $(CUSV_LIBS) $(DL_LIBS) -o $@
+
 $(CUSV_BENCH_BIN): tests/cusv_bench.cpp $(BUILD)/cusv_diag.o $(BUILD)/cusv_parity.o $(MIPT_HEADERS) | $(BUILD)
 	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $(NVQXXFLAGS_COMMON) $< $(BUILD)/cusv_diag.o $(BUILD)/cusv_parity.o \
 	  $(MIPT_CUDA_LIBS) $(CUSV_LIBS) $(DL_LIBS) -o $@
@@ -432,6 +437,13 @@ test-cusv: test-cusv-gates $(CUSV_EQUIV_BIN)
 test-cusv-parity: $(CUSV_PARITY_TEST_BIN)
 	$(CUSV_PARITY_TEST_BIN) 12 6 2026
 	$(CUSV_PARITY_TEST_BIN) 10 10 4711
+
+# The probe-side use of the same encoding: the pre-attachment prefix, run on
+# 2^(N-1) amplitudes inside the wider probe register.
+test-probed-parity: $(PROBED_PARITY_TEST_BIN)
+	$(PROBED_PARITY_TEST_BIN) 10 8 2026
+	$(PROBED_PARITY_TEST_BIN) 12 6 4711
+	MIPT_CUSV_PARITY=0 $(PROBED_PARITY_TEST_BIN) 10 6 99
 
 # The mode-3 pattern cusv_equiv cannot reach: a register two qubits wider than
 # the circuit, with references attached mid-trajectory.

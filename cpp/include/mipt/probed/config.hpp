@@ -189,8 +189,20 @@ inline void print_help(const char *program)
         << "Runtime controls:\n"
         << "  MIPT_PROBED_DISTANCE=1       Legacy one-probe depth d.\n"
         << "  MIPT_PROBED_PREFETCH=0       Disable CPU layer prefetch.\n"
-              << "  MIPT_PROBED_PARITY_ENCODING=0 Disable exact one-probe parity "
-                 "encoding.\n"
+              << "  MIPT_PROBED_PARITY_ENCODING=0 Disable the exact one-probe parity "
+                 "encoding\n"
+              << "                               (modes 0/1/2: the reference is the "
+                 "system parity,\n"
+              << "                               so N qubits are simulated, not "
+                 "N+1).\n"
+              << "  MIPT_CUSV_PARITY=0           Disable the even-parity-sector "
+                 "encoding of the\n"
+              << "                               pre-attachment prefix (modes 0/1 "
+                 "multi-probe,\n"
+              << "                               3, 4, 5): 2^(N-1) amplitudes instead "
+                 "of 2^(N+probes)\n"
+              << "                               until the first reference is "
+                 "attached.\n"
         << "  MIPT_PROBED_ISOLATE_P=0      Disable per-p subprocess isolation.\n"
               << "  MIPT_PROBED_RESUME=0         Replace, rather than resume, a p "
                  "scan.\n"
@@ -540,7 +552,14 @@ inline void parse_mode5(int argc, char *argv[], ProbeRunConfig &config)
 inline void resolve_derived_settings(ProbeRunConfig &config)
 {
     const int n = config.n;
-    config.parity_encoding = config.mode == 1 && config.probes == 1 &&
+    // The reference is a function of the system parity only while it is
+    // attached at t=0 and never re-attached, which is exactly one probe in
+    // modes 0, 1 and 2. Mode 3/4/5 reset their partner sites mid-trajectory;
+    // their pre-attachment prefix is covered by the sector encoding instead
+    // (CircuitWorkspace1D::advance_parity_sector).
+    const bool attached_at_origin =
+        config.mode == 0 || config.mode == 1 || config.mode == 2;
+    config.parity_encoding = attached_at_origin && config.probes == 1 &&
                              preserves_computational_parity(config.type) &&
                              env::boolean("MIPT_PROBED_PARITY_ENCODING", true);
     const bool fronts = config.mode == 5 && config.probes == 1;

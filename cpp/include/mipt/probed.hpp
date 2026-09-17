@@ -11,6 +11,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstddef>
+#include <iostream>
 #include <memory>
 #include <random>
 #include <stdexcept>
@@ -77,32 +78,18 @@ struct RfgsAdvanceKernel
     }
 };
 
-struct RppuParityProbeKernel
+struct ParityProbeInitKernel
 {
-    void operator()(int n,
-                    int probe_site,
-                    const std::vector<RppuLayer> &layers) __qpu__
+    void operator()(int n, int probe_site) __qpu__
     {
         cudaq::qvector q(n);
         // Exact symmetry encoding of a reference Bell pair: when every system
         // operation preserves computational parity, the omitted reference bit
         // is equal to the system parity.  H on probe_site is the isometric
-        // image of (|00>+|11>)/sqrt(2).
+        // image of (|00>+|11>)/sqrt(2), so the trajectory that follows runs on
+        // n qubits rather than n+1 and every consumer reads the reference off
+        // the system's parity weights.
         h(q[probe_site]);
-        apply_rppu_layers(q, n, layers);
-    }
-};
-
-struct RfgsParityProbeKernel
-{
-    void operator()(int n,
-                    int probe_site,
-                    const std::vector<RfgsLayer> &layers,
-                    bool closed) __qpu__
-    {
-        cudaq::qvector q(n);
-        h(q[probe_site]);
-        apply_rfgs_layers(q, n, layers, closed);
     }
 };
 
@@ -264,10 +251,20 @@ class CircuitWorkspace1D
         return state;
     }
 
-    cudaq::state simulate_parity_encoded_probe(
-        int n,
-        int probe_site,
-        std::string_view context = {})
+    // The one-probe trajectory with the reference *not* simulated.
+    //
+    // A parity-preserving circuit leaves the reference qubit untouched after
+    // the Bell pair is made, and the pair correlates it with the system
+    // parity exactly, so the reference bit is a function of the state rather
+    // than a degree of freedom: |psi> on n+1 qubits is the isometric image of
+    // H|0...0> on n. The register is half the size for the whole trajectory,
+    // and the readout reads the reference marginal off the parity weights
+    // (measure_parity_encoded_probe). Only valid while the reference is
+    // attached at t=0 and never re-attached -- attach_reference resets its
+    // partner site, which is a measurement and breaks the correspondence.
+    cudaq::state initialize_parity_encoded_probe(int n,
+                                                 int probe_site,
+                                                 std::string_view context = {}) const
     {
         if (n != prepared_n_ || probe_site < 0 || probe_site >= n)
         {
@@ -279,63 +276,115 @@ class CircuitWorkspace1D
             throw std::invalid_argument(
                 "Parity-encoded probes require a parity-preserving circuit.");
         }
-#ifdef MIPT_ENABLE_CUSV
-        // Same construction as the kernels below -- H on the probe site, then
-        // the whole prepared history -- but through the cuStateVec engine.
-        if (cusv_available() && prepared_type_ != CircuitType::RFGS)
-        {
-            auto state = cudaq::get_state(mipt::ZeroStateKernel{}, n);
-            if (adopt_state(state))
-            {
-                engine_->apply_matrix({probe_site},
-                                      cusv::single_qubit_on(1, 0, cusv::mat_hadamard()));
-                const int block = cusv::max_block_targets();
-                for (int t = 0; t < prepared_timesteps_; ++t)
-                {
-                    const auto ops = layer_ops(t);
-                    engine_->apply_ops(ops.ops, block);
-                    engine_->measure_layer(ops.measure_sites, measure_rng_);
-                }
-                return state;
-            }
-        }
-#endif
-        log_start(
-            context,
-            circuit_type_name(prepared_type_),
-            prepared_n_,
-            prepared_timesteps_,
-            0);
+        log_start(context, "initialization", n, 0, 0);
         const auto start = std::chrono::steady_clock::now();
-        switch (prepared_type_)
+        auto state = cudaq::get_state(ParityProbeInitKernel{}, n, probe_site);
+        log_done(context, "initialization", start);
+        return state;
+    }
+
+    // Runs the prefix [0, timestep_count) inside the even global-parity
+    // sector, on 2^(n-1) amplitudes, then expands the result into the low 2^n
+    // of the caller's (n+probes)-qubit buffer. Returns false, having touched
+    // nothing, when the encoding does not apply.
+    //
+    // This is the encoding Circuit1D::try_cusv_parity uses for dist_scaling
+    // (mipt/cusv/parity.hpp), applied to the part of a probe trajectory that
+    // runs *before* any reference is attached. There the register is the bare
+    // system tensored with idle |0> ancillas, so it sits in the even sector
+    // and the prefix -- 2N to 4N timesteps, most of a mode-5 circuit -- costs
+    // 2^(n-1) amplitudes instead of 2^(n+probes).
+    //
+    // It stops at the attachment, and that is a property of the protocol
+    // rather than a limitation of the encoder. attach_reference resets its
+    // partner site and Bell-pairs it with an ancilla: the *combined* register
+    // still has a definite parity, but the system alone no longer does, so
+    // the derived bit (the system's top mode) is no longer a function of the
+    // others. Deriving from the top ancilla instead would work, at the price
+    // of tracking the sector flip each reset draws and expanding the state at
+    // every readout -- and the modes that attach early read out nearly every
+    // timestep, so there is little left to win there.
+    //
+    // Refuses unless the buffer is provably |0...0>: one amplitude is copied
+    // back and normalization pins the rest. That is what keeps it from firing
+    // on a reference-encoded probe state, which is a superposition of both
+    // sectors and looks identical from the outside.
+    bool advance_parity_sector(cudaq::state &state, int timestep_count)
+    {
+        validate_segment(0, timestep_count);
+#ifdef MIPT_ENABLE_CUSV
+        if (!cusv_available() || !cusv::parity_encoding_enabled() ||
+            !preserves_computational_parity(prepared_type_) ||
+            prepared_type_ == CircuitType::RFGS || prepared_n_ < 4)
         {
-        case CircuitType::FermionRPPU:
-        case CircuitType::QubitRPPU:
-            return finish_logged(
-                cudaq::get_state(
-                    RppuParityProbeKernel{},
-                    n,
-                    probe_site,
-                    rppu_layers_),
-                context,
-                circuit_type_name(prepared_type_),
-                start);
-        case CircuitType::RFGS:
-            return finish_logged(
-                cudaq::get_state(
-                    RfgsParityProbeKernel{},
-                    n,
-                    probe_site,
-                    rfgs_layers_,
-                    true),
-                context,
-                circuit_type_name(prepared_type_),
-                start);
-        default:
-            break;
+            return false;
         }
-        throw std::invalid_argument(
-            "Unsupported parity-encoded probe circuit.");
+        const auto tensor = state.get_tensor();
+        if (tensor.get_rank() != 1 || tensor.data == nullptr || !state.is_on_gpu())
+        {
+            return false;
+        }
+        const auto elements = tensor.get_num_elements();
+        int total_qubits = 0;
+        while ((std::size_t{1} << total_qubits) < elements)
+        {
+            ++total_qubits;
+        }
+        // Strictly wider than the circuit: the ancillas have to still be
+        // there and idle. An equal width is the reference-encoded probe
+        // state, whose reference lives in the system parity.
+        if ((std::size_t{1} << total_qubits) != elements || total_qubits <= prepared_n_)
+        {
+            return false;
+        }
+
+        // Rewrite the whole prefix before touching a state vector -- a
+        // refusal half-way through would leave a mutated buffer behind.
+        std::vector<std::vector<cusv::Op>> encoded;
+        std::vector<std::vector<int>> measured;
+        encoded.reserve(static_cast<std::size_t>(timestep_count));
+        measured.reserve(static_cast<std::size_t>(timestep_count));
+        for (int t = 0; t < timestep_count; ++t)
+        {
+            auto ops = layer_ops(t);
+            auto rewritten = cusv::encode_parity_sector(ops.ops, prepared_n_);
+            if (!rewritten)
+            {
+                return false;
+            }
+            encoded.push_back(std::move(*rewritten));
+            measured.push_back(std::move(ops.measure_sites));
+        }
+
+        const bool fp64 = state.get_precision() == cudaq::SimulationState::precision::fp64;
+        if (!engine_ || engine_->fp64() != fp64)
+        {
+            engine_ = std::make_unique<cusv::Engine>(fp64);
+        }
+        engine_->adopt(tensor.data, prepared_n_ - 1);
+        if (std::abs(engine_->zero_amplitude_weight() - 1.0) > 1e-6)
+        {
+            engine_->adopt(tensor.data, total_qubits);
+            return false;
+        }
+        announce_parity_prefix(prepared_n_, total_qubits);
+
+        const int block = cusv::max_block_targets();
+        for (int t = 0; t < timestep_count; ++t)
+        {
+            const auto index = static_cast<std::size_t>(t);
+            engine_->apply_ops(encoded[index], block);
+            engine_->measure_layer_encoded(measured[index], prepared_n_, measure_rng_);
+        }
+        // Expands into [0, 2^n); the ancilla block above it is still the zero
+        // CUDA-Q handed out, which is exactly |system> tensor |0...0>.
+        engine_->expand_parity_sector(prepared_n_);
+        engine_->adopt(tensor.data, total_qubits);
+        return true;
+#else
+        (void)state;
+        return false;
+#endif
     }
 
     // Advances `state` in place through [first_timestep, first_timestep+count).
@@ -703,6 +752,22 @@ class CircuitWorkspace1D
         {
             throw std::invalid_argument("Requested timestep segment is outside the prepared trajectory.");
         }
+    }
+
+    // One line per process, on the same channel and in the same wording
+    // Circuit1D::try_cusv_parity uses, so a probe run that takes the encoded
+    // prefix says so exactly once.
+    static void announce_parity_prefix(int n, int total_qubits)
+    {
+        static bool announced = false;
+        if (announced)
+        {
+            return;
+        }
+        announced = true;
+        std::cerr << "parity_sector=1: pre-attachment prefix simulated on 2^" << (n - 1)
+                  << " amplitudes instead of 2^" << total_qubits
+                  << "; MIPT_CUSV_PARITY=0 restores the full path.\n";
     }
 
     static std::string prefix(std::string_view context)

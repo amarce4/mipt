@@ -70,6 +70,27 @@ struct SdpSettings
 namespace detail
 {
 
+// The pre-attachment prefix every reference-attaching mode runs first.
+//
+// Until a reference is attached the register is the bare system tensored with
+// idle |0> ancillas, so a parity-preserving circuit keeps it in the even
+// global-parity sector and the prefix can be simulated on 2^(N-1) amplitudes
+// instead of 2^(N+probes) -- the same encoding dist_scaling.exe uses, and the
+// same MIPT_CUSV_PARITY switch. The workspace refuses (having touched
+// nothing) whenever that does not hold, so this is the ordinary advance with
+// a fast path in front of it, not a second protocol.
+inline void equilibrate(probed::CircuitWorkspace1D &workspace, cudaq::state &state, int timesteps)
+{
+    if (timesteps <= 0)
+    {
+        return;
+    }
+    if (!workspace.advance_parity_sector(state, timesteps))
+    {
+        workspace.advance(state, 0, timesteps);
+    }
+}
+
 // Mode 4: equilibrate, attach the references at the sampled geometry, then
 // read out along tau. Three-probe runs also queue each RDM for an SDP solve.
 inline void run_mode4_trajectory(const ProbeRunConfig &config, probed::CircuitWorkspace1D &workspace,
@@ -79,10 +100,7 @@ inline void run_mode4_trajectory(const ProbeRunConfig &config, probed::CircuitWo
                                  const std::vector<std::vector<unsigned char>> &gmn_selected, SdpBatchQueue *sdp_queue)
 {
     const int n = config.n;
-    if (config.t_eq > 0)
-    {
-        workspace.advance(state, 0, config.t_eq);
-    }
+    equilibrate(workspace, state, config.t_eq);
     int current_t = config.t_eq;
     state = attach_references(state, n, active_sites);
 
@@ -140,10 +158,7 @@ inline void run_mode5_trajectory(const ProbeRunConfig &config, probed::CircuitWo
                                  std::vector<Sample> &scratch, std::vector<unsigned char> &filled)
 {
     const int n = config.n;
-    if (config.t_eq > 0)
-    {
-        workspace.advance(state, 0, config.t_eq);
-    }
+    equilibrate(workspace, state, config.t_eq);
     int current_t = config.t_eq;
     // Resets x0 and Bell-entangles it with the reference. The reference is
     // never touched by a later layer, so it holds exactly what the measurement
@@ -187,10 +202,7 @@ inline void run_mode5_stagger_trajectory(const ProbeRunConfig &config, probed::C
                                          const std::vector<int> &sites, int delay, std::size_t bin)
 {
     const int n = config.n;
-    if (config.t_eq > 0)
-    {
-        workspace.advance(state, 0, config.t_eq);
-    }
+    equilibrate(workspace, state, config.t_eq);
     int current_t = config.t_eq;
     state = attach_reference(state, n, sites[0], 0);
     if (delay > 0)
@@ -221,7 +233,7 @@ inline void run_mode3_trajectory(const ProbeRunConfig &config, probed::CircuitWo
                                  cudaq::state &state, std::vector<Aggregate> &aggregates)
 {
     const int n = config.n;
-    workspace.advance(state, 0, 4 * n);
+    equilibrate(workspace, state, 4 * n);
     int current_t = 4 * n;
     state = attach_reference(state, n, config.sites[0], 0);
     if (config.delta_t > 0)
@@ -253,9 +265,10 @@ inline void run_mode3_trajectory(const ProbeRunConfig &config, probed::CircuitWo
 // its end.
 inline void run_sampling_trajectory(const ProbeRunConfig &config, probed::CircuitWorkspace1D &workspace,
                                     cudaq::state &state, std::vector<Aggregate> &aggregates,
-                                    std::vector<Aggregate> *batch_aggregates, int current_t)
+                                    std::vector<Aggregate> *batch_aggregates)
 {
     const int n = config.n;
+    int current_t = 0;
     // The batch replica sees exactly the samples the global accumulator sees,
     // so the two can never disagree about what was measured.
     const auto record = [&](std::size_t index, const Sample &sample) {
@@ -267,7 +280,7 @@ inline void run_sampling_trajectory(const ProbeRunConfig &config, probed::Circui
     };
     if ((config.mode == 0 || config.mode == 1) && config.probes > 1)
     {
-        workspace.advance(state, 0, 2 * n);
+        equilibrate(workspace, state, 2 * n);
         current_t = 2 * n;
         state = attach_references(state, n, config.sites);
     }
@@ -562,9 +575,8 @@ inline SimulationResult simulate(const ProbeRunConfig &config, ProgressReporter 
             const bool attach_at_start = config.mode == 2 || (config.probes == 1 && config.mode != 5);
             auto &workspace = workspaces[current];
             auto state = config.parity_encoding
-                             ? workspace.simulate_parity_encoded_probe(n, active_sites.front())
+                             ? workspace.initialize_parity_encoded_probe(n, active_sites.front())
                              : initialize_state(n, active_sites, attach_at_start);
-            const int current_t = config.parity_encoding ? t_max : 0;
 
             if (config.mode == 5 && config.probes == 2)
             {
@@ -587,7 +599,7 @@ inline SimulationResult simulate(const ProbeRunConfig &config, ProgressReporter 
             }
             else
             {
-                detail::run_sampling_trajectory(config, workspace, state, aggregates, batch_target, current_t);
+                detail::run_sampling_trajectory(config, workspace, state, aggregates, batch_target);
             }
 
             ++completed;

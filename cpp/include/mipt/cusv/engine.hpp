@@ -476,6 +476,34 @@ class Engine
         qubits_ = full_qubits;
     }
 
+    // |amplitude(0)|^2, read back as a single element. That is enough to
+    // certify a buffer really holds |0...0>: normalization pins every other
+    // amplitude to zero once this one carries all the weight. Used by the
+    // probe prefix encoding, which is only valid on an untouched product
+    // state and must be able to refuse cheaply rather than assume.
+    double zero_amplitude_weight()
+    {
+        double re = 0.0;
+        double im = 0.0;
+        if (fp64_)
+        {
+            std::complex<double> value{};
+            check_cuda(cudaMemcpy(&value, active(), sizeof(value), cudaMemcpyDeviceToHost),
+                       "cudaMemcpy(zero_amplitude_weight fp64)");
+            re = value.real();
+            im = value.imag();
+        }
+        else
+        {
+            std::complex<float> value{};
+            check_cuda(cudaMemcpy(&value, active(), sizeof(value), cudaMemcpyDeviceToHost),
+                       "cudaMemcpy(zero_amplitude_weight fp32)");
+            re = static_cast<double>(value.real());
+            im = static_cast<double>(value.imag());
+        }
+        return re * re + im * im;
+    }
+
     // Squared norm of the whole state; used by the self-checks.
     double squared_norm()
     {
