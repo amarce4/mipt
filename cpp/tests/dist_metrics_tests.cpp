@@ -2,6 +2,7 @@
 #include "mipt/dist_records.hpp"
 #include "mipt/dist_scaling_resume.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <complex>
@@ -10,6 +11,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <functional>
 #include <limits>
 #include <random>
@@ -1062,6 +1064,513 @@ void test_dist_records()
 }
 
 // ---------------------------------------------------------------------------
+// Gate-path diagnostics (MIPT_DIST_GATE_DIAGNOSTICS): the record payload, the
+// header provenance, the pair CSV metadata, the resume refusals, and the run
+// preconditions. The graph side (capacities, widest paths) is pinned by
+// dist_connectivity_tests; this pins what the writer does with the values.
+// ---------------------------------------------------------------------------
+namespace dist_gate_tests
+{
+namespace dist = mipt::dist;
+namespace rec = mipt::dist::records;
+namespace res = mipt::dist::resume;
+using dist_record_tests::read_back;
+using dist_resume_tests::expect;
+using dist_resume_tests::refuses;
+
+std::string scratch_directory()
+{
+    const auto path = std::filesystem::temp_directory_path() / "mipt_dist_gate_tests";
+    std::filesystem::remove_all(path);
+    std::filesystem::create_directories(path);
+    return path.string();
+}
+
+dist::RunConfig rppu_config(bool gate)
+{
+    dist::RunConfig config;
+    config.k = 2;
+    config.n = 8;
+    config.periods = 4;
+    config.realizations = 4;
+    config.type = mipt::CircuitType::FermionRPPU;
+    config.gate_path_diagnostics = gate;
+    return config;
+}
+
+std::vector<std::array<int, 4>> pair_embeddings(int n)
+{
+    std::vector<std::array<int, 4>> embeddings;
+    std::vector<int> seen(static_cast<std::size_t>(n / 2), 0);
+    for (int i = 0; i < n; ++i)
+    {
+        for (int j = i + 1; j < n; ++j)
+        {
+            const int bin = mipt::util::periodic_distance(i, j, n) - 1;
+            embeddings.push_back({bin, seen[static_cast<std::size_t>(bin)]++, i, j});
+        }
+    }
+    return embeddings;
+}
+
+// Remove every occurrence of `token` from `text`.
+std::string erase_all(std::string text, const std::string &token)
+{
+    for (std::size_t at = text.find(token); at != std::string::npos; at = text.find(token))
+    {
+        text.erase(at, token.size());
+    }
+    return text;
+}
+
+bool refuses_argument(const std::function<void()> &action)
+{
+    try
+    {
+        action();
+    }
+    catch (const std::invalid_argument &)
+    {
+        return true;
+    }
+    return false;
+}
+
+const std::vector<std::string> GATE_NAMES{
+    "component_size", "shortest_path", "shortest_path_unitary_count",
+    "shortest_maximin_gate_ep", "widest_gate_ep", "widest_even_mix", "widest_odd_mix"};
+
+// The seven gate values go after *every* detail-level value, at every detail
+// level, and nowhere when the setting is off.
+void test_observable_ordering()
+{
+    for (const auto detail : {dist::RecordDetail::Basic, dist::RecordDetail::Channel,
+                              dist::RecordDetail::Full})
+    {
+        for (const auto type : {mipt::CircuitType::FermionRPPU, mipt::CircuitType::QubitRPPU})
+        {
+            auto config = rppu_config(false);
+            config.type = type;
+            config.record_detail = detail;
+            const auto off = rec::pair_observable_names(config);
+            expect(off == rec::pair_detail_observable_names(config),
+                   "with the diagnostics off the observable list is the detail list");
+            for (const auto &name : off)
+            {
+                expect(std::find(GATE_NAMES.begin(), GATE_NAMES.end(), name) == GATE_NAMES.end(),
+                       "no gate observable appears with the diagnostics off");
+            }
+            config.gate_path_diagnostics = true;
+            const auto on = rec::pair_observable_names(config);
+            expect(on.size() == off.size() + GATE_NAMES.size(),
+                   "the diagnostics append exactly seven observables");
+            expect(std::equal(off.begin(), off.end(), on.begin()),
+                   "the detail-level observables keep their positions");
+            expect(std::equal(GATE_NAMES.begin(), GATE_NAMES.end(), on.begin() + off.size()),
+                   "the gate observables follow, in the contract's order");
+        }
+    }
+    expect(rec::gate_observable_names().size() == rec::GATE_RECORD_VALUES,
+           "the gate name list and the value count agree");
+    for (std::size_t i = 0; i < GATE_NAMES.size(); ++i)
+    {
+        expect(GATE_NAMES[i] == rec::gate_observable_names()[i],
+               "gate_observable_names matches the contract");
+    }
+}
+
+// Off: byte-identical to the pre-feature format. On: exactly the documented
+// additions and nothing else, so stripping them recovers the off header.
+void test_headers()
+{
+    auto off = rppu_config(false);
+    auto on = rppu_config(true);
+    const auto bins = dist::make_pair_bins(off.n);
+    const auto embeddings = pair_embeddings(off.n);
+
+    // ---- pair CSV
+    const std::string csv_off = dist::pair_csv_header(off);
+    const std::string csv_on = dist::pair_csv_header(on);
+    expect(csv_off.find("gate") == std::string::npos,
+           "the pair CSV header carries no gate token with the diagnostics off");
+    expect(csv_off.find(",connectivity_graph_version,connectivity_graph,separation,") !=
+               std::string::npos,
+           "with the diagnostics off the graph columns run straight into the bin columns");
+    expect(csv_on.find(",connectivity_graph,gate_path_diagnostics,gate_diagnostics_version,"
+                       "gate_diagnostics_definition,separation,") != std::string::npos,
+           "the gate columns sit right after connectivity_graph");
+    expect(erase_all(csv_on, ",gate_path_diagnostics,gate_diagnostics_version,"
+                             "gate_diagnostics_definition") == csv_off,
+           "the gate columns are the only difference in the pair CSV header");
+    // The k=3 header never changes.
+    auto triple_off = off;
+    triple_off.k = 3;
+    auto triple_on = triple_off;
+    triple_on.gate_path_diagnostics = true;
+    expect(dist::triple_csv_header(triple_off) == dist::triple_csv_header(triple_on),
+           "the triangle CSV header ignores the gate setting");
+
+    // The rendered rows carry the values.
+    const std::string rendered = dist::render_pair_csv(on, bins);
+    std::string definition = mipt::util::csv_quote(mipt::GATE_DIAGNOSTICS_DEFINITION);
+    expect(rendered.find(",1," + std::to_string(mipt::GATE_DIAGNOSTICS_VERSION) + "," +
+                         definition + ",") != std::string::npos,
+           "every pair row writes 1, the version, and the quoted definition");
+
+    // ---- record header
+    const std::string rec_off = rec::pair_header_text(off, bins, embeddings);
+    const std::string rec_on = rec::pair_header_text(on, bins, embeddings);
+    for (const char *token : {"gate", "cusv", "component_size", "widest"})
+    {
+        expect(rec_off.find(token) == std::string::npos,
+               std::string("the record header carries no '") + token +
+                   "' with the diagnostics off");
+    }
+    const std::string definition_line =
+        std::string("gate_diagnostics_definition=") + mipt::GATE_DIAGNOSTICS_DEFINITION + "\n";
+    expect(rec_on.find("\ngate_path_diagnostics=1\n") != std::string::npos,
+           "the record header announces the diagnostics");
+    expect(rec_on.find("\ngate_diagnostics_version=" +
+                       std::to_string(mipt::GATE_DIAGNOSTICS_VERSION) + "\n") !=
+               std::string::npos,
+           "the record header carries the definition version");
+    expect(rec_on.find(definition_line) != std::string::npos,
+           "the record header carries the definition string");
+    for (const char *key : {"\ncusv_parity=", "\ncusv_measure_bits=", "\ncusv_block_targets="})
+    {
+        expect(rec_on.find(key) != std::string::npos,
+               std::string("the record header carries ") + (key + 1));
+    }
+    // Strip the documented additions and the off header must come back. The
+    // cuStateVec values depend on the environment, so take them from the
+    // header itself.
+    std::string stripped = rec_on;
+    for (const char *key : {"gate_path_diagnostics=", "gate_diagnostics_version=",
+                            "gate_diagnostics_definition=", "cusv_parity=",
+                            "cusv_measure_bits=", "cusv_block_targets="})
+    {
+        const std::size_t at = stripped.find(std::string("\n") + key);
+        expect(at != std::string::npos, std::string("found ") + key);
+        const std::size_t end = stripped.find('\n', at + 1);
+        stripped.erase(at, end - at);
+    }
+    std::string gate_fields;
+    std::string gate_observables;
+    for (const auto &name : GATE_NAMES)
+    {
+        gate_fields += "," + name + ":f8";
+        gate_observables += "," + name;
+    }
+    stripped = erase_all(stripped, gate_fields);
+    stripped = erase_all(stripped, gate_observables);
+    expect(stripped == rec_off,
+           "the gate fields and observables are the only difference in the record header");
+
+    // k=3 record headers never change.
+    auto geometries = mipt::probed::enumerate_three_probe_geometries(off.n, 0.5);
+    const auto triple_bins = dist::make_triple_bins(off.n, geometries);
+    expect(rec::triple_header_text(triple_off, triple_bins, 1, geometries) ==
+               rec::triple_header_text(triple_on, triple_bins, 1, geometries),
+           "the triangle record header ignores the gate setting");
+}
+
+// The one decision that matters: no path is NaN, never 0. component_size is
+// written for every evaluated pair.
+void test_record_values()
+{
+    mipt::dist::GatePathMetrics gate;
+    gate.available = true;
+    gate.shortest_path_length = 9;
+    gate.shortest_path_unitary_count = 3;
+    gate.shortest_maximin_entangling_power = 0.25;
+    gate.widest_entangling_power = 0.5;
+    gate.widest_even_block_mixing = 0.75;
+    gate.widest_odd_block_mixing = 0.125;
+
+    mipt::dist::PairConnectivity conn;
+    conn.evaluated = true;
+    conn.survives_i = conn.survives_j = conn.interior_path = conn.connected = true;
+    conn.component_size = 42;
+    conn.shortest_path = 9;
+
+    std::array<double, rec::GATE_RECORD_VALUES> out{};
+    rec::fill_gate_record_values(conn, gate, out.data());
+    const std::array<double, rec::GATE_RECORD_VALUES> expected{42.0, 9.0, 3.0, 0.25,
+                                                               0.5,  0.75, 0.125};
+    expect(out == expected, "a connected pair writes every gate value");
+
+    const auto blanked = [](const std::array<double, rec::GATE_RECORD_VALUES> &values) {
+        for (std::size_t i = 1; i < values.size(); ++i)
+        {
+            if (!std::isnan(values[i]))
+            {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    // Shares an interior component but endpoint j was measured last: the
+    // final-slice path exists, the pair is not connected.
+    auto measured = conn;
+    measured.survives_j = false;
+    measured.connected = false;
+    rec::fill_gate_record_values(measured, gate, out.data());
+    expect(out[0] == 42.0, "component_size is written for a pair that is not connected");
+    expect(blanked(out), "a pair that is not connected writes NaN, not 0, for every path value");
+
+    // Different components: no path, gate metrics unavailable.
+    auto disconnected = conn;
+    disconnected.interior_path = disconnected.connected = false;
+    disconnected.component_size = 7;
+    disconnected.shortest_path = -1;
+    rec::fill_gate_record_values(disconnected, mipt::dist::GatePathMetrics{}, out.data());
+    expect(out[0] == 7.0, "component_size is written for a disconnected pair");
+    expect(blanked(out), "a disconnected pair writes NaN for every path value");
+
+    // Connected, but the graph had no gate metrics.
+    rec::fill_gate_record_values(conn, mipt::dist::GatePathMetrics{}, out.data());
+    expect(out[0] == 42.0 && blanked(out), "unavailable gate metrics are NaN, not 0");
+
+    // An unevaluated pair has nothing at all.
+    rec::fill_gate_record_values(mipt::dist::PairConnectivity{}, gate, out.data());
+    expect(std::isnan(out[0]) && blanked(out), "an unevaluated pair writes NaN throughout");
+}
+
+// Write a record file under the real k=2 header with the gate fields, read it
+// back with the independent reader, and check the NaNs survive bit for bit.
+void test_binary_round_trip(const std::string &directory)
+{
+    auto config = rppu_config(true);
+    const auto bins = dist::make_pair_bins(config.n);
+    const auto embeddings = pair_embeddings(config.n);
+    const auto names = rec::pair_observable_names(config);
+    const std::size_t detail_count = rec::pair_detail_observable_names(config).size();
+    const std::string header = rec::pair_header_text(config, bins, embeddings);
+    const std::string path = directory + "/gate_records.bin";
+
+    mipt::dist::GatePathMetrics gate;
+    gate.available = true;
+    gate.shortest_path_length = 5;
+    gate.shortest_path_unitary_count = 2;
+    gate.shortest_maximin_entangling_power = 0.3;
+    gate.widest_entangling_power = 0.6;
+    gate.widest_even_block_mixing = 0.2;
+    gate.widest_odd_block_mixing = 0.9;
+
+    std::vector<std::vector<double>> written;
+    {
+        rec::RecordSink sink;
+        sink.open(path, header, names.size(), 0);
+        for (std::uint32_t realization = 0; realization < 2; ++realization)
+        {
+            for (std::size_t e = 0; e < embeddings.size(); ++e)
+            {
+                std::vector<double> values(names.size());
+                for (std::size_t slot = 0; slot < detail_count; ++slot)
+                {
+                    values[slot] = 0.01 * static_cast<double>(slot + e) + realization;
+                }
+                mipt::dist::PairConnectivity conn;
+                conn.evaluated = true;
+                conn.survives_i = conn.survives_j = true;
+                conn.interior_path = conn.connected = (e % 3) != 0;
+                conn.component_size = static_cast<std::uint32_t>(10 + e);
+                rec::fill_gate_record_values(conn, conn.connected ? gate
+                                                                  : mipt::dist::GatePathMetrics{},
+                                             values.data() + detail_count);
+                sink.add(realization, static_cast<std::uint32_t>(embeddings[e][0]),
+                         static_cast<std::uint32_t>(embeddings[e][1]), conn.flags(),
+                         values.data());
+                written.push_back(values);
+            }
+        }
+        sink.close();
+    }
+
+    const auto [read_header, rows] = read_back(path, names.size());
+    expect(read_header == header, "the gate header round-trips verbatim");
+    expect(rows.size() == written.size(), "every gate record reached the file");
+    for (std::size_t index = 0; index < rows.size(); ++index)
+    {
+        expect(std::memcmp(rows[index].values.data(), written[index].data(),
+                           names.size() * sizeof(double)) == 0,
+               "gate records round-trip bit for bit, NaNs included");
+        const bool connected = (rows[index].flags & mipt::dist::FLAG_CONNECTED) != 0u;
+        expect(connected == !std::isnan(rows[index].values[detail_count + 4]),
+               "widest_gate_ep is present exactly on connected records");
+        expect(!std::isnan(rows[index].values[detail_count]),
+               "component_size is present on every record");
+    }
+
+    // The record file refuses a resume across the setting, both ways: the
+    // header differs and so does the record width.
+    auto off = rppu_config(false);
+    const auto off_names = rec::pair_observable_names(off);
+    const std::string off_header = rec::pair_header_text(off, bins, embeddings);
+    expect(refuses([&] {
+               rec::RecordSink sink;
+               sink.open(path, off_header, off_names.size(), 2);
+           }),
+           "a gate record file cannot be extended with the diagnostics off");
+    const std::string off_path = directory + "/plain_records.bin";
+    {
+        rec::RecordSink sink;
+        sink.open(off_path, off_header, off_names.size(), 0);
+        std::vector<double> values(off_names.size(), 0.5);
+        sink.add(0, 0, 0, 0u, values.data());
+        sink.close();
+    }
+    expect(refuses([&] {
+               rec::RecordSink sink;
+               sink.open(off_path, header, names.size(), 1);
+           }),
+           "a plain record file cannot be extended with the diagnostics on");
+    // ... and the same file still resumes under its own setting.
+    {
+        rec::RecordSink sink;
+        sink.open(path, header, names.size(), 2);
+        expect(sink.inherited_records() == written.size(),
+               "a gate record file resumes under the setting it was written with");
+        sink.close();
+    }
+}
+
+// The pair CSV refuses a resume across the setting in both directions, and
+// round-trips under it.
+void test_csv_resume(const std::string &directory)
+{
+    auto on = rppu_config(true);
+    on.output_path = directory + "/gate_pairs.csv";
+    auto off = rppu_config(false);
+    off.output_path = directory + "/plain_pairs.csv";
+
+    auto bins = dist::make_pair_bins(on.n);
+    for (auto &bin : bins)
+    {
+        for (std::uint64_t e = 0; e < 2 * bin.embedding_count; ++e)
+        {
+            for (auto *stats : {&bin.mi, &bin.mn, &bin.g2, &bin.f2, &bin.fmi, &bin.fmn,
+                                &bin.fg2, &bin.ff2, &bin.fmn_residual, &bin.n_i, &bin.n_j,
+                                &bin.dnn, &bin.rho_n, &bin.abs_rho_n, &bin.rho_n_sq,
+                                &bin.i_occ})
+            {
+                stats->add(0.1 + 0.01 * static_cast<double>(e));
+            }
+        }
+    }
+    dist::publish_csv(on.output_path, dist::render_pair_csv(on, bins));
+    dist::publish_csv(off.output_path, dist::render_pair_csv(off, bins));
+
+    {
+        auto restored = dist::make_pair_bins(on.n);
+        const auto report = res::load_pairs(on, restored);
+        expect(report.loaded && report.completed == 2,
+               "a gate pair CSV resumes under the setting it was written with");
+    }
+    {
+        auto restored = dist::make_pair_bins(off.n);
+        expect(res::load_pairs(off, restored).completed == 2,
+               "a plain pair CSV still resumes with the diagnostics off");
+    }
+    auto on_reading_off = on;
+    on_reading_off.output_path = off.output_path;
+    expect(refuses([&] {
+               auto b = dist::make_pair_bins(on.n);
+               (void)res::load_pairs(on_reading_off, b);
+           }),
+           "a plain pair CSV cannot be resumed with the diagnostics on");
+    auto off_reading_on = off;
+    off_reading_on.output_path = on.output_path;
+    expect(refuses([&] {
+               auto b = dist::make_pair_bins(on.n);
+               (void)res::load_pairs(off_reading_on, b);
+           }),
+           "a gate pair CSV cannot be resumed with the diagnostics off");
+
+    // A file claiming another definition version is refused too.
+    std::ifstream in(on.output_path);
+    std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    const std::string needle = ",1," + std::to_string(mipt::GATE_DIAGNOSTICS_VERSION) + ",\"";
+    for (std::size_t at = text.find(needle); at != std::string::npos; at = text.find(needle, at))
+    {
+        text.replace(at, needle.size(), ",1,999,\"");
+    }
+    auto edited = on;
+    edited.output_path = directory + "/edited_pairs.csv";
+    dist::publish_csv(edited.output_path, text);
+    expect(refuses([&] {
+               auto b = dist::make_pair_bins(on.n);
+               (void)res::load_pairs(edited, b);
+           }),
+           "a pair CSV from another gate-definition version is refused");
+}
+
+void test_validation()
+{
+    auto config = rppu_config(true);
+    expect(!refuses_argument([&] { rec::validate_gate_diagnostics(config, true); }),
+           "RPPU, k=2, connectivity on, records on is accepted");
+    auto qubit = config;
+    qubit.type = mipt::CircuitType::QubitRPPU;
+    expect(!refuses_argument([&] { rec::validate_gate_diagnostics(qubit, true); }),
+           "qRPPU is accepted");
+    auto both = config;
+    both.k = 0;
+    expect(!refuses_argument([&] { rec::validate_gate_diagnostics(both, true); }),
+           "k=0 is accepted");
+    auto gap_only = config;
+    gap_only.pair_gap.enabled = true;
+    expect(!refuses_argument([&] { rec::validate_gate_diagnostics(gap_only, false); }),
+           "the triple analysis alone is somewhere to write");
+
+    for (const auto type : {mipt::CircuitType::Haar, mipt::CircuitType::MMS,
+                            mipt::CircuitType::RFGS})
+    {
+        auto other = config;
+        other.type = type;
+        expect(refuses_argument([&] { rec::validate_gate_diagnostics(other, true); }),
+               "a circuit without gate capacities is refused, not written as NaN");
+    }
+    auto triangles = config;
+    triangles.k = 3;
+    expect(refuses_argument([&] { rec::validate_gate_diagnostics(triangles, true); }),
+           "k=3 is refused");
+    auto no_graph = config;
+    no_graph.connectivity = false;
+    expect(refuses_argument([&] { rec::validate_gate_diagnostics(no_graph, true); }),
+           "connectivity off is refused");
+    expect(refuses_argument([&] { rec::validate_gate_diagnostics(config, false); }),
+           "nowhere to write is refused");
+
+    // Off never refuses, whatever else is set.
+    auto off = config;
+    off.gate_path_diagnostics = false;
+    off.type = mipt::CircuitType::Haar;
+    off.k = 3;
+    off.connectivity = false;
+    expect(!refuses_argument([&] { rec::validate_gate_diagnostics(off, false); }),
+           "the diagnostics off imposes nothing");
+}
+
+void run(const std::string &directory)
+{
+    test_observable_ordering();
+    test_headers();
+    test_record_values();
+    test_binary_round_trip(directory);
+    test_csv_resume(directory);
+    test_validation();
+    std::filesystem::remove_all(directory);
+}
+} // namespace dist_gate_tests
+
+void test_dist_gate_diagnostics()
+{
+    dist_gate_tests::run(dist_gate_tests::scratch_directory());
+}
+
+// ---------------------------------------------------------------------------
 // The two-mode channel: the closed-form fermionic negativity, the occupation
 // diagnostics, and the precision behaviour that motivates both.
 // ---------------------------------------------------------------------------
@@ -1559,6 +2068,7 @@ int main()
 
     test_dist_scaling_resume();
     test_dist_records();
+    test_dist_gate_diagnostics();
     dist_channel_tests::run();
 
     std::cout << "dist_metrics_tests: PASS\n";

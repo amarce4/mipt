@@ -12,6 +12,8 @@
 // Neither is a transcription of the circuit; both are choices, and a wrong one
 // silently fuses the whole ring into a single cluster.
 
+#include "mipt/analysis/gate_entanglement.hpp"
+#include "mipt/cusv/matrix.hpp"
 #include "mipt/types.hpp"
 
 #include <algorithm>
@@ -35,6 +37,12 @@ struct RppuBondGate
     int q1 = 0;
     U2Params even;
     U2Params odd;
+    // How entangling this gate is (analysis/gate_entanglement.hpp), computed
+    // at draw time from the very 2x2 blocks the parameters are decomposed
+    // from. NaN for an FSWAP (kind 1), which is transport and gets none. A JW
+    // boundary gate (kind 2) carries the diagnostic of its two-mode unitary,
+    // never of the CZ string that represents it.
+    GateEntanglement entanglement;
 };
 
 struct RppuLayer
@@ -104,9 +112,40 @@ inline RppuBondGate random_parity_preserving_gate(int q0, int q1, std::mt19937 &
     gate.kind = 0;
     gate.q0 = q0;
     gate.q1 = q1;
-    gate.even = decompose_u2_to_u3_phase(haar_unitary_2(rng));
-    gate.odd = decompose_u2_to_u3_phase(haar_unitary_2(rng));
+    // Even block first, then odd: the same draw order as before the
+    // diagnostic existed, so a recorded master seed still names the same
+    // circuit.
+    const GateMatrix2 even = haar_unitary_2(rng);
+    const GateMatrix2 odd = haar_unitary_2(rng);
+    gate.entanglement = parity_preserving_gate_entanglement(even, odd);
+    gate.even = decompose_u2_to_u3_phase(even);
+    gate.odd = decompose_u2_to_u3_phase(odd);
     return gate;
+}
+
+// The 4x4 a kind-0/kind-2 gate applies, rebuilt from its parameters exactly as
+// the cuStateVec engine rebuilds it (cusv::rppu_bond_matrix delegates here).
+// Bit 0 is gate.q0. Agrees with the pre-decomposition matrix to rounding.
+inline GateMatrix4 rppu_gate_matrix(const RppuBondGate &gate)
+{
+    return parity_preserving_matrix(cusv::mat_from_u2_params(gate.even),
+                                    cusv::mat_from_u2_params(gate.odd));
+}
+
+// The diagnostic of a gate, from the stored draw-time value when there is one
+// and from its parameters otherwise (a gate assembled by hand rather than
+// drawn). Both describe the same matrix.
+inline GateEntanglement rppu_gate_entanglement(const RppuBondGate &gate)
+{
+    if (gate.kind == 1)
+    {
+        return {};
+    }
+    if (std::isfinite(gate.entanglement.entangling_power_normalized))
+    {
+        return gate.entanglement;
+    }
+    return gate_entanglement(rppu_gate_matrix(gate));
 }
 
 inline RppuBondGate random_parity_preserving_jw_string_gate(int q0, int q1, std::mt19937 &rng)
@@ -316,8 +355,9 @@ inline LogicalLayer logical_layer_from_rppu(const RppuLayer &layer, int n,
 {
     LogicalLayer out;
     out.bonds.reserve(layer.gates.size());
-    for (const RppuBondGate &gate : layer.gates)
+    for (std::size_t gate_index = 0; gate_index < layer.gates.size(); ++gate_index)
     {
+        const RppuBondGate &gate = layer.gates[gate_index];
         const std::size_t q0 = static_cast<std::size_t>(gate.q0);
         const std::size_t q1 = static_cast<std::size_t>(gate.q1);
         if (gate.kind == 1)
@@ -330,9 +370,18 @@ inline LogicalLayer logical_layer_from_rppu(const RppuLayer &layer, int n,
         // exactly -- no reconstruction of the 2x2 needed.
         const double pair_amplitude = std::sin(0.5 * gate.even.theta);
         const double hop_amplitude = std::sin(0.5 * gate.odd.theta);
-        out.bonds.push_back({mode_at_site[q0], mode_at_site[q1],
-                             pair_amplitude * pair_amplitude,
-                             hop_amplitude * hop_amplitude});
+        const GateEntanglement metrics = rppu_gate_entanglement(gate);
+        LogicalBond bond{mode_at_site[q0], mode_at_site[q1], pair_amplitude * pair_amplitude,
+                         hop_amplitude * hop_amplitude};
+        // Which simulated gate this bond is: an index into layer.gates, so a
+        // replay can recover the exact 4x4. Implementation-specific (the
+        // FSWAP network puts the boundary gate after its transport), unlike
+        // the metrics, which are identical across boundary implementations.
+        bond.source_gate_index = static_cast<int>(gate_index);
+        bond.entangling_power = metrics.entangling_power_normalized;
+        bond.even_block_mixing = metrics.even_block_mixing;
+        bond.odd_block_mixing = metrics.odd_block_mixing;
+        out.bonds.push_back(bond);
     }
     set_measured(out, n, layer.measure_flags, mode_at_site);
     return out;

@@ -50,6 +50,7 @@ from .plotting import _show
 from .records import (
     FLAG_CONNECTED,
     FLAG_EVALUATED,
+    FLAG_FN_POSITIVE,
     histogram_edges,
     iter_record_chunks,
     record_file_info,
@@ -82,6 +83,31 @@ _OUTCOME_COLUMNS = (
 )
 
 _GROUP_KEYS = ["realization_id", "anchor_role", "pair_i", "pair_j"]
+
+# The gate-path columns gap format v3 added (MIPT_DIST_GATE_DIAGNOSTICS), in
+# file order, with the names this module uses for them -- the record binary's
+# observable names, so a pair table and a record frame line up. They are
+# optional on read: a v2 file has none of them and still loads, with the
+# columns present and NaN. NaN also means "no path" or "diagnostics off" in a
+# v3 file; it is never a zero.
+_GATE_PATH_COLUMNS = {
+    "path_unitary_count_ij": "shortest_path_unitary_count",
+    "shortest_maximin_gate_ep_ij": "shortest_maximin_gate_ep",
+    "widest_gate_ep_ij": "widest_gate_ep",
+    "widest_even_mix_ij": "widest_even_mix",
+    "widest_odd_mix_ij": "widest_odd_mix",
+}
+
+
+def _ensure_gate_path_columns(frame: pd.DataFrame) -> pd.DataFrame:
+    """Rename the gate-path columns if present, add them as NaN if not."""
+    frame = frame.rename(columns=_GATE_PATH_COLUMNS)
+    for name in _GATE_PATH_COLUMNS.values():
+        if name not in frame.columns:
+            frame[name] = np.nan
+        else:
+            frame[name] = pd.to_numeric(frame[name], errors="coerce")
+    return frame
 
 
 def aggregate_path_for(outcome_csv: str | Path) -> Path:
@@ -168,7 +194,7 @@ def read_pair_summary(path: str | Path) -> pd.DataFrame:
     from this path and one reduced from the outcome rows are interchangeable.
     """
     frame = pd.read_csv(path)
-    out = frame.rename(columns=_SUMMARY_RENAME)
+    out = _ensure_gate_path_columns(frame.rename(columns=_SUMMARY_RENAME))
     out["r3"] = out["positive_thirds"] > 0
     # No positive third, but something the solver could not resolve: the pair's
     # R_3 is unknown and it belongs in neither the numerator nor the
@@ -214,7 +240,9 @@ def _reduce_groups(frame: pd.DataFrame) -> pd.DataFrame:
         _block_j=(frame["min_cut_site"] == "j").astype(np.int64),
         _block_k=(frame["min_cut_site"] == "k").astype(np.int64),
     )
+    work = _ensure_gate_path_columns(work)
     grouped = work.groupby(_GROUP_KEYS, sort=False, observed=True)
+    gate_aggregations = {name: (name, "first") for name in _GATE_PATH_COLUMNS.values()}
     out = grouped.agg(
         separation=("separation", "first"),
         d=("chord", "first"),
@@ -230,6 +258,8 @@ def _reduce_groups(frame: pd.DataFrame) -> pd.DataFrame:
         blocked_by_i=("_block_i", "sum"),
         blocked_by_j=("_block_j", "sum"),
         blocked_by_k=("_block_k", "sum"),
+        # A property of the anchor pair, identical on its L-2 rows.
+        **gate_aggregations,
     ).reset_index()
     out["r3"] = out["positive_thirds"] > 0
     # No positive k, but at least one k whose solve failed: the pair's R_3 is
@@ -264,6 +294,10 @@ def pair_level_table(
         if summary.exists():
             return read_pair_summary(summary)
     columns = list(_OUTCOME_COLUMNS)
+    # The gate-path columns only exist from gap format v3 on; read them when the
+    # file has them, and let _reduce_groups fill NaN when it does not.
+    available = set(pd.read_csv(outcome_csv, nrows=0).columns)
+    columns += [name for name in _GATE_PATH_COLUMNS if name in available]
     pieces: list[pd.DataFrame] = []
     carry: pd.DataFrame | None = None
     reader = pd.read_csv(
@@ -781,3 +815,619 @@ def _print_summary(
                 f"{rows['connected_zero_above_null_max'].min():.3g}.."
                 f"{rows['connected_zero_above_null_max'].max():.3g}"
             )
+
+
+# ---------------------------------------------------------------------------
+# Gate-path diagnostics (MIPT_DIST_GATE_DIAGNOSTICS=1)
+#
+# The question: is a connected-but-unentangled ("gap") pair one whose every
+# spacetime path runs through a nearly non-entangling gate? The record binary
+# then carries, per pair, the widest-path and shortest-maximin values of the
+# gates' normalized entangling power and the widest values of the two
+# parity-block mixings. A *marginal* comparison of those between gap pairs and
+# entangled connected pairs is confounded by geometry -- both depend strongly on
+# separation and on how large the component is -- so every gap pair is compared
+# against an entangled connected pair from the *same trajectory*, matched on
+# geometry first and then on the graph's own shortest path and component size.
+# What remains of the difference is then attributable to the gates.
+#
+# Everything here streams the binary one trajectory at a time. A trajectory's
+# records are contiguous and in realization order (the writer flushes only at
+# trajectory boundaries), which is what lets the matching -- a strictly
+# within-trajectory operation -- run with memory bounded by one trajectory plus
+# the gap pairs kept for the clustered bootstrap.
+# ---------------------------------------------------------------------------
+
+GATE_OBSERVABLES = (
+    "component_size",
+    "shortest_path",
+    "shortest_path_unitary_count",
+    "shortest_maximin_gate_ep",
+    "widest_gate_ep",
+    "widest_even_mix",
+    "widest_odd_mix",
+)
+
+# The four capacities compared between groups. All live in [0, 1].
+GATE_COMPARISON_METRICS = (
+    "widest_gate_ep",
+    "shortest_maximin_gate_ep",
+    "widest_even_mix",
+    "widest_odd_mix",
+)
+
+# How a gap pair's control was found, best first. `none` means the trajectory
+# held no entangled connected pair at all; such a gap pair still counts in the
+# group statistics but has no matched difference.
+MATCH_LEVELS = ("geometry_shortest_path", "geometry", "nearest_separation", "none")
+
+_GATE_DIAGNOSTICS_HINT = (
+    "it was written without the gate-path observables. Rerun dist_scaling.exe "
+    "(circ_type 2 or 4, k=2 or k=0) with MIPT_DIST_GATE_DIAGNOSTICS=1."
+)
+
+
+def default_gate_path_thresholds() -> np.ndarray:
+    """``logspace(-6, 0, 13)`` together with 0.05, 0.1 and 0.2, sorted."""
+    return np.unique(np.concatenate([np.logspace(-6.0, 0.0, 13), [0.05, 0.1, 0.2]]))
+
+
+def gate_path_output_path(records: str | Path, suffix: str) -> Path:
+    """``<stem><suffix>`` beside a ``<stem>_records.bin``."""
+    path = Path(records)
+    stem = path.with_suffix("")
+    name = stem.name
+    if name.endswith("_records"):
+        name = name[: -len("_records")]
+    return stem.with_name(name + suffix)
+
+
+def _header_float(header: Mapping[str, Any], key: str) -> float:
+    value = header.get(key)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float("nan")
+
+
+def gate_record_context(records: str | Path, info: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Validate a record file for the gate-path analyses and collect what they need.
+
+    Refuses -- naming the setting that produces them -- a file without the
+    gate-path observables, and any file that is not a format v2 k=2 file with
+    connectivity flags, since the gap/control split is read off those flags.
+    """
+    info = info or record_file_info(records)
+    if int(info["k"]) != 2:
+        raise ValueError(f"{records}: gate-path diagnostics are per pair; this is a k={info['k']} file.")
+    if not info["has_flags"]:
+        raise ValueError(
+            f"{records}: no connectivity flags (format v1, or MIPT_DIST_CONNECTIVITY=0), so "
+            "connected pairs cannot be identified."
+        )
+    observables = set(info["observables"])
+    missing = [name for name in GATE_OBSERVABLES if name not in observables]
+    if missing:
+        raise ValueError(f"{records}: no {', '.join(missing)} -- {_GATE_DIAGNOSTICS_HINT}")
+    fermionic = "fmn" in observables
+    entanglement = "fmn" if fermionic else "mn"
+    information = "fmi" if fermionic else "mi"
+    # The zero class needs the occupations and the channel weight, i.e. a
+    # `channel`- or `full`-detail file; the channel weight is the fermionic
+    # one wherever it exists, exactly as PairProtocol classifies.
+    channel = ("fg2", "ff2") if fermionic else ("g2", "f2")
+    classifiable = {"n_i", "n_j", "dnn", *channel} <= observables
+    geometries = info["geometries"]
+    geometry_count = int(geometries["geometry_id"].max()) + 1
+    separation = np.full(geometry_count, np.nan)
+    separation_column = "separation" if "separation" in geometries.columns else "d"
+    separation[geometries["geometry_id"].to_numpy(dtype=int)] = geometries[
+        separation_column
+    ].to_numpy(dtype=float)
+    distance = np.full(geometry_count, np.nan)
+    distance[geometries["geometry_id"].to_numpy(dtype=int)] = geometries["d"].to_numpy(dtype=float)
+    header = info["header"]
+    return {
+        "info": info,
+        "entanglement": entanglement,
+        "information": information,
+        "channel": channel,
+        "classifiable": classifiable,
+        "separation": separation,
+        "distance": distance,
+        "occupation_mi_tol": _header_float(header, "occupation_mi_tol"),
+        "channel_floor": _header_float(header, "channel_floor"),
+    }
+
+
+def iter_realization_blocks(
+    records: str | Path,
+    *,
+    info: dict[str, Any],
+    chunk_records: int = 1_000_000,
+):
+    """Yield ``(realization_id, block)`` with every record of one trajectory.
+
+    Streams the binary in chunks and carries a trajectory that straddles a
+    chunk boundary into the next one, so a block is always whole. Refuses a
+    file whose realization ids ever decrease: the within-trajectory matching
+    would silently split a trajectory in two.
+    """
+    carry: np.ndarray | None = None
+    previous = -1
+    for chunk in iter_record_chunks(records, chunk_records=chunk_records, info=info):
+        if carry is not None and carry.size:
+            chunk = np.concatenate([carry, chunk])
+        ids = chunk["realization_id"].astype(np.int64)
+        if ids.size == 0:
+            continue
+        if ids[0] < previous or np.any(np.diff(ids) < 0):
+            raise ValueError(
+                f"{records}: realization ids are not in nondecreasing order, so a trajectory's "
+                "records are not contiguous and cannot be matched within it."
+            )
+        starts = np.concatenate([[0], np.flatnonzero(np.diff(ids)) + 1])
+        for begin, end in zip(starts[:-1], starts[1:]):
+            yield int(ids[begin]), chunk[begin:end]
+        carry = chunk[starts[-1] :].copy()
+        previous = int(ids[starts[-1]])
+    if carry is not None and carry.size:
+        yield int(carry["realization_id"][0]), carry
+
+
+def zero_classes(block: np.ndarray, context: Mapping[str, Any]) -> np.ndarray:
+    """``classify_unentangled`` (dist_scaling_csv.hpp) on a record block.
+
+    occupation_correlated when I_occ > occupation_mi_tol, else
+    coherent_subthreshold when the channel weight |G|^2 + |F|^2 exceeds the
+    channel floor, else silent -- both comparisons strict, so a value exactly at
+    its tolerance falls into the lower class, as in the C++. The thresholds are
+    the file's own (header ``occupation_mi_tol`` / ``channel_floor``). Returns
+    ``"unknown"`` everywhere for a file without the channel observables.
+    """
+    out = np.full(block.size, "unknown", dtype=object)
+    if not context["classifiable"]:
+        return out
+    from .records import _occupation_mutual_information
+
+    i_occ = _occupation_mutual_information(
+        np.asarray(block["n_i"], dtype=float),
+        np.asarray(block["n_j"], dtype=float),
+        np.asarray(block["dnn"], dtype=float),
+    )
+    first, second = context["channel"]
+    weight = np.asarray(block[first], dtype=float) + np.asarray(block[second], dtype=float)
+    occupation = i_occ > context["occupation_mi_tol"]
+    coherent = (~occupation) & (weight > context["channel_floor"])
+    out[:] = "silent"
+    out[coherent] = "coherent_subthreshold"
+    out[occupation] = "occupation_correlated"
+    return out
+
+
+def rank_controls(
+    gap: np.void,
+    controls: np.ndarray,
+    separation: np.ndarray,
+    rng: np.random.Generator,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Order a trajectory's controls by how well they match one gap pair.
+
+    Key, most significant first: same geometry before any other; among other
+    geometries the nearest separation; then an equal shortest path (NaN equals
+    nothing); then the nearest component size; then a seeded random tiebreak.
+    Returns the ordering and each ordered control's match level.
+    """
+    if controls.size == 0:
+        return np.empty(0, dtype=np.int64), np.empty(0, dtype=object)
+    geometry = controls["geometry_id"].astype(np.int64)
+    same = geometry == int(gap["geometry_id"])
+    separation_gap = abs(separation[geometry] - separation[int(gap["geometry_id"])])
+    separation_gap = np.where(same, 0.0, np.nan_to_num(separation_gap, nan=np.inf))
+    path = np.asarray(controls["shortest_path"], dtype=float)
+    path_mismatch = ~(path == float(gap["shortest_path"]))
+    size_gap = np.abs(np.asarray(controls["component_size"], dtype=float) - float(gap["component_size"]))
+    size_gap = np.nan_to_num(size_gap, nan=np.inf)
+    tiebreak = rng.random(controls.size)
+    order = np.lexsort((tiebreak, size_gap, path_mismatch, separation_gap, ~same))
+    level = np.where(
+        same[order],
+        np.where(path_mismatch[order], "geometry", "geometry_shortest_path"),
+        "nearest_separation",
+    ).astype(object)
+    return order, level
+
+
+def _clustered_draws(clusters: int, n_boot: int, seed: int, budget: int = 20_000_000):
+    """Poisson(1) weights per cluster, in batches of draws.
+
+    The Poisson bootstrap resamples trajectories independently, so a statistic
+    that is a ratio of sums over records (a fraction, a mean, a quantile) only
+    sees the weights of trajectories that contribute to it -- which is what
+    makes it safe to draw weights for the trajectories at hand rather than for
+    the whole file. Yields ``(batch_slice, weights)``, weights shaped
+    ``(batch, clusters)``. The same ``(clusters, seed)`` gives the same weights,
+    so statistics of different groups drawn with one seed share their resamples.
+    """
+    clusters = max(int(clusters), 1)
+    rng = np.random.default_rng(seed)
+    batch = int(max(1, min(n_boot, budget // max(clusters, 1))))
+    done = 0
+    while done < n_boot:
+        take = min(batch, n_boot - done)
+        yield slice(done, done + take), rng.poisson(1.0, size=(take, clusters)).astype(float)
+        done += take
+
+
+def _weighted_quantile_draws(
+    values: np.ndarray, cluster: np.ndarray, clusters: int, q: float, n_boot: int, seed: int
+) -> np.ndarray:
+    """Clustered-bootstrap draws of the q-quantile of ``values`` (finite only)."""
+    order = np.argsort(values, kind="stable")
+    sorted_values = values[order]
+    sorted_cluster = cluster[order]
+    draws = np.full(n_boot, np.nan)
+    budget = max(1, 5_000_000 // max(values.size, 1))
+    for where, weights in _clustered_draws(clusters, n_boot, seed):
+        for start in range(0, weights.shape[0], budget):
+            w = weights[start : start + budget][:, sorted_cluster]
+            cumulative = np.cumsum(w, axis=1)
+            total = cumulative[:, -1]
+            target = q * total
+            index = np.array(
+                [np.searchsorted(row, t, side="left") for row, t in zip(cumulative, target)]
+            )
+            valid = total > 0
+            out = np.full(w.shape[0], np.nan)
+            out[valid] = sorted_values[np.minimum(index[valid], values.size - 1)]
+            draws[where.start + start : where.start + start + w.shape[0]] = out
+    return draws
+
+
+def _ratio_draws(
+    numerator: np.ndarray,
+    denominator: np.ndarray,
+    cluster: np.ndarray,
+    clusters: int,
+    n_boot: int,
+    seed: int,
+) -> np.ndarray:
+    """Clustered-bootstrap draws of sum(numerator) / sum(denominator).
+
+    ``numerator`` may be 2-D (records x columns); per-record contributions are
+    first reduced per cluster, so the cost per draw is the trajectory count.
+    """
+    clusters = max(int(clusters), 1)
+    numerator = np.asarray(numerator, dtype=float)
+    two_d = numerator.ndim == 2
+    num = numerator if two_d else numerator[:, None]
+    per_num = np.zeros((clusters, num.shape[1]))
+    np.add.at(per_num, cluster, num)
+    per_den = np.bincount(cluster, weights=np.asarray(denominator, dtype=float), minlength=clusters)
+    draws = np.full((n_boot, num.shape[1]), np.nan)
+    for where, weights in _clustered_draws(clusters, n_boot, seed):
+        top = weights @ per_num
+        bottom = weights @ per_den
+        with np.errstate(invalid="ignore", divide="ignore"):
+            draws[where] = top / bottom[:, None]
+    return draws if two_d else draws[:, 0]
+
+
+def _interval(draws: np.ndarray) -> tuple[float, float]:
+    finite = np.asarray(draws, dtype=float)
+    finite = finite[np.isfinite(finite)]
+    if finite.size < 2:
+        return float("nan"), float("nan")
+    return float(np.quantile(finite, 0.025)), float(np.quantile(finite, 0.975))
+
+
+# Log grid for the quantiles of the *all-controls* group, which is too large to
+# keep: an exact-zero bin, then 100 bins per decade from 1e-16 to 1 (values are
+# capacities in [0, 1]). Quantiles of that group are therefore at 2.3% relative
+# resolution, reported as the geometric centre of the bin they fall in.
+_CONTROL_GRID = np.logspace(-16.0, 0.0, 1601)
+
+
+def _grid_bin(values: np.ndarray) -> np.ndarray:
+    """Bin index on _CONTROL_GRID: 0 for an exact zero, 1.. for the log bins."""
+    index = np.searchsorted(_CONTROL_GRID, values, side="right")
+    index = np.clip(index, 1, _CONTROL_GRID.size - 1)
+    return np.where(values <= 0.0, 0, index)
+
+
+def _grid_quantile(histogram: np.ndarray, q: float) -> float:
+    total = histogram.sum()
+    if total == 0:
+        return float("nan")
+    cumulative = np.cumsum(histogram)
+    index = int(np.searchsorted(cumulative, q * total, side="left"))
+    if index == 0:
+        return 0.0
+    return float(np.sqrt(_CONTROL_GRID[index - 1] * _CONTROL_GRID[index]))
+
+
+def gate_path_gap_test(
+    records: str | Path,
+    *,
+    thresholds: Sequence[float] | np.ndarray | None = None,
+    n_boot: int = 1000,
+    seed: int = 0,
+    chunk_records: int = 1_000_000,
+    write: bool = True,
+    output: str | Path | None = None,
+) -> dict[str, Any]:
+    """Are gap pairs connected only through weak gates? A matched comparison.
+
+    Groups, from the record flags:
+
+    * ``gap`` -- ``connected`` and not ``fn_positive``: graph-connected pairs
+      with no (fermionic) negativity above the run's ``pair_zero_tol``. Also
+      split by zero class into ``gap_silent``, ``gap_coherent_subthreshold`` and
+      ``gap_occupation_correlated``, with the C++ ``classify_unentangled`` rule
+      and the file's own ``occupation_mi_tol`` / ``channel_floor``.
+    * ``control`` -- ``connected`` and ``fn_positive``: every entangled
+      connected pair.
+    * ``control_matched`` -- the one control matched to each gap pair: same
+      trajectory always; same geometry, equal shortest path and nearest
+      component size when possible, then same geometry, then the nearest
+      separation (``match_level`` records which). Controls are drawn with
+      replacement and ties are broken by a generator seeded from
+      ``(seed, realization_id)``, so the result does not depend on the chunking.
+
+    For each of ``widest_gate_ep``, ``shortest_maximin_gate_ep``,
+    ``widest_even_mix`` and ``widest_odd_mix``: per-group counts, medians and
+    5th/95th percentiles; the fraction strictly below each threshold
+    (``thresholds``, default :func:`default_gate_path_thresholds`); and the
+    matched differences gap - control (mean and median). Every CI is a 95%
+    trajectory-clustered Poisson bootstrap over realization ids with ``n_boot``
+    draws. **NaN is never counted as zero**: a pair whose value is NaN (no path)
+    is dropped from that metric's statistics, and a matched difference needs
+    both values finite. The ``control`` group is too large to keep, so its
+    quantiles come from a fixed log grid (see ``_CONTROL_GRID``) and its
+    fractions from streaming bootstrap sums; every other group is exact.
+
+    Streams the record binary one trajectory at a time and never loads it
+    whole; memory is one trajectory plus ~100 bytes per gap pair.
+
+    Writes ``<stem>_gate_path_summary.csv`` (tidy long:
+    ``metric,statistic,group,threshold,value,ci_low,ci_high,n``) unless
+    ``write=False``. Returns ``{"summary", "pairs", "match_levels", "path",
+    "context"}``: ``pairs`` has one row per gap pair with its matched control's
+    identifiers and values.
+    """
+    context = gate_record_context(records)
+    info = context["info"]
+    thresholds = (
+        default_gate_path_thresholds()
+        if thresholds is None
+        else np.unique(np.asarray(list(thresholds), dtype=float))
+    )
+    metrics = GATE_COMPARISON_METRICS
+    m_count, t_count = len(metrics), thresholds.size
+    separation = context["separation"]
+    entanglement = context["entanglement"]
+
+    # The all-controls group, reduced as it streams.
+    control_count = np.zeros(m_count, dtype=np.int64)
+    control_hist = np.zeros((m_count, _CONTROL_GRID.size), dtype=np.int64)
+    control_below = np.zeros((m_count, t_count), dtype=np.int64)
+    control_boot_below = np.zeros((n_boot, m_count, t_count))
+    control_boot_finite = np.zeros((n_boot, m_count))
+    boot_rng = np.random.default_rng([seed, 2])
+
+    rows: dict[str, list[Any]] = {
+        name: []
+        for name in (
+            "realization_id",
+            "geometry_id",
+            "embedding_id",
+            "separation",
+            "d",
+            "zero_class",
+            "match_level",
+            "shortest_path",
+            "component_size",
+            entanglement,
+            "control_geometry_id",
+            "control_embedding_id",
+            "control_shortest_path",
+            "control_component_size",
+            "control_" + entanglement,
+        )
+    }
+    for metric in metrics:
+        rows[metric] = []
+        rows["control_" + metric] = []
+    trajectories = 0
+
+    for realization, block in iter_realization_blocks(
+        records, info=info, chunk_records=chunk_records
+    ):
+        trajectories += 1
+        flags = block["flags"]
+        connected = (flags & FLAG_CONNECTED) != 0
+        positive = (flags & FLAG_FN_POSITIVE) != 0
+        gaps = block[connected & ~positive]
+        controls = block[connected & positive]
+
+        if controls.size:
+            finite_now = np.zeros(m_count)
+            below_now = np.zeros((m_count, t_count))
+            for position, metric in enumerate(metrics):
+                values = np.asarray(controls[metric], dtype=float)
+                values = values[np.isfinite(values)]
+                control_count[position] += values.size
+                np.add.at(control_hist[position], _grid_bin(values), 1)
+                below = (values[:, None] < thresholds[None, :]).sum(axis=0)
+                control_below[position] += below
+                finite_now[position] = values.size
+                below_now[position] = below
+            weights = boot_rng.poisson(1.0, size=n_boot).astype(float)
+            control_boot_finite += weights[:, None] * finite_now[None, :]
+            control_boot_below += weights[:, None, None] * below_now[None, :, :]
+
+        if gaps.size == 0:
+            continue
+        classes = zero_classes(gaps, context)
+        rng = np.random.default_rng([seed, realization])
+        for index in range(gaps.size):
+            gap = gaps[index]
+            order, levels = rank_controls(gap, controls, separation, rng)
+            geometry = int(gap["geometry_id"])
+            rows["realization_id"].append(realization)
+            rows["geometry_id"].append(geometry)
+            rows["embedding_id"].append(int(gap["embedding_id"]))
+            rows["separation"].append(separation[geometry])
+            rows["d"].append(context["distance"][geometry])
+            rows["zero_class"].append(classes[index])
+            rows["shortest_path"].append(float(gap["shortest_path"]))
+            rows["component_size"].append(float(gap["component_size"]))
+            rows[entanglement].append(float(gap[entanglement]))
+            for metric in metrics:
+                rows[metric].append(float(gap[metric]))
+            if order.size == 0:
+                rows["match_level"].append("none")
+                for name in (
+                    "control_geometry_id",
+                    "control_embedding_id",
+                ):
+                    rows[name].append(-1)
+                for name in ("control_shortest_path", "control_component_size", "control_" + entanglement):
+                    rows[name].append(np.nan)
+                for metric in metrics:
+                    rows["control_" + metric].append(np.nan)
+                continue
+            control = controls[order[0]]
+            rows["match_level"].append(levels[0])
+            rows["control_geometry_id"].append(int(control["geometry_id"]))
+            rows["control_embedding_id"].append(int(control["embedding_id"]))
+            rows["control_shortest_path"].append(float(control["shortest_path"]))
+            rows["control_component_size"].append(float(control["component_size"]))
+            rows["control_" + entanglement].append(float(control[entanglement]))
+            for metric in metrics:
+                rows["control_" + metric].append(float(control[metric]))
+
+    pairs = pd.DataFrame(rows)
+    summary_rows: list[dict[str, Any]] = []
+
+    def add(metric, statistic, group, value, ci=(np.nan, np.nan), n=0, threshold=np.nan):
+        summary_rows.append(
+            {
+                "metric": metric,
+                "statistic": statistic,
+                "group": group,
+                "threshold": threshold,
+                "value": value,
+                "ci_low": ci[0],
+                "ci_high": ci[1],
+                "n": int(n),
+            }
+        )
+
+    # Exact groups: every gap pair, each zero class, and the matched controls.
+    cluster_ids, cluster = np.unique(pairs["realization_id"].to_numpy(dtype=np.int64), return_inverse=True)
+    cluster = cluster.astype(np.int64)
+    exact_groups: list[tuple[str, np.ndarray, str]] = [("gap", np.ones(len(pairs), dtype=bool), "")]
+    for zero_class in ZERO_CLASSES:
+        mask = (pairs["zero_class"] == zero_class).to_numpy()
+        if context["classifiable"]:
+            exact_groups.append((f"gap_{zero_class}", mask, ""))
+    matched = (pairs["match_level"] != "none").to_numpy()
+    exact_groups.append(("control_matched", matched, "control_"))
+
+    stat_seed = seed * 7919 + 17
+    for position, metric in enumerate(metrics):
+        for group, mask, prefix in exact_groups:
+            values = pairs[prefix + metric].to_numpy(dtype=float)
+            usable = mask & np.isfinite(values)
+            v = values[usable]
+            c = cluster[usable]
+            add(metric, "count", group, float(v.size), n=v.size)
+            add(metric, "nan_count", group, float((mask & ~np.isfinite(values)).sum()), n=int(mask.sum()))
+            for name, q in (("median", 0.5), ("p05", 0.05), ("p95", 0.95)):
+                add(metric, name, group, float(np.quantile(v, q)) if v.size else np.nan, n=v.size)
+            if v.size:
+                below = (v[:, None] < thresholds[None, :]).astype(float)
+                draws = _ratio_draws(below, np.ones(v.size), c, cluster_ids.size, n_boot, stat_seed)
+                point = below.mean(axis=0)
+            else:
+                draws = np.full((n_boot, t_count), np.nan)
+                point = np.full(t_count, np.nan)
+            for t_index, threshold in enumerate(thresholds):
+                add(
+                    metric,
+                    "fraction_below",
+                    group,
+                    float(point[t_index]),
+                    _interval(draws[:, t_index]),
+                    n=v.size,
+                    threshold=float(threshold),
+                )
+
+        # The all-controls group, from its streamed reductions.
+        n = int(control_count[position])
+        add(metric, "count", "control", float(n), n=n)
+        for name, q in (("median", 0.5), ("p05", 0.05), ("p95", 0.95)):
+            add(metric, name, "control", _grid_quantile(control_hist[position], q), n=n)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            boot = control_boot_below[:, position, :] / control_boot_finite[:, position][:, None]
+        for t_index, threshold in enumerate(thresholds):
+            add(
+                metric,
+                "fraction_below",
+                "control",
+                control_below[position, t_index] / n if n else np.nan,
+                _interval(boot[:, t_index]),
+                n=n,
+                threshold=float(threshold),
+            )
+
+        # Matched differences, gap - control, overall and per zero class.
+        difference = pairs[metric].to_numpy(dtype=float) - pairs["control_" + metric].to_numpy(dtype=float)
+        for group, mask, prefix in exact_groups:
+            if prefix:
+                continue
+            usable = mask & matched & np.isfinite(difference)
+            v = difference[usable]
+            c = cluster[usable]
+            if v.size:
+                mean_draws = _ratio_draws(v, np.ones(v.size), c, cluster_ids.size, n_boot, stat_seed + 1)
+                median_draws = _weighted_quantile_draws(v, c, cluster_ids.size, 0.5, n_boot, stat_seed + 2)
+                add(metric, "matched_mean_difference", group, float(v.mean()), _interval(mean_draws), n=v.size)
+                add(
+                    metric,
+                    "matched_median_difference",
+                    group,
+                    float(np.median(v)),
+                    _interval(median_draws),
+                    n=v.size,
+                )
+            else:
+                add(metric, "matched_mean_difference", group, np.nan)
+                add(metric, "matched_median_difference", group, np.nan)
+
+    match_levels = (
+        pairs.groupby(["zero_class", "match_level"]).size().rename("pairs").reset_index()
+        if len(pairs)
+        else pd.DataFrame(columns=["zero_class", "match_level", "pairs"])
+    )
+    for level in MATCH_LEVELS:
+        add("match", f"match_level_{level}", "gap", float((pairs["match_level"] == level).sum()), n=len(pairs))
+    add("trajectories", "count", "all", float(trajectories), n=trajectories)
+    add("trajectories", "count", "gap", float(cluster_ids.size), n=cluster_ids.size)
+
+    summary = pd.DataFrame(
+        summary_rows,
+        columns=["metric", "statistic", "group", "threshold", "value", "ci_low", "ci_high", "n"],
+    )
+    path = None
+    if write:
+        path = Path(output) if output is not None else gate_path_output_path(records, "_gate_path_summary.csv")
+        summary.to_csv(path, index=False, float_format="%.17g")
+    return {
+        "summary": summary,
+        "pairs": pairs,
+        "match_levels": match_levels,
+        "path": path,
+        "context": context,
+    }

@@ -318,6 +318,20 @@ inline Report load_pairs(const RunConfig &config, std::vector<PairBin> &bins)
         return report;
     }
     const std::string &path = config.output_path;
+    // The gate-path diagnostics change the schema, so require_schema would
+    // refuse a mismatch anyway -- but with a message about binary versions
+    // that sends the reader looking in the wrong place. Name the setting.
+    // Pooling across it would leave a record file whose trajectories carry
+    // gate fields for only part of the run.
+    if (table.has_column("gate_path_diagnostics") != config.gate_path_diagnostics)
+    {
+        csv::refuse(
+            path + " was written with MIPT_DIST_GATE_DIAGNOSTICS=" +
+            (config.gate_path_diagnostics ? "0" : "1") + ", but this run sets it to " +
+            (config.gate_path_diagnostics ? "1" : "0") +
+            ". Resume it with the setting it was started under, move it aside, or set "
+            "MIPT_DIST_RESUME=0 to overwrite it.");
+    }
     require_schema(table, pair_csv_header(config), path);
     if (table.row_count() != bins.size())
     {
@@ -346,6 +360,17 @@ inline Report load_pairs(const RunConfig &config, std::vector<PairBin> &bins)
         require_same_text(
             "connectivity_graph", CONNECTIVITY_GRAPH_DEFINITION,
             table.text(row, "connectivity_graph"), path);
+        if (config.gate_path_diagnostics)
+        {
+            csv::require_same(
+                "gate_path_diagnostics", 1L, table.integer(row, "gate_path_diagnostics"), path);
+            csv::require_same(
+                "gate_diagnostics_version", static_cast<long>(GATE_DIAGNOSTICS_VERSION),
+                table.integer(row, "gate_diagnostics_version"), path);
+            require_same_text(
+                "gate_diagnostics_definition", GATE_DIAGNOSTICS_DEFINITION,
+                table.text(row, "gate_diagnostics_definition"), path);
+        }
         PairBin &bin = bins[row];
         csv::require_same(
             "separation", static_cast<long>(bin.separation),

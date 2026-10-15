@@ -327,6 +327,16 @@ struct LogicalBond
     // analysis then degenerates to the unweighted one rather than lying.
     double pair_weight = 1.0;
     double hop_weight = 1.0;
+    // Gate diagnostics (analysis/gate_entanglement.hpp). `entangling_power`
+    // is the *normalized* entangling power (9/2) e_p in [0, 1], the same unit
+    // the graph's edge capacities use. NaN wherever the circuit does not
+    // supply them (MMS, Haar, RFGS), which is why gate diagnostics are only
+    // accepted for RPPU and qRPPU. `source_gate_index` indexes the simulated
+    // layer's gate list; -1 when the bond has no simulated counterpart.
+    int source_gate_index = -1;
+    double entangling_power = std::numeric_limits<double>::quiet_NaN();
+    double even_block_mixing = std::numeric_limits<double>::quiet_NaN();
+    double odd_block_mixing = std::numeric_limits<double>::quiet_NaN();
 };
 
 struct LogicalLayer

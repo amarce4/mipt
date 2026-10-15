@@ -29,6 +29,16 @@ dist_pair_gap(...)    The connected-zero triple analysis: for graph-connected pa
                        fGMN-positive third site (trajectory-clustered errors),
                        the partition of P(C) - P(E_2), and a null comparison
                        against distance-matched disconnected pairs.
+gate_path_gap_test(...) Gate-path diagnostic (MIPT_DIST_GATE_DIAGNOSTICS=1): streams
+                       a record binary, matches every connected-zero pair to an
+                       entangled connected pair from the same trajectory, and
+                       compares widest/shortest-maximin gate entangling power
+                       and parity-block mixing with trajectory-clustered CIs;
+                       writes <stem>_gate_path_summary.csv.
+select_gate_traces(...) Stratified sample of silent connected-zero pairs plus
+                       matched entangled controls, written as the
+                       <stem>_gate_trace_selection.csv rppu_gate_trace.exe replays.
+                       Also ``python -m data_analysis.select_gate_traces``.
 dist_scaling_comparison(...) Overlay completed distance-scaling results for
                        circuit-ensemble or evolution-depth comparisons.
 expvals(...)           Plot aggregate fermionic observables and Wick residuals.
@@ -70,13 +80,16 @@ probes_collapse    one-, two-, and four-probe bulk-exponent collapses
 probes_dynamics    mode-4 distance-resolved and three-probe dynamics
 probes_scans       mode-1 critical scans, mode-2 entropy maps, mode-3 anisotropy
 front, stagger     mode-5 one-probe fronts and two-probe staggered velocities
-pair_gap           dist_scaling.exe's connected-zero triple analysis
+pair_gap           dist_scaling.exe's connected-zero triple analysis and the
+                   gate-path gap test
+select_gate_traces the replay sample for rppu_gate_trace.exe
 """
 
 from __future__ import annotations
 
 from .distance import dist_percolation, dist_scaling, dist_scaling_comparison
-from .pair_gap import dist_pair_gap, read_four_site, read_pair_summary
+from .pair_gap import dist_pair_gap, gate_path_gap_test, read_four_site, read_pair_summary
+from .select_gate_traces import select_gate_traces
 from .entropy import entropy
 from .expvals import expvals
 from .free_energy import free_energy_ceff, free_energy_equilibration
@@ -99,6 +112,8 @@ __all__ = [
     "entropy",
     "dist_percolation",
     "dist_pair_gap",
+    "gate_path_gap_test",
+    "select_gate_traces",
     "read_pair_summary",
     "read_four_site",
     "dist_scaling",

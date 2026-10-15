@@ -12,6 +12,7 @@
 // standard errors and sample counts. That projection is invertible, which is
 // what makes the output file its own checkpoint; see dist_scaling_resume.hpp.
 
+#include "mipt/analysis/gate_entanglement.hpp"
 #include "mipt/dist_connectivity.hpp"
 #include "mipt/dist_metrics.hpp"
 #include "mipt/env.hpp"
@@ -319,6 +320,11 @@ struct RunConfig
     // trajectory. Cheap, but it is a second-stage explanatory diagnostic
     // rather than part of the decisive measurement, so it can be switched off.
     bool connectivity_paths = true;
+    // Gate-path diagnostics (MIPT_DIST_GATE_DIAGNOSTICS): how entangling the
+    // gates on each pair's connecting paths are. Off by default; RPPU and
+    // qRPPU only. Never changes `connected`. See dist_connectivity.hpp
+    // (GatePathMetrics) and analysis/gate_entanglement.hpp.
+    bool gate_path_diagnostics = false;
 
     // --- per-record output ------------------------------------------------
     RecordDetail record_detail = RecordDetail::Channel;
@@ -731,8 +737,18 @@ inline std::string pair_csv_header(const RunConfig &config)
     // count below: which threshold decided "entangled", which measure it was
     // applied to, and which graph convention produced the flags.
     header +=
-        ",contingency_measure,connectivity_graph_version,connectivity_graph,"
-        "separation,chord_length,d,embedding_count,"
+        ",contingency_measure,connectivity_graph_version,connectivity_graph";
+    // Gate-path diagnostics are a property of the run, not of a bin, so they
+    // ride with the graph convention. They are written *only* when enabled:
+    // a run with them off keeps the 2026-09-13 schema byte for byte, so every
+    // existing file still resumes. With them on, the definition string is what
+    // a stored widest_gate_ep in the record file has to be read against.
+    if (config.gate_path_diagnostics)
+    {
+        header += ",gate_path_diagnostics,gate_diagnostics_version,gate_diagnostics_definition";
+    }
+    header +=
+        ",separation,chord_length,d,embedding_count,"
         "mi_mean,mi_stderr,mi_samples,"
         "mn_mean,mn_stderr,mn_samples,mn_positive_count,mn_positive_fraction,"
         "g2_mean,g2_stderr,g2_samples,"
@@ -817,6 +833,13 @@ inline std::string render_pair_csv(const RunConfig &config, const std::vector<Pa
         line += std::to_string(CONNECTIVITY_GRAPH_VERSION);
         line += ',';
         line += csv_quote(CONNECTIVITY_GRAPH_DEFINITION);
+        if (config.gate_path_diagnostics)
+        {
+            line += ",1,";
+            line += std::to_string(GATE_DIAGNOSTICS_VERSION);
+            line += ',';
+            line += csv_quote(GATE_DIAGNOSTICS_DEFINITION);
+        }
         line += ',';
         line += std::to_string(bin.separation);
         line += ',';

@@ -1066,7 +1066,7 @@ def _annotate_distance_fit(
         textcoords="offset points",
         ha="right" if below else "left",
         va="top" if below else "bottom",
-        fontsize=8.0,
+        fontsize=16.0,
         color="black",
         annotation_clip=True,
         zorder=7,
@@ -2214,8 +2214,8 @@ def dist_scaling(
                 ordered_axes[0].legend(
                     handles=handles,
                     loc="lower left",
-                    fontsize=7.5,
-                    ncols=min(4, max(1, len(handles))),
+                    fontsize=16,
+                    ncols=2,
                 )
         else:
             # Decomposition/correlator grids do not encode trace convention by
@@ -2242,7 +2242,7 @@ def dist_scaling(
                     for k_of_slot in sorted(drawn_party_counts.get(slot, ()))
                 ]
                 if handles:
-                    axis.legend(handles=handles, fontsize=7.5)
+                    axis.legend(handles=handles, fontsize=16)
 
         if title is not None:
             local_fig.suptitle(title, fontsize=12)

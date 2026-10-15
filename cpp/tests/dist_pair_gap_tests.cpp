@@ -235,6 +235,21 @@ mipt::LogicalHistory ring_history(const std::vector<int> &measured_last)
     {
         odd.measured[static_cast<std::size_t>(site)] = 1u;
     }
+    // Hand-set gate diagnostics, distinct per bond and per layer, so the
+    // gate-path columns have something non-trivial to carry. They change
+    // nothing the graph reports unless the index is built with gate paths.
+    int gate = 0;
+    for (mipt::LogicalLayer *layer : {&even, &odd})
+    {
+        for (mipt::LogicalBond &bond : layer->bonds)
+        {
+            bond.source_gate_index = gate;
+            bond.entangling_power = 0.15 + 0.13 * gate;
+            bond.even_block_mixing = 0.9 - 0.11 * gate;
+            bond.odd_block_mixing = 0.2 + 0.07 * gate;
+            ++gate;
+        }
+    }
     history.layers = {even, odd};
     history.valid = true;
     return history;
@@ -303,7 +318,7 @@ std::unique_ptr<Trajectory> make_trajectory(std::uint32_t t, const dist::RunConf
     if (t % 3 == 1) measured = {3};
     if (t % 3 == 2) measured = {0, 5};
     out->history = ring_history(measured);
-    out->connectivity.build(out->history, true);
+    out->connectivity.build(out->history, true, config.gate_path_diagnostics);
     out->measurement.reset(N);
     out->measurement.realization = t;
     const int max_separation = N / 2;
@@ -327,6 +342,10 @@ std::unique_ptr<Trajectory> make_trajectory(std::uint32_t t, const dist::RunConf
             snap.fermion_rho_ri = out->pair_rdms[index].data();
             snap.fermion = dist::two_party_metrics(snap.fermion_rho_ri, true, true);
             snap.conn = out->connectivity.query(i, j);
+            if (config.gate_path_diagnostics)
+            {
+                snap.gate_path = out->connectivity.gate_path_metrics(i, j);
+            }
             snap.entangled = snap.fermion.mn > config.pair_zero_tol;
             snap.zero_class = dist::classify_unentangled(
                 snap.fermion.i_occ, snap.fermion.g2 + snap.fermion.f2, config.occupation_mi_tol,
@@ -1377,6 +1396,308 @@ void test_pair_summary(const std::string &base)
 }
 
 // ---------------------------------------------------------------------------
+// Gate format v3: gate_diagnostics_version and the five gate-path columns
+// ---------------------------------------------------------------------------
+
+const char *const GATE_COLUMNS[] = {"path_unitary_count_ij", "shortest_maximin_gate_ep_ij",
+                                    "widest_gate_ep_ij", "widest_even_mix_ij",
+                                    "widest_odd_mix_ij"};
+
+// The five gate-path fields of a parsed row, joined as they were written.
+std::string gate_text(const std::vector<std::string> &fields,
+                      const std::vector<std::string> &columns)
+{
+    std::string out;
+    for (const char *name : GATE_COLUMNS)
+    {
+        out += ',';
+        out += fields[static_cast<std::size_t>(std::find(columns.begin(), columns.end(), name) -
+                                               columns.begin())];
+    }
+    return out;
+}
+
+std::string field_of(const std::vector<std::string> &fields,
+                     const std::vector<std::string> &columns, const char *name)
+{
+    return fields[static_cast<std::size_t>(std::find(columns.begin(), columns.end(), name) -
+                                           columns.begin())];
+}
+
+void test_gate_path_columns(const std::string &base)
+{
+    namespace audit = mipt::dist::gap::audit;
+    // The writer by hand: an unavailable path is five nans whatever its numeric
+    // fields hold, and an available one carries the count as an integer.
+    {
+        mipt::dist::GatePathMetrics stale;
+        stale.shortest_path_unitary_count = 7;
+        stale.widest_entangling_power = 0.5;
+        std::string out;
+        gap::append_gate_path(out, stale);
+        expect(out == ",nan,nan,nan,nan,nan",
+               "gate v3: an unavailable gate path is written as nan, never as its fields or 0");
+        mipt::dist::GatePathMetrics set;
+        set.available = true;
+        set.shortest_path_unitary_count = 3;
+        set.shortest_maximin_entangling_power = 0.25;
+        set.widest_entangling_power = 0.5;
+        set.widest_even_block_mixing = 0.125;
+        set.widest_odd_block_mixing = 1.0;
+        out.clear();
+        gap::append_gate_path(out, set);
+        expect(out == ",3,0.25,0.5,0.125,1", "gate v3: an available gate path is written in full");
+    }
+    expect(gap::GAP_FORMAT_VERSION == 3, "gate v3: the gap format version is 3");
+
+    for (const bool enabled : {false, true})
+    {
+        const std::string dir = base + (enabled ? "/gate_on" : "/gate_off");
+        std::filesystem::create_directories(dir);
+        dist::RunConfig config = test_config(dir);
+        config.gate_path_diagnostics = enabled;
+        config.realizations = 6;
+        std::vector<std::unique_ptr<Trajectory>> trajectories;
+        for (std::uint32_t t = 0; t < 6; ++t)
+        {
+            trajectories.push_back(make_trajectory(t, config));
+        }
+        if (enabled)
+        {
+            expect(trajectories[0]->connectivity.has_gate_metrics(),
+                   "gate v3: the fixture's graph carries gate capacities");
+        }
+        auto run = open_run(config, 0, dist::make_pair_bins(N));
+        process_range(*run, 0, 6, false);
+        run->analysis->finish(std::cerr);
+        const std::string version = enabled ? std::to_string(mipt::GATE_DIAGNOSTICS_VERSION) : "0";
+
+        // Every outcome row: the version, and its own snapshot's metrics.
+        const auto &columns = gap::outcome_columns();
+        std::ifstream file(config.pair_gap.output_path);
+        std::string line;
+        std::getline(file, line);
+        std::size_t anchors_available = 0;
+        std::size_t controls = 0;
+        std::size_t controls_unavailable = 0;
+        std::size_t rows = 0;
+        while (std::getline(file, line))
+        {
+            const auto fields = mipt::util::resume::split_csv_row(line);
+            expect(fields.size() == columns.size(), "gate v3: every row has the declared columns");
+            if (fields.size() != columns.size())
+            {
+                break;
+            }
+            ++rows;
+            expect(field_of(fields, columns, "gate_diagnostics_version") == version,
+                   "gate v3: gate_diagnostics_version is 0 off and the definition version on");
+            expect(field_of(fields, columns, "gap_format_version") == "3",
+                   "gate v3: rows carry gap format 3");
+            const std::uint32_t t =
+                static_cast<std::uint32_t>(std::stoul(field_of(fields, columns, "realization_id")));
+            const int i = std::stoi(field_of(fields, columns, "pair_i"));
+            const int j = std::stoi(field_of(fields, columns, "pair_j"));
+            const mipt::dist::GatePathMetrics &gate =
+                trajectories[t]->measurement.pair(i, j).gate_path;
+            std::string expected;
+            gap::append_gate_path(expected, gate);
+            expect(gate_text(fields, columns) == expected,
+                   "gate v3: the five columns are the row's own snapshot's GatePathMetrics");
+            const bool control = field_of(fields, columns, "anchor_role") == "control";
+            if (!enabled)
+            {
+                expect(gate_text(fields, columns) == ",nan,nan,nan,nan,nan",
+                       "gate v3: with the diagnostics off every gate column is nan");
+            }
+            else if (control)
+            {
+                ++controls;
+                controls_unavailable += gate.available ? 0u : 1u;
+            }
+            else
+            {
+                expect(gate.available,
+                       "gate v3: a connected anchor's gate path is available when enabled");
+                anchors_available += gate.available ? 1u : 0u;
+                if (gate.available)
+                {
+                    const mipt::dist::GatePathMetrics direct =
+                        trajectories[t]->connectivity.gate_path_metrics(i, j);
+                    expect(direct.widest_entangling_power == gate.widest_entangling_power &&
+                               direct.shortest_path_unitary_count ==
+                                   gate.shortest_path_unitary_count,
+                           "gate v3: and it is the index's own answer for (i, j)");
+                    expect(gate.widest_entangling_power >= 0.15 &&
+                               gate.widest_entangling_power <= 0.15 + 0.13 * 5 &&
+                               gate.shortest_maximin_entangling_power <=
+                                   gate.widest_entangling_power,
+                           "gate v3: widest >= shortest-maximin, within the hand-set capacities");
+                }
+            }
+        }
+        expect(rows > 0, "gate v3: the run wrote rows");
+        if (enabled)
+        {
+            expect(anchors_available > 0, "gate v3: some anchor rows carry gate metrics");
+            // A control is graph-disconnected, but gate_path_metrics is
+            // measured between final-slice nodes, so in this fixture some
+            // controls still share a component and carry values. The per-row
+            // check above is the contract: each control writes its *own*
+            // snapshot, nan exactly when that is unavailable.
+            expect(controls > 0, "gate v3: the gate-on run exercises the control group");
+            std::cerr << "gate v3: " << controls_unavailable << " of " << controls
+                      << " control row(s) carry unavailable (nan) gate metrics\n";
+        }
+
+        // The pair summary carries the same five, per pair.
+        const std::string summary_path = run->analysis->summary_path();
+        {
+            const auto &all = gap::pair_summary_columns();
+            std::ifstream summary(summary_path);
+            std::getline(summary, line);
+            expect(line + "\n" == gap::pair_summary_csv_header(),
+                   "gate v3: the summary header is its column list");
+            std::size_t summary_rows = 0;
+            while (std::getline(summary, line))
+            {
+                const auto fields = mipt::util::resume::split_csv_row(line);
+                expect(fields.size() == all.size(), "gate v3: summary rows have the declared columns");
+                if (fields.size() != all.size())
+                {
+                    break;
+                }
+                ++summary_rows;
+                expect(field_of(fields, all, "gate_diagnostics_version") == version,
+                       "gate v3: the summary carries gate_diagnostics_version");
+                const std::uint32_t t = static_cast<std::uint32_t>(
+                    std::stoul(field_of(fields, all, "realization_id")));
+                const int i = std::stoi(field_of(fields, all, "pair_i"));
+                const int j = std::stoi(field_of(fields, all, "pair_j"));
+                std::string expected;
+                gap::append_gate_path(expected, trajectories[t]->measurement.pair(i, j).gate_path);
+                expect(gate_text(fields, all) == expected,
+                       "gate v3: the summary's five columns are the pair's GatePathMetrics");
+            }
+            expect(summary_rows > 0, "gate v3: the summary is not empty");
+        }
+
+        // Round trip: the summary rebuilt from the outcome rows on resume is
+        // byte-identical, gate columns included, and so is the outcome file.
+        const std::string before_summary = read_file(summary_path);
+        const std::string before_rows = read_file(config.pair_gap.output_path);
+        {
+            std::vector<dist::PairBin> bins = dist::make_pair_bins(N);
+            for (const auto &trajectory : trajectories)
+            {
+                bin_trajectory(bins, trajectory->measurement);
+            }
+            auto resumed = open_run(config, 6, bins);
+            resumed->analysis->finish(std::cerr);
+        }
+        expect(read_file(summary_path) == before_summary,
+               "gate v3: the summary rebuilt on resume is byte-identical, gate columns included");
+        expect(read_file(config.pair_gap.output_path) == before_rows,
+               "gate v3: and the outcome rows are untouched");
+
+        // The audit reads v3 and regenerates the same summary from the rows.
+        {
+            const audit::OutcomeMeta meta = audit::read_outcome_meta(config.pair_gap.output_path);
+            expect(meta.gate_diagnostics_version == (enabled ? mipt::GATE_DIAGNOSTICS_VERSION : 0),
+                   "gate v3: the audit recovers gate_diagnostics_version");
+            audit::AuditSettings settings;
+            settings.pair_tols = {meta.pair_zero_tol};
+            settings.fgmn_tols = {meta.positive_tol};
+            settings.cut_tol = meta.cut_positive_tol;
+            audit::SweepTable table(1, 1, meta.n);
+            gap::GapAggregate rebuilt;
+            rebuilt.reset(meta.n);
+            std::string regenerated = gap::pair_summary_csv_header();
+            dist::RunConfig audit_config = config;
+            audit_config.gate_path_diagnostics = meta.gate_diagnostics_version != 0;
+            const gap::RowPrefix prefix = gap::row_prefix(audit_config);
+            audit::sweep_outcomes(config.pair_gap.output_path, settings, meta, table, rebuilt,
+                                  [&](const gap::PairSummaryRow &row) {
+                                      gap::append_pair_summary_row(regenerated, prefix,
+                                                                   meta.run_id, row);
+                                  });
+            expect(regenerated == before_summary,
+                   "gate v3: the audit regenerates the summary byte-identically");
+        }
+
+        // A resume with the diagnostics switched the other way is refused:
+        // the summary would be rewritten under the wrong provenance.
+        {
+            dist::RunConfig flipped = config;
+            flipped.gate_path_diagnostics = !enabled;
+            std::vector<dist::PairBin> bins = dist::make_pair_bins(N);
+            for (const auto &trajectory : trajectories)
+            {
+                bin_trajectory(bins, trajectory->measurement);
+            }
+            expect(refuses([&] { (void)open_run(flipped, 6, bins); }),
+                   "gate v3: resuming with MIPT_DIST_GATE_DIAGNOSTICS flipped is refused");
+            expect(read_file(config.pair_gap.output_path) == before_rows,
+                   "gate v3: and the refusal leaves the outcome rows alone");
+        }
+
+        // A v2 file -- no gate_diagnostics_version, no gate columns -- is
+        // refused by the audit, and the refusal names the version.
+        if (!enabled)
+        {
+            std::vector<std::size_t> drop;
+            for (const char *name : {"gate_diagnostics_version", "path_unitary_count_ij",
+                                     "shortest_maximin_gate_ep_ij", "widest_gate_ep_ij",
+                                     "widest_even_mix_ij", "widest_odd_mix_ij"})
+            {
+                drop.push_back(static_cast<std::size_t>(
+                    std::find(columns.begin(), columns.end(), name) - columns.begin()));
+            }
+            const std::size_t version_at = static_cast<std::size_t>(
+                std::find(columns.begin(), columns.end(), "gap_format_version") - columns.begin());
+            auto strip = [&](std::vector<std::string> fields, bool header) {
+                if (!header)
+                {
+                    fields[version_at] = "2";
+                }
+                std::string out;
+                for (std::size_t f = 0; f < fields.size(); ++f)
+                {
+                    if (std::find(drop.begin(), drop.end(), f) != drop.end())
+                    {
+                        continue;
+                    }
+                    out += out.empty() ? "" : ",";
+                    out += fields[f];
+                }
+                return out + "\n";
+            };
+            std::ifstream source(config.pair_gap.output_path);
+            std::string header_line;
+            std::string row_line;
+            std::getline(source, header_line);
+            std::getline(source, row_line);
+            const std::string v2_path = dir + "/v2_connected_zero_thirds.csv";
+            std::ofstream(v2_path, std::ios::binary | std::ios::trunc)
+                << strip(mipt::util::resume::split_csv_row(header_line), true)
+                << strip(mipt::util::resume::split_csv_row(row_line), false);
+            std::string message;
+            try
+            {
+                (void)audit::read_outcome_meta(v2_path);
+            }
+            catch (const std::runtime_error &error)
+            {
+                message = error.what();
+            }
+            expect(message.find("gap format v2") != std::string::npos &&
+                       message.find("v3") != std::string::npos,
+                   "gate v3: the audit refuses a v2 outcome file and names its version");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Request 11.3, 11.4, 11.5, 11.8: named states, named answers
 // ---------------------------------------------------------------------------
 
@@ -1733,6 +2054,7 @@ int main()
     test_driver_resume_and_reconciliation(directory);
     test_solver_failures(directory);
     test_pair_summary(directory);
+    test_gate_path_columns(directory);
     test_named_triple_states();
     test_four_mode_ghz();
     test_high_precision_replay();

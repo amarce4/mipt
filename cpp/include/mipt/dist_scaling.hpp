@@ -1000,6 +1000,13 @@ class PairProtocol
             << ", fermionic_outputs=" << (include_fermionic_ ? 1 : 0)
             << ", output=" << config_.output_path << '\n'
             << "pair_policy=unordered i<j; reversed pairs are observable-equivalent\n";
+        if (config_.gate_path_diagnostics)
+        {
+            out << "gate_path_diagnostics=1: gate_diagnostics_version="
+                << GATE_DIAGNOSTICS_VERSION
+                << "; widest-path and shortest-maximin gate entangling power per pair, "
+                   "appended to the records (NaN unless connected)\n";
+        }
         records::announce(out, sink_, config_.output_path);
     }
 
@@ -1116,6 +1123,13 @@ class PairProtocol
 
             const PairConnectivity conn =
                 connectivity.query(pairs_[pair_index][0], pairs_[pair_index][1]);
+            // Gate quality along the pair's paths. A lookup: build() precomputed
+            // every pair. Left at its unavailable default when the diagnostics
+            // are off, so neither the record nor the triple analysis sees it.
+            const GatePathMetrics gate_path =
+                config_.gate_path_diagnostics
+                    ? connectivity.gate_path_metrics(pairs_[pair_index][0], pairs_[pair_index][1])
+                    : GatePathMetrics{};
             if (collect_)
             {
                 gap::PairSnapshot snapshot;
@@ -1125,6 +1139,13 @@ class PairProtocol
                 snapshot.chord = bin.chord;
                 snapshot.fermion = include_fermionic_ ? fermion_metrics : metrics;
                 snapshot.conn = conn;
+                // Same rule as the record values: a path value is reported
+                // only for the complete percolation event C. A pair whose
+                // endpoint is measured in the last layer shares a component at
+                // slice T-1 but has no path to its endpoint, so a disconnected
+                // control carries NaN rather than the value of a path that
+                // does not reach it.
+                snapshot.gate_path = conn.connected ? gate_path : GatePathMetrics{};
                 snapshot.entangled = entangled;
                 snapshot.zero_class = zero_class;
                 snapshot.fermion_rho_ri =
@@ -1188,7 +1209,7 @@ class PairProtocol
                 std::uint32_t flags = conn.flags();
                 flags |= entangled ? FLAG_FN_POSITIVE : 0u;
                 flags |= mn_positive ? FLAG_MN_POSITIVE : 0u;
-                fill_record_values(metrics, fermion_metrics);
+                fill_record_values(metrics, fermion_metrics, conn, gate_path);
                 sink_.add(static_cast<std::uint32_t>(realization),
                           static_cast<std::uint32_t>(bin_of_pair_[pair_index]),
                           embedding_of_pair_[pair_index], flags, record_values_.data());
@@ -1214,7 +1235,22 @@ class PairProtocol
     // declares. The two must agree field for field; they are next to each
     // other in this file and in dist_records.hpp for that reason, and
     // `make test-dist` pins the pairing by name.
-    void fill_record_values(const PairMetrics &metrics, const PairMetrics &fermion_metrics)
+    void fill_record_values(const PairMetrics &metrics, const PairMetrics &fermion_metrics,
+                            const PairConnectivity &conn, const GatePathMetrics &gate_path)
+    {
+        const std::size_t slot = fill_detail_record_values(metrics, fermion_metrics);
+        // The gate-path diagnostics go after every detail-level value, exactly
+        // where records::pair_observable_names appends their names, and through
+        // the same host-tested helper that decides NaN-for-no-path.
+        if (config_.gate_path_diagnostics)
+        {
+            records::fill_gate_record_values(conn, gate_path, record_values_.data() + slot);
+        }
+    }
+
+    // The detail-level values; returns the next free slot.
+    std::size_t fill_detail_record_values(const PairMetrics &metrics,
+                                          const PairMetrics &fermion_metrics)
     {
         std::size_t slot = 0;
         record_values_[slot++] = metrics.mi;
@@ -1226,7 +1262,7 @@ class PairProtocol
         }
         if (config_.record_detail == RecordDetail::Basic)
         {
-            return;
+            return slot;
         }
         record_values_[slot++] = metrics.n_i;
         record_values_[slot++] = metrics.n_j;
@@ -1240,13 +1276,14 @@ class PairProtocol
         }
         if (config_.record_detail != RecordDetail::Full)
         {
-            return;
+            return slot;
         }
         const PairMetrics &channel = include_fermionic_ ? fermion_metrics : metrics;
         record_values_[slot++] = channel.g.real();
         record_values_[slot++] = channel.g.imag();
         record_values_[slot++] = channel.f.real();
         record_values_[slot++] = channel.f.imag();
+        return slot;
     }
 
     RunConfig config_;
@@ -1989,12 +2026,26 @@ inline void run_protocols(const RunConfig &config, PairProtocol *pairs, TriplePr
             // Built from the history that produced *this* state. Comparing an
             // entanglement against a graph from any other draw would measure
             // nothing; see TrajectoryResult.
-            connectivity.build(trajectory.history, config.connectivity_paths);
+            connectivity.build(trajectory.history, config.connectivity_paths,
+                               config.gate_path_diagnostics);
             if (!connectivity.ready() && !connectivity_warned)
             {
                 connectivity_warned = true;
                 std::cerr << "WARNING: no logical layer history was available, so the "
                              "spacetime connectivity columns will stay empty.\n";
+            }
+            // validate_gate_diagnostics admits only circuits whose layers carry
+            // gate capacities, so a graph without them here means the history
+            // lost them somewhere -- and every gate field would silently come
+            // out NaN. Stop instead.
+            if (config.gate_path_diagnostics && !connectivity.has_gate_metrics())
+            {
+                throw std::runtime_error(
+                    "MIPT_DIST_GATE_DIAGNOSTICS=1, but the spacetime graph of realization " +
+                    std::to_string(realization) +
+                    " carries no finite gate capacities. The logical history did not "
+                    "record the gates' entangling powers, so the diagnostics would be "
+                    "NaN throughout.");
             }
         }
         if (!backend_reported)
@@ -2123,6 +2174,9 @@ inline void apply_environment(RunConfig &config)
                                      0.0, 1.0);
     config.connectivity = env::boolean("MIPT_DIST_CONNECTIVITY", true);
     config.connectivity_paths = env::boolean("MIPT_DIST_CONN_PATHS", true);
+    // Per-pair gate quality along the spacetime paths; off by default. Its
+    // preconditions are checked by validate_gate_diagnostics in run().
+    config.gate_path_diagnostics = env::boolean("MIPT_DIST_GATE_DIAGNOSTICS", false);
     config.record_detail = parse_record_detail(
         env::text("MIPT_DIST_RECORD_DETAIL", record_detail_name(RecordDetail::Channel)));
     config.record_stride = env::integer("MIPT_DIST_RECORD_STRIDE", 1, 1, 1000000000);
@@ -2320,6 +2374,7 @@ inline void run(const RunConfig &input)
 {
     validate_args(input);
     validate_pair_gap(input);
+    records::validate_gate_diagnostics(input, records::enabled());
     if (input.k == 0)
     {
         run_both(input);
@@ -2460,6 +2515,17 @@ inline void print_usage(const char *argv0)
         << "    component sizes (one BFS per site per trajectory).\n"
         << "  MIPT_DIST_OCC_MI_TOL=1e-12 below this an occupation mutual information\n"
         << "    counts as zero when splitting the connected-but-unentangled records.\n"
+        << "  MIPT_DIST_GATE_DIAGNOSTICS=0 set to 1 to weight the spacetime graph's gate\n"
+        << "    edges by each RPPU/qRPPU gate's normalized entangling power and parity-\n"
+        << "    block mixing, and report per pair the widest-path (max over paths of the\n"
+        << "    weakest gate) and shortest-maximin values. Appended to every k=2 record\n"
+        << "    as component_size, shortest_path, shortest_path_unitary_count,\n"
+        << "    shortest_maximin_gate_ep, widest_gate_ep, widest_even_mix,\n"
+        << "    widest_odd_mix (NaN unless the pair is connected), and to the triple\n"
+        << "    analysis's anchors. Never changes the percolation event. circ_type 2/4,\n"
+        << "    k=2 or k=0, MIPT_DIST_CONNECTIVITY=1, and records or\n"
+        << "    MIPT_DIST_PAIR_GAP_TRIPLES=1 required. Changes the pair CSV and record\n"
+        << "    headers, so a run cannot be resumed across this setting.\n"
         << "  k=2 / k=0 connected-zero triple analysis (parity-preserving circuits):\n"
         << "  MIPT_DIST_PAIR_GAP_TRIPLES=0 set to 1 to analyse every graph-connected pair\n"
         << "    with fN <= MIPT_DIST_PAIR_ZERO_TOL against every third site k != i, j:\n"

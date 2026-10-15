@@ -1788,6 +1788,8 @@ def _draw_lyu_extrapolation_row(
         formatter = ScalarFormatter(useMathText=True)
         formatter.set_powerlimits((-3, -3))
         axis.xaxis.set_major_formatter(formatter)
+    legend_kwargs["fontsize"] = 12
+    legend_kwargs["loc"] = "upper left"
     ax_pc.legend(**legend_kwargs)
     ax_pc.set_ylabel(r"$p_c(L_1,L_2)$")
     ax_nu.set_ylabel(r"$\nu(L_1,L_2)$")
@@ -2405,6 +2407,32 @@ def _panel_size(value: Any, name: str) -> tuple[float, float]:
     return width, height
 
 
+def _touch_right_extrapolation_stacks(fig, axes: np.ndarray) -> None:
+    """Close each right-hand pair's layout gap without changing its aspect."""
+    fig.canvas.draw()
+    fig.set_layout_engine("none")
+    for _, _, ax_pc, ax_nu in axes:
+        pc_position = ax_pc.get_position()
+        nu_position = ax_nu.get_position()
+        boundary = 0.5 * (pc_position.y0 + nu_position.y1)
+        ax_pc.set_position(
+            [
+                pc_position.x0,
+                boundary,
+                pc_position.width,
+                pc_position.height,
+            ]
+        )
+        ax_nu.set_position(
+            [
+                nu_position.x0,
+                boundary - nu_position.height,
+                nu_position.width,
+                nu_position.height,
+            ]
+        )
+
+
 def _draw_probe_pc_extrapolation(
     fits: Mapping[str, Mapping[str, Any]],
     pairwise_fits: Mapping[str, Mapping[str, Any]],
@@ -2435,31 +2463,59 @@ def _draw_probe_pc_extrapolation(
     raw_ylim: Any,
     raw_panel_size: tuple[float, float],
     extrapolation_panel_size: tuple[float, float],
+    extrapolation_layout: str,
     figsize: tuple[float, float] | None,
     dpi: int,
 ) -> tuple[Any, np.ndarray]:
-    """Draw the raw collapse above the two Lyu extrapolation panels."""
+    """Draw the raw collapse and the two Lyu extrapolation panels."""
     metric_count = len(selected_metrics)
     raw_width, raw_height = _panel_size(raw_panel_size, "raw_panel_size")
     ext_width, ext_height = _panel_size(
         extrapolation_panel_size, "extrapolation_panel_size"
     )
+    # A side-by-side stack is most balanced when its two axes jointly match
+    # the raw panel's height. Preserve the requested extrapolation aspect while
+    # scaling both right-hand panels together to that common span.
+    if extrapolation_layout == "right":
+        layout_ext_height = 0.5 * raw_height
+        layout_ext_width = ext_width * layout_ext_height / ext_height
+    else:
+        layout_ext_width, layout_ext_height = ext_width, ext_height
     if figsize is None:
-        figsize = (
-            max(raw_width, 2.0 * ext_width + _EXTRAPOLATION_GUTTER)
-            + _EXTRAPOLATION_WIDTH_MARGIN,
-            metric_count
-            * (raw_height + ext_height + _EXTRAPOLATION_ROW_MARGIN)
-            + _EXTRAPOLATION_SUPTITLE_MARGIN,
-        )
+        if extrapolation_layout == "below":
+            figsize = (
+                max(raw_width, 2.0 * ext_width + _EXTRAPOLATION_GUTTER)
+                + _EXTRAPOLATION_WIDTH_MARGIN,
+                metric_count
+                * (raw_height + ext_height + _EXTRAPOLATION_ROW_MARGIN)
+                + _EXTRAPOLATION_SUPTITLE_MARGIN,
+            )
+        else:
+            figsize = (
+                raw_width
+                + layout_ext_width
+                + _EXTRAPOLATION_GUTTER
+                + _EXTRAPOLATION_WIDTH_MARGIN,
+                metric_count
+                * (raw_height + _EXTRAPOLATION_ROW_MARGIN)
+                + _EXTRAPOLATION_SUPTITLE_MARGIN,
+            )
     fig = plt.figure(figsize=figsize, dpi=dpi)
-    # Rows are shared out by requested axes height, and every panel is locked to
-    # its requested aspect, so the realized footprints keep the requested ratio
-    # even when an explicit `figsize` scales them all.
-    height_ratios = [
-        ratio for _ in selected_metrics for ratio in (raw_height, ext_height)
-    ]
-    grid = fig.add_gridspec(2 * metric_count, 2, height_ratios=height_ratios)
+    # Every panel is locked to its requested aspect, so the realized footprints
+    # keep the requested ratio even when an explicit `figsize` scales them all.
+    if extrapolation_layout == "below":
+        height_ratios = [
+            ratio for _ in selected_metrics for ratio in (raw_height, ext_height)
+        ]
+        grid = fig.add_gridspec(2 * metric_count, 2, height_ratios=height_ratios)
+    else:
+        height_ratios = [layout_ext_height for _ in range(2 * metric_count)]
+        grid = fig.add_gridspec(
+            2 * metric_count,
+            2,
+            width_ratios=(raw_width, layout_ext_width),
+            height_ratios=height_ratios,
+        )
     all_sizes = sorted(
         {int(curve["L"]) for curves in curves_by_metric.values() for curve in curves}
     )
@@ -2469,11 +2525,14 @@ def _draw_probe_pc_extrapolation(
     top_legend_loc = legend_loc or "center left"
     top_annotation_loc = annotation_loc or "lower left"
     for row, metric in enumerate(selected_metrics):
-        ax_raw = fig.add_subplot(grid[2 * row, :])
-        # The top panel spans both columns, so without an aspect lock it would
-        # stretch to the full figure width while the two extrapolation panels
-        # keep their own. Locking it to `raw_panel_size` is what lets the
-        # default put the three panels on a common span.
+        if extrapolation_layout == "below":
+            raw_slot = grid[2 * row, :]
+        else:
+            raw_slot = grid[2 * row : 2 * row + 2, 0]
+        ax_raw = fig.add_subplot(raw_slot)
+        # In the lower layout the raw panel spans both columns; in the right
+        # layout it spans both rows. Its aspect lock preserves the same panel
+        # proportions in either arrangement.
         ax_raw.set_box_aspect(raw_height / raw_width)
         ax_scaled = ax_raw.inset_axes(rectangle)
         _style_inset(
@@ -2509,8 +2568,12 @@ def _draw_probe_pc_extrapolation(
             collapse_title=collapse_title,
             raw_ylim=_resolve_raw_ylim(raw_ylim, metric),
         )
-        ax_pc = fig.add_subplot(grid[2 * row + 1, 0])
-        ax_nu = fig.add_subplot(grid[2 * row + 1, 1])
+        if extrapolation_layout == "below":
+            ax_pc = fig.add_subplot(grid[2 * row + 1, 0])
+            ax_nu = fig.add_subplot(grid[2 * row + 1, 1])
+        else:
+            ax_pc = fig.add_subplot(grid[2 * row, 1])
+            ax_nu = fig.add_subplot(grid[2 * row + 1, 1], sharex=ax_pc)
         for ax in (ax_pc, ax_nu):
             ax.set_box_aspect(ext_height / ext_width)
         _draw_lyu_extrapolation_row(
@@ -2527,6 +2590,20 @@ def _draw_probe_pc_extrapolation(
             annotation_fontsize=annotation_fontsize,
             title_prefix=metric_count > 1,
         )
+        if extrapolation_layout == "right":
+            # One x label and one scientific-notation multiplier serve both
+            # vertically stacked extrapolation axes.
+            ax_pc.set_title("")
+            ax_nu.set_title("")
+            ax_pc.set_ylabel(
+                r"Critical measurement rate $p_c(L_1,L_2)$"
+            )
+            ax_nu.set_ylabel(
+                r"Correlation-length exponent $\nu(L_1,L_2)$"
+            )
+            ax_pc.set_xlabel("")
+            ax_pc.tick_params(axis="x", which="both", labelbottom=False)
+            ax_pc.xaxis.get_offset_text().set_visible(False)
         _panel_label(ax_raw, f"{chr(ord('a') + 3 * row)})")
         _panel_label(ax_pc, f"{chr(ord('b') + 3 * row)})")
         _panel_label(ax_nu, f"{chr(ord('c') + 3 * row)})")
@@ -2556,6 +2633,7 @@ def probe_pc_collapse(
     fixed_x: float | Mapping[str, float] | None = None,
     correction_to_scaling: bool = False,
     extrapolate: bool = False,
+    extrapolation_layout: str = "below",
     omega_bounds: tuple[float, float] = (0.1, 4.0),
     fixed_omega: float | Mapping[str, float] | None = None,
     f1_order: int = 2,
@@ -2644,13 +2722,18 @@ def probe_pc_collapse(
     loaded sizes remain visible in the raw panel.
 
     Set ``extrapolate=True`` for a three-panel figure: the ordinary raw scan
-    and collapse inset on top, followed by the pairwise large-``L`` analysis
-    of Fig. 3 in Lyu et al. (2026). Every ``(L1,L2)`` combination from the
-    selected collapse-size range is fitted independently with the original
-    ansatz. A Fig.-7-style supplemental grid shows every pairwise collapse
-    with an inset of the curve difference at ``nu*`` and ``nu* +/- dnu``.
-    A second supplemental figure recreates Zabalo et al. Fig. S4, including
-    the white ``O=1.3 O*`` contour. This mode is deliberately
+    with its collapse inset and the pairwise large-``L`` analysis of Fig. 3 in
+    Lyu et al. (2026). ``extrapolation_layout="below"`` keeps the two
+    extrapolation panels side by side below the raw scan. Set
+    ``extrapolation_layout="right"`` to place them in a vertical stack to its
+    right; that stack shares its ``(L_1L_2)^{-1}`` axis and shows the label only
+    on the lower panel. Its two frames touch, and their observables are named
+    directly on the y axes rather than in subplot titles. Every ``(L1,L2)``
+    combination from the selected collapse-size range is fitted independently
+    with the original ansatz. A Fig.-7-style supplemental grid shows every
+    pairwise collapse with an inset of the curve difference at ``nu*`` and
+    ``nu* +/- dnu``. A second supplemental figure recreates Zabalo et al.
+    Fig. S4, including the white ``O=1.3 O*`` contour. This mode is deliberately
     incompatible with ``correction_to_scaling=True`` and fixed ``p_c`` or
     ``nu``.
 
@@ -2668,14 +2751,17 @@ def probe_pc_collapse(
     *each* of the two extrapolation panels, which are always equal. Both are
     ignored when ``extrapolate=False``. Every panel is locked to the requested
     aspect and the figure size is derived from them, so the realized footprints
-    come out at the requested inches. The defaults are chosen so the top panel
-    spans exactly the two extrapolation panels plus their gutter; changing one
-    without the other breaks that alignment, and a top width of about
-    ``2 * width + 1.03`` restores it to within half a percent (the gutter
-    itself creeps up a little as the panels grow). Passing ``figsize``
-    explicitly overrides the
-    derived size -- the panels then keep their aspect ratios but scale to fit,
-    so an under-sized ``figsize`` shrinks them rather than distorting them.
+    come out at the requested inches. In the default lower layout, the defaults
+    make the top panel span exactly the two extrapolation panels plus their
+    gutter; changing one without the other breaks that alignment, and a top
+    width of about ``2 * width + 1.03`` restores it to within half a percent
+    (the gutter itself creeps up a little as the panels grow). In the right-hand
+    layout, the two extrapolation panels retain the requested aspect but scale
+    together so their stacked axes match the raw panel's height; this removes
+    the otherwise large blank bands above and below the raw plot. Passing
+    ``figsize`` explicitly overrides the derived size -- the panels then keep
+    their aspect ratios but scale to fit, so an under-sized ``figsize`` shrinks
+    them rather than distorting them.
 
     Each collapse is drawn by default as an inset in the top-right corner of
     its raw panel, with one legend per row on the raw axes. ``inset_size``
@@ -2698,6 +2784,12 @@ def probe_pc_collapse(
         raise ValueError(
             "extrapolate=True requires collapse_inset=True so the top panel "
             "retains the original raw-plus-inset layout."
+        )
+    extrapolation_layout = str(extrapolation_layout).strip().lower()
+    if extrapolation_layout not in {"below", "right"}:
+        raise ValueError(
+            "extrapolation_layout must be 'below' or 'right'; "
+            f"got {extrapolation_layout!r}."
         )
     if fixed_omega is not None and not correction_to_scaling:
         raise ValueError(
@@ -2885,6 +2977,7 @@ def probe_pc_collapse(
             raw_ylim=raw_ylim,
             raw_panel_size=raw_panel_size,
             extrapolation_panel_size=extrapolation_panel_size,
+            extrapolation_layout=extrapolation_layout,
             figsize=figsize,
             dpi=dpi,
         )
@@ -2897,6 +2990,7 @@ def probe_pc_collapse(
             "axes": axes,
             "collapse_inset": True,
             "extrapolate": True,
+            "extrapolation_layout": extrapolation_layout,
             "probes": probes,
             "metrics": selected_metrics,
             "correction_to_scaling": False,
@@ -2913,7 +3007,17 @@ def probe_pc_collapse(
         # Show the main composite first, then the pair-by-pair Fig.-7-style
         # collapses and finally the objective surface.  Notebook output thus
         # follows the analysis from result to diagnostic.
-        _show(fig, show)
+        if extrapolation_layout == "right":
+            _show(
+                fig,
+                show,
+                tight_layout_kwargs={"h_pad": 0.0},
+                post_tight_callback=lambda figure: (
+                    _touch_right_extrapolation_stacks(figure, axes)
+                ),
+            )
+        else:
+            _show(fig, show)
         pairwise_supplemental = _draw_pairwise_collapse_figures(
             pairwise_fits,
             collapse_curves_by_metric,

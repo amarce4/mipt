@@ -22,7 +22,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <iostream>
+#include <limits>
 #include <random>
 #include <set>
 #include <string>
@@ -668,6 +670,434 @@ void test_history_extremes()
            "the FSWAP boundary network returns every mode to its own site");
 }
 
+
+// ---------------------------------------------------------------------------
+// Gate-path diagnostics (MIPT_DIST_GATE_DIAGNOSTICS)
+//
+// The binary graph says *whether* a path exists; these say how entangling the
+// weakest gate on the best path is. Two values per pair, and the difference
+// between them is the point: the shortest-maximin value only looks at shortest
+// paths, the widest value at every path. A pair whose shortest path runs through
+// a nearly local gate but which has a longer strong detour must report a small
+// first number and a large second one -- otherwise the diagnostic would blame
+// the gap on a weak gate the state could simply route around.
+// ---------------------------------------------------------------------------
+
+struct GateBond
+{
+    int a;
+    int b;
+    double ep;
+    double even = 0.5;
+    double odd = 0.5;
+};
+
+// A history whose bonds carry explicit gate metrics. source_gate_index is the
+// bond's position within its layer, which is all a hand-built history has.
+LogicalHistory make_gate_history(int n, const std::vector<std::pair<std::vector<GateBond>,
+                                                                  std::vector<int>>> &layers)
+{
+    LogicalHistory history;
+    history.reset(n);
+    for (const auto &[bonds, measured] : layers)
+    {
+        LogicalLayer layer;
+        layer.measured.assign(static_cast<std::size_t>(n), 0u);
+        int index = 0;
+        for (const GateBond &bond : bonds)
+        {
+            mipt::LogicalBond logical{bond.a, bond.b};
+            logical.source_gate_index = index++;
+            logical.entangling_power = bond.ep;
+            logical.even_block_mixing = bond.even;
+            logical.odd_block_mixing = bond.odd;
+            layer.bonds.push_back(logical);
+        }
+        for (int site : measured)
+        {
+            layer.measured[static_cast<std::size_t>(site)] = 1u;
+        }
+        history.layers.push_back(std::move(layer));
+    }
+    history.valid = true;
+    return history;
+}
+
+// Walk a returned edge list from endpoint i: every edge must touch the node the
+// walk is at, and the walk must end on endpoint j. Reports the hop count, the
+// gate count and the weakest gate capacity along the way.
+struct WalkedPath
+{
+    bool contiguous = false;
+    int hops = 0;
+    int gates = 0;
+    double weakest = std::numeric_limits<double>::infinity();
+};
+
+WalkedPath walk(const ConnectivityIndex &index, int i, int j,
+                const std::vector<std::uint32_t> &edges,
+                mipt::dist::GateCapacity which = mipt::dist::GateCapacity::EntanglingPower)
+{
+    WalkedPath out;
+    std::uint32_t at = index.final_node(i);
+    const auto &all = index.graph_edges();
+    for (std::uint32_t id : edges)
+    {
+        if (id >= all.size())
+        {
+            return out;
+        }
+        const mipt::dist::GraphEdge &edge = all[id];
+        if (edge.a == at)
+        {
+            at = edge.b;
+        }
+        else if (edge.b == at)
+        {
+            at = edge.a;
+        }
+        else
+        {
+            return out;
+        }
+        ++out.hops;
+        if (edge.kind == mipt::dist::GraphEdgeKind::Unitary)
+        {
+            ++out.gates;
+        }
+        out.weakest = std::min(out.weakest, mipt::dist::edge_capacity(edge, which));
+    }
+    out.contiguous = !edges.empty() && at == index.final_node(j);
+    return out;
+}
+
+bool same_value(double a, double b) { return (std::isnan(a) && std::isnan(b)) || a == b; }
+
+bool same_metrics(const mipt::dist::GatePathMetrics &x, const mipt::dist::GatePathMetrics &y)
+{
+    return x.available == y.available && x.shortest_path_length == y.shortest_path_length &&
+           x.shortest_path_unitary_count == y.shortest_path_unitary_count &&
+           same_value(x.shortest_maximin_entangling_power, y.shortest_maximin_entangling_power) &&
+           same_value(x.widest_entangling_power, y.widest_entangling_power) &&
+           same_value(x.widest_even_block_mixing, y.widest_even_block_mixing) &&
+           same_value(x.widest_odd_block_mixing, y.widest_odd_block_mixing);
+}
+
+// Shortest path is the weak direct gate in the last layer; the detour down to
+// layer 0 and back crosses a strong gate. Shortest-maximin must see only the
+// weak one, widest must find the detour.
+void test_gate_path_weak_shortcut()
+{
+    const LogicalHistory history = make_gate_history(2, {
+        {{{0, 1, 0.9, 0.8, 0.7}}, {}},
+        {{{0, 1, 0.1, 0.2, 0.3}}, {}},
+    });
+    for (bool precompute : {false, true})
+    {
+        ConnectivityIndex index;
+        index.build(history, true, precompute);
+        expect(index.has_gate_metrics(), "G1 a history with finite bond metrics has gate metrics");
+        const mipt::dist::GatePathMetrics g = index.gate_path_metrics(0, 1);
+        expect(g.available, "G1 the endpoints share a component, so the query is available");
+        expect(g.shortest_path_length == 1, "G1 the shortest path is the one direct bond");
+        expect(g.shortest_path_unitary_count == 1, "G1 and it carries one gate");
+        expect(g.shortest_maximin_entangling_power == 0.1,
+               "G1 shortest-maximin is the weak shortcut's capacity");
+        expect(g.widest_entangling_power == 0.9,
+               "G1 widest finds the longer strong detour");
+        expect(g.widest_even_block_mixing == 0.8 && g.widest_odd_block_mixing == 0.7,
+               "G1 the mixing bottlenecks route through the detour too");
+        expect(g.shortest_path_length == index.query(0, 1).shortest_path,
+               "G1 the gate-path length agrees with the binary shortest path");
+
+        const auto short_edges = index.shortest_maximin_path(0, 1);
+        const WalkedPath s = walk(index, 0, 1, short_edges);
+        expect(s.contiguous, "G1 the shortest-maximin path is contiguous from i to j");
+        expect(s.hops == 1 && s.gates == 1 && s.weakest == 0.1,
+               "G1 the shortest-maximin path is the direct weak bond");
+
+        const auto wide_edges = index.widest_gate_path(0, 1);
+        const WalkedPath w = walk(index, 0, 1, wide_edges);
+        expect(w.contiguous, "G1 the widest path is contiguous from i to j");
+        expect(w.hops == 3 && w.gates == 1 && w.weakest == 0.9,
+               "G1 the widest path is temporal, strong gate, temporal");
+        expect(index.graph_edges()[wide_edges[1]].layer == 0 &&
+                   index.graph_edges()[wide_edges[1]].kind == mipt::dist::GraphEdgeKind::Unitary,
+               "G1 the widest path's gate is the layer-0 one");
+
+        const auto odd_edges = index.widest_gate_path(0, 1, mipt::dist::GateCapacity::OddBlockMixing);
+        const WalkedPath o =
+            walk(index, 0, 1, odd_edges, mipt::dist::GateCapacity::OddBlockMixing);
+        expect(o.contiguous && o.weakest == 0.7,
+               "G1 the odd-mixing widest path reaches its own bottleneck");
+
+        // Symmetric in the endpoints.
+        const mipt::dist::GatePathMetrics r = index.gate_path_metrics(1, 0);
+        expect(r.widest_entangling_power == g.widest_entangling_power &&
+                   r.shortest_maximin_entangling_power == g.shortest_maximin_entangling_power,
+               "G1 the values do not depend on which endpoint is first");
+    }
+}
+
+// Every connection crosses a weak gate: widest is small, and it is the larger
+// of the two weak gates (the better of two bad routes).
+void test_gate_path_all_weak()
+{
+    const LogicalHistory history = make_gate_history(2, {
+        {{{0, 1, 0.05}}, {}},
+        {{{0, 1, 0.1}}, {}},
+    });
+    ConnectivityIndex index;
+    index.build(history, true, true);
+    const mipt::dist::GatePathMetrics g = index.gate_path_metrics(0, 1);
+    expect(g.available, "G2 available");
+    expect(g.widest_entangling_power == 0.1,
+           "G2 when every path has a weak gate, widest is the best weak gate");
+    expect(g.shortest_maximin_entangling_power == 0.1, "G2 shortest-maximin agrees");
+}
+
+// A path that is mostly temporal: three idle steps on each side of one gate.
+// Temporal edges carry capacity 1 and must never become the bottleneck.
+void test_gate_path_temporal_is_free()
+{
+    const LogicalHistory history = make_gate_history(2, {
+        {{{0, 1, 0.7, 0.6, 0.5}}, {}},
+        {{}, {}},
+        {{}, {}},
+        {{}, {}},
+    });
+    ConnectivityIndex index;
+    index.build(history, true, true);
+    const mipt::dist::GatePathMetrics g = index.gate_path_metrics(0, 1);
+    expect(g.available, "G3 available");
+    expect(g.shortest_path_length == 7, "G3 three idle steps, the gate, three idle steps");
+    expect(g.shortest_path_unitary_count == 1, "G3 one gate on the path");
+    expect(g.widest_entangling_power == 0.7 && g.shortest_maximin_entangling_power == 0.7,
+           "G3 temporal edges do not lower the entangling-power bottleneck");
+    expect(g.widest_even_block_mixing == 0.6 && g.widest_odd_block_mixing == 0.5,
+           "G3 nor the mixing bottlenecks");
+    const WalkedPath w = walk(index, 0, 1, index.widest_gate_path(0, 1));
+    expect(w.contiguous && w.hops == 7 && w.gates == 1, "G3 the widest path is the whole column");
+}
+
+// No path, no value: endpoints in different components, and a history whose
+// bonds carry no metrics (the MMS/Haar case), both report unavailable with NaN
+// -- never a zero that would read as "a non-entangling gate".
+void test_gate_path_unavailable()
+{
+    {
+        const LogicalHistory history = make_gate_history(4, {
+            {{{0, 1, 0.9}, {2, 3, 0.9}}, {}},
+        });
+        ConnectivityIndex index;
+        index.build(history, true, true);
+        expect(index.has_gate_metrics(), "G4 metrics are present");
+        const mipt::dist::GatePathMetrics g = index.gate_path_metrics(0, 2);
+        expect(!g.available, "G4 different components: unavailable");
+        expect(std::isnan(g.widest_entangling_power) &&
+                   std::isnan(g.shortest_maximin_entangling_power) &&
+                   std::isnan(g.widest_even_block_mixing) && std::isnan(g.widest_odd_block_mixing),
+               "G4 different components: every value is NaN");
+        expect(index.shortest_maximin_path(0, 2).empty() && index.widest_gate_path(0, 2).empty(),
+               "G4 different components: no path is returned");
+        expect(index.gate_path_metrics(0, 1).available, "G4 but the bonded pair is available");
+        expect(!index.gate_path_metrics(1, 1).available, "G4 a site with itself is not a pair");
+    }
+    {
+        // make_history leaves the LogicalBond defaults: NaN metrics.
+        const LogicalHistory history = make_history(2, {{{{0, 1}}, {}}});
+        ConnectivityIndex index;
+        index.build(history, true, true);
+        expect(index.query(0, 1).connected, "G4 the binary graph is unaffected by missing metrics");
+        expect(!index.has_gate_metrics(), "G4 NaN bond metrics: no gate metrics");
+        const mipt::dist::GatePathMetrics g = index.gate_path_metrics(0, 1);
+        expect(!g.available && std::isnan(g.widest_entangling_power),
+               "G4 NaN bond metrics: unavailable and NaN, not zero");
+        expect(index.widest_gate_path(0, 1).empty(), "G4 NaN bond metrics: no path");
+    }
+}
+
+// Two shortest paths of equal length, one through three gates and one through
+// a single gate. The unitary count is the fewest gates over the shortest paths
+// that attain the shortest-maximin value -- so it follows the bottleneck, not
+// whichever path a traversal happens to see first.
+//
+//   final layer: 0 -(g)- 1 -(g)- 3 -(g)- 2         (three gates, length 3)
+//   detour:      (1,0) ~ (0,0) -(g)- (0,2) ~ (1,2) (one gate,   length 3)
+void test_gate_path_unitary_count()
+{
+    auto build = [](double chain, double detour) {
+        return make_gate_history(4, {
+            {{{0, 2, detour}}, {}},
+            {{{0, 1, chain}, {1, 3, chain}, {3, 2, chain}}, {}},
+        });
+    };
+    struct Case
+    {
+        double chain;
+        double detour;
+        double maximin;
+        int count;
+        const char *what;
+    };
+    for (const Case &c : {Case{0.8, 0.3, 0.8, 3, "the strong three-gate chain wins"},
+                          Case{0.8, 0.9, 0.9, 1, "the strong one-gate detour wins"},
+                          Case{0.8, 0.8, 0.8, 1, "a tie goes to the fewest gates"}})
+    {
+        const LogicalHistory history = build(c.chain, c.detour);
+        for (bool precompute : {false, true})
+        {
+            ConnectivityIndex index;
+            index.build(history, true, precompute);
+            const mipt::dist::GatePathMetrics g = index.gate_path_metrics(0, 2);
+            const std::string tag = std::string("G5 ") + c.what;
+            expect(g.available && g.shortest_path_length == 3, tag + ": shortest length 3");
+            expect(g.shortest_maximin_entangling_power == c.maximin, tag + ": maximin value");
+            expect(g.shortest_path_unitary_count == c.count, tag + ": unitary count");
+            const auto edges = index.shortest_maximin_path(0, 2);
+            const WalkedPath s = walk(index, 0, 2, edges);
+            expect(s.contiguous, tag + ": the canonical path is contiguous");
+            expect(s.hops == 3 && s.gates == c.count && s.weakest == c.maximin,
+                   tag + ": the canonical path realizes both values");
+        }
+    }
+}
+
+// The flags may not move when gate paths are requested, and the precomputed
+// table must equal the on-demand computation for every pair.
+void test_gate_paths_change_nothing_else()
+{
+    constexpr int n = 8;
+    std::mt19937 rng(9091);
+    for (int trial = 0; trial < 6; ++trial)
+    {
+        std::vector<mipt::RppuLayer> layers;
+        mipt::build_rppu_layers(layers, n, 5, 0.15 + 0.05 * trial, true, rng, trial % 2 == 0);
+        const LogicalHistory history = mipt::logical_history_from_rppu(layers, n);
+        ConnectivityIndex plain;
+        ConnectivityIndex gated;
+        plain.build(history, true, false);
+        gated.build(history, true, true);
+        expect(plain.has_gate_metrics() && gated.has_gate_metrics(),
+               "G6 RPPU histories carry gate metrics");
+        for (int i = 0; i < n; ++i)
+        {
+            for (int j = 0; j < n; ++j)
+            {
+                const PairConnectivity a = plain.query(i, j);
+                const PairConnectivity b = gated.query(i, j);
+                expect(a.flags() == b.flags() && a.component_size == b.component_size &&
+                           a.shortest_path == b.shortest_path,
+                       "G6 query() is identical with and without gate paths");
+                if (i == j)
+                {
+                    continue;
+                }
+                expect(same_metrics(plain.gate_path_metrics(i, j), gated.gate_path_metrics(i, j)),
+                       "G6 precomputed gate-path metrics equal the on-demand ones");
+            }
+        }
+    }
+}
+
+// The FSWAP network and the JW-string gate are one logical bond; they must
+// also carry one diagnostic. Only the index into the simulated gate list may
+// differ, because the FSWAP network puts the boundary gate after its transport.
+void test_boundary_gate_diagnostics_agree()
+{
+    constexpr int n = 8;
+    mipt::RppuLayer fswap_layer;
+    mipt::RppuLayer jw_layer;
+    std::mt19937 fswap_rng(31337);
+    std::mt19937 jw_rng(31337);
+    mipt::fill_rppu_layer(fswap_layer, n, true, 0.3, true, fswap_rng,
+                          mipt::RppuBoundaryMode::FermionicFSwap);
+    mipt::fill_rppu_layer(jw_layer, n, true, 0.3, true, jw_rng,
+                          mipt::RppuBoundaryMode::FermionicJWString);
+    const LogicalLayer fswap = project(fswap_layer, n);
+    const LogicalLayer jw = project(jw_layer, n);
+    expect(fswap.bonds.size() == jw.bonds.size(), "G7 same logical bond count");
+    bool boundary_index_differs = false;
+    for (std::size_t k = 0; k < std::min(fswap.bonds.size(), jw.bonds.size()); ++k)
+    {
+        const mipt::LogicalBond &f = fswap.bonds[k];
+        const mipt::LogicalBond &w = jw.bonds[k];
+        expect(f.a == w.a && f.b == w.b, "G7 the k-th logical bond joins the same modes");
+        expect(std::isfinite(f.entangling_power) && f.entangling_power == w.entangling_power,
+               "G7 identical entangling power");
+        expect(f.even_block_mixing == w.even_block_mixing &&
+                   f.odd_block_mixing == w.odd_block_mixing,
+               "G7 identical parity-block mixings");
+        const auto &fg = fswap_layer.gates[static_cast<std::size_t>(f.source_gate_index)];
+        const auto &wg = jw_layer.gates[static_cast<std::size_t>(w.source_gate_index)];
+        expect(fg.kind != 1 && wg.kind != 1, "G7 source_gate_index never names an FSWAP");
+        if ((f.a == 0 && f.b == n - 1) || (f.a == n - 1 && f.b == 0))
+        {
+            boundary_index_differs = f.source_gate_index != w.source_gate_index;
+            expect(wg.kind == 2, "G7 the JW boundary bond points at the kind-2 gate");
+            expect(fg.kind == 0 && fg.q0 == 0 && fg.q1 == 1,
+                   "G7 the FSWAP boundary bond points at the gate on sites (0, 1)");
+        }
+    }
+    expect(boundary_index_differs,
+           "G7 the boundary bond's source_gate_index differs between implementations");
+}
+
+// End to end on a real draw: every connected pair has finite gate-path values
+// in [0, 1], ordered widest >= shortest-maximin, and every unavailable pair is
+// exactly the pairs in different components.
+void test_rppu_history_gate_paths()
+{
+    constexpr int n = 10;
+    std::mt19937 rng(424242);
+    std::vector<mipt::RppuLayer> layers;
+    mipt::build_rppu_layers(layers, n, 6, 0.2, true, rng, true);
+    const LogicalHistory history = mipt::logical_history_from_rppu(layers, n);
+    ConnectivityIndex index;
+    index.build(history, true, true);
+    expect(index.has_gate_metrics(), "G8 an RPPU history has gate metrics");
+    int available = 0;
+    for (int i = 0; i < n; ++i)
+    {
+        for (int j = i + 1; j < n; ++j)
+        {
+            const PairConnectivity conn = index.query(i, j);
+            const mipt::dist::GatePathMetrics g = index.gate_path_metrics(i, j);
+            expect(g.available == conn.interior_path,
+                   "G8 available exactly when the endpoints share a component");
+            if (!g.available)
+            {
+                continue;
+            }
+            ++available;
+            const double values[] = {g.shortest_maximin_entangling_power,
+                                     g.widest_entangling_power, g.widest_even_block_mixing,
+                                     g.widest_odd_block_mixing};
+            for (double v : values)
+            {
+                expect(std::isfinite(v) && v >= 0.0 && v <= 1.0 + 1.0e-12,
+                       "G8 every gate-path value is finite and in [0, 1]");
+            }
+            expect(g.widest_entangling_power >= g.shortest_maximin_entangling_power,
+                   "G8 widest over all paths is at least the shortest-path value");
+            expect(g.shortest_path_length == conn.shortest_path,
+                   "G8 the gate-path length is the binary shortest path");
+            expect(g.shortest_path_unitary_count >= 1 &&
+                       g.shortest_path_unitary_count <= g.shortest_path_length,
+                   "G8 a path between distinct modes crosses at least one gate");
+            const WalkedPath s = walk(index, i, j, index.shortest_maximin_path(i, j));
+            expect(s.contiguous && s.hops == g.shortest_path_length &&
+                       s.gates == g.shortest_path_unitary_count &&
+                       s.weakest == g.shortest_maximin_entangling_power,
+                   "G8 the canonical shortest-maximin path realizes its metrics");
+            const WalkedPath w = walk(index, i, j, index.widest_gate_path(i, j));
+            expect(w.contiguous && w.weakest == g.widest_entangling_power,
+                   "G8 the canonical widest path realizes the widest value");
+        }
+    }
+    expect(available > 0, "G8 premise: some pair is connected at p=0.2");
+}
+
 } // namespace
 
 int main()
@@ -686,6 +1116,14 @@ int main()
     test_boundary_implementations_agree();
     test_fswap_is_transport();
     test_history_extremes();
+    test_gate_path_weak_shortcut();
+    test_gate_path_all_weak();
+    test_gate_path_temporal_is_free();
+    test_gate_path_unavailable();
+    test_gate_path_unitary_count();
+    test_gate_paths_change_nothing_else();
+    test_boundary_gate_diagnostics_agree();
+    test_rppu_history_gate_paths();
 
     if (failures != 0)
     {

@@ -68,7 +68,9 @@
 #include <algorithm>
 #include <cmath>
 #include <deque>
+#include <functional>
 #include <limits>
+#include <queue>
 #include <string>
 #include <utility>
 #include <vector>
@@ -129,6 +131,98 @@ struct PairConnectivity
         mask |= connected ? FLAG_CONNECTED : 0u;
         return mask;
     }
+};
+
+// ---------------------------------------------------------------------------
+// Edge identities and gate-path diagnostics (MIPT_DIST_GATE_DIAGNOSTICS)
+//
+// The binary graph only needs to know *that* an edge exists. The gate
+// diagnostics need to know *which* edge a path uses -- its kind, its layer, the
+// simulated gate behind it, and how entangling that gate is -- so every
+// adjacency slot also names the undirected edge it belongs to.
+//
+// None of this touches the union-find, endpoint survival, or `connected`:
+// those are built from exactly the same edge set as before, and the tests
+// assert the flags are identical with the diagnostics on and off.
+// ---------------------------------------------------------------------------
+
+enum class GraphEdgeKind
+{
+    Temporal,
+    Unitary
+};
+
+struct GraphEdge
+{
+    std::uint32_t a = 0; // node ids, layer * n + mode
+    std::uint32_t b = 0;
+    GraphEdgeKind kind = GraphEdgeKind::Temporal;
+    int layer = 0;
+    // Index into the simulated layer's gate list (LogicalBond::source_gate_index);
+    // -1 for a temporal edge.
+    int source_gate_index = -1;
+    // Capacities. A temporal edge transmits perfectly and carries 1.0 in all
+    // three, so it can never lower a bottleneck; a unitary edge carries its
+    // gate's normalized entangling power and parity-block mixing strengths.
+    double entangling_power = 1.0;
+    double even_block_mixing = 1.0;
+    double odd_block_mixing = 1.0;
+};
+
+// One adjacency slot: the neighbour it reaches and the edge it travels.
+struct GraphArc
+{
+    std::uint32_t node = 0;
+    std::uint32_t edge = 0;
+};
+
+enum class GateCapacity
+{
+    EntanglingPower,
+    EvenBlockMixing,
+    OddBlockMixing
+};
+
+inline double edge_capacity(const GraphEdge &edge, GateCapacity which)
+{
+    switch (which)
+    {
+    case GateCapacity::EntanglingPower: return edge.entangling_power;
+    case GateCapacity::EvenBlockMixing: return edge.even_block_mixing;
+    case GateCapacity::OddBlockMixing: return edge.odd_block_mixing;
+    }
+    return edge.entangling_power;
+}
+
+// Gate quality along the paths joining two final-slice endpoints.
+//
+//   * shortest_maximin_entangling_power: over the *shortest* paths only, the
+//     largest achievable weakest gate, max_{gamma shortest} min_{g in gamma}
+//     e_norm(g).
+//   * widest_*: the same max-min over *every* path. This is the decisive one:
+//     it is near zero only when every connection between the endpoints passes
+//     through a nearly non-entangling gate.
+//   * shortest_path_unitary_count: the number of gates on the path the
+//     shortest-maximin value is read from. Shortest paths of different gate
+//     composition can coexist, so this is defined exactly as the fewest gates
+//     over the shortest paths whose weakest gate attains that value -- a
+//     property of the graph, not of a traversal order.
+//
+// `available` is false when the endpoints share no component (no path, so no
+// value -- never a zero) or the graph carries no gate metrics. Everything is
+// measured between the final-slice nodes, like `shortest_path`; the record
+// writer additionally blanks a pair that is not `connected`, because the
+// implicit last temporal step to a measured endpoint does not exist.
+struct GatePathMetrics
+{
+    bool available = false;
+    int shortest_path_length = -1;
+    int shortest_path_unitary_count = 0;
+
+    double shortest_maximin_entangling_power = std::numeric_limits<double>::quiet_NaN();
+    double widest_entangling_power = std::numeric_limits<double>::quiet_NaN();
+    double widest_even_block_mixing = std::numeric_limits<double>::quiet_NaN();
+    double widest_odd_block_mixing = std::numeric_limits<double>::quiet_NaN();
 };
 
 // Union-find with path halving and union by size. Small enough to keep here
@@ -357,9 +451,15 @@ class ConnectivityIndex
     // Build the graph for one trajectory. `with_paths` adds one BFS sweep per
     // site to fill the shortest-path matrix; the component labels and every
     // flag are available either way.
-    void build(const LogicalHistory &history, bool with_paths)
+    //
+    // `with_gate_paths` additionally precomputes GatePathMetrics for every
+    // final-slice pair (one bottleneck sweep per site per capacity, plus the
+    // shortest-path DAG walks), so gate_path_metrics() is a lookup. It changes
+    // nothing else the index reports.
+    void build(const LogicalHistory &history, bool with_paths, bool with_gate_paths = false)
     {
         ready_ = false;
+        gate_paths_.clear();
         n_ = history.n;
         layers_ = static_cast<int>(history.layers.size());
         if (!history.valid || n_ <= 0 || layers_ <= 0)
@@ -374,7 +474,7 @@ class ConnectivityIndex
         // than N*T little vectors.
         degree_.assign(nodes + 1u, 0u);
         edges_ = 0;
-        auto count_edge = [&](std::uint32_t a, std::uint32_t b, bool, double, double) {
+        auto count_edge = [&](std::uint32_t a, std::uint32_t b, const GraphEdge &, double, double) {
             ++degree_[a];
             ++degree_[b];
             ++edges_;
@@ -391,9 +491,24 @@ class ConnectivityIndex
         edge_from_.assign(static_cast<std::size_t>(edges_) * 2u, 0u);
         weight_pair_.assign(static_cast<std::size_t>(edges_) * 2u, 1.0);
         weight_hop_.assign(static_cast<std::size_t>(edges_) * 2u, 1.0);
+        arc_edge_.assign(static_cast<std::size_t>(edges_) * 2u, 0u);
+        graph_edges_.clear();
+        graph_edges_.reserve(static_cast<std::size_t>(edges_));
+        gate_metrics_ = true;
         cursor_ = offset_;
-        auto add_edge = [&](std::uint32_t a, std::uint32_t b, bool gate, double pair_weight,
-                            double hop_weight) {
+        auto add_edge = [&](std::uint32_t a, std::uint32_t b, const GraphEdge &meta,
+                            double pair_weight, double hop_weight) {
+            const bool gate = meta.kind == GraphEdgeKind::Unitary;
+            const std::uint32_t edge_id = static_cast<std::uint32_t>(graph_edges_.size());
+            graph_edges_.push_back(meta);
+            if (gate && !(std::isfinite(meta.entangling_power) &&
+                          std::isfinite(meta.even_block_mixing) &&
+                          std::isfinite(meta.odd_block_mixing)))
+            {
+                gate_metrics_ = false;
+            }
+            arc_edge_[cursor_[a]] = edge_id;
+            arc_edge_[cursor_[b]] = edge_id;
             edge_kind_[cursor_[a]] = gate ? 1u : 0u;
             edge_from_[cursor_[a]] = a;
             weight_pair_[cursor_[a]] = pair_weight;
@@ -439,6 +554,114 @@ class ConnectivityIndex
         // what keeps the anatomy affordable at 200k anchors.
         build_block_cut_tree();
         ready_ = true;
+        if (with_gate_paths && gate_metrics_)
+        {
+            fill_gate_paths();
+        }
+    }
+
+    // Whether every unitary edge carries finite gate metrics (RPPU/qRPPU do;
+    // the other circuits leave them NaN).
+    bool has_gate_metrics() const { return ready_ && gate_metrics_; }
+    const std::vector<GraphEdge> &graph_edges() const { return graph_edges_; }
+    std::uint32_t final_node(int site) const
+    {
+        return node_index(layers_ - 1, mode_of_site_[static_cast<std::size_t>(site)]);
+    }
+    int sites() const { return n_; }
+    // The arcs leaving one node, with the edge each one travels.
+    std::vector<GraphArc> arcs(std::uint32_t node) const
+    {
+        std::vector<GraphArc> out;
+        for (std::uint32_t slot = offset_[node]; slot < offset_[node + 1u]; ++slot)
+        {
+            out.push_back({adjacency_[slot], arc_edge_[slot]});
+        }
+        return out;
+    }
+
+    // Gate quality between two final-slice endpoints. A lookup when build()
+    // precomputed it, computed on demand otherwise.
+    GatePathMetrics gate_path_metrics(int site_i, int site_j) const
+    {
+        if (!gate_query_valid(site_i, site_j))
+        {
+            return {};
+        }
+        if (!gate_paths_.empty())
+        {
+            return gate_paths_[static_cast<std::size_t>(site_i) * static_cast<std::size_t>(n_) +
+                               static_cast<std::size_t>(site_j)];
+        }
+        return compute_gate_path(site_i, site_j);
+    }
+
+    // The edges (graph_edges() indices, from endpoint i to endpoint j) of the
+    // canonical path behind each GatePathMetrics value: the shortest path
+    // attaining the shortest-maximin value with the fewest gates, and the
+    // shortest path whose every edge is at least the widest value. Ties go to
+    // the lowest adjacency slot, so a regenerated circuit gives the same path.
+    // Empty when the query is not available.
+    std::vector<std::uint32_t> shortest_maximin_path(int site_i, int site_j) const
+    {
+        std::vector<std::uint32_t> out;
+        if (!gate_query_valid(site_i, site_j))
+        {
+            return out;
+        }
+        const std::uint32_t source = final_node(site_i);
+        const std::uint32_t sink = final_node(site_j);
+        std::vector<std::int32_t> distance;
+        std::vector<std::uint32_t> order;
+        bfs(source, distance, order);
+        std::vector<double> best;
+        shortest_bottleneck(distance, order, source, best);
+        std::vector<int> count;
+        std::vector<std::uint32_t> via;
+        fewest_gates(distance, order, source, best[sink], count, &via);
+        walk_back(source, sink, via, out);
+        return out;
+    }
+
+    std::vector<std::uint32_t> widest_gate_path(int site_i, int site_j,
+                                                GateCapacity which = GateCapacity::EntanglingPower) const
+    {
+        std::vector<std::uint32_t> out;
+        if (!gate_query_valid(site_i, site_j))
+        {
+            return out;
+        }
+        const std::uint32_t source = final_node(site_i);
+        const std::uint32_t sink = final_node(site_j);
+        std::vector<double> widest;
+        widest_from(source, which, widest);
+        const double floor = widest[sink];
+        // Shortest path inside the subgraph of edges at least that wide.
+        const std::size_t nodes = node_count();
+        std::vector<std::uint32_t> via(nodes, UNSET);
+        std::vector<std::uint8_t> seen(nodes, 0u);
+        std::vector<std::uint32_t> queue{source};
+        seen[source] = 1u;
+        for (std::size_t head = 0; head < queue.size(); ++head)
+        {
+            const std::uint32_t node = queue[head];
+            if (node == sink)
+            {
+                break;
+            }
+            for (std::uint32_t slot = offset_[node]; slot < offset_[node + 1u]; ++slot)
+            {
+                const std::uint32_t next = adjacency_[slot];
+                if (seen[next] == 0u && capacity(slot, which) >= floor)
+                {
+                    seen[next] = 1u;
+                    via[next] = slot;
+                    queue.push_back(next);
+                }
+            }
+        }
+        walk_back(source, sink, via, out);
+        return out;
     }
 
     bool ready() const { return ready_; }
@@ -696,6 +919,244 @@ class ConnectivityIndex
     }
 
   private:
+    std::size_t node_count() const
+    {
+        return static_cast<std::size_t>(layers_) * static_cast<std::size_t>(n_);
+    }
+
+    bool gate_query_valid(int site_i, int site_j) const
+    {
+        return ready_ && gate_metrics_ && site_i != site_j && site_i >= 0 && site_j >= 0 &&
+               site_i < n_ && site_j < n_ &&
+               root_[static_cast<std::size_t>(site_i)] == root_[static_cast<std::size_t>(site_j)];
+    }
+
+    double capacity(std::uint32_t slot, GateCapacity which) const
+    {
+        return edge_capacity(graph_edges_[arc_edge_[slot]], which);
+    }
+
+    bool unitary(std::uint32_t slot) const
+    {
+        return graph_edges_[arc_edge_[slot]].kind == GraphEdgeKind::Unitary;
+    }
+
+    void bfs(std::uint32_t source, std::vector<std::int32_t> &distance,
+             std::vector<std::uint32_t> &order) const
+    {
+        distance.assign(node_count(), -1);
+        order.assign(1, source);
+        distance[source] = 0;
+        for (std::size_t head = 0; head < order.size(); ++head)
+        {
+            const std::uint32_t node = order[head];
+            for (std::uint32_t slot = offset_[node]; slot < offset_[node + 1u]; ++slot)
+            {
+                const std::uint32_t next = adjacency_[slot];
+                if (distance[next] < 0)
+                {
+                    distance[next] = distance[node] + 1;
+                    order.push_back(next);
+                }
+            }
+        }
+    }
+
+    // Max-min entangling power over shortest paths, for every node: a DP over
+    // the BFS layering, in BFS order so every predecessor is final first.
+    void shortest_bottleneck(const std::vector<std::int32_t> &distance,
+                             const std::vector<std::uint32_t> &order, std::uint32_t source,
+                             std::vector<double> &best) const
+    {
+        best.assign(node_count(), -1.0);
+        best[source] = std::numeric_limits<double>::infinity();
+        for (std::uint32_t node : order)
+        {
+            if (node == source)
+            {
+                continue;
+            }
+            for (std::uint32_t slot = offset_[node]; slot < offset_[node + 1u]; ++slot)
+            {
+                const std::uint32_t previous = adjacency_[slot];
+                if (distance[previous] == distance[node] - 1)
+                {
+                    best[node] = std::max(best[node],
+                                          std::min(best[previous],
+                                                   capacity(slot, GateCapacity::EntanglingPower)));
+                }
+            }
+        }
+    }
+
+    // Fewest gates over shortest paths using only edges of capacity >= floor.
+    // Optionally records, per node, the in-slot of the canonical predecessor.
+    void fewest_gates(const std::vector<std::int32_t> &distance,
+                      const std::vector<std::uint32_t> &order, std::uint32_t source, double floor,
+                      std::vector<int> &count, std::vector<std::uint32_t> *via) const
+    {
+        constexpr int NONE = std::numeric_limits<int>::max();
+        count.assign(node_count(), NONE);
+        if (via != nullptr)
+        {
+            via->assign(node_count(), UNSET);
+        }
+        count[source] = 0;
+        for (std::uint32_t node : order)
+        {
+            if (node == source)
+            {
+                continue;
+            }
+            for (std::uint32_t slot = offset_[node]; slot < offset_[node + 1u]; ++slot)
+            {
+                const std::uint32_t previous = adjacency_[slot];
+                if (distance[previous] != distance[node] - 1 || count[previous] == NONE ||
+                    !(capacity(slot, GateCapacity::EntanglingPower) >= floor))
+                {
+                    continue;
+                }
+                const int candidate = count[previous] + (unitary(slot) ? 1 : 0);
+                if (candidate < count[node])
+                {
+                    count[node] = candidate;
+                    if (via != nullptr)
+                    {
+                        // The slot is node's own arc back to `previous`; walk_back
+                        // follows it.
+                        (*via)[node] = slot;
+                    }
+                }
+            }
+        }
+    }
+
+    // Widest (max-min capacity) path value from `source` to every node.
+    // Temporal edges carry 1.0, so they never lower a bottleneck.
+    void widest_from(std::uint32_t source, GateCapacity which, std::vector<double> &widest) const
+    {
+        widest.assign(node_count(), -1.0);
+        widest[source] = std::numeric_limits<double>::infinity();
+        using Item = std::pair<double, std::uint32_t>;
+        std::priority_queue<Item> heap;
+        heap.push({widest[source], source});
+        std::vector<std::uint8_t> done(node_count(), 0u);
+        while (!heap.empty())
+        {
+            const auto [value, node] = heap.top();
+            heap.pop();
+            if (done[node] != 0u)
+            {
+                continue;
+            }
+            done[node] = 1u;
+            for (std::uint32_t slot = offset_[node]; slot < offset_[node + 1u]; ++slot)
+            {
+                const std::uint32_t next = adjacency_[slot];
+                const double candidate = std::min(value, capacity(slot, which));
+                if (done[next] == 0u && candidate > widest[next])
+                {
+                    widest[next] = candidate;
+                    heap.push({candidate, next});
+                }
+            }
+        }
+    }
+
+    // Follow recorded in-slots from sink back to source; `via[v]` is a slot of
+    // v's own adjacency or of its predecessor's, both of which name the edge.
+    void walk_back(std::uint32_t source, std::uint32_t sink, const std::vector<std::uint32_t> &via,
+                   std::vector<std::uint32_t> &out) const
+    {
+        out.clear();
+        std::uint32_t node = sink;
+        while (node != source)
+        {
+            const std::uint32_t slot = via[node];
+            if (slot == UNSET)
+            {
+                out.clear();
+                return;
+            }
+            out.push_back(arc_edge_[slot]);
+            const GraphEdge &edge = graph_edges_[arc_edge_[slot]];
+            node = edge.a == node ? edge.b : edge.a;
+        }
+        std::reverse(out.begin(), out.end());
+    }
+
+    GatePathMetrics compute_gate_path(int site_i, int site_j) const
+    {
+        GatePathMetrics out;
+        const std::uint32_t source = final_node(site_i);
+        const std::uint32_t sink = final_node(site_j);
+        std::vector<std::int32_t> distance;
+        std::vector<std::uint32_t> order;
+        bfs(source, distance, order);
+        std::vector<double> best;
+        shortest_bottleneck(distance, order, source, best);
+        fill_from_source(source, sink, distance, order, best, out);
+        std::vector<double> widest;
+        widest_from(source, GateCapacity::EntanglingPower, widest);
+        out.widest_entangling_power = widest[sink];
+        widest_from(source, GateCapacity::EvenBlockMixing, widest);
+        out.widest_even_block_mixing = widest[sink];
+        widest_from(source, GateCapacity::OddBlockMixing, widest);
+        out.widest_odd_block_mixing = widest[sink];
+        return out;
+    }
+
+    void fill_from_source(std::uint32_t source, std::uint32_t sink,
+                          const std::vector<std::int32_t> &distance,
+                          const std::vector<std::uint32_t> &order, const std::vector<double> &best,
+                          GatePathMetrics &out) const
+    {
+        out.available = true;
+        out.shortest_path_length = distance[sink];
+        out.shortest_maximin_entangling_power = best[sink];
+        std::vector<int> count;
+        fewest_gates(distance, order, source, best[sink], count, nullptr);
+        out.shortest_path_unitary_count = count[sink];
+    }
+
+    // Every final-slice pair at once: per source, one BFS, one shortest-path
+    // DP, three widest sweeps, and one fewest-gates walk per target.
+    void fill_gate_paths()
+    {
+        gate_paths_.assign(static_cast<std::size_t>(n_) * static_cast<std::size_t>(n_),
+                           GatePathMetrics{});
+        std::vector<std::int32_t> distance;
+        std::vector<std::uint32_t> order;
+        std::vector<double> best;
+        std::vector<double> widest_ep;
+        std::vector<double> widest_even;
+        std::vector<double> widest_odd;
+        for (int i = 0; i < n_; ++i)
+        {
+            const std::uint32_t source = final_node(i);
+            bfs(source, distance, order);
+            shortest_bottleneck(distance, order, source, best);
+            widest_from(source, GateCapacity::EntanglingPower, widest_ep);
+            widest_from(source, GateCapacity::EvenBlockMixing, widest_even);
+            widest_from(source, GateCapacity::OddBlockMixing, widest_odd);
+            for (int j = 0; j < n_; ++j)
+            {
+                if (j == i || root_[static_cast<std::size_t>(i)] != root_[static_cast<std::size_t>(j)])
+                {
+                    continue;
+                }
+                const std::uint32_t sink = final_node(j);
+                GatePathMetrics &out =
+                    gate_paths_[static_cast<std::size_t>(i) * static_cast<std::size_t>(n_) +
+                                static_cast<std::size_t>(j)];
+                fill_from_source(source, sink, distance, order, best, out);
+                out.widest_entangling_power = widest_ep[sink];
+                out.widest_even_block_mixing = widest_even[sink];
+                out.widest_odd_block_mixing = widest_odd[sink];
+            }
+        }
+    }
+
     // Maximum-product path (via logs), widest path, and how many edge-disjoint
     // paths survive at the widest path's bottleneck.
     void strongest_path(const std::vector<double> &weight, std::uint32_t source,
@@ -814,8 +1275,16 @@ class ConnectivityIndex
                 {
                     continue;
                 }
-                on_edge(node_index(layer, bond.a), node_index(layer, bond.b), true,
-                        bond.pair_weight, bond.hop_weight);
+                GraphEdge meta;
+                meta.a = node_index(layer, bond.a);
+                meta.b = node_index(layer, bond.b);
+                meta.kind = GraphEdgeKind::Unitary;
+                meta.layer = layer;
+                meta.source_gate_index = bond.source_gate_index;
+                meta.entangling_power = bond.entangling_power;
+                meta.even_block_mixing = bond.even_block_mixing;
+                meta.odd_block_mixing = bond.odd_block_mixing;
+                on_edge(meta.a, meta.b, meta, bond.pair_weight, bond.hop_weight);
             }
             if (layer + 1 >= layers_)
             {
@@ -826,7 +1295,12 @@ class ConnectivityIndex
                 if (!current.measured[static_cast<std::size_t>(mode)])
                 {
                     // An idle mode transmits perfectly in both parity sectors.
-                    on_edge(node_index(layer, mode), node_index(layer + 1, mode), false, 1.0, 1.0);
+                    GraphEdge meta;
+                    meta.a = node_index(layer, mode);
+                    meta.b = node_index(layer + 1, mode);
+                    meta.kind = GraphEdgeKind::Temporal;
+                    meta.layer = layer;
+                    on_edge(meta.a, meta.b, meta, 1.0, 1.0);
                 }
             }
         }
@@ -1218,6 +1692,13 @@ class ConnectivityIndex
     std::vector<std::uint32_t> edge_from_;
     std::vector<double> weight_pair_;
     std::vector<double> weight_hop_;
+    // Parallel to `adjacency_`: the undirected edge each slot travels, and the
+    // edge table it indexes (GraphArc = {adjacency_[slot], arc_edge_[slot]}).
+    std::vector<std::uint32_t> arc_edge_;
+    std::vector<GraphEdge> graph_edges_;
+    bool gate_metrics_ = false;
+    // n*n, filled only when build() was asked for gate paths.
+    std::vector<GatePathMetrics> gate_paths_;
     std::vector<int> mode_of_site_;
     std::vector<std::uint32_t> root_;
     std::vector<std::uint32_t> component_size_;

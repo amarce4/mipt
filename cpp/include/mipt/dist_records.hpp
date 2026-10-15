@@ -210,11 +210,9 @@ inline void append_field(std::string &out, const char *key, const std::string &v
     out += '\n';
 }
 
-// The observables one k=2 record carries, in payload order.
-//
-// The first two (or four) entries are exactly what format v1 wrote, so a v2
-// `basic` file is v1's value list with flags and an embedding table added.
-inline std::vector<std::string> pair_observable_names(const RunConfig &config)
+// The detail-level part of a k=2 record's observables: everything except the
+// optional gate-path diagnostics, which pair_observable_names() appends.
+inline std::vector<std::string> pair_detail_observable_names(const RunConfig &config)
 {
     const bool fermionic = config.fermionic_outputs();
     std::vector<std::string> names{"mi", "mn"};
@@ -249,6 +247,112 @@ inline std::vector<std::string> pair_observable_names(const RunConfig &config)
         for (const char *field : {"re_g", "im_g", "re_f", "im_f"})
         {
             names.push_back(std::string(prefix) + field);
+        }
+    }
+    return names;
+}
+
+// ---------------------------------------------------------------------------
+// Gate-path diagnostics (MIPT_DIST_GATE_DIAGNOSTICS=1)
+//
+// Seven values appended to every k=2 record, after whatever the detail level
+// asked for, so a file with the setting off is byte-identical to one written
+// before it existed. Kept here, pure and host-side, so `make test-dist` can pin
+// the one decision that matters: *a missing path is NaN, never zero*.
+//
+// `component_size` is always written -- it is defined for any evaluated pair,
+// connected or not, and is what says how large the cluster a disconnected
+// endpoint sits in was. The other six describe the paths joining the pair, and
+// are only meaningful when the percolation event C holds and the graph carries
+// gate capacities. A pair whose endpoints share an interior component but one
+// of which was measured in the last layer has a path between the final-slice
+// nodes and no path to the measured endpoint itself: gate_path_metrics()
+// reports `available` there, and this is where it is blanked. Writing 0
+// instead would read as "every path runs through a non-entangling gate", which
+// is the exact opposite of "there is no path", and the whole diagnostic exists
+// to tell those apart.
+// ---------------------------------------------------------------------------
+
+inline constexpr std::size_t GATE_RECORD_VALUES = 7;
+
+inline const std::array<const char *, GATE_RECORD_VALUES> &gate_observable_names()
+{
+    static const std::array<const char *, GATE_RECORD_VALUES> names{
+        "component_size", "shortest_path", "shortest_path_unitary_count",
+        "shortest_maximin_gate_ep", "widest_gate_ep", "widest_even_mix", "widest_odd_mix"};
+    return names;
+}
+
+// Lay the seven gate values out in gate_observable_names() order.
+inline void fill_gate_record_values(const PairConnectivity &conn, const GatePathMetrics &gate,
+                                    double *out)
+{
+    constexpr double nan = std::numeric_limits<double>::quiet_NaN();
+    out[0] = conn.evaluated ? static_cast<double>(conn.component_size) : nan;
+    const bool path = conn.evaluated && conn.connected && gate.available;
+    out[1] = (path && gate.shortest_path_length >= 0)
+                 ? static_cast<double>(gate.shortest_path_length)
+                 : nan;
+    out[2] = path ? static_cast<double>(gate.shortest_path_unitary_count) : nan;
+    out[3] = path ? gate.shortest_maximin_entangling_power : nan;
+    out[4] = path ? gate.widest_entangling_power : nan;
+    out[5] = path ? gate.widest_even_block_mixing : nan;
+    out[6] = path ? gate.widest_odd_block_mixing : nan;
+}
+
+// The run-level preconditions, as a pure function of the settings so the
+// refusals are testable on the host. dist_scaling.hpp calls it with
+// records::enabled().
+//
+// Every refusal is a configuration that would otherwise produce a file that
+// *looks* like it carries the diagnostic and does not: a Haar or MMS circuit
+// has no gate capacities (the widest path would be NaN on every record, or
+// worse, an artefact of a convention the definition does not cover); k=3
+// records have no pair to attach the values to; without the graph there is no
+// path; and with neither the record file nor the triple analysis there is
+// nowhere for a per-pair value to go -- the aggregate CSV does not carry it.
+inline void validate_gate_diagnostics(const RunConfig &config, bool records_enabled)
+{
+    if (!config.gate_path_diagnostics)
+    {
+        return;
+    }
+    auto refuse = [](const std::string &why) {
+        throw std::invalid_argument("MIPT_DIST_GATE_DIAGNOSTICS=1 " + why);
+    };
+    if (config.type != CircuitType::FermionRPPU && config.type != CircuitType::QubitRPPU)
+    {
+        refuse("needs circ_type 2 (RPPU) or 4 (qRPPU): only those gate sets carry the "
+               "entangling-power and parity-block-mixing capacities it reports.");
+    }
+    if (config.k != 2 && config.k != 0)
+    {
+        refuse("needs k=2 or k=0: the diagnostics are per pair.");
+    }
+    if (!config.connectivity)
+    {
+        refuse("needs MIPT_DIST_CONNECTIVITY=1: the diagnostics are measured along the "
+               "spacetime graph's paths.");
+    }
+    if (!records_enabled && !config.pair_gap.enabled)
+    {
+        refuse("has nowhere to write: enable the record file (MIPT_DIST_RECORDS=1) or the "
+               "connected-zero triple analysis (MIPT_DIST_PAIR_GAP_TRIPLES=1).");
+    }
+}
+
+// The observables one k=2 record carries, in payload order.
+//
+// The first two (or four) entries are exactly what format v1 wrote, so a v2
+// `basic` file is v1's value list with flags and an embedding table added.
+inline std::vector<std::string> pair_observable_names(const RunConfig &config)
+{
+    std::vector<std::string> names = pair_detail_observable_names(config);
+    if (config.gate_path_diagnostics)
+    {
+        for (const char *name : gate_observable_names())
+        {
+            names.push_back(name);
         }
     }
     return names;
@@ -336,6 +440,26 @@ inline std::string common_header_fields(const RunConfig &config,
     return out;
 }
 
+// The gate-path diagnostics' provenance, k=2 record files only and only when
+// enabled, so a file with the setting off keeps its header byte for byte and
+// still resumes. The three cuStateVec knobs are here because stage two replays
+// these trajectories: the joint-measurement chunking and the parity-sector
+// encoding decide how a seeded trajectory's measurement *outcomes* are drawn,
+// so a replay that wants the same record has to run under the same settings.
+// Read through env:: with the defaults and ranges cusv/engine.hpp and
+// backend.hpp use, rather than by including them -- this header is host-only.
+inline void append_gate_header_fields(std::string &out)
+{
+    append_field(out, "gate_path_diagnostics", "1");
+    append_field(out, "gate_diagnostics_version", std::to_string(GATE_DIAGNOSTICS_VERSION));
+    append_field(out, "gate_diagnostics_definition", GATE_DIAGNOSTICS_DEFINITION);
+    append_field(out, "cusv_parity", env::boolean("MIPT_CUSV_PARITY", true) ? "1" : "0");
+    append_field(out, "cusv_measure_bits",
+                 std::to_string(env::integer("MIPT_CUSV_MEASURE_BITS", 16, 1, 24)));
+    append_field(out, "cusv_block_targets",
+                 std::to_string(env::integer("MIPT_CUSV_BLOCK_TARGETS", 4, 2, 12)));
+}
+
 // (geometry_id, embedding_id) -> the sites that embedding actually names.
 //
 // v1 could say a record belonged to separation 5 but not which of the N pairs
@@ -374,6 +498,10 @@ inline std::string pair_header_text(const RunConfig &config, const std::vector<P
                                     const std::vector<std::array<int, 4>> &embeddings)
 {
     std::string out = common_header_fields(config, pair_observable_names(config));
+    if (config.gate_path_diagnostics)
+    {
+        append_gate_header_fields(out);
+    }
 
     std::string rows;
     for (std::size_t index = 0; index < bins.size(); ++index)

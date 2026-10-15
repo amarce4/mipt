@@ -189,6 +189,9 @@ CORE_TEST_BIN := $(HOST_BUILD)/core_tests
 DIST_TEST_BIN := $(HOST_BUILD)/dist_metrics_tests
 DIST_CONN_TEST_BIN := $(HOST_BUILD)/dist_connectivity_tests
 DIST_GAP_TEST_BIN := $(HOST_BUILD)/dist_pair_gap_tests
+GATE_TEST_BIN := $(HOST_BUILD)/gate_entanglement_tests
+GATE_TRACE_TEST_BIN := $(HOST_BUILD)/gate_trace_tests
+RPPU_GATE_TRACE_BIN := $(BUILD)/rppu_gate_trace.exe
 SPECTRAL_TEST_BIN := $(HOST_BUILD)/spectral_tests
 FRONT_TEST_BIN := $(HOST_BUILD)/front_metrics_tests
 GMN_SOLVER_TEST_BIN := $(HOST_BUILD)/gmn_solver_tests
@@ -209,6 +212,9 @@ CORE_TEST_OBJS := $(HOST_BUILD)/core_tests.o
 DIST_TEST_OBJS := $(HOST_BUILD)/dist_metrics_tests.o
 DIST_CONN_TEST_OBJS := $(HOST_BUILD)/dist_connectivity_tests.o
 DIST_GAP_TEST_OBJS := $(HOST_BUILD)/dist_pair_gap_tests.o
+GATE_TEST_OBJS := $(HOST_BUILD)/gate_entanglement_tests.o
+GATE_TRACE_TEST_OBJS := $(HOST_BUILD)/gate_trace_tests.o
+RPPU_GATE_TRACE_OBJS := $(BUILD)/rppu_gate_trace.o
 SPECTRAL_TEST_OBJS := $(HOST_BUILD)/spectral_tests.o
 FRONT_TEST_OBJS := $(HOST_BUILD)/front_metrics_tests.o
 # Exercises both GMN back ends, so it links the C API and the Fusion object.
@@ -223,6 +229,7 @@ ifeq ($(CUSV),1)
   FREE_ENERGY_OBJS += $(CUSV_OBJS)
   SIM_TMI_OBJS += $(CUSV_OBJS)
   DIST_SCALING_OBJS += $(CUSV_OBJS)
+  RPPU_GATE_TRACE_OBJS += $(CUSV_OBJS)
   ENTROPY_OBJS += $(CUSV_OBJS)
 endif
 
@@ -235,13 +242,14 @@ ifeq ($(CUDA_RHO),1)
   # The connected-zero four-site pass reduces on the host -- see the batch4
   # lambda in dist_scaling.hpp for why there is no device path to link.
   DIST_SCALING_OBJS += $(BUILD)/rho2_reduce.o $(BUILD)/rho_reduce.o
+  RPPU_GATE_TRACE_OBJS += $(BUILD)/rho2_reduce.o
   ENTROPY_OBJS += $(BUILD)/rho_reduce.o $(BUILD)/entropy_cuda.o
 endif
 
 ALL_OBJS := $(MIPT_OBJS) $(MIPT_PROBED_OBJS) $(FREE_ENERGY_OBJS) \
   $(SIM_TMI_OBJS) $(DIST_SCALING_OBJS) $(ENTROPY_OBJS) $(GMN_OBJS) $(FGMN_OBJS) \
   $(RING_OBJS) $(EXP_VALS_OBJS) $(CORE_TEST_OBJS) $(DIST_TEST_OBJS) \
-  $(DIST_CONN_TEST_OBJS) $(DIST_GAP_TEST_OBJS) \
+  $(DIST_CONN_TEST_OBJS) $(DIST_GAP_TEST_OBJS) $(GATE_TEST_OBJS) $(GATE_TRACE_TEST_OBJS) \
   $(SPECTRAL_TEST_OBJS) $(FRONT_TEST_OBJS) $(GMN_SOLVER_TEST_OBJS) \
   $(MIPT_PROBED_FGMN_PIC_OBJ)
 DEPS := $(ALL_OBJS:.o=.d)
@@ -257,7 +265,7 @@ MIPT_HEADERS := $(shell find include -name '*.hpp' 2>/dev/null)
 # into a binary. (Same reasoning as MIPT_HEADERS above, which covers nvq++.)
 MIPT_CUDA_HEADERS := $(shell find include -name '*.cuh' 2>/dev/null) $(MIPT_HEADERS)
 
-.PHONY: all simulation analysis clean cpu gpu print-config format test-core test-dist test-front \
+.PHONY: all simulation analysis clean cpu gpu print-config format test-core test-dist test-gate test-front \
   test-spectral test-gmn test-rdm-gram test-rho-reduce test-cusv test-cusv-gates \
   test-mode3 test-cusv-parity test-probed-parity bench-cusv \
   mipt.exe mipt_probed.exe free_energy.exe sim_tmi.exe dist_scaling.exe \
@@ -279,6 +287,10 @@ mipt_probed.exe: $(MIPT_PROBED_BIN) $(MIPT_PROBED_FGMN_LIB)
 free_energy.exe: $(FREE_ENERGY_BIN)
 	cp $< $@
 sim_tmi.exe: $(SIM_TMI_BIN)
+	cp $< $@
+# Stage-2 gate-trace replay. Needs the cuStateVec engine and an FP64=1 build
+# matching the run being replayed; it refuses otherwise.
+rppu_gate_trace.exe: $(RPPU_GATE_TRACE_BIN)
 	cp $< $@
 dist_scaling.exe: $(DIST_SCALING_BIN) $(MIPT_PROBED_FGMN_LIB)
 	cp $(DIST_SCALING_BIN) $@
@@ -330,6 +342,12 @@ $(DIST_CONN_TEST_BIN): $(DIST_CONN_TEST_OBJS)
 	$(HOSTCXX) $^ -o $@
 $(DIST_GAP_TEST_BIN): $(DIST_GAP_TEST_OBJS)
 	$(HOSTCXX) $^ -pthread -o $@
+$(GATE_TEST_BIN): $(GATE_TEST_OBJS)
+	$(HOSTCXX) $^ -o $@
+$(GATE_TRACE_TEST_BIN): $(GATE_TRACE_TEST_OBJS)
+	$(HOSTCXX) $^ -o $@
+$(RPPU_GATE_TRACE_BIN): $(RPPU_GATE_TRACE_OBJS)
+	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $^ $(MIPT_CUDA_LIBS) $(DIST_SCALING_CUDA_LIBS) $(CUSV_LIBS) $(DL_LIBS) -o $@
 $(DIST_TEST_BIN): $(DIST_TEST_OBJS)
 	$(HOSTCXX) $^ -o $@
 $(SPECTRAL_TEST_BIN): $(SPECTRAL_TEST_OBJS)
@@ -344,10 +362,16 @@ test-core: $(CORE_TEST_BIN)
 # Both halves of the dist_scaling host surface: the metrics/CSV/record round
 # trips, and the spacetime graph plus the logical layer projection it is built
 # from.
-test-dist: $(DIST_TEST_BIN) $(DIST_CONN_TEST_BIN) $(DIST_GAP_TEST_BIN)
+test-dist: $(DIST_TEST_BIN) $(DIST_CONN_TEST_BIN) $(DIST_GAP_TEST_BIN) $(GATE_TEST_BIN) \
+  $(GATE_TRACE_TEST_BIN)
+	$(GATE_TEST_BIN)
+	$(GATE_TRACE_TEST_BIN)
 	$(DIST_TEST_BIN)
 	$(DIST_CONN_TEST_BIN)
 	$(DIST_GAP_TEST_BIN)
+# Gate entanglement metrics alone (also run by test-dist).
+test-gate: $(GATE_TEST_BIN)
+	$(GATE_TEST_BIN)
 test-spectral: $(SPECTRAL_TEST_BIN)
 	$(SPECTRAL_TEST_BIN)
 test-front: $(FRONT_TEST_BIN)
@@ -467,6 +491,8 @@ $(BUILD)/sim_tmi.o: apps/sim_tmi.cpp $(MIPT_HEADERS) | $(BUILD)
 	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $(NVQXXFLAGS_COMMON) -c $< -o $@
 $(BUILD)/dist_scaling.o: apps/dist_scaling.cpp $(MIPT_HEADERS) | $(BUILD)
 	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $(NVQXXFLAGS_COMMON) -c $< -o $@
+$(BUILD)/rppu_gate_trace.o: apps/rppu_gate_trace.cpp $(MIPT_HEADERS) | $(BUILD)
+	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $(NVQXXFLAGS_COMMON) -c $< -o $@
 $(BUILD)/entropy.o: apps/entropy.cpp $(MIPT_HEADERS) | $(BUILD)
 	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $(NVQXXFLAGS_COMMON) -c $< -o $@
 
@@ -516,6 +542,10 @@ $(HOST_BUILD)/core_tests.o: tests/core_tests.cpp | $(HOST_BUILD)
 $(HOST_BUILD)/dist_pair_gap_tests.o: tests/dist_pair_gap_tests.cpp | $(HOST_BUILD)
 	$(HOSTCXX) $(CPPFLAGS_COMMON) -std=c++20 -O2 -pthread -MMD -MP -c $< -o $@
 $(HOST_BUILD)/dist_connectivity_tests.o: tests/dist_connectivity_tests.cpp | $(HOST_BUILD)
+	$(HOSTCXX) $(CPPFLAGS_COMMON) -std=c++20 -O2 -MMD -MP -c $< -o $@
+$(HOST_BUILD)/gate_entanglement_tests.o: tests/gate_entanglement_tests.cpp | $(HOST_BUILD)
+	$(HOSTCXX) $(CPPFLAGS_COMMON) -std=c++20 -O2 -MMD -MP -c $< -o $@
+$(HOST_BUILD)/gate_trace_tests.o: tests/gate_trace_tests.cpp | $(HOST_BUILD)
 	$(HOSTCXX) $(CPPFLAGS_COMMON) -std=c++20 -O2 -MMD -MP -c $< -o $@
 $(HOST_BUILD)/dist_metrics_tests.o: tests/dist_metrics_tests.cpp | $(HOST_BUILD)
 	$(HOSTCXX) $(CPPFLAGS_COMMON) -std=c++20 -O2 -MMD -MP -c $< -o $@

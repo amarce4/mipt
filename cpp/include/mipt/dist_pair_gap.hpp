@@ -57,6 +57,7 @@
 #include "mipt/analysis/separability.hpp"
 #include "mipt/dist_pair_four.hpp"
 #include "mipt/analysis/fgmn.hpp"
+#include "mipt/analysis/gate_entanglement.hpp"
 #include "mipt/dist_connectivity.hpp"
 #include "mipt/dist_metrics.hpp"
 #include "mipt/dist_scaling_csv.hpp"
@@ -92,7 +93,12 @@ namespace mipt::dist::gap
 // four-way fgmn_class) and the per-pair summary file. Version 1 rows recorded a
 // single fGMN value and a bare positive/failed flag, which cannot be
 // reclassified at another threshold, so they are not readable here.
-inline constexpr int GAP_FORMAT_VERSION = 2;
+// 3: the gate-path columns (path_unitary_count_ij, shortest_maximin_gate_ep_ij,
+// widest_gate_ep_ij, widest_even_mix_ij, widest_odd_mix_ij) on every outcome and
+// pair-summary row, and gate_diagnostics_version in the provenance block (0 when
+// MIPT_DIST_GATE_DIAGNOSTICS is off, GATE_DIAGNOSTICS_VERSION when on). A v2 file
+// has neither, so its header no longer matches and it is refused by name.
+inline constexpr int GAP_FORMAT_VERSION = 3;
 // FGMN_STATUS_* are the solver's own codes; this one is ours.
 inline constexpr int STATUS_PREFILTERED = -1;
 
@@ -226,6 +232,9 @@ struct PairSnapshot
     double chord = 0.0;
     PairMetrics fermion;           // fermionic trace; mn is the closed form
     PairConnectivity conn;
+    // Gate quality on the pair's connecting paths; `available` is false unless
+    // the run enabled MIPT_DIST_GATE_DIAGNOSTICS and the pair has a path.
+    GatePathMetrics gate_path;
     bool entangled = false;        // fermion.mn > pair_zero_tol
     ZeroClass zero_class = ZeroClass::Silent; // meaningful only when !entangled
     const double *fermion_rho_ri = nullptr;   // raw reducer output, 32 doubles
@@ -987,6 +996,7 @@ inline const std::vector<std::string> &outcome_columns()
             // provenance
             "N", "periods", "p", "circ_type", "circuit_name", "master_seed", "statevector_precision",
             "boundary_implementation", "connectivity_graph_version", "gap_format_version",
+            "gate_diagnostics_version",
             // thresholds
             "pair_zero_tol", "occupation_mi_tol", "channel_floor", "fgmn_positive_tol",
             "prefilter_tol", "cut_positive_tol", "correlation_tol", "mosek_tol",
@@ -1010,6 +1020,13 @@ inline const std::vector<std::string> &outcome_columns()
             // event, never a redefinition of it.
             "f_channel_log_weight", "g_channel_log_weight", "f_channel_bottleneck",
             "g_channel_bottleneck", "f_channel_multiplicity", "g_channel_multiplicity",
+            // Gate quality along the pair's spacetime paths (gate format v3,
+            // MIPT_DIST_GATE_DIAGNOSTICS). All five are nan unless the run
+            // enabled the diagnostics and the endpoints share a component, so a
+            // missing path is never a zero. Like the channel columns, these sit
+            // beside the percolation event and do not redefine it.
+            "path_unitary_count_ij", "shortest_maximin_gate_ep_ij", "widest_gate_ep_ij",
+            "widest_even_mix_ij", "widest_odd_mix_ij",
             // third-site graph
             "survives_k", "idle_k", "interior_path_ik", "connected_ik", "shortest_path_ik",
             "interior_path_jk", "connected_jk", "shortest_path_jk", "same_component_ijk"};
@@ -1139,11 +1156,40 @@ inline std::size_t edge_slot(int p, int q)
 }
 
 // Fixed per-run text: the provenance and threshold block, rendered once.
+//
+// `gate` is gate_diagnostics_version, kept apart from `provenance` because the
+// four-site CSV shares the provenance block and does not carry it: the outcome
+// and pair-summary rows append it right after gap_format_version.
 struct RowPrefix
 {
     std::string provenance;
+    std::string gate;
     std::string thresholds;
 };
+
+// What gate_diagnostics_version a run writes: 0 with the diagnostics off.
+inline int gate_diagnostics_version(const RunConfig &config)
+{
+    return config.gate_path_diagnostics ? GATE_DIAGNOSTICS_VERSION : 0;
+}
+
+// The five gate-path columns. All nan when the metrics are unavailable -- the
+// diagnostics were off, or the endpoints share no component -- and the unitary
+// count is written as an integer otherwise, so `gate_path_from_fields` can tell
+// the two apart from the count alone and the round trip is exact.
+inline void append_gate_path(std::string &out, const GatePathMetrics &gate)
+{
+    if (!gate.available)
+    {
+        out += ",nan,nan,nan,nan,nan";
+        return;
+    }
+    field(out, static_cast<long long>(gate.shortest_path_unitary_count));
+    field(out, gate.shortest_maximin_entangling_power);
+    field(out, gate.widest_entangling_power);
+    field(out, gate.widest_even_block_mixing);
+    field(out, gate.widest_odd_block_mixing);
+}
 
 inline RowPrefix row_prefix(const RunConfig &config)
 {
@@ -1160,6 +1206,7 @@ inline RowPrefix row_prefix(const RunConfig &config)
     p += ',' + csv_quote(config.boundary_implementation());
     p += ',' + std::to_string(CONNECTIVITY_GRAPH_VERSION);
     p += ',' + std::to_string(GAP_FORMAT_VERSION);
+    out.gate = std::to_string(gate_diagnostics_version(config));
 
     std::string &t = out.thresholds;
     append_double(t, config.pair_zero_tol);
@@ -1222,6 +1269,8 @@ inline void append_outcome_row(std::string &out, const RowPrefix &prefix,
     out += ',';
     out += prefix.provenance;
     out += ',';
+    out += prefix.gate;
+    out += ',';
     out += prefix.thresholds;
 
     const PairMetrics &f = pair.fermion;
@@ -1274,6 +1323,9 @@ inline void append_outcome_row(std::string &out, const RowPrefix &prefix,
     field(out, channels.hop_bottleneck);
     field(out, static_cast<long long>(channels.pair_multiplicity));
     field(out, static_cast<long long>(channels.hop_multiplicity));
+    // The row's own snapshot: an anchor's paths, or a control's (normally
+    // unavailable, since a control is graph-disconnected by definition).
+    append_gate_path(out, pair.gate_path);
 
     field_flag(out, conn_ik.survives_j);
     field(out, static_cast<long long>(conn_ik.idle_j));
@@ -1427,6 +1479,7 @@ struct RowSummary
     long long vertex_disjoint = 0;
     ComponentAnatomy anatomy;
     ChannelConnectivity channels;
+    GatePathMetrics gate_path; // only the five written columns survive a round trip
     bool survives_i = false;
     bool survives_j = false;
     bool interior_path = false;
@@ -1505,6 +1558,7 @@ struct PairSummaryRow
     long long vertex_disjoint = 0;
     ComponentAnatomy anatomy;
     ChannelConnectivity channels;
+    GatePathMetrics gate_path; // only the five written columns survive a round trip
     bool survives_i = false;
     bool survives_j = false;
     bool interior_path = false;
@@ -1576,6 +1630,7 @@ inline PairSummaryRow summarize_pair(const RowSummary *rows, std::size_t count)
     out.vertex_disjoint = head.vertex_disjoint;
     out.anatomy = head.anatomy;
     out.channels = head.channels;
+    out.gate_path = head.gate_path;
     out.survives_i = head.survives_i;
     out.survives_j = head.survives_j;
     out.interior_path = head.interior_path;
@@ -1837,6 +1892,7 @@ inline const std::vector<std::string> &pair_summary_columns()
         // provenance
         "N", "periods", "p", "circ_type", "circuit_name", "master_seed", "statevector_precision",
         "boundary_implementation", "connectivity_graph_version", "gap_format_version",
+        "gate_diagnostics_version",
         // thresholds
         "pair_zero_tol", "occupation_mi_tol", "channel_floor", "fgmn_positive_tol", "prefilter_tol",
         "cut_positive_tol", "correlation_tol", "mosek_tol",
@@ -1850,6 +1906,8 @@ inline const std::vector<std::string> &pair_summary_columns()
         "endpoint_degree_j", "shortest_path_gates", "shortest_path_temporal",
         "f_channel_log_weight", "g_channel_log_weight", "f_channel_bottleneck",
         "g_channel_bottleneck", "f_channel_multiplicity", "g_channel_multiplicity",
+        "path_unitary_count_ij", "shortest_maximin_gate_ep_ij", "widest_gate_ep_ij",
+        "widest_even_mix_ij", "widest_odd_mix_ij",
         // the thirds
         "thirds", "thirds_same_component", "thirds_positive", "thirds_bounded_below_threshold",
         "thirds_unresolved", "thirds_failed", "thirds_all_cuts_entangled",
@@ -1890,6 +1948,8 @@ inline void append_pair_summary_row(std::string &out, const RowPrefix &prefix,
     out += ',';
     out += prefix.provenance;
     out += ',';
+    out += prefix.gate;
+    out += ',';
     out += prefix.thresholds;
 
     field(out, row.pair_fn);
@@ -1925,6 +1985,7 @@ inline void append_pair_summary_row(std::string &out, const RowPrefix &prefix,
     field(out, row.channels.hop_bottleneck);
     field(out, static_cast<long long>(row.channels.pair_multiplicity));
     field(out, static_cast<long long>(row.channels.hop_multiplicity));
+    append_gate_path(out, row.gate_path);
 
     field(out, static_cast<long long>(row.thirds));
     field(out, static_cast<long long>(row.thirds_same_component));
@@ -2293,6 +2354,8 @@ struct OutcomeColumns
     std::size_t mean_branch = 0, max_branch = 0, degree_i = 0, degree_j = 0;
     std::size_t path_gates = 0, path_temporal = 0;
     std::size_t f_log = 0, g_log = 0, f_bottleneck = 0, g_bottleneck = 0, f_mult = 0, g_mult = 0;
+    std::size_t gate_version = 0, gate_unitaries = 0, gate_maximin = 0, gate_widest = 0;
+    std::size_t gate_even = 0, gate_odd = 0;
 
     static OutcomeColumns resolve()
     {
@@ -2361,6 +2424,12 @@ struct OutcomeColumns
         c.g_bottleneck = at("g_channel_bottleneck");
         c.f_mult = at("f_channel_multiplicity");
         c.g_mult = at("g_channel_multiplicity");
+        c.gate_version = at("gate_diagnostics_version");
+        c.gate_unitaries = at("path_unitary_count_ij");
+        c.gate_maximin = at("shortest_maximin_gate_ep_ij");
+        c.gate_widest = at("widest_gate_ep_ij");
+        c.gate_even = at("widest_even_mix_ij");
+        c.gate_odd = at("widest_odd_mix_ij");
         return c;
     }
 };
@@ -2450,6 +2519,19 @@ inline RowSummary row_summary_from_fields(const std::vector<std::string> &fields
     row.channels.hop_bottleneck = number(c.g_bottleneck, "g_channel_bottleneck");
     row.channels.pair_multiplicity = static_cast<int>(integer(c.f_mult));
     row.channels.hop_multiplicity = static_cast<int>(integer(c.g_mult));
+    // `append_gate_path` writes the count as an integer exactly when the
+    // metrics were available, so its text alone restores `available`.
+    if (fields[c.gate_unitaries] != "nan")
+    {
+        row.gate_path.available = true;
+        row.gate_path.shortest_path_unitary_count = static_cast<int>(integer(c.gate_unitaries));
+        row.gate_path.shortest_path_length = static_cast<int>(row.shortest_path);
+        row.gate_path.shortest_maximin_entangling_power =
+            number(c.gate_maximin, "shortest_maximin_gate_ep_ij");
+        row.gate_path.widest_entangling_power = number(c.gate_widest, "widest_gate_ep_ij");
+        row.gate_path.widest_even_block_mixing = number(c.gate_even, "widest_even_mix_ij");
+        row.gate_path.widest_odd_block_mixing = number(c.gate_odd, "widest_odd_mix_ij");
+    }
     row.survives_i = flag(c.survives_i);
     row.survives_j = flag(c.survives_j);
     row.interior_path = flag(c.interior);
@@ -2465,11 +2547,17 @@ inline RowSummary row_summary_from_fields(const std::vector<std::string> &fields
 // kill it can hold trajectories the pair checkpoint does not. The outcome rows
 // are the record of what was measured; the aggregate is recomputed from them,
 // which is also what makes the two reconcile exactly.
+//
+// `expected_gate_version`, when non-empty, is the gate_diagnostics_version this
+// run writes. Every kept row must carry the same value: the summary is rewritten
+// with this run's prefix, so a row from a run with the diagnostics switched the
+// other way would come back under the wrong provenance.
 using PairSummarySink = std::function<void(const PairSummaryRow &)>;
 
 inline OutcomeScan scan_outcomes(const std::string &path, std::uint64_t completed,
                                  GapAggregate &aggregate, const PairGapSettings &settings,
-                                 const PairSummarySink &sink = PairSummarySink())
+                                 const PairSummarySink &sink = PairSummarySink(),
+                                 const std::string &expected_gate_version = std::string())
 {
     std::ifstream file(path, std::ios::binary);
     if (!file)
@@ -2560,6 +2648,14 @@ inline OutcomeScan scan_outcomes(const std::string &path, std::uint64_t complete
         {
             util::resume::refuse(path + " skips or repeats an outcome_id near row " +
                                  std::to_string(scan.rows_kept + 2) + ".");
+        }
+        if (!expected_gate_version.empty() && fields[c.gate_version] != expected_gate_version)
+        {
+            util::resume::refuse(
+                path + " was written with gate_diagnostics_version=" + fields[c.gate_version] +
+                " but this run writes " + expected_gate_version +
+                " (MIPT_DIST_GATE_DIAGNOSTICS). Resume with the setting the file was "
+                "started with, move it aside, or set MIPT_DIST_RESUME=0.");
         }
         RowSummary row = row_summary_from_fields(fields, c, path, settings.positive_tol,
                                                  settings.cut_positive_tol);
@@ -2987,6 +3083,7 @@ class PairGapAnalysis
                     row.vertex_disjoint = paths.vertex;
                     row.anatomy = anatomy;
                     row.channels = channels;
+                    row.gate_path = pair.gate_path;
                     row.survives_i = pair.conn.survives_i;
                     row.survives_j = pair.conn.survives_j;
                     row.interior_path = pair.conn.interior_path;
@@ -3260,7 +3357,8 @@ class PairGapAnalysis
             scan_outcomes(outcome_path_, completed_, aggregate_, settings_,
                           [&](const PairSummaryRow &summary) {
                               append_pair_summary_row(rebuilt, prefix_, run_, summary);
-                          });
+                          },
+                          prefix_.gate);
         restored_rows_ = scan.rows_kept;
         restored_trimmed_ = scan.trimmed;
         next_outcome_id_ = scan.rows_kept;

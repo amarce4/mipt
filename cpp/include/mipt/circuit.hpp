@@ -16,6 +16,7 @@
 #include <memory>
 #include <optional>
 #include <random>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -56,6 +57,54 @@ struct ZeroStateKernel
     }
 };
 
+#ifdef MIPT_ENABLE_CUSV
+// A read-only window onto a trajectory as the cuStateVec engine runs it.
+//
+// Exists for one consumer, the stage-2 gate-trace replay (rppu_gate_trace.exe),
+// which has to see the state *between* the unitary half and the measurement
+// half of chosen layers of a trajectory it regenerates from a recorded seed.
+// Regenerating is only worth anything if the outcomes come out the same, and
+// they only do if the replay drives the identical engine calls with the
+// identically seeded measure_rng_ -- so the replay has to run *this* code, not
+// a copy of it. The hook is how it does that without a second simulator.
+//
+// Zero behaviour change by construction:
+//   * with no observer installed (the default, and every production caller)
+//     the engine calls are the same calls, in the same order, with the same
+//     arguments as before the hook existed;
+//   * with one installed, the only differences are the callbacks themselves
+//     and an `outcomes` vector handed to measure_layer*(), which those
+//     functions only ever write -- they draw exactly the same uniforms from
+//     the rng either way (cusv/engine.hpp);
+//   * an observer must not mutate the engine. It gets a reference so it can
+//     call to_host(); anything else would change the trajectory it is
+//     observing.
+//
+// `layer` indexes the prepared layer list. `encoded` says whether the engine
+// currently holds the even-parity-sector state on n-1 qubits (try_cusv_parity)
+// or the full 2^n state (try_cusv); `n` is always the full mode count. The
+// measured `sites` and their `outcomes` are given in the order the layer lists
+// them.
+struct LayerObserver
+{
+    virtual ~LayerObserver() = default;
+    virtual void before_unitaries(std::size_t layer, cusv::Engine &engine, bool encoded,
+                                  int n) = 0;
+    virtual void after_measurements(std::size_t layer, cusv::Engine &engine, bool encoded,
+                                    int n, const std::vector<int> &sites,
+                                    const std::vector<int> &outcomes) = 0;
+};
+#endif
+
+// Which engine produced the last trajectory; see Circuit1D::last_engine_path().
+enum class EnginePath
+{
+    None,
+    CusvParity,
+    Cusv,
+    CudaqFallback,
+};
+
 class Circuit1D
 {
   public:
@@ -90,7 +139,40 @@ class Circuit1D
 #endif
     }
 
+    // Refuse, rather than take, the CUDA-Q gate-by-gate fallback. Off by
+    // default and never set by a production executable. The gate-trace replay
+    // sets it because measurement outcomes only follow the seed on the
+    // cuStateVec path: a trajectory that silently fell back would be a
+    // different trajectory with the right layer draw, which is exactly the
+    // failure a replay cannot afford to make quietly. Honoured by the
+    // circuits the engine implements (RPPU, qRPPU); see refuse_fallback().
+    void require_cusv(bool required) { require_cusv_ = required; }
+    EnginePath last_engine_path() const { return last_engine_path_; }
+
+#ifdef MIPT_ENABLE_CUSV
+    // Install (or with nullptr, remove) the observer consulted by try_cusv and
+    // try_cusv_parity. Not owned. nullptr is the default and the production
+    // configuration.
+    void set_layer_observer(LayerObserver *observer) { observer_ = observer; }
+#endif
+
   protected:
+    bool require_cusv_ = false;
+    EnginePath last_engine_path_ = EnginePath::None;
+
+    void refuse_fallback(std::string_view name) const
+    {
+        if (require_cusv_)
+        {
+            throw std::runtime_error(
+                std::string(name) +
+                ": the cuStateVec engine could not run this trajectory and the caller "
+                "requires it (the CUDA-Q fallback draws measurement outcomes from a stream "
+                "the seed does not control). Check MIPT_CUSV, the CUDA-Q target, and that "
+                "the build has CUSV=1.");
+        }
+    }
+
     // Shared by every circuit so that seed() has one stream to pin rather than
     // five identical private ones.
     std::mt19937 rng_{std::random_device{}()};
@@ -178,11 +260,23 @@ class Circuit1D
         engine_->adopt(tensor.data, n);
 
         const int block = cusv::max_block_targets();
-        for (const auto &layer : layers)
+        for (std::size_t index = 0; index < layers.size(); ++index)
         {
-            const auto ops = build_ops(layer);
+            const auto ops = build_ops(layers[index]);
+            if (observer_ == nullptr)
+            {
+                engine_->apply_ops(ops.ops, block);
+                engine_->measure_layer(ops.measure_sites, measure_rng_);
+                continue;
+            }
+            // Same calls as above; the outcomes vector is write-only inside
+            // measure_layer, so the rng draws are identical.
+            observer_->before_unitaries(index, *engine_, false, n);
             engine_->apply_ops(ops.ops, block);
-            engine_->measure_layer(ops.measure_sites, measure_rng_);
+            observed_outcomes_.clear();
+            engine_->measure_layer(ops.measure_sites, measure_rng_, &observed_outcomes_);
+            observer_->after_measurements(index, *engine_, false, n, ops.measure_sites,
+                                          observed_outcomes_);
         }
         return state;
     }
@@ -249,8 +343,19 @@ class Circuit1D
         const int block = cusv::max_block_targets();
         for (std::size_t i = 0; i < encoded.size(); ++i)
         {
+            if (observer_ == nullptr)
+            {
+                engine_->apply_ops(encoded[i], block);
+                engine_->measure_layer_encoded(measured[i], n, measure_rng_);
+                continue;
+            }
+            // Same calls as above; see LayerObserver for why the outcomes
+            // vector changes nothing.
+            observer_->before_unitaries(i, *engine_, true, n);
             engine_->apply_ops(encoded[i], block);
-            engine_->measure_layer_encoded(measured[i], n, measure_rng_);
+            observed_outcomes_.clear();
+            engine_->measure_layer_encoded(measured[i], n, measure_rng_, &observed_outcomes_);
+            observer_->after_measurements(i, *engine_, true, n, measured[i], observed_outcomes_);
         }
         engine_->expand_parity_sector(n);
         return state;
@@ -259,6 +364,8 @@ class Circuit1D
     std::unique_ptr<cusv::Engine> engine_;
     // Separate stream so measurement outcomes never perturb layer sampling.
     std::mt19937 measure_rng_{std::random_device{}()};
+    LayerObserver *observer_ = nullptr;
+    std::vector<int> observed_outcomes_;
 #endif
 };
 
@@ -360,19 +467,29 @@ class RppuCircuit1D final : public Circuit1D
         { return cusv::build_rppu_layer_ops(layer, n); };
         if (auto fast = try_cusv_parity(n, layers_, rppu_ops))
         {
+            last_engine_path_ = EnginePath::CusvParity;
             log_done(context, "FermionRPPU", start);
             return {std::move(*fast), std::move(history)};
         }
         if (auto fast = try_cusv(n, layers_, rppu_ops))
         {
+            last_engine_path_ = EnginePath::Cusv;
             log_done(context, "FermionRPPU", start);
             return {std::move(*fast), std::move(history)};
         }
 #endif
+        refuse_fallback("FermionRPPU");
+        last_engine_path_ = EnginePath::CudaqFallback;
         auto state = cudaq::get_state(RppuKernel1D{}, n, layers_);
         log_done(context, "FermionRPPU", start);
         return {std::move(state), std::move(history)};
     }
+
+    // The layer list the last simulate() drew and ran, after any debug
+    // truncation -- the exact list the engine executed, so a replay can rebuild
+    // each gate's 4x4 from it (rppu_gate_matrix) rather than redrawing.
+    // Already filled in when the first LayerObserver callback fires.
+    const std::vector<RppuLayer> &layers() const { return layers_; }
 
   private:
     std::vector<RppuLayer> layers_;
@@ -430,15 +547,19 @@ class QrppuCircuit1D final : public Circuit1D
         { return cusv::build_rppu_layer_ops(layer, n); };
         if (auto fast = try_cusv_parity(n, layers_, rppu_ops))
         {
+            last_engine_path_ = EnginePath::CusvParity;
             log_done(context, "qRPPU", start);
             return {std::move(*fast), std::move(history)};
         }
         if (auto fast = try_cusv(n, layers_, rppu_ops))
         {
+            last_engine_path_ = EnginePath::Cusv;
             log_done(context, "qRPPU", start);
             return {std::move(*fast), std::move(history)};
         }
 #endif
+        refuse_fallback("qRPPU");
+        last_engine_path_ = EnginePath::CudaqFallback;
         auto state = cudaq::get_state(RppuKernel1D{}, n, layers_);
         log_done(context, "qRPPU", start);
         return {std::move(state), std::move(history)};

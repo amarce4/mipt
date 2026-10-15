@@ -200,17 +200,18 @@ inline LayerOps build_haar_layer_ops(const HaarLayer &layer, int n)
 // Bit 0 is gate.q0.
 inline DenseMatrix rppu_bond_matrix(const RppuBondGate &gate)
 {
-    const Matrix2 even = mat_from_u2_params(gate.even);
-    const Matrix2 odd = mat_from_u2_params(gate.odd);
+    // One definition of the layout, shared with the gate diagnostics
+    // (mipt::parity_preserving_matrix), so the entangling power a graph edge
+    // carries is the entangling power of exactly this matrix.
+    const GateMatrix4 source = rppu_gate_matrix(gate);
     DenseMatrix m(2);
-    m.at(0, 0) = even[0];
-    m.at(0, 3) = even[1];
-    m.at(3, 0) = even[2];
-    m.at(3, 3) = even[3];
-    m.at(2, 2) = odd[0];
-    m.at(2, 1) = odd[1];
-    m.at(1, 2) = odd[2];
-    m.at(1, 1) = odd[3];
+    for (int r = 0; r < 4; ++r)
+    {
+        for (int c = 0; c < 4; ++c)
+        {
+            m.at(r, c) = source[static_cast<std::size_t>(r * 4 + c)];
+        }
+    }
     return m;
 }
 
