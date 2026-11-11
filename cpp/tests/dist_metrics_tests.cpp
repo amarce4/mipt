@@ -14,7 +14,9 @@
 #include <iterator>
 #include <functional>
 #include <limits>
+#include <map>
 #include <random>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -1571,6 +1573,1043 @@ void test_dist_gate_diagnostics()
 }
 
 // ---------------------------------------------------------------------------
+// Temporal-turn diagnostics (MIPT_DIST_TURN_DIAGNOSTICS): the twenty-one record
+// values and their NaN rule, flag bits 7-9, the header provenance, the three
+// refined contingency tables of the pair CSV and their exact invariants, the
+// resume refusals in both directions, and the one precondition of their own.
+// The shapes and the doubled network themselves are pinned by
+// temporal_turn_tests; this pins what the writers do with them, on PairTurns a
+// real ConnectivityIndex computed from hand-built histories.
+// ---------------------------------------------------------------------------
+namespace dist_turn_tests
+{
+namespace dist = mipt::dist;
+namespace rec = mipt::dist::records;
+namespace res = mipt::dist::resume;
+using dist_gate_tests::erase_all;
+using dist_gate_tests::GATE_NAMES;
+using dist_gate_tests::pair_embeddings;
+using dist_gate_tests::refuses_argument;
+using dist_record_tests::read_back;
+using dist_resume_tests::expect;
+using dist_resume_tests::refuses;
+
+std::string scratch_directory()
+{
+    const auto path = std::filesystem::temp_directory_path() / "mipt_dist_turn_tests";
+    std::filesystem::remove_all(path);
+    std::filesystem::create_directories(path);
+    return path.string();
+}
+
+// The contract's names and lines, spelled out rather than taken from the code
+// under test.
+const std::vector<std::string> TURN_NAMES{
+    "sm_turns",        "sm_temporal_forward", "sm_temporal_backward", "sm_min_layer",
+    "sm_max_layer",    "sm_class",            "sm_bridges",           "sm_bridges_measured",
+    "sm_bridges_trace_only", "sm_cancelled_gates",
+    "wd_turns",        "wd_temporal_forward", "wd_temporal_backward", "wd_min_layer",
+    "wd_max_layer",    "wd_class",            "wd_bridges",           "wd_bridges_measured",
+    "wd_bridges_trace_only", "wd_cancelled_gates",
+    "min_turns"};
+const std::string OLD_FLAG_BITS =
+    "flag_bits=0:evaluated,1:survives_i,2:survives_j,3:interior_path,4:connected\n";
+const std::string TURN_FLAG_BITS =
+    "flag_bits=0:evaluated,1:survives_i,2:survives_j,3:interior_path,4:connected,"
+    "5:fn_positive,6:mn_positive,7:connected_common_source,8:connected_certified,"
+    "9:connected_doubled\n";
+const std::string TURN_META =
+    ",turn_diagnostics,turn_diagnostics_version,turn_diagnostics_definition";
+const std::string TURN_COUNTERS =
+    "connected_common_source_count,connected_common_source_ent_positive_count,"
+    "connected_common_source_ent_zero_count,disconnected_common_source_ent_positive_count,"
+    "disconnected_common_source_ent_zero_count,"
+    "connected_certified_count,connected_certified_ent_positive_count,"
+    "connected_certified_ent_zero_count,disconnected_certified_ent_positive_count,"
+    "disconnected_certified_ent_zero_count,"
+    "connected_doubled_count,connected_doubled_ent_positive_count,"
+    "connected_doubled_ent_zero_count,disconnected_doubled_ent_positive_count,"
+    "disconnected_doubled_ent_zero_count";
+constexpr std::uint32_t TURN_BITS = mipt::dist::FLAG_CONNECTED_COMMON_SOURCE |
+                                    mipt::dist::FLAG_CONNECTED_CERTIFIED |
+                                    mipt::dist::FLAG_CONNECTED_DOUBLED;
+const std::string NESTING = "C_common_source <= C_certified <= C_doubled <= C";
+
+dist::RunConfig turn_config(bool turn)
+{
+    dist::RunConfig config = dist_gate_tests::rppu_config(true);
+    config.turn_diagnostics = turn;
+    return config;
+}
+
+std::size_t slot_of(const std::vector<std::string> &names, const std::string &name)
+{
+    return static_cast<std::size_t>(std::find(names.begin(), names.end(), name) - names.begin());
+}
+
+// A history from bonds per layer and (layer, mode) measurements. Every gate
+// carries capacities, which the canonical paths need to exist at all; the
+// turn values do not read them.
+mipt::LogicalHistory make_history(int n, const std::vector<std::vector<std::pair<int, int>>> &bonds,
+                                  const std::vector<std::pair<int, int>> &measured,
+                                  bool gate_metrics = true)
+{
+    mipt::LogicalHistory history;
+    history.reset(n);
+    for (std::size_t t = 0; t < bonds.size(); ++t)
+    {
+        mipt::LogicalLayer layer;
+        layer.measured.assign(static_cast<std::size_t>(n), 0u);
+        int index = 0;
+        for (const auto &[a, b] : bonds[t])
+        {
+            mipt::LogicalBond bond{a, b};
+            bond.source_gate_index = index++;
+            if (gate_metrics)
+            {
+                bond.entangling_power = 0.9;
+                bond.even_block_mixing = 0.8;
+                bond.odd_block_mixing = 0.7;
+            }
+            layer.bonds.push_back(bond);
+        }
+        for (const auto &[at, mode] : measured)
+        {
+            if (at == static_cast<int>(t))
+            {
+                layer.measured[static_cast<std::size_t>(mode)] = 1u;
+            }
+        }
+        history.layers.push_back(std::move(layer));
+    }
+    history.valid = true;
+    return history;
+}
+
+// The four-mode zig-zag: gates (0,1) and (2,3) in layer 0, the bridge (1,2) in
+// layer 1, nothing in layer 2. The only path joining 0 and 3 climbs mode 1 to
+// the bridge and descends mode 2 -- three turns, one peak -- and with nothing
+// measured the bridge lies in neither endpoint's past light cone, so the
+// doubled network cancels it.
+mipt::LogicalHistory zigzag(const std::vector<std::pair<int, int>> &measured,
+                            bool gate_metrics = true)
+{
+    return make_history(4, {{{0, 1}, {2, 3}}, {{1, 2}}, {}}, measured, gate_metrics);
+}
+
+// The same zig-zag plus a fifth mode, which connector 1 gates with in the last
+// layer and which is measured there. The bridge is then in that measurement's
+// past light cone and survives the doubled network, yet no connector is
+// measured after it, so no walk is certified: C_doubled without C_certified.
+mipt::LogicalHistory zigzag_with_witness()
+{
+    return make_history(5, {{{0, 1}, {2, 3}}, {{1, 2}}, {{1, 4}}}, {{2, 4}});
+}
+
+// The twenty-one turn values follow the seven gate values at every detail
+// level, in the contract's order, and appear nowhere with the setting off.
+void test_observable_ordering()
+{
+    expect(rec::TURN_RECORD_VALUES == TURN_NAMES.size() &&
+               rec::turn_observable_names().size() == TURN_NAMES.size(),
+           "twenty-one turn observables");
+    for (std::size_t i = 0; i < TURN_NAMES.size(); ++i)
+    {
+        expect(TURN_NAMES[i] == rec::turn_observable_names()[i],
+               "turn_observable_names matches the contract at " + TURN_NAMES[i]);
+    }
+    for (const auto detail : {dist::RecordDetail::Basic, dist::RecordDetail::Channel,
+                              dist::RecordDetail::Full})
+    {
+        for (const auto type : {mipt::CircuitType::FermionRPPU, mipt::CircuitType::QubitRPPU})
+        {
+            auto config = turn_config(false);
+            config.type = type;
+            config.record_detail = detail;
+            const auto off = rec::pair_observable_names(config);
+            expect(off.size() == rec::pair_detail_observable_names(config).size() + GATE_NAMES.size(),
+                   "with the turns off a record carries the gate tail alone");
+            for (const auto &name : off)
+            {
+                expect(std::find(TURN_NAMES.begin(), TURN_NAMES.end(), name) == TURN_NAMES.end(),
+                       "no turn observable appears with the setting off");
+            }
+            config.turn_diagnostics = true;
+            const auto on = rec::pair_observable_names(config);
+            expect(on.size() == off.size() + TURN_NAMES.size(),
+                   "the setting appends exactly twenty-one observables");
+            expect(std::equal(off.begin(), off.end(), on.begin()),
+                   "every earlier observable keeps its position");
+            expect(std::equal(TURN_NAMES.begin(), TURN_NAMES.end(), on.begin() + off.size()),
+                   "the turn observables follow the gate ones, in the contract's order");
+        }
+    }
+}
+
+// The payload against the declared names, by name, for every combination of
+// the two settings. Every field of the inputs is distinct, so a transposed or
+// shifted slot cannot pass.
+void test_diagnostic_tail_pairing()
+{
+    dist::PairConnectivity conn;
+    conn.evaluated = conn.survives_i = conn.survives_j = conn.interior_path = conn.connected = true;
+    conn.component_size = 42;
+    dist::GatePathMetrics gate;
+    gate.available = true;
+    gate.shortest_path_length = 9;
+    gate.shortest_path_unitary_count = 3;
+    gate.shortest_maximin_entangling_power = 0.25;
+    gate.widest_entangling_power = 0.5;
+    gate.widest_even_block_mixing = 0.75;
+    gate.widest_odd_block_mixing = 0.125;
+    const auto shape = [](int base, dist::PathClass path_class) {
+        dist::PathShape s;
+        s.available = true;
+        s.turns = base + 1;
+        s.temporal_forward = base + 2;
+        s.temporal_backward = base + 3;
+        s.min_layer = base + 4;
+        s.max_layer = base + 5;
+        s.path_class = path_class;
+        s.bridges.resize(static_cast<std::size_t>(base + 6));
+        s.bridges_measured = base + 7;
+        s.bridges_trace_only = base + 8;
+        s.cancelled_gates = base + 9;
+        return s;
+    };
+    dist::PairTurns turns;
+    turns.evaluated = true;
+    turns.shortest_maximin = shape(10, dist::PathClass::ZigzagCertified);
+    turns.widest = shape(20, dist::PathClass::ZigzagTraceOnly);
+    turns.min_turns = 31;
+    const std::map<std::string, double> expected{
+        {"component_size", 42.0},        {"shortest_path", 9.0},
+        {"shortest_path_unitary_count", 3.0}, {"shortest_maximin_gate_ep", 0.25},
+        {"widest_gate_ep", 0.5},         {"widest_even_mix", 0.75},
+        {"widest_odd_mix", 0.125},
+        {"sm_turns", 11.0},              {"sm_temporal_forward", 12.0},
+        {"sm_temporal_backward", 13.0},  {"sm_min_layer", 14.0},
+        {"sm_max_layer", 15.0},          {"sm_class", 2.0},
+        {"sm_bridges", 16.0},            {"sm_bridges_measured", 17.0},
+        {"sm_bridges_trace_only", 18.0}, {"sm_cancelled_gates", 19.0},
+        {"wd_turns", 21.0},              {"wd_temporal_forward", 22.0},
+        {"wd_temporal_backward", 23.0},  {"wd_min_layer", 24.0},
+        {"wd_max_layer", 25.0},          {"wd_class", 3.0},
+        {"wd_bridges", 26.0},            {"wd_bridges_measured", 27.0},
+        {"wd_bridges_trace_only", 28.0}, {"wd_cancelled_gates", 29.0},
+        {"min_turns", 31.0}};
+    for (const auto detail : {dist::RecordDetail::Basic, dist::RecordDetail::Channel,
+                              dist::RecordDetail::Full})
+    {
+        for (const bool gate_on : {false, true})
+        {
+            for (const bool turn_on : {false, true})
+            {
+                auto config = dist_gate_tests::rppu_config(gate_on);
+                config.turn_diagnostics = turn_on;
+                config.record_detail = detail;
+                const auto names = rec::pair_observable_names(config);
+                const std::size_t detail_count = rec::pair_detail_observable_names(config).size();
+                std::vector<double> tail(names.size() - detail_count + 1, -7.0);
+                const std::size_t filled =
+                    rec::fill_pair_diagnostic_values(config, conn, gate, turns, tail.data());
+                expect(filled == names.size() - detail_count,
+                       "the diagnostic tail is exactly as long as the declared one");
+                expect(tail.back() == -7.0, "nothing is written past the declared tail");
+                for (std::size_t k = 0; k < filled; ++k)
+                {
+                    const std::string &name = names[detail_count + k];
+                    expect(expected.count(name) == 1 && tail[k] == expected.at(name),
+                           "the slot named " + name + " carries its own value");
+                }
+            }
+        }
+    }
+}
+
+// The NaN rule, on PairTurns a real index computed.
+void test_record_values()
+{
+    using Values = std::array<double, rec::TURN_RECORD_VALUES>;
+    const auto all_nan = [](const Values &values, std::size_t begin, std::size_t end) {
+        for (std::size_t k = begin; k < end; ++k)
+        {
+            if (!std::isnan(values[k]))
+            {
+                return false;
+            }
+        }
+        return true;
+    };
+    Values out{};
+
+    // The connected, trace-only zig-zag: every value written, and one gate --
+    // the bridge -- cancelled on each canonical path.
+    dist::ConnectivityIndex index;
+    index.build(zigzag({}), true, true, true);
+    const dist::PairConnectivity connected = index.query(0, 3);
+    const dist::PairTurns zigzag_turns = index.pair_turns(0, 3);
+    expect(index.has_turns() && connected.connected && zigzag_turns.evaluated &&
+               zigzag_turns.min_turns == 3 && !zigzag_turns.doubled_network,
+           "the fixture is a connected zig-zag the doubled network cuts");
+    rec::fill_turn_record_values(connected, zigzag_turns, out.data());
+    const Values trace_only{3.0, 3.0, 3.0, 0.0, 2.0, 3.0, 1.0, 0.0, 1.0, 1.0,
+                            3.0, 3.0, 3.0, 0.0, 2.0, 3.0, 1.0, 0.0, 1.0, 1.0, 3.0};
+    expect(out == trace_only,
+           "a trace-only zig-zag writes both shapes, its cancelled bridge, and min_turns");
+
+    // The connector measured after the bridge: the same path, now certified,
+    // and nothing on it cancelled.
+    {
+        dist::ConnectivityIndex certified;
+        certified.build(zigzag({{1, 1}}), true, true, true);
+        rec::fill_turn_record_values(certified.query(0, 3), certified.pair_turns(0, 3), out.data());
+        const Values expected{3.0, 3.0, 3.0, 0.0, 2.0, 2.0, 1.0, 1.0, 0.0, 0.0,
+                              3.0, 3.0, 3.0, 0.0, 2.0, 2.0, 1.0, 1.0, 0.0, 0.0, 3.0};
+        expect(out == expected, "a certified zig-zag writes class 2, a measured bridge, and "
+                                "no cancelled gate");
+    }
+
+    // Not connected: endpoint 3 measured in the last layer. The final-slice
+    // nodes still share a component, so the index has both shapes, their
+    // cancellation counts and min_turns -- the blanking is the writer's.
+    {
+        dist::ConnectivityIndex measured;
+        measured.build(zigzag({{2, 3}}), true, true, true);
+        const auto conn = measured.query(0, 3);
+        const auto turns = measured.pair_turns(0, 3);
+        expect(!conn.connected && conn.interior_path && turns.shortest_maximin.available &&
+                   turns.shortest_maximin.cancelled_gates == 1 && turns.min_turns == 3,
+               "the index has the shape of a pair whose endpoint was measured last");
+        rec::fill_turn_record_values(conn, turns, out.data());
+        expect(all_nan(out, 0, out.size()),
+               "a pair that is not connected writes NaN, not 0, for every turn value");
+    }
+
+    // Shapes unavailable (no gate capacities): connected, min_turns known.
+    {
+        dist::ConnectivityIndex bare;
+        bare.build(zigzag({}, false), true, true, true);
+        const auto turns = bare.pair_turns(0, 3);
+        expect(bare.query(0, 3).connected && !turns.shortest_maximin.available &&
+                   !turns.widest.available && turns.min_turns == 3,
+               "without capacities the index has no shapes but does have min_turns");
+        rec::fill_turn_record_values(bare.query(0, 3), turns, out.data());
+        expect(all_nan(out, 0, 20) && out[20] == 3.0,
+               "unavailable shapes write NaN, not 0, while min_turns is still written");
+    }
+
+    // No walk at all: a cut below the bridge splits the components, so
+    // min_turns is -1 -- written as NaN, never as -1.
+    {
+        dist::ConnectivityIndex cut;
+        cut.build(zigzag({{0, 1}}), true, true, true);
+        const auto turns = cut.pair_turns(0, 3);
+        expect(!cut.query(0, 3).interior_path && turns.evaluated && turns.min_turns == -1,
+               "a cut pair has no walk");
+        rec::fill_turn_record_values(cut.query(0, 3), turns, out.data());
+        expect(all_nan(out, 0, out.size()), "a pair with no walk writes NaN throughout");
+    }
+
+    // The two -1 rules on their own, on a connected pair (combinations the
+    // index cannot produce, which is why they are built by hand): a walk search
+    // that found nothing, and a cancellation count that was never computed.
+    {
+        dist::PairTurns turns = zigzag_turns;
+        turns.min_turns = -1;
+        rec::fill_turn_record_values(connected, turns, out.data());
+        expect(std::isnan(out[20]) && out[0] == 3.0 && out[19] == 1.0,
+               "min_turns = -1 is NaN and leaves the shapes alone");
+        turns = zigzag_turns;
+        turns.shortest_maximin.cancelled_gates = -1;
+        rec::fill_turn_record_values(connected, turns, out.data());
+        expect(std::isnan(out[9]) && out[8] == 1.0 && out[19] == 1.0 && out[20] == 3.0,
+               "an uncomputed cancellation count is NaN and leaves everything else alone");
+    }
+
+    // Off, and unevaluated: nothing at all.
+    rec::fill_turn_record_values(connected, dist::PairTurns{}, out.data());
+    expect(all_nan(out, 0, out.size()), "an unevaluated PairTurns writes NaN throughout");
+    rec::fill_turn_record_values(dist::PairConnectivity{}, zigzag_turns, out.data());
+    expect(all_nan(out, 0, out.size()), "an unevaluated pair writes NaN throughout");
+}
+
+// Flag bits 7-9 through the one function the run and the replay both use, on
+// every combination the hand-built histories produce.
+void test_flag_bits()
+{
+    struct Case
+    {
+        mipt::LogicalHistory history;
+        int i;
+        int j;
+        bool connected;
+        bool source;
+        bool certified;
+        bool doubled;
+        const char *what;
+    };
+    const std::vector<Case> cases{
+        {zigzag({}), 0, 3, true, false, false, false,
+         "a trace-only zig-zag is connected and nothing more"},
+        {zigzag({{1, 1}}), 0, 3, true, false, true, true,
+         "a connector measured after the bridge certifies the zig-zag"},
+        {zigzag({{2, 2}}), 0, 3, true, false, true, true,
+         "so does the other connector, measured in the last layer"},
+        {zigzag({}), 0, 1, true, true, true, true, "a common source is all three"},
+        {zigzag({}), 0, 2, true, true, true, true,
+         "a V that crosses the bridge on its way up is a common source"},
+        {zigzag_with_witness(), 0, 3, true, false, false, true,
+         "a bridge feeding a later measurement survives the doubled network uncertified"},
+        {zigzag({{2, 3}}), 0, 3, false, false, false, false,
+         "an endpoint measured last carries no turn bit"},
+        {zigzag({{0, 1}}), 0, 3, false, false, false, false,
+         "a cut below the bridge carries no turn bit"},
+    };
+    for (const Case &c : cases)
+    {
+        const std::string what(c.what);
+        dist::ConnectivityIndex index;
+        index.build(c.history, true, true, true);
+        const auto conn = index.query(c.i, c.j);
+        const auto turns = index.pair_turns(c.i, c.j);
+        expect(conn.connected == c.connected, what + ": connectivity");
+        for (const bool fn : {false, true})
+        {
+            for (const bool mn : {false, true})
+            {
+                const std::uint32_t legacy = conn.flags() | (fn ? dist::FLAG_FN_POSITIVE : 0u) |
+                                             (mn ? dist::FLAG_MN_POSITIVE : 0u);
+                expect(rec::pair_record_flags(conn, fn, mn, dist::PairTurns{}) == legacy,
+                       what + ": with the setting off the word is the pre-feature one");
+                expect((rec::pair_record_flags(conn, fn, mn, turns) & ~TURN_BITS) == legacy,
+                       what + ": the turn bits are the only difference");
+            }
+        }
+        const std::uint32_t flags = rec::pair_record_flags(conn, false, false, turns);
+        expect(((flags & dist::FLAG_CONNECTED_COMMON_SOURCE) != 0u) == c.source, what + ": bit 7");
+        expect(((flags & dist::FLAG_CONNECTED_CERTIFIED) != 0u) == c.certified, what + ": bit 8");
+        expect(((flags & dist::FLAG_CONNECTED_DOUBLED) != 0u) == c.doubled, what + ": bit 9");
+        expect((flags & TURN_BITS) == 0u || (flags & dist::FLAG_CONNECTED) != 0u,
+               what + ": a turn bit implies C");
+    }
+
+    // Bit 9 is the doubled network's answer, not the path class's: the witness
+    // path is still classed trace-only, yet nothing on it cancels.
+    dist::ConnectivityIndex witness;
+    witness.build(zigzag_with_witness(), true, true, true);
+    const auto turns = witness.pair_turns(0, 3);
+    expect(turns.shortest_maximin.path_class == dist::PathClass::ZigzagTraceOnly &&
+               turns.shortest_maximin.cancelled_gates == 0,
+           "a trace-only class with nothing cancelled: bits 8 and 9 answer different questions");
+}
+
+// Off: byte-identical to the pre-feature format. On: exactly the documented
+// additions, so stripping them recovers the off header. k=3 never changes.
+void test_headers()
+{
+    auto off = turn_config(false);
+    auto on = turn_config(true);
+    const auto bins = dist::make_pair_bins(off.n);
+    const auto embeddings = pair_embeddings(off.n);
+
+    // ---- pair CSV
+    const std::string csv_off = dist::pair_csv_header(off);
+    const std::string csv_on = dist::pair_csv_header(on);
+    for (const char *token : {"turn", "common_source", "certified", "doubled"})
+    {
+        expect(csv_off.find(token) == std::string::npos,
+               std::string("the pair CSV header carries no '") + token + "' with the setting off");
+    }
+    expect(csv_on.find(",gate_diagnostics_definition" + TURN_META + ",separation,") !=
+               std::string::npos,
+           "the turn columns sit right after the gate columns");
+    const std::string tail = "," + TURN_COUNTERS + "\n";
+    expect(csv_on.size() > tail.size() &&
+               csv_on.compare(csv_on.size() - tail.size(), tail.size(), tail) == 0,
+           "the fifteen counters close the header, in the contract's order");
+    expect(erase_all(erase_all(csv_on, TURN_META), "," + TURN_COUNTERS) == csv_off,
+           "the turn columns are the only difference in the pair CSV header");
+    auto triple_off = off;
+    triple_off.k = 3;
+    triple_off.gate_path_diagnostics = false;
+    auto triple_on = triple_off;
+    triple_on.gate_path_diagnostics = true;
+    triple_on.turn_diagnostics = true;
+    expect(dist::triple_csv_header(triple_off) == dist::triple_csv_header(triple_on),
+           "the triangle CSV header ignores the turn setting");
+
+    const std::string rendered = dist::render_pair_csv(on, bins);
+    const std::string metadata = ",1," + std::to_string(dist::TURN_DIAGNOSTICS_VERSION) + "," +
+                                 mipt::util::csv_quote(dist::TURN_DIAGNOSTICS_DEFINITION) + ",";
+    std::size_t rows_with_metadata = 0;
+    for (std::size_t at = rendered.find(metadata); at != std::string::npos;
+         at = rendered.find(metadata, at + 1))
+    {
+        ++rows_with_metadata;
+    }
+    expect(rows_with_metadata == bins.size(),
+           "every pair row writes 1, the version, and the quoted definition");
+
+    // ---- record header
+    const std::string rec_off = rec::pair_header_text(off, bins, embeddings);
+    const std::string rec_on = rec::pair_header_text(on, bins, embeddings);
+    expect(rec_off.find("\n" + OLD_FLAG_BITS) != std::string::npos,
+           "with the setting off the flag_bits line is the old one");
+    for (const char *token : {"turn_diagnostics", "sm_turns", "wd_turns", "min_turns",
+                              "cancelled_gates", "5:fn_positive", "connected_common_source",
+                              "connected_certified", "connected_doubled"})
+    {
+        expect(rec_off.find(token) == std::string::npos,
+               std::string("the record header carries no '") + token + "' with the setting off");
+    }
+    const std::size_t flag_at = rec_on.find("\n" + TURN_FLAG_BITS);
+    expect(flag_at != std::string::npos, "with it on the flag_bits line names bits 5 through 9");
+    const std::size_t cusv = rec_on.find("\ncusv_block_targets=");
+    const std::size_t line_end = cusv == std::string::npos ? cusv : rec_on.find('\n', cusv + 1);
+    const std::string block = "turn_diagnostics=1\nturn_diagnostics_version=" +
+                              std::to_string(dist::TURN_DIAGNOSTICS_VERSION) +
+                              "\nturn_diagnostics_definition=" +
+                              std::string(dist::TURN_DIAGNOSTICS_DEFINITION) + "\n";
+    expect(line_end != std::string::npos && rec_on.compare(line_end + 1, block.size(), block) == 0,
+           "the three turn fields follow cusv_block_targets");
+    std::string stripped = rec_on;
+    stripped.erase(line_end + 1, block.size());
+    stripped.replace(flag_at + 1, TURN_FLAG_BITS.size(), OLD_FLAG_BITS);
+    std::string fields;
+    std::string observables;
+    for (const auto &name : TURN_NAMES)
+    {
+        fields += "," + name + ":f8";
+        observables += "," + name;
+    }
+    stripped = erase_all(erase_all(stripped, fields), observables);
+    expect(stripped == rec_off,
+           "the documented additions are the only difference in the record header");
+
+    // k=3 record headers never change -- not even the flag_bits line, which a
+    // k=0 run's triangle protocol sees under the turn setting too.
+    const auto geometries = mipt::probed::enumerate_three_probe_geometries(off.n, 0.5);
+    const auto triple_bins = dist::make_triple_bins(off.n, geometries);
+    const std::string triple_plain = rec::triple_header_text(triple_off, triple_bins, 1, geometries);
+    expect(triple_plain == rec::triple_header_text(triple_on, triple_bins, 1, geometries),
+           "the triangle record header ignores the turn setting");
+    expect(triple_plain.find("\n" + OLD_FLAG_BITS) != std::string::npos,
+           "and keeps the old flag_bits line");
+}
+
+// A record file under the real header, filled through the production helpers
+// from real PairTurns, read back with the independent reader.
+void test_binary_round_trip(const std::string &directory)
+{
+    auto config = turn_config(true);
+    config.n = 4;
+    const auto bins = dist::make_pair_bins(config.n);
+    const auto embeddings = pair_embeddings(config.n);
+    const auto names = rec::pair_observable_names(config);
+    const std::size_t detail_count = rec::pair_detail_observable_names(config).size();
+    const std::string header = rec::pair_header_text(config, bins, embeddings);
+    const std::string path = directory + "/turn_records.bin";
+
+    // One trajectory per draw, between them every bit combination the
+    // four-mode zig-zag can produce.
+    const std::vector<std::vector<std::pair<int, int>>> draws{{}, {{1, 1}}, {{2, 3}}, {{0, 1}}};
+    std::vector<std::vector<double>> written;
+    std::vector<std::uint32_t> written_flags;
+    {
+        rec::RecordSink sink;
+        sink.open(path, header, names.size(), 0);
+        for (std::size_t r = 0; r < draws.size(); ++r)
+        {
+            dist::ConnectivityIndex index;
+            index.build(zigzag(draws[r]), true, true, true);
+            expect(index.has_turns(), "the index precomputed the turn table");
+            for (const auto &row : embeddings)
+            {
+                std::vector<double> values(names.size(), 0.0);
+                for (std::size_t slot = 0; slot < detail_count; ++slot)
+                {
+                    values[slot] = 0.01 * static_cast<double>(slot) + static_cast<double>(r);
+                }
+                const auto conn = index.query(row[2], row[3]);
+                const auto turns = index.pair_turns(row[2], row[3]);
+                const std::size_t filled = rec::fill_pair_diagnostic_values(
+                    config, conn, index.gate_path_metrics(row[2], row[3]), turns,
+                    values.data() + detail_count);
+                expect(detail_count + filled == names.size(),
+                       "the diagnostic tail fills the record exactly");
+                const std::uint32_t flags =
+                    rec::pair_record_flags(conn, (row[3] - row[2]) % 2 == 1, false, turns);
+                sink.add(static_cast<std::uint32_t>(r), static_cast<std::uint32_t>(row[0]),
+                         static_cast<std::uint32_t>(row[1]), flags, values.data());
+                written.push_back(values);
+                written_flags.push_back(flags);
+            }
+        }
+        sink.close();
+    }
+
+    const auto [read_header, rows] = read_back(path, names.size());
+    expect(read_header == header, "the turn header round-trips verbatim");
+    expect(rows.size() == written.size(), "every turn record reached the file");
+    const std::size_t sm_turns = slot_of(names, "sm_turns");
+    const std::size_t sm_cancelled = slot_of(names, "sm_cancelled_gates");
+    const std::size_t wd_cancelled = slot_of(names, "wd_cancelled_gates");
+    const std::size_t min_turns = slot_of(names, "min_turns");
+    std::size_t all_three = 0;
+    std::size_t certified_only = 0;
+    std::size_t connected_none = 0;
+    std::size_t disconnected = 0;
+    for (std::size_t k = 0; k < rows.size() && k < written.size(); ++k)
+    {
+        expect(std::memcmp(rows[k].values.data(), written[k].data(),
+                           names.size() * sizeof(double)) == 0,
+               "turn records round-trip bit for bit, NaNs included");
+        expect(rows[k].flags == written_flags[k], "the turn flag bits round-trip");
+        const std::uint32_t flags = rows[k].flags;
+        const bool connected = (flags & dist::FLAG_CONNECTED) != 0u;
+        const bool source = (flags & dist::FLAG_CONNECTED_COMMON_SOURCE) != 0u;
+        const bool certified = (flags & dist::FLAG_CONNECTED_CERTIFIED) != 0u;
+        const bool doubled = (flags & dist::FLAG_CONNECTED_DOUBLED) != 0u;
+        expect((!source || certified) && (!certified || doubled) && (!doubled || connected),
+               NESTING + " holds in every stored record");
+        const auto &values = rows[k].values;
+        expect(connected == !std::isnan(values[sm_turns]) &&
+                   connected == !std::isnan(values[min_turns]) &&
+                   connected == !std::isnan(values[sm_cancelled]) &&
+                   connected == !std::isnan(values[wd_cancelled]),
+               "the turn values are present exactly on connected records");
+        // A theorem rather than a fixture property: if every gate of a path
+        // survived, the path itself would join the endpoints in the doubled
+        // network.
+        if (connected && !doubled)
+        {
+            expect(values[sm_cancelled] > 0.0 && values[wd_cancelled] > 0.0,
+                   "a connected pair the doubled network cuts has a cancelled gate on each "
+                   "canonical path");
+        }
+        all_three += (source && certified && doubled) ? 1u : 0u;
+        certified_only += (!source && certified && doubled) ? 1u : 0u;
+        connected_none += (connected && !doubled) ? 1u : 0u;
+        disconnected += connected ? 0u : 1u;
+    }
+    expect(all_three > 0 && certified_only > 0 && connected_none > 0 && disconnected > 0,
+           "the fixture exercises every bit combination the zig-zag produces");
+
+    // The record file refuses a resume across the setting, both ways.
+    auto off = turn_config(false);
+    off.n = 4;
+    const auto off_names = rec::pair_observable_names(off);
+    const std::string off_header = rec::pair_header_text(off, bins, embeddings);
+    expect(refuses([&] {
+               rec::RecordSink sink;
+               sink.open(path, off_header, off_names.size(), draws.size());
+           }),
+           "a turn record file cannot be extended with the setting off");
+    const std::string off_path = directory + "/plain_turn_records.bin";
+    {
+        rec::RecordSink sink;
+        sink.open(off_path, off_header, off_names.size(), 0);
+        std::vector<double> values(off_names.size(), 0.5);
+        sink.add(0, 0, 0, 0u, values.data());
+        sink.close();
+    }
+    expect(refuses([&] {
+               rec::RecordSink sink;
+               sink.open(off_path, header, names.size(), 1);
+           }),
+           "a plain record file cannot be extended with the setting on");
+    {
+        rec::RecordSink sink;
+        sink.open(path, header, names.size(), draws.size());
+        expect(sink.inherited_records() == written.size(),
+               "a turn record file resumes under the setting it was written with");
+        sink.close();
+    }
+}
+
+// Drive bins the way PairProtocol::measure does: per record (C, E) and the
+// three refinements drawn nested inside C, into the plain table and all three
+// refined ones from the same draw, plus every statistic load_pairs restores.
+void add_trajectory(std::vector<dist::PairBin> &bins, std::mt19937 &rng)
+{
+    std::uniform_real_distribution<double> unit(0.0, 1.0);
+    for (auto &bin : bins)
+    {
+        for (std::uint64_t e = 0; e < bin.embedding_count; ++e)
+        {
+            for (auto *stats : {&bin.mi, &bin.mn, &bin.g2, &bin.f2, &bin.fmi, &bin.fmn, &bin.fg2,
+                                &bin.ff2, &bin.fmn_residual, &bin.n_i, &bin.n_j, &bin.dnn,
+                                &bin.rho_n, &bin.abs_rho_n, &bin.rho_n_sq, &bin.i_occ})
+            {
+                stats->add(unit(rng));
+            }
+            const bool survives_i = unit(rng) > 0.15;
+            const bool survives_j = unit(rng) > 0.15;
+            const bool interior = unit(rng) > 0.15;
+            const bool connected = survives_i && survives_j && interior;
+            const bool doubled = connected && unit(rng) > 0.2;
+            const bool certified = doubled && unit(rng) > 0.2;
+            const bool source = certified && unit(rng) > 0.3;
+            const bool entangled = unit(rng) > 0.5;
+            ++bin.conn_records;
+            bin.survive_i += survives_i ? 1u : 0u;
+            bin.survive_j += survives_j ? 1u : 0u;
+            bin.survive_both += (survives_i && survives_j) ? 1u : 0u;
+            bin.interior_path += interior ? 1u : 0u;
+            bin.component_size.add(50.0 * unit(rng));
+            if (connected)
+            {
+                ++bin.connected;
+                bin.ent_given_connected.add(entangled ? 1.0 : 0.0);
+                if (entangled)
+                {
+                    ++bin.connected_ent_positive;
+                }
+                else
+                {
+                    ++bin.connected_ent_zero;
+                    ++bin.classical_silent;
+                    bin.i_occ_connected_classical.add(0.0);
+                }
+            }
+            else
+            {
+                bin.ent_given_disconnected.add(entangled ? 1.0 : 0.0);
+                ++(entangled ? bin.disconnected_ent_positive : bin.disconnected_ent_zero);
+            }
+            bin.common_source.add(source, entangled);
+            bin.certified.add(certified, entangled);
+            bin.doubled.add(doubled, entangled);
+        }
+    }
+}
+
+bool same_cells(const dist::RefinedContingency &a, const dist::RefinedContingency &b)
+{
+    return a.connected == b.connected && a.connected_ent_positive == b.connected_ent_positive &&
+           a.connected_ent_zero == b.connected_ent_zero &&
+           a.disconnected_ent_positive == b.disconnected_ent_positive &&
+           a.disconnected_ent_zero == b.disconnected_ent_zero;
+}
+
+// The refusal message, or empty when the action did not refuse.
+std::string refusal(const std::function<void()> &action)
+{
+    try
+    {
+        action();
+    }
+    catch (const std::runtime_error &error)
+    {
+        return error.what();
+    }
+    return {};
+}
+
+// The pair CSV: the counters render in place, round-trip exactly, continue as
+// an uninterrupted run would, and every exact invariant refuses a file that
+// breaks it -- each edit breaking that invariant alone.
+void test_csv_counters_and_resume(const std::string &directory)
+{
+    auto on = turn_config(true);
+    on.realizations = 12;
+    on.output_path = directory + "/turn_pairs.csv";
+    auto off = turn_config(false);
+    off.realizations = 12;
+    off.output_path = directory + "/plain_pairs.csv";
+
+    std::mt19937 rng(20261110u);
+    auto bins = dist::make_pair_bins(on.n);
+    const int before_break = 6;
+    for (int t = 0; t < before_break; ++t)
+    {
+        add_trajectory(bins, rng);
+    }
+
+    // ---- every row ends with its bin's fifteen counters, in header order
+    const std::string rendered = dist::render_pair_csv(on, bins);
+    {
+        std::istringstream lines(rendered);
+        std::string line;
+        std::getline(lines, line);
+        for (const auto &bin : bins)
+        {
+            std::getline(lines, line);
+            std::string tail;
+            for (const auto *cells : {&bin.common_source, &bin.certified, &bin.doubled})
+            {
+                for (const std::uint64_t value :
+                     {cells->connected, cells->connected_ent_positive, cells->connected_ent_zero,
+                      cells->disconnected_ent_positive, cells->disconnected_ent_zero})
+                {
+                    tail += "," + std::to_string(value);
+                }
+            }
+            expect(line.size() > tail.size() &&
+                       line.compare(line.size() - tail.size(), tail.size(), tail) == 0,
+                   "a pair row ends with its fifteen refined counters");
+        }
+    }
+    dist::publish_csv(on.output_path, rendered);
+    dist::publish_csv(off.output_path, dist::render_pair_csv(off, bins));
+
+    // ---- round trip, and a continuation that ends where an uninterrupted run would
+    auto restored = dist::make_pair_bins(on.n);
+    const res::Report report = res::load_pairs(on, restored);
+    expect(report.loaded && report.completed == before_break,
+           "a turn pair CSV resumes under the setting it was written with");
+    for (std::size_t b = 0; b < bins.size(); ++b)
+    {
+        expect(same_cells(restored[b].common_source, bins[b].common_source) &&
+                   same_cells(restored[b].certified, bins[b].certified) &&
+                   same_cells(restored[b].doubled, bins[b].doubled),
+               "every refined counter comes back exactly");
+    }
+    auto reference = bins;
+    const std::mt19937 saved = rng;
+    for (int t = before_break; t < on.realizations; ++t)
+    {
+        add_trajectory(reference, rng);
+    }
+    rng = saved;
+    for (int t = before_break; t < on.realizations; ++t)
+    {
+        add_trajectory(restored, rng);
+    }
+    for (std::size_t b = 0; b < bins.size(); ++b)
+    {
+        expect(same_cells(restored[b].common_source, reference[b].common_source) &&
+                   same_cells(restored[b].certified, reference[b].certified) &&
+                   same_cells(restored[b].doubled, reference[b].doubled),
+               "a resumed run's refined tables end where an uninterrupted run's do");
+    }
+    {
+        auto finished = on;
+        finished.output_path = directory + "/finished_turn_pairs.csv";
+        dist::publish_csv(finished.output_path, dist::render_pair_csv(finished, restored));
+        auto again = dist::make_pair_bins(on.n);
+        expect(res::load_pairs(finished, again).completed == on.realizations,
+               "the continued file passes every invariant and reads back whole");
+    }
+
+    // ---- across the setting, both ways, refused by name
+    {
+        auto on_reading_off = on;
+        on_reading_off.output_path = off.output_path;
+        const std::string message = refusal([&] {
+            auto fresh = dist::make_pair_bins(on.n);
+            (void)res::load_pairs(on_reading_off, fresh);
+        });
+        expect(message.find("MIPT_DIST_TURN_DIAGNOSTICS=0") != std::string::npos &&
+                   message.find("sets it to 1") != std::string::npos,
+               "a plain pair CSV resumed with the setting on is refused by name");
+        auto off_reading_on = off;
+        off_reading_on.output_path = on.output_path;
+        const std::string reverse = refusal([&] {
+            auto fresh = dist::make_pair_bins(on.n);
+            (void)res::load_pairs(off_reading_on, fresh);
+        });
+        expect(reverse.find("MIPT_DIST_TURN_DIAGNOSTICS=1") != std::string::npos &&
+                   reverse.find("sets it to 0") != std::string::npos,
+               "a turn pair CSV resumed with the setting off is refused by name");
+        auto plain = dist::make_pair_bins(off.n);
+        expect(res::load_pairs(off, plain).completed == before_break,
+               "a plain pair CSV still resumes with the setting off");
+    }
+
+    // ---- provenance
+    {
+        std::ifstream in(on.output_path);
+        const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        const std::string quoted = mipt::util::csv_quote(dist::TURN_DIAGNOSTICS_DEFINITION);
+        const std::string version = std::to_string(dist::TURN_DIAGNOSTICS_VERSION);
+        const std::string metadata = ",1," + version + "," + quoted;
+        const auto refused_text = [&](const std::string &replacement, const std::string &what) {
+            std::string edited = text;
+            std::size_t count = 0;
+            for (std::size_t at = edited.find(metadata); at != std::string::npos;
+                 at = edited.find(metadata, at + replacement.size()))
+            {
+                edited.replace(at, metadata.size(), replacement);
+                ++count;
+            }
+            expect(count == bins.size(), what + ": every row carries the turn metadata");
+            auto edited_config = on;
+            edited_config.output_path = directory + "/edited_turn_pairs.csv";
+            dist::publish_csv(edited_config.output_path, edited);
+            expect(refuses([&] {
+                       auto fresh = dist::make_pair_bins(on.n);
+                       (void)res::load_pairs(edited_config, fresh);
+                   }),
+                   what);
+        };
+        refused_text(",2," + version + "," + quoted, "a turn_diagnostics value other than 1 is refused");
+        refused_text(",1,999," + quoted, "a pair CSV from another turn-definition version is refused");
+        refused_text(",1," + version + "," +
+                         mipt::util::csv_quote(std::string(dist::TURN_DIAGNOSTICS_DEFINITION) + "x"),
+                     "a pair CSV under another turn definition is refused");
+    }
+
+    // ---- every exact invariant, each broken alone
+    //
+    // A bin where every refinement is strict and every cell an edit below
+    // moves a record out of is populated; otherwise an edit could not break
+    // one identity without breaking another.
+    std::size_t b = bins.size();
+    for (std::size_t k = 0; k < bins.size() && b == bins.size(); ++k)
+    {
+        const dist::PairBin &x = bins[k];
+        if (x.common_source.connected < x.certified.connected &&
+            x.certified.connected < x.doubled.connected && x.doubled.connected < x.connected &&
+            x.common_source.disconnected_ent_zero > 0 && x.certified.disconnected_ent_zero > 0 &&
+            x.certified.disconnected_ent_positive > 0 && x.certified.connected_ent_zero > 0 &&
+            x.doubled.disconnected_ent_zero > 0 && x.disconnected_ent_zero > 0)
+        {
+            b = k;
+        }
+    }
+    expect(b < bins.size(), "the fixture has a bin where every refinement is strict");
+    const auto refused_with = [&](const std::function<void(dist::PairBin &)> &edit,
+                                  const std::string &needle, const std::string &what) {
+        auto broken = bins;
+        edit(broken[b]);
+        auto broken_config = on;
+        broken_config.output_path = directory + "/broken_turn_pairs.csv";
+        dist::publish_csv(broken_config.output_path, dist::render_pair_csv(broken_config, broken));
+        const std::string message = refusal([&] {
+            auto fresh = dist::make_pair_bins(on.n);
+            (void)res::load_pairs(broken_config, fresh);
+        });
+        expect(message.find(needle) != std::string::npos,
+               what + " is refused by the check that names it (got: '" + message + "')");
+    };
+    refused_with([](dist::PairBin &x) { ++x.common_source.disconnected_ent_zero; },
+                 "common_source contingency table summing to",
+                 "a refined table that does not partition conn_records");
+    refused_with([](dist::PairBin &x) { ++x.doubled.connected; },
+                 "connected_doubled_count disagreeing",
+                 "a refined connected count that is not its two cells");
+    refused_with(
+        [](dist::PairBin &x) {
+            --x.certified.disconnected_ent_zero;
+            ++x.certified.disconnected_ent_positive;
+        },
+        "entangled records in its certified table",
+        "a refined table whose entangled margin differs from the plain one");
+    // Nesting, one link at a time: copy the outer table and move one record
+    // into the event, which keeps the partition, the connected count and the
+    // margin exact and breaks only the link.
+    const auto move_into_event = [](dist::RefinedContingency &cells) {
+        --cells.disconnected_ent_zero;
+        ++cells.connected_ent_zero;
+        ++cells.connected;
+    };
+    refused_with(
+        [&](dist::PairBin &x) {
+            x.common_source = x.certified;
+            move_into_event(x.common_source);
+        },
+        NESTING, "C_common_source outnumbering C_certified");
+    refused_with(
+        [&](dist::PairBin &x) {
+            x.certified = x.doubled;
+            move_into_event(x.certified);
+        },
+        NESTING, "C_certified outnumbering C_doubled");
+    refused_with(
+        [&](dist::PairBin &x) {
+            x.doubled.connected = x.connected;
+            x.doubled.connected_ent_positive = x.connected_ent_positive;
+            x.doubled.connected_ent_zero = x.connected_ent_zero;
+            x.doubled.disconnected_ent_positive = x.disconnected_ent_positive;
+            x.doubled.disconnected_ent_zero = x.disconnected_ent_zero;
+            move_into_event(x.doubled);
+        },
+        NESTING, "C_doubled outnumbering C");
+    // One entangled cell alone, with every total consistent.
+    refused_with(
+        [](dist::PairBin &x) {
+            x.common_source = x.certified;
+            --x.common_source.connected_ent_zero;
+            ++x.common_source.connected_ent_positive;
+            --x.common_source.disconnected_ent_positive;
+            ++x.common_source.disconnected_ent_zero;
+        },
+        NESTING, "an entangled C_common_source cell outnumbering C_certified's");
+}
+
+void test_validation()
+{
+    auto config = turn_config(true);
+    expect(!refuses_argument([&] { rec::validate_turn_diagnostics(config); }),
+           "the turn diagnostics with the gate diagnostics are accepted");
+    expect(!refuses_argument([&] { rec::validate_gate_diagnostics(config, true); }),
+           "and the configuration passes every gate precondition");
+    auto both = config;
+    both.k = 0;
+    expect(!refuses_argument([&] { rec::validate_turn_diagnostics(both); }) &&
+               !refuses_argument([&] { rec::validate_gate_diagnostics(both, true); }),
+           "k=0 is accepted");
+
+    auto no_gate = config;
+    no_gate.gate_path_diagnostics = false;
+    std::string message;
+    try
+    {
+        rec::validate_turn_diagnostics(no_gate);
+    }
+    catch (const std::invalid_argument &error)
+    {
+        message = error.what();
+    }
+    expect(message.find("MIPT_DIST_TURN_DIAGNOSTICS=1") != std::string::npos &&
+               message.find("MIPT_DIST_GATE_DIAGNOSTICS=1") != std::string::npos,
+           "the turn diagnostics without the gate diagnostics are refused, naming both");
+    for (const auto type : {mipt::CircuitType::Haar, mipt::CircuitType::MMS,
+                            mipt::CircuitType::QubitRPPU})
+    {
+        auto other = no_gate;
+        other.type = type;
+        expect(refuses_argument([&] { rec::validate_turn_diagnostics(other); }),
+               "the missing gate setting is refused whatever the circuit");
+    }
+    // The preconditions the turns inherit are the gate validator's to refuse.
+    auto triangles = config;
+    triangles.k = 3;
+    expect(!refuses_argument([&] { rec::validate_turn_diagnostics(triangles); }) &&
+               refuses_argument([&] { rec::validate_gate_diagnostics(triangles, true); }),
+           "k=3 is refused through the gate preconditions, not twice");
+    auto off = config;
+    off.turn_diagnostics = false;
+    off.gate_path_diagnostics = false;
+    off.type = mipt::CircuitType::Haar;
+    off.k = 3;
+    off.connectivity = false;
+    expect(!refuses_argument([&] { rec::validate_turn_diagnostics(off); }),
+           "the setting off imposes nothing");
+}
+
+void run(const std::string &directory)
+{
+    test_observable_ordering();
+    test_diagnostic_tail_pairing();
+    test_record_values();
+    test_flag_bits();
+    test_headers();
+    test_binary_round_trip(directory);
+    test_csv_counters_and_resume(directory);
+    test_validation();
+    std::filesystem::remove_all(directory);
+}
+} // namespace dist_turn_tests
+
+void test_dist_turn_diagnostics()
+{
+    dist_turn_tests::run(dist_turn_tests::scratch_directory());
+}
+
+// ---------------------------------------------------------------------------
 // The two-mode channel: the closed-form fermionic negativity, the occupation
 // diagnostics, and the precision behaviour that motivates both.
 // ---------------------------------------------------------------------------
@@ -2069,6 +3108,7 @@ int main()
     test_dist_scaling_resume();
     test_dist_records();
     test_dist_gate_diagnostics();
+    test_dist_turn_diagnostics();
     dist_channel_tests::run();
 
     std::cout << "dist_metrics_tests: PASS\n";

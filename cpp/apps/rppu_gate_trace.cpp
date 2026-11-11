@@ -57,7 +57,10 @@ void print_usage(const char *program)
         << "the two-mode fermionic state at every gate on each selected pair's\n"
         << "shortest-maximin and widest-entangling-power spacetime paths.\n\n"
         << "  records.bin    a format-v2 <stem>_records.bin written by dist_scaling.exe at\n"
-        << "                 fp64 with MIPT_DIST_GATE_DIAGNOSTICS=1\n"
+        << "                 fp64 with MIPT_DIST_GATE_DIAGNOSTICS=1. A file that also carries\n"
+        << "                 the temporal-turn diagnostics (MIPT_DIST_TURN_DIAGNOSTICS=1, or\n"
+        << "                 dist_graph_replay.exe augment output) is validated on its turn\n"
+        << "                 values and flag bits 7-9 too\n"
         << "  selection.csv  data_analysis/select_gate_traces.py output, header\n"
         << "                 " << mipt::gate_trace::SELECTION_HEADER << "\n"
         << "  output.csv     default <selection stem>_gate_trace.csv; the validation table\n"
@@ -288,6 +291,13 @@ int run(const std::string &records_path, const std::string &selection_path,
     {
         refuse(records_path + " says gate_path_diagnostics=" + reader.field("gate_path_diagnostics") + ".");
     }
+    // The temporal-turn diagnostics (MIPT_DIST_TURN_DIAGNOSTICS=1, or a file
+    // dist_graph_replay.exe augmented) are twenty-one more values and flag bits
+    // 7-9, all pure functions of the layer draw. When the file carries them the
+    // replayed graph computes them too and every record is validated on them;
+    // otherwise they stay out of the replay entirely, and a file without them
+    // validates exactly as before.
+    const bool turn_diagnostics = gt::carries_turn_diagnostics(reader);
     // The engine knobs. Each changes either the floating-point order of the
     // circuit (block width) or how many uniforms a measurement layer draws
     // (chunk width, parity encoding), and so the outcomes.
@@ -448,10 +458,14 @@ int run(const std::string &records_path, const std::string &selection_path,
                 throw std::runtime_error("The layer history ends on a non-identity mode "
                                          "permutation; the snapshot mode labels would be wrong.");
             }
-            connectivity.build(plan_history, true, true);
+            connectivity.build(plan_history, true, true, turn_diagnostics);
             if (!connectivity.has_gate_metrics())
             {
                 throw std::runtime_error("The regenerated graph carries no gate metrics.");
+            }
+            if (turn_diagnostics && !connectivity.has_turns())
+            {
+                throw std::runtime_error("The regenerated graph has no temporal-turn table.");
             }
             for (std::size_t m = 0; m < members.size(); ++m)
             {
@@ -537,10 +551,10 @@ int run(const std::string &records_path, const std::string &selection_path,
             const int j = pairs[k][1];
             const mipt::dist::PairConnectivity conn = connectivity.query(i, j);
             const mipt::dist::GatePathMetrics gate = connectivity.gate_path_metrics(i, j);
-            std::uint32_t flags = conn.flags();
-            flags |= fermion.mn > pair_zero_tol ? mipt::dist::FLAG_FN_POSITIVE : 0u;
-            flags |= metrics.mn > pair_zero_tol ? mipt::dist::FLAG_MN_POSITIVE : 0u;
-            replayed[{i, j}] = {flags, gt::replayed_observables(observables, metrics, fermion, conn, gate)};
+            const mipt::dist::PairTurns turns =
+                turn_diagnostics ? connectivity.pair_turns(i, j) : mipt::dist::PairTurns{};
+            replayed[{i, j}] =
+                gt::replay_record(observables, metrics, fermion, conn, gate, turns, pair_zero_tol);
             pair_index[{i, j}] = k;
             fermion_of[{i, j}] = fermion;
         }

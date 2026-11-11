@@ -110,6 +110,64 @@ def _ensure_gate_path_columns(frame: pd.DataFrame) -> pd.DataFrame:
     return frame
 
 
+# The temporal-turn columns gap format v4 added (MIPT_DIST_TURN_DIAGNOSTICS), in
+# file order, renamed the same way: to the record binary's observable names
+# where one exists (sm_turns, wd_turns, min_turns, *_cancelled_gates), and to
+# the flag names for the three refined percolation events. Optional on read, so
+# v2 and v3 files still load, with every one of them present and NaN.
+#
+# Two kinds, and the split matters. The numbers are counts, 0/1 indicators or
+# `nan` -- "the shape was unavailable" or "the diagnostics were off", never a
+# zero. The text columns are names (path_class_name / connector_status_name)
+# and the ordered gate layers of the path as `l1;l2;...`; those are read as
+# strings, because a column whose every path happens to cross one gate would
+# otherwise be inferred as integers and lose its type between files.
+_TURN_NUMERIC_COLUMNS = {
+    "sm_turns_ij": "sm_turns",
+    "sm_trace_only_bridge_ij": "sm_trace_only_bridge",
+    "wd_turns_ij": "wd_turns",
+    "wd_trace_only_bridge_ij": "wd_trace_only_bridge",
+    "min_turns_ij": "min_turns",
+    "connected_common_source_ij": "connected_common_source",
+    "connected_certified_ij": "connected_certified",
+    "sm_cancelled_gates_ij": "sm_cancelled_gates",
+    "wd_cancelled_gates_ij": "wd_cancelled_gates",
+    "connected_doubled_ij": "connected_doubled",
+}
+_TURN_TEXT_COLUMNS = {
+    "sm_path_class_ij": "sm_path_class",
+    "sm_connector_status_ij": "sm_connector_status",
+    "sm_gate_layers_ij": "sm_gate_layers",
+    "wd_path_class_ij": "wd_path_class",
+    "wd_connector_status_ij": "wd_connector_status",
+    "wd_gate_layers_ij": "wd_gate_layers",
+}
+_TURN_COLUMNS = {**_TURN_NUMERIC_COLUMNS, **_TURN_TEXT_COLUMNS}
+
+
+def _turn_text_dtypes(path: str | Path) -> dict[str, type]:
+    """``read_csv`` dtypes that keep a file's turn text columns as strings."""
+    available = set(pd.read_csv(path, nrows=0).columns)
+    return {name: str for name in _TURN_TEXT_COLUMNS if name in available}
+
+
+def _ensure_turn_columns(frame: pd.DataFrame) -> pd.DataFrame:
+    """Rename the gap-v4 turn columns if present, add them as NaN if not."""
+    frame = frame.rename(columns=_TURN_COLUMNS)
+    for name in _TURN_NUMERIC_COLUMNS.values():
+        if name not in frame.columns:
+            frame[name] = np.nan
+        else:
+            frame[name] = pd.to_numeric(frame[name], errors="coerce")
+    for name in _TURN_TEXT_COLUMNS.values():
+        if name not in frame.columns:
+            frame[name] = np.nan
+        else:
+            column = frame[name]
+            frame[name] = column.where(column.isna(), column.astype(str)).astype(object)
+    return frame
+
+
 def aggregate_path_for(outcome_csv: str | Path) -> Path:
     path = Path(outcome_csv)
     return path.with_name(path.stem + "_aggregate.csv")
@@ -193,8 +251,8 @@ def read_pair_summary(path: str | Path) -> pd.DataFrame:
     explanatory class. ``r3`` and ``undetermined`` are derived here so a table
     from this path and one reduced from the outcome rows are interchangeable.
     """
-    frame = pd.read_csv(path)
-    out = _ensure_gate_path_columns(frame.rename(columns=_SUMMARY_RENAME))
+    frame = pd.read_csv(path, dtype=_turn_text_dtypes(path))
+    out = _ensure_turn_columns(_ensure_gate_path_columns(frame.rename(columns=_SUMMARY_RENAME)))
     out["r3"] = out["positive_thirds"] > 0
     # No positive third, but something the solver could not resolve: the pair's
     # R_3 is unknown and it belongs in neither the numerator nor the
@@ -240,9 +298,12 @@ def _reduce_groups(frame: pd.DataFrame) -> pd.DataFrame:
         _block_j=(frame["min_cut_site"] == "j").astype(np.int64),
         _block_k=(frame["min_cut_site"] == "k").astype(np.int64),
     )
-    work = _ensure_gate_path_columns(work)
+    work = _ensure_turn_columns(_ensure_gate_path_columns(work))
     grouped = work.groupby(_GROUP_KEYS, sort=False, observed=True)
     gate_aggregations = {name: (name, "first") for name in _GATE_PATH_COLUMNS.values()}
+    # Like the gate columns, the turn columns describe the anchor pair and are
+    # repeated on its L-2 rows.
+    gate_aggregations.update({name: (name, "first") for name in _TURN_COLUMNS.values()})
     out = grouped.agg(
         separation=("separation", "first"),
         d=("chord", "first"),
@@ -298,6 +359,8 @@ def pair_level_table(
     # file has them, and let _reduce_groups fill NaN when it does not.
     available = set(pd.read_csv(outcome_csv, nrows=0).columns)
     columns += [name for name in _GATE_PATH_COLUMNS if name in available]
+    # Likewise the turn columns, from gap format v4 on.
+    columns += [name for name in _TURN_COLUMNS if name in available]
     pieces: list[pd.DataFrame] = []
     carry: pd.DataFrame | None = None
     reader = pd.read_csv(
@@ -310,6 +373,7 @@ def pair_level_table(
             "fgmn_method": "category",
             "fgmn_status": "category",
             "min_cut_site": "category",
+            **_turn_text_dtypes(outcome_csv),
         },
     )
     for chunk in reader:

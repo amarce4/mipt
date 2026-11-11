@@ -525,21 +525,77 @@ inline std::vector<Selection> read_selection(const std::string &path)
 // Validation against the stored records
 // ---------------------------------------------------------------------------
 
+// Whether a record file carries the temporal-turn diagnostics -- twenty-one
+// values and flag bits 7-9 -- checked against the definition this binary
+// computes them under. A file written under another definition version is a
+// refusal rather than a validation failure: every one of its records would
+// disagree on the turn columns, and reporting that as "the replay is a
+// different trajectory" would send the reader after the wrong cause. Throws
+// std::invalid_argument, which the app reports as a refusal.
+inline bool carries_turn_diagnostics(const dist::records::RecordReader &reader)
+{
+    if (!reader.has("turn_diagnostics"))
+    {
+        return false;
+    }
+    const std::string &path = reader.path();
+    if (reader.field("turn_diagnostics") != "1")
+    {
+        throw std::invalid_argument(path + " says turn_diagnostics=" +
+                                    reader.field("turn_diagnostics") +
+                                    "; a file carries the turn diagnostics as 1 or not at all.");
+    }
+    const std::string version = std::to_string(dist::TURN_DIAGNOSTICS_VERSION);
+    if (!reader.has("turn_diagnostics_version") ||
+        reader.field("turn_diagnostics_version") != version)
+    {
+        throw std::invalid_argument(
+            path + " was written under turn_diagnostics_version=" +
+            (reader.has("turn_diagnostics_version") ? reader.field("turn_diagnostics_version")
+                                                    : std::string("<missing>")) +
+            ", but this binary computes version " + version +
+            ", so the replay cannot reproduce its turn columns.");
+    }
+    if (!reader.has("turn_diagnostics_definition") ||
+        reader.field("turn_diagnostics_definition") != dist::TURN_DIAGNOSTICS_DEFINITION)
+    {
+        throw std::invalid_argument(path + " records a different turn_diagnostics_definition "
+                                           "than this binary computes the turns under.");
+    }
+    for (const char *name : dist::records::turn_observable_names())
+    {
+        if (reader.observable_index(name) < 0)
+        {
+            throw std::invalid_argument(path + " says turn_diagnostics=1 but carries no `" +
+                                        std::string(name) + "` observable.");
+        }
+    }
+    return true;
+}
+
 // The value a record named `name` would carry for this pair, recomputed from
 // the replay -- a by-name mirror of PairProtocol::fill_record_values, with the
-// gate-path values going through records::fill_gate_record_values, the very
-// function production writes them with. An observable this does not know is a
-// refusal: a replay that skipped a stored column would be validated against
-// less than the file holds and would not say so.
+// gate-path and turn values going through records::fill_gate_record_values and
+// records::fill_turn_record_values, the very functions production writes them
+// with. `turns` is the replayed graph's PairTurns for a file that carries the
+// turn diagnostics; it defaults to an unevaluated one, whose turn values are
+// all NaN, so a caller that forgets it fails validation on such a file rather
+// than passing it. An observable this does not know is a refusal: a replay
+// that skipped a stored column would be validated against less than the file
+// holds and would not say so.
 inline std::vector<double> replayed_observables(const std::vector<std::string> &names,
                                                 const dist::PairMetrics &metrics,
                                                 const dist::PairMetrics &fermion,
                                                 const dist::PairConnectivity &conn,
-                                                const dist::GatePathMetrics &gate)
+                                                const dist::GatePathMetrics &gate,
+                                                const dist::PairTurns &turns = dist::PairTurns{})
 {
     std::array<double, dist::records::GATE_RECORD_VALUES> gate_values{};
     dist::records::fill_gate_record_values(conn, gate, gate_values.data());
     const auto &gate_names = dist::records::gate_observable_names();
+    std::array<double, dist::records::TURN_RECORD_VALUES> turn_values{};
+    dist::records::fill_turn_record_values(conn, turns, turn_values.data());
+    const auto &turn_names = dist::records::turn_observable_names();
 
     std::vector<double> out;
     out.reserve(names.size());
@@ -547,9 +603,15 @@ inline std::vector<double> replayed_observables(const std::vector<std::string> &
     {
         const auto gate_it = std::find_if(gate_names.begin(), gate_names.end(),
                                           [&](const char *g) { return name == g; });
+        const auto turn_it = std::find_if(turn_names.begin(), turn_names.end(),
+                                          [&](const char *t) { return name == t; });
         if (gate_it != gate_names.end())
         {
             out.push_back(gate_values[static_cast<std::size_t>(gate_it - gate_names.begin())]);
+        }
+        else if (turn_it != turn_names.end())
+        {
+            out.push_back(turn_values[static_cast<std::size_t>(turn_it - turn_names.begin())]);
         }
         else if (name == "mi") { out.push_back(metrics.mi); }
         else if (name == "mn") { out.push_back(metrics.mn); }
@@ -609,6 +671,27 @@ struct ReplayedRecord
     std::vector<double> values;
 };
 
+// One pair's replayed record, built by the functions production writes it
+// with: records::pair_record_flags for the flag word, replayed_observables for
+// the values. The replay is RPPU only, so "entangled" is the fermionic fN, as
+// it is in PairProtocol for every parity-preserving circuit. Pass the replayed
+// graph's PairTurns exactly when carries_turn_diagnostics() says the file has
+// them: then flag bits 7-9 are compared like every other bit, and with a
+// default PairTurns they stay clear, which is what a file without them holds.
+inline ReplayedRecord replay_record(const std::vector<std::string> &observables,
+                                    const dist::PairMetrics &metrics,
+                                    const dist::PairMetrics &fermion,
+                                    const dist::PairConnectivity &conn,
+                                    const dist::GatePathMetrics &gate,
+                                    const dist::PairTurns &turns, double pair_zero_tol)
+{
+    ReplayedRecord out;
+    out.flags = dist::records::pair_record_flags(conn, fermion.mn > pair_zero_tol,
+                                                 metrics.mn > pair_zero_tol, turns);
+    out.values = replayed_observables(observables, metrics, fermion, conn, gate, turns);
+    return out;
+}
+
 struct RealizationCheck
 {
     std::size_t records_compared = 0;
@@ -626,9 +709,10 @@ struct RealizationCheck
 // `replayed` is keyed by the ascending site pair. Every stored record must
 // find its pair through the embedding table, every replayed pair must be
 // stored exactly once (a record file at stride 1 holds every pair of a kept
-// trajectory), and the flags must agree bit for bit -- the connectivity bits
-// are a pure function of the layer draw and the positivity bits of values that
-// agree, so a flag that differs is a different trajectory.
+// trajectory), and the flags must agree bit for bit -- the connectivity bits,
+// turn bits 7-9 included where the file carries them, are a pure function of
+// the layer draw and the positivity bits of values that agree, so a flag that
+// differs is a different trajectory.
 inline RealizationCheck check_realization(
     const std::vector<std::string> &observables,
     const std::vector<dist::records::StoredRecord> &stored,

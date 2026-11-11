@@ -151,6 +151,7 @@ struct OutcomeMeta
     int statevector_precision = 0;
     int gap_format_version = 0;
     int gate_diagnostics_version = 0;
+    int turn_diagnostics_version = 0;
     double pair_zero_tol = 0.0;
     double occupation_mi_tol = 0.0;
     double channel_floor = 0.0;
@@ -178,29 +179,16 @@ inline OutcomeMeta read_outcome_meta(const std::string &path)
     expected.pop_back();
     if (line != expected)
     {
-        // Name the version when the file says what it is. Every gap format
-        // since v1 carries a gap_format_version column, so the first data row
-        // settles it; only a file with no such column, or no rows, is unnamed.
-        std::string version = "an unknown gap format version";
-        const std::vector<std::string> names = util::resume::split_csv_row(line);
-        const auto it = std::find(names.begin(), names.end(), "gap_format_version");
+        // Name the version when the file says what it is (stated_gap_format:
+        // the first data row settles it). The resume refuses a stale file with
+        // the same history, so the two never explain a version differently.
         std::string row;
-        if (it != names.end() && std::getline(file, row))
-        {
-            const std::vector<std::string> values = util::resume::split_csv_row(row);
-            const std::size_t index = static_cast<std::size_t>(it - names.begin());
-            if (index < values.size())
-            {
-                version = "gap format v" + values[index];
-            }
-        }
+        std::getline(file, row);
         throw std::runtime_error(
-            path + " is " + version + ", and this audit reads gap format v" +
+            path + " is " + stated_gap_format(line, row) + ", and this audit reads gap format v" +
             std::to_string(GAP_FORMAT_VERSION) + " only (its column layout differs from what "
-            "this binary writes). v2 added the certified fGMN interval, without which a row "
-            "cannot be reclassified; v3 added gate_diagnostics_version and the gate-path "
-            "columns, without which the regenerated pair summary would not match the file. "
-            "Audit it with the binary that wrote it.");
+            "this binary writes). " + gap_format_history() +
+            ". Audit it with the binary that wrote it.");
     }
     if (!std::getline(file, line))
     {
@@ -237,6 +225,18 @@ inline OutcomeMeta read_outcome_meta(const std::string &path)
             path + " was written with gate_diagnostics_version=" +
             std::to_string(meta.gate_diagnostics_version) + "; this binary defines version " +
             std::to_string(GATE_DIAGNOSTICS_VERSION) +
+            ". Audit it with the binary that wrote it.");
+    }
+    meta.turn_diagnostics_version = std::stoi(text("turn_diagnostics_version"));
+    if (meta.turn_diagnostics_version != 0 &&
+        meta.turn_diagnostics_version != TURN_DIAGNOSTICS_VERSION)
+    {
+        // Same reason: the regenerated summary would carry this binary's
+        // version beside sixteen columns computed under another definition.
+        throw std::runtime_error(
+            path + " was written with turn_diagnostics_version=" +
+            std::to_string(meta.turn_diagnostics_version) + "; this binary defines version " +
+            std::to_string(TURN_DIAGNOSTICS_VERSION) +
             ". Audit it with the binary that wrote it.");
     }
     meta.pair_zero_tol = std::stod(text("pair_zero_tol"));
@@ -1112,7 +1112,9 @@ inline int run_audit(const std::string &outcome_csv, const std::string &rho3_pat
     out << "Gap audit of " << outcome_csv << '\n';
     out << "  run " << meta.run_id << ": N=" << meta.n << ", p=" << meta.p
         << ", circuit=" << meta.circuit_name << ", precision=fp" << meta.statevector_precision
-        << ", gap format v" << meta.gap_format_version << '\n';
+        << ", gap format v" << meta.gap_format_version
+        << ", gate_diagnostics_version=" << meta.gate_diagnostics_version
+        << ", turn_diagnostics_version=" << meta.turn_diagnostics_version << '\n';
     out << "  recorded thresholds: pair_zero_tol=" << meta.pair_zero_tol
         << ", fgmn_positive_tol=" << meta.positive_tol << ", prefilter_tol=" << meta.prefilter_tol
         << ", cut_positive_tol=" << meta.cut_positive_tol << ", mosek_tol=" << meta.mosek_tol
@@ -1152,7 +1154,10 @@ inline int run_audit(const std::string &outcome_csv, const std::string &rho3_pat
     config.type = static_cast<CircuitType>(meta.circ_type);
     config.seed = meta.master_seed;
     config.statevector_precision = meta.statevector_precision;
+    // Both diagnostic versions are provenance the summary repeats, so they come
+    // from the file rather than from this process's environment.
     config.gate_path_diagnostics = meta.gate_diagnostics_version != 0;
+    config.turn_diagnostics = meta.turn_diagnostics_version != 0;
     config.pair_zero_tol = settings.pair_tols.front();
     config.occupation_mi_tol = meta.occupation_mi_tol;
     config.channel_floor = meta.channel_floor;

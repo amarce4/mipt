@@ -35,6 +35,18 @@ gate_path_gap_test(...) Gate-path diagnostic (MIPT_DIST_GATE_DIAGNOSTICS=1): str
                        compares widest/shortest-maximin gate entangling power
                        and parity-block mixing with trajectory-clustered CIs;
                        writes <stem>_gate_path_summary.csv.
+temporal_turn_test(...) Temporal-turn diagnostic (MIPT_DIST_TURN_DIAGNOSTICS=1, or a
+                       `dist_graph_replay.exe augment` file): streams the record
+                       binary and asks whether zig-zag / cancelled paths explain
+                       the connected-but-unentangled gap -- P(gap | turns, path
+                       class, cancelled gates), a same-trajectory matched
+                       comparison, and kappa/eta under the common-source,
+                       certified and doubled-network refinements of C, all with
+                       trajectory-clustered CIs; writes <stem>_turn_summary.csv
+                       and the <stem>_turn_selection.csv `dist_graph_replay.exe
+                       paths` replays. Also ``python -m data_analysis.turns``.
+read_turn_paths(...)   Load the `paths` tool's CSV with proper dtypes;
+turn_path_report(...)  tabulates it gap against control.
 select_gate_traces(...) Stratified sample of silent connected-zero pairs plus
                        matched entangled controls, written as the
                        <stem>_gate_trace_selection.csv rppu_gate_trace.exe replays.
@@ -83,6 +95,8 @@ front, stagger     mode-5 one-probe fronts and two-probe staggered velocities
 pair_gap           dist_scaling.exe's connected-zero triple analysis and the
                    gate-path gap test
 select_gate_traces the replay sample for rppu_gate_trace.exe
+turns              the temporal-turn / doubled-network gap test and the
+                   dist_graph_replay.exe paths selection and report
 """
 
 from __future__ import annotations
@@ -90,6 +104,7 @@ from __future__ import annotations
 from .distance import dist_percolation, dist_scaling, dist_scaling_comparison
 from .pair_gap import dist_pair_gap, gate_path_gap_test, read_four_site, read_pair_summary
 from .select_gate_traces import select_gate_traces
+from .turns import read_turn_paths, temporal_turn_test, turn_path_report
 from .entropy import entropy
 from .expvals import expvals
 from .free_energy import free_energy_ceff, free_energy_equilibration
@@ -114,6 +129,9 @@ __all__ = [
     "dist_pair_gap",
     "gate_path_gap_test",
     "select_gate_traces",
+    "temporal_turn_test",
+    "read_turn_paths",
+    "turn_path_report",
     "read_pair_summary",
     "read_four_site",
     "dist_scaling",

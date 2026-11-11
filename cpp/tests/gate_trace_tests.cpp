@@ -16,6 +16,10 @@
 //       binary search, and check_realization accepts an exact replay and
 //       rejects a perturbed value or flag
 //   (f) the host parity-sector expansion reproduces a directly built state
+//   (g) a record file carrying the temporal-turn diagnostics validates against
+//       a replay that recomputes the turns and fails one that does not, on
+//       both the turn values and flag bits 7-9; the header check refuses a
+//       file whose turns this binary cannot reproduce
 //   plus the selection-CSV reader.
 
 #include "mipt/circuits/rppu_layer.hpp"
@@ -28,6 +32,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <iostream>
+#include <map>
 #include <random>
 #include <sstream>
 #include <string>
@@ -563,6 +568,247 @@ void test_replayed_observables()
     expect(refused, "an unknown observable is refused");
 }
 
+// (g) A file that carries the temporal-turn diagnostics. Its records are
+// written through the production helpers from real PairTurns; a replay that
+// recomputes the turns reproduces every value and every flag bit, and the same
+// replay without the turn table is caught on both. A file without them still
+// validates without them, and the header check refuses a file whose turns this
+// binary cannot reproduce.
+void test_turn_replay()
+{
+    const int n = 4;
+    mipt::dist::RunConfig config;
+    config.k = 2;
+    config.n = n;
+    config.periods = 2;
+    config.p = 0.25;
+    config.realizations = 1;
+    config.type = mipt::CircuitType::FermionRPPU;
+    config.gate_path_diagnostics = true;
+    config.turn_diagnostics = true;
+    config.statevector_precision = 64;
+    config.record_detail = mipt::dist::RecordDetail::Basic;
+    const auto bins = mipt::dist::make_pair_bins(n);
+    const auto embeddings = pair_embeddings(n);
+    const double pair_zero_tol = 1.0e-12;
+
+    // The four-mode zig-zag -- gates (0,1),(2,3), then the bridge (1,2) --
+    // with connector 1 measured after the bridge, so its six pairs hold
+    // disconnected records, common sources (bits 7-9), and the certified
+    // zig-zag (bits 8 and 9 only).
+    mipt::LogicalHistory history;
+    history.reset(n);
+    const std::vector<std::vector<std::pair<int, int>>> bonds{{{0, 1}, {2, 3}}, {{1, 2}}, {}};
+    for (const auto &layer_bonds : bonds)
+    {
+        mipt::LogicalLayer layer;
+        layer.measured.assign(static_cast<std::size_t>(n), 0u);
+        int index = 0;
+        for (const auto &[a, b] : layer_bonds)
+        {
+            mipt::LogicalBond bond{a, b};
+            bond.source_gate_index = index++;
+            bond.entangling_power = 0.9;
+            bond.even_block_mixing = 0.8;
+            bond.odd_block_mixing = 0.7;
+            layer.bonds.push_back(bond);
+        }
+        history.layers.push_back(std::move(layer));
+    }
+    history.layers[1].measured[1] = 1u;
+    history.valid = true;
+    mipt::dist::ConnectivityIndex connectivity;
+    connectivity.build(history, true, true, true);
+    expect(connectivity.has_turns(), "(g) the index precomputed the turn table");
+
+    // Distinct synthetic metrics per pair; fN alternates around the threshold.
+    std::map<std::pair<int, int>, mipt::dist::PairMetrics> ordinary;
+    std::map<std::pair<int, int>, mipt::dist::PairMetrics> fermionic;
+    for (const auto &row : embeddings)
+    {
+        const double base = 0.1 * row[2] + 0.01 * row[3];
+        mipt::dist::PairMetrics m;
+        m.mi = base + 1.0;
+        m.mn = base + 2.0;
+        mipt::dist::PairMetrics f;
+        f.mi = base + 3.0;
+        f.mn = ((row[2] + row[3]) % 2 == 0) ? 0.0 : base + 4.0;
+        ordinary[{row[2], row[3]}] = m;
+        fermionic[{row[2], row[3]}] = f;
+    }
+
+    // Write one realization as PairProtocol would: the detail values by name,
+    // the diagnostic tail and the flag word through the records:: helpers.
+    const auto write = [&](const mipt::dist::RunConfig &cfg, const std::string &tag) {
+        const std::vector<std::string> names = records::pair_observable_names(cfg);
+        const std::size_t detail_count = records::pair_detail_observable_names(cfg).size();
+        const std::filesystem::path path =
+            std::filesystem::temp_directory_path() / ("gate_trace_turns_" + tag + ".bin");
+        std::filesystem::remove(path);
+        records::RecordSink sink;
+        sink.open(path.string(), records::pair_header_text(cfg, bins, embeddings), names.size(), 0);
+        for (const auto &row : embeddings)
+        {
+            const std::pair<int, int> key{row[2], row[3]};
+            const auto &m = ordinary.at(key);
+            const auto &f = fermionic.at(key);
+            std::vector<double> values(names.size(), 0.0);
+            for (std::size_t slot = 0; slot < detail_count; ++slot)
+            {
+                const std::string &name = names[slot];
+                values[slot] = name == "mi" ? m.mi : name == "mn" ? m.mn : name == "fmi" ? f.mi : f.mn;
+            }
+            const auto conn = connectivity.query(row[2], row[3]);
+            const auto turns = cfg.turn_diagnostics ? connectivity.pair_turns(row[2], row[3])
+                                                    : mipt::dist::PairTurns{};
+            records::fill_pair_diagnostic_values(cfg, conn, connectivity.gate_path_metrics(row[2], row[3]),
+                                                 turns, values.data() + detail_count);
+            sink.add(0, static_cast<std::uint32_t>(row[0]), static_cast<std::uint32_t>(row[1]),
+                     records::pair_record_flags(conn, f.mn > pair_zero_tol, m.mn > pair_zero_tol, turns),
+                     values.data());
+        }
+        sink.close();
+        return path.string();
+    };
+    const auto replay = [&](records::RecordReader &reader, bool with_turns) {
+        const auto stored = reader.read_realization(0);
+        std::map<std::pair<int, int>, gt::ReplayedRecord> replayed;
+        for (const auto &row : embeddings)
+        {
+            const std::pair<int, int> key{row[2], row[3]};
+            const auto turns = with_turns ? connectivity.pair_turns(row[2], row[3])
+                                          : mipt::dist::PairTurns{};
+            replayed[key] = gt::replay_record(reader.observables(), ordinary.at(key),
+                                              fermionic.at(key), connectivity.query(row[2], row[3]),
+                                              connectivity.gate_path_metrics(row[2], row[3]), turns,
+                                              pair_zero_tol);
+        }
+        return gt::check_realization(reader.observables(), stored, reader.embedding_sites(), replayed);
+    };
+
+    const std::string turn_path = write(config, "on");
+    {
+        records::RecordReader reader(turn_path);
+        expect(gt::carries_turn_diagnostics(reader), "(g) the header says the file carries turns");
+        for (const char *name : records::turn_observable_names())
+        {
+            expect(reader.observable_index(name) >= 0, "(g) the turn observables are declared");
+        }
+        const gt::RealizationCheck exact = replay(reader, true);
+        expect(exact.valid() && exact.records_compared == embeddings.size(),
+               "(g) a replay with the turn table validates a turn file: " + exact.first_mismatch);
+        const gt::RealizationCheck blind = replay(reader, false);
+        expect(!blind.valid() && blind.flag_mismatches > 0 && blind.mismatches > 0,
+               "(g) a replay without the turn table fails on the turn bits and the turn values");
+        bool saw_bit9_only_with_8 = false;
+        for (const auto &record : reader.read_realization(0))
+        {
+            const bool doubled = (record.flags & mipt::dist::FLAG_CONNECTED_DOUBLED) != 0u;
+            const bool source = (record.flags & mipt::dist::FLAG_CONNECTED_COMMON_SOURCE) != 0u;
+            saw_bit9_only_with_8 = saw_bit9_only_with_8 || (doubled && !source);
+        }
+        expect(saw_bit9_only_with_8, "(g) the fixture stores a certified zig-zag (bits 8, 9 without 7)");
+    }
+
+    auto plain = config;
+    plain.turn_diagnostics = false;
+    const std::string plain_path = write(plain, "off");
+    {
+        records::RecordReader reader(plain_path);
+        expect(!gt::carries_turn_diagnostics(reader), "(g) a file without turns says so");
+        expect(replay(reader, false).valid(), "(g) a file without turns validates without them");
+    }
+
+    // The header check: rewrite one field of the turn header, keep the
+    // payload layout, and the file must be refused rather than validated.
+    const std::string header = records::pair_header_text(config, bins, embeddings);
+    const std::size_t value_count = records::pair_observable_names(config).size();
+    const auto refused_header = [&](const std::string &from, const std::string &to,
+                                    std::size_t count, const std::string &what) {
+        std::string text = header;
+        const std::size_t at = text.find(from);
+        expect(at != std::string::npos, "(g) found " + from);
+        if (at == std::string::npos)
+        {
+            return;
+        }
+        text.replace(at, from.size(), to);
+        const std::filesystem::path path =
+            std::filesystem::temp_directory_path() / "gate_trace_turns_edited.bin";
+        std::filesystem::remove(path);
+        {
+            records::RecordSink sink;
+            sink.open(path.string(), text, count, 0);
+            std::vector<double> values(count, 0.0);
+            sink.add(0, 0, 0, 0u, values.data());
+            sink.close();
+        }
+        bool refused = false;
+        try
+        {
+            records::RecordReader reader(path.string());
+            (void)gt::carries_turn_diagnostics(reader);
+        }
+        catch (const std::invalid_argument &)
+        {
+            refused = true;
+        }
+        expect(refused, "(g) " + what);
+        std::filesystem::remove(path);
+    };
+    const std::string version = std::to_string(mipt::dist::TURN_DIAGNOSTICS_VERSION);
+    refused_header("\nturn_diagnostics=1\n", "\nturn_diagnostics=2\n", value_count,
+                   "a turn_diagnostics value other than 1 is refused");
+    refused_header("\nturn_diagnostics_version=" + version + "\n", "\nturn_diagnostics_version=999\n",
+                   value_count, "another turn-definition version is refused");
+    refused_header("\nturn_diagnostics_definition=", "\nturn_diagnostics_definition=x", value_count,
+                   "another turn definition is refused");
+    // The turn fields on a header whose observables lack them: the payload is
+    // the turn-off layout, so the reader accepts it and the check must not.
+    {
+        const std::string plain_header = records::pair_header_text(plain, bins, embeddings);
+        const std::string turn_block = "turn_diagnostics=1\nturn_diagnostics_version=" + version +
+                                       "\nturn_diagnostics_definition=" +
+                                       std::string(mipt::dist::TURN_DIAGNOSTICS_DEFINITION) + "\n";
+        const std::size_t at = header.find(turn_block);
+        expect(at != std::string::npos, "(g) the turn header carries its block");
+        const std::string anchor = "\ncusv_block_targets=";
+        const std::size_t cusv = plain_header.find(anchor);
+        const std::size_t end = cusv == std::string::npos ? cusv : plain_header.find('\n', cusv + 1);
+        expect(end != std::string::npos, "(g) the plain header has a cusv_block_targets line");
+        if (end != std::string::npos)
+        {
+            std::string text = plain_header;
+            text.insert(end + 1, turn_block);
+            const std::filesystem::path path =
+                std::filesystem::temp_directory_path() / "gate_trace_turns_spliced.bin";
+            std::filesystem::remove(path);
+            const std::size_t count = records::pair_observable_names(plain).size();
+            {
+                records::RecordSink sink;
+                sink.open(path.string(), text, count, 0);
+                std::vector<double> values(count, 0.0);
+                sink.add(0, 0, 0, 0u, values.data());
+                sink.close();
+            }
+            bool refused = false;
+            try
+            {
+                records::RecordReader reader(path.string());
+                (void)gt::carries_turn_diagnostics(reader);
+            }
+            catch (const std::invalid_argument &)
+            {
+                refused = true;
+            }
+            expect(refused, "(g) turn fields without the turn observables are refused");
+            std::filesystem::remove(path);
+        }
+    }
+    std::filesystem::remove(turn_path);
+    std::filesystem::remove(plain_path);
+}
+
 void test_parity_expansion(std::mt19937 &rng)
 {
     for (const int n : {4, 7, 10})
@@ -625,6 +871,7 @@ int main()
     test_covariance(rng);
     test_record_reader(rng);
     test_replayed_observables();
+    test_turn_replay();
     test_parity_expansion(rng);
     test_selection_reader();
     if (failures != 0)

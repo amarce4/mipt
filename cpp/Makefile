@@ -191,6 +191,9 @@ DIST_CONN_TEST_BIN := $(HOST_BUILD)/dist_connectivity_tests
 DIST_GAP_TEST_BIN := $(HOST_BUILD)/dist_pair_gap_tests
 GATE_TEST_BIN := $(HOST_BUILD)/gate_entanglement_tests
 GATE_TRACE_TEST_BIN := $(HOST_BUILD)/gate_trace_tests
+TURN_TEST_BIN := $(HOST_BUILD)/temporal_turn_tests
+GRAPH_REPLAY_TEST_BIN := $(HOST_BUILD)/graph_replay_tests
+GRAPH_REPLAY_BIN := $(HOST_BUILD)/dist_graph_replay.exe
 RPPU_GATE_TRACE_BIN := $(BUILD)/rppu_gate_trace.exe
 SPECTRAL_TEST_BIN := $(HOST_BUILD)/spectral_tests
 FRONT_TEST_BIN := $(HOST_BUILD)/front_metrics_tests
@@ -214,6 +217,9 @@ DIST_CONN_TEST_OBJS := $(HOST_BUILD)/dist_connectivity_tests.o
 DIST_GAP_TEST_OBJS := $(HOST_BUILD)/dist_pair_gap_tests.o
 GATE_TEST_OBJS := $(HOST_BUILD)/gate_entanglement_tests.o
 GATE_TRACE_TEST_OBJS := $(HOST_BUILD)/gate_trace_tests.o
+TURN_TEST_OBJS := $(HOST_BUILD)/temporal_turn_tests.o
+GRAPH_REPLAY_TEST_OBJS := $(HOST_BUILD)/graph_replay_tests.o
+GRAPH_REPLAY_OBJS := $(HOST_BUILD)/dist_graph_replay.o
 RPPU_GATE_TRACE_OBJS := $(BUILD)/rppu_gate_trace.o
 SPECTRAL_TEST_OBJS := $(HOST_BUILD)/spectral_tests.o
 FRONT_TEST_OBJS := $(HOST_BUILD)/front_metrics_tests.o
@@ -250,6 +256,7 @@ ALL_OBJS := $(MIPT_OBJS) $(MIPT_PROBED_OBJS) $(FREE_ENERGY_OBJS) \
   $(SIM_TMI_OBJS) $(DIST_SCALING_OBJS) $(ENTROPY_OBJS) $(GMN_OBJS) $(FGMN_OBJS) \
   $(RING_OBJS) $(EXP_VALS_OBJS) $(CORE_TEST_OBJS) $(DIST_TEST_OBJS) \
   $(DIST_CONN_TEST_OBJS) $(DIST_GAP_TEST_OBJS) $(GATE_TEST_OBJS) $(GATE_TRACE_TEST_OBJS) \
+  $(TURN_TEST_OBJS) $(GRAPH_REPLAY_TEST_OBJS) $(GRAPH_REPLAY_OBJS) \
   $(SPECTRAL_TEST_OBJS) $(FRONT_TEST_OBJS) $(GMN_SOLVER_TEST_OBJS) \
   $(MIPT_PROBED_FGMN_PIC_OBJ)
 DEPS := $(ALL_OBJS:.o=.d)
@@ -287,6 +294,10 @@ mipt_probed.exe: $(MIPT_PROBED_BIN) $(MIPT_PROBED_FGMN_LIB)
 free_energy.exe: $(FREE_ENERGY_BIN)
 	cp $< $@
 sim_tmi.exe: $(SIM_TMI_BIN)
+	cp $< $@
+# Host-only: regenerates each trajectory's spacetime graph from a record file's
+# master seed (no GPU, no CUDA-Q) to add or check graph diagnostics offline.
+dist_graph_replay.exe: $(GRAPH_REPLAY_BIN)
 	cp $< $@
 # Stage-2 gate-trace replay. Needs the cuStateVec engine and an FP64=1 build
 # matching the run being replayed; it refuses otherwise.
@@ -346,6 +357,12 @@ $(GATE_TEST_BIN): $(GATE_TEST_OBJS)
 	$(HOSTCXX) $^ -o $@
 $(GATE_TRACE_TEST_BIN): $(GATE_TRACE_TEST_OBJS)
 	$(HOSTCXX) $^ -o $@
+$(TURN_TEST_BIN): $(TURN_TEST_OBJS)
+	$(HOSTCXX) $^ -o $@
+$(GRAPH_REPLAY_TEST_BIN): $(GRAPH_REPLAY_TEST_OBJS)
+	$(HOSTCXX) $^ -pthread -o $@
+$(GRAPH_REPLAY_BIN): $(GRAPH_REPLAY_OBJS)
+	$(HOSTCXX) $^ -pthread -o $@
 $(RPPU_GATE_TRACE_BIN): $(RPPU_GATE_TRACE_OBJS)
 	$(NVQXX) $(CUDAQ_TARGET_FLAGS) $^ $(MIPT_CUDA_LIBS) $(DIST_SCALING_CUDA_LIBS) $(CUSV_LIBS) $(DL_LIBS) -o $@
 $(DIST_TEST_BIN): $(DIST_TEST_OBJS)
@@ -363,9 +380,11 @@ test-core: $(CORE_TEST_BIN)
 # trips, and the spacetime graph plus the logical layer projection it is built
 # from.
 test-dist: $(DIST_TEST_BIN) $(DIST_CONN_TEST_BIN) $(DIST_GAP_TEST_BIN) $(GATE_TEST_BIN) \
-  $(GATE_TRACE_TEST_BIN)
+  $(GATE_TRACE_TEST_BIN) $(TURN_TEST_BIN) $(GRAPH_REPLAY_TEST_BIN)
 	$(GATE_TEST_BIN)
 	$(GATE_TRACE_TEST_BIN)
+	$(TURN_TEST_BIN)
+	$(GRAPH_REPLAY_TEST_BIN)
 	$(DIST_TEST_BIN)
 	$(DIST_CONN_TEST_BIN)
 	$(DIST_GAP_TEST_BIN)
@@ -547,6 +566,12 @@ $(HOST_BUILD)/gate_entanglement_tests.o: tests/gate_entanglement_tests.cpp | $(H
 	$(HOSTCXX) $(CPPFLAGS_COMMON) -std=c++20 -O2 -MMD -MP -c $< -o $@
 $(HOST_BUILD)/gate_trace_tests.o: tests/gate_trace_tests.cpp | $(HOST_BUILD)
 	$(HOSTCXX) $(CPPFLAGS_COMMON) -std=c++20 -O2 -MMD -MP -c $< -o $@
+$(HOST_BUILD)/temporal_turn_tests.o: tests/temporal_turn_tests.cpp | $(HOST_BUILD)
+	$(HOSTCXX) $(CPPFLAGS_COMMON) -std=c++20 -O2 -MMD -MP -c $< -o $@
+$(HOST_BUILD)/graph_replay_tests.o: tests/graph_replay_tests.cpp | $(HOST_BUILD)
+	$(HOSTCXX) $(CPPFLAGS_COMMON) -std=c++20 -O2 -pthread -MMD -MP -c $< -o $@
+$(HOST_BUILD)/dist_graph_replay.o: apps/dist_graph_replay.cpp | $(HOST_BUILD)
+	$(HOSTCXX) $(CPPFLAGS_COMMON) -std=c++20 -O2 -pthread -MMD -MP -c $< -o $@
 $(HOST_BUILD)/dist_metrics_tests.o: tests/dist_metrics_tests.cpp | $(HOST_BUILD)
 	$(HOSTCXX) $(CPPFLAGS_COMMON) -std=c++20 -O2 -MMD -MP -c $< -o $@
 $(HOST_BUILD)/spectral_tests.o: tests/spectral_tests.cpp | $(HOST_BUILD)

@@ -300,6 +300,138 @@ inline void fill_gate_record_values(const PairConnectivity &conn, const GatePath
     out[6] = path ? gate.widest_odd_block_mixing : nan;
 }
 
+// ---------------------------------------------------------------------------
+// Temporal-turn diagnostics (MIPT_DIST_TURN_DIAGNOSTICS=1)
+//
+// Twenty-one values appended to every k=2 record after the seven gate values,
+// read off the same two canonical paths the gate diagnostics take their
+// bottlenecks from. For the shortest-maximin path (`sm_`) and then the widest
+// entangling-power path (`wd_`): its turn count, its forward and backward
+// temporal steps, the layer span it covers, its class as int(PathClass)
+// (0 time_monotone, 1 common_source, 2 zigzag_certified, 3 zigzag_trace_only),
+// its bridges -- all of them, the measured ones, and the trace-only ones --
+// and how many of its gates the doubled-network reduction cancels for this
+// pair (> 0 means the path itself does not survive in rho_ij). Last comes
+// min_turns, the fewest turns over *every* walk joining the pair, which is
+// what says whether a better path than either canonical one exists. "Temporal
+// turns" and "The doubled network" in dist_connectivity.hpp have the
+// definitions.
+//
+// The NaN rule is the gate values' rule, for the gate values' reason. A shape
+// is a property of a path, so every value of it is NaN unless the percolation
+// event C holds and the shape could be read; writing 0 there would claim "a
+// time-monotone path with no bridge", a positive statement about a path that
+// does not exist. cancelled_gates is additionally NaN when the index did not
+// count it (-1 in PathShape), and min_turns under the C condition and also
+// when no walk joins the final-slice endpoints at all (-1 in PairTurns). A -1
+// is never written: it would read as a count.
+//
+// Defined once, here, because there are two writers: PairProtocol on a live
+// run, and dist_graph_replay.exe's `augment`, which appends exactly these
+// values to a record file written without them. Calling the one function is
+// what makes an augmented file and a live one agree by construction.
+// ---------------------------------------------------------------------------
+
+inline constexpr std::size_t TURN_RECORD_VALUES = 21;
+
+inline const std::array<const char *, TURN_RECORD_VALUES> &turn_observable_names()
+{
+    static const std::array<const char *, TURN_RECORD_VALUES> names{
+        "sm_turns",       "sm_temporal_forward", "sm_temporal_backward", "sm_min_layer",
+        "sm_max_layer",   "sm_class",            "sm_bridges",           "sm_bridges_measured",
+        "sm_bridges_trace_only", "sm_cancelled_gates",
+        "wd_turns",       "wd_temporal_forward", "wd_temporal_backward", "wd_min_layer",
+        "wd_max_layer",   "wd_class",            "wd_bridges",           "wd_bridges_measured",
+        "wd_bridges_trace_only", "wd_cancelled_gates",
+        "min_turns"};
+    return names;
+}
+
+// Lay the twenty-one turn values out in turn_observable_names() order.
+inline void fill_turn_record_values(const PairConnectivity &conn, const PairTurns &turns,
+                                    double *out)
+{
+    constexpr double nan = std::numeric_limits<double>::quiet_NaN();
+    const bool connected = conn.evaluated && conn.connected;
+    // Ten values per path shape: the same layout twice, sm_ then wd_.
+    auto shape = [&](const PathShape &path, double *slot) {
+        const bool have = connected && path.available;
+        auto value = [&](int x) { return have ? static_cast<double>(x) : nan; };
+        slot[0] = value(path.turns);
+        slot[1] = value(path.temporal_forward);
+        slot[2] = value(path.temporal_backward);
+        slot[3] = value(path.min_layer);
+        slot[4] = value(path.max_layer);
+        slot[5] = value(static_cast<int>(path.path_class));
+        slot[6] = value(static_cast<int>(path.bridges.size()));
+        slot[7] = value(path.bridges_measured);
+        slot[8] = value(path.bridges_trace_only);
+        slot[9] = path.cancelled_gates >= 0 ? value(path.cancelled_gates) : nan;
+    };
+    shape(turns.shortest_maximin, out);
+    shape(turns.widest, out + 10);
+    out[20] = (connected && turns.min_turns >= 0) ? static_cast<double>(turns.min_turns) : nan;
+}
+
+// The flag word of one k=2 record. The turn bits come from a PairTurns that is
+// left at its default -- every bit clear -- whenever the diagnostics are off,
+// so with the setting off the word is exactly what it was before they existed.
+// All three turn bits (7 common source, 8 certified, 9 doubled network) imply
+// C (PairTurns), so a pair that is not connected carries none of them. Shared
+// by PairProtocol and the gate-trace replay, which has to reproduce the word
+// bit for bit.
+inline std::uint32_t pair_record_flags(const PairConnectivity &conn, bool fn_positive,
+                                       bool mn_positive, const PairTurns &turns)
+{
+    std::uint32_t flags = conn.flags();
+    flags |= fn_positive ? FLAG_FN_POSITIVE : 0u;
+    flags |= mn_positive ? FLAG_MN_POSITIVE : 0u;
+    flags |= turns.flags();
+    return flags;
+}
+
+// The optional diagnostic tail of a k=2 record, after its detail-level values:
+// the gate values, then the turn values, each exactly when
+// pair_observable_names() declares it. Returns the slots written. One function
+// owns the ordering so the payload PairProtocol writes and the names the header
+// declares cannot drift apart, and so the host tests can pin the pairing by
+// name rather than by trusting two parallel lists.
+inline std::size_t fill_pair_diagnostic_values(const RunConfig &config, const PairConnectivity &conn,
+                                               const GatePathMetrics &gate, const PairTurns &turns,
+                                               double *out)
+{
+    std::size_t slot = 0;
+    if (config.gate_path_diagnostics)
+    {
+        fill_gate_record_values(conn, gate, out + slot);
+        slot += GATE_RECORD_VALUES;
+    }
+    if (config.turn_diagnostics)
+    {
+        fill_turn_record_values(conn, turns, out + slot);
+        slot += TURN_RECORD_VALUES;
+    }
+    return slot;
+}
+
+// The turn diagnostics' one precondition of their own. They read their shapes
+// off the gate diagnostics' two canonical paths, so they need those -- and,
+// through them, everything validate_gate_diagnostics below enforces (RPPU or
+// qRPPU, k=2 or k=0, the graph, somewhere to write). run() calls this first, so
+// a turn run without the gate setting is refused by the setting it is missing
+// rather than by a gate precondition it never asked about.
+inline void validate_turn_diagnostics(const RunConfig &config)
+{
+    if (config.turn_diagnostics && !config.gate_path_diagnostics)
+    {
+        throw std::invalid_argument(
+            "MIPT_DIST_TURN_DIAGNOSTICS=1 needs MIPT_DIST_GATE_DIAGNOSTICS=1: the turn shapes "
+            "are read off the gate diagnostics' two canonical paths (shortest-maximin and "
+            "widest entangling power), which exist only on a graph carrying gate capacities. "
+            "Set MIPT_DIST_GATE_DIAGNOSTICS=1 as well.");
+    }
+}
+
 // The run-level preconditions, as a pure function of the settings so the
 // refusals are testable on the host. dist_scaling.hpp calls it with
 // records::enabled().
@@ -345,12 +477,21 @@ inline void validate_gate_diagnostics(const RunConfig &config, bool records_enab
 //
 // The first two (or four) entries are exactly what format v1 wrote, so a v2
 // `basic` file is v1's value list with flags and an embedding table added.
+// The diagnostic tail follows in fill_pair_diagnostic_values() order: gate
+// values, then turn values.
 inline std::vector<std::string> pair_observable_names(const RunConfig &config)
 {
     std::vector<std::string> names = pair_detail_observable_names(config);
     if (config.gate_path_diagnostics)
     {
         for (const char *name : gate_observable_names())
+        {
+            names.push_back(name);
+        }
+    }
+    if (config.turn_diagnostics)
+    {
+        for (const char *name : turn_observable_names())
         {
             names.push_back(name);
         }
@@ -369,9 +510,26 @@ inline std::vector<std::string> triple_observable_names(const RunConfig &config)
     return names;
 }
 
+// The `flag_bits` line. Bits 7-9 are named only in a k=2 file whose run sets
+// them, so a header written with the turn diagnostics off is byte for byte the
+// one written before they existed and every such run still resumes. Bits 5 and
+// 6 have been set in every v2 record all along but were never named here; the
+// extended line names them too, since it is new text anyway, while the old
+// line stays exactly as it was.
+inline const char *flag_bits_text(bool turn_bits)
+{
+    return turn_bits ? "0:evaluated,1:survives_i,2:survives_j,3:interior_path,4:connected,"
+                       "5:fn_positive,6:mn_positive,7:connected_common_source,"
+                       "8:connected_certified,9:connected_doubled"
+                     : "0:evaluated,1:survives_i,2:survives_j,3:interior_path,4:connected";
+}
+
 // The `key=value` block every record file carries, whatever its party count.
+// `turn_flag_bits` is the pair header's to set: a k=0 run hands the turn
+// setting to its triangle protocol too, whose records carry no turn bits.
 inline std::string common_header_fields(const RunConfig &config,
-                                        const std::vector<std::string> &observables)
+                                        const std::vector<std::string> &observables,
+                                        bool turn_flag_bits = false)
 {
     std::string out;
     append_field(out, "format", "mipt_dist_records");
@@ -418,8 +576,7 @@ inline std::string common_header_fields(const RunConfig &config,
     append_field(out, "connectivity_graph", CONNECTIVITY_GRAPH_DEFINITION);
     // One definition of the flag bits, shared by this file, the CSV
     // documentation, and data_analysis.records.
-    append_field(out, "flag_bits",
-                 "0:evaluated,1:survives_i,2:survives_j,3:interior_path,4:connected");
+    append_field(out, "flag_bits", flag_bits_text(turn_flag_bits));
 
     std::string fields = "realization_id:u4,geometry_id:u2,embedding_id:u2,flags:u4,"
                          "reserved:u4";
@@ -460,6 +617,19 @@ inline void append_gate_header_fields(std::string &out)
                  std::to_string(env::integer("MIPT_CUSV_BLOCK_TARGETS", 4, 2, 12)));
 }
 
+// The turn diagnostics' provenance, after the gate block they depend on; k=2
+// record files only and only when enabled, for the same byte-identity reason.
+// The definition string is what a stored sm_class or flag bit 9 has to be read
+// against: change what a turn, a measured bridge or a cancelled gate is and the
+// same layer draw gives different values, so the version is bumped and a
+// resume refuses.
+inline void append_turn_header_fields(std::string &out)
+{
+    append_field(out, "turn_diagnostics", "1");
+    append_field(out, "turn_diagnostics_version", std::to_string(TURN_DIAGNOSTICS_VERSION));
+    append_field(out, "turn_diagnostics_definition", TURN_DIAGNOSTICS_DEFINITION);
+}
+
 // (geometry_id, embedding_id) -> the sites that embedding actually names.
 //
 // v1 could say a record belonged to separation 5 but not which of the N pairs
@@ -494,13 +664,25 @@ inline void append_geometry_table(std::string &out, const std::string &columns,
 }
 
 // k=2: the geometry is the ring separation, and `d` is its chord length.
+//
+// The only renderer of a k=2 header: PairProtocol and dist_graph_replay.exe's
+// `augment` both call it, so an augmented file's header is the live run's by
+// construction. Note what it reads besides `config`: the cuStateVec knobs of
+// the gate block come from the environment (append_gate_header_fields), and
+// the boundary implementation through RunConfig, so a caller reproducing
+// another run's header has to reproduce that environment too.
 inline std::string pair_header_text(const RunConfig &config, const std::vector<PairBin> &bins,
                                     const std::vector<std::array<int, 4>> &embeddings)
 {
-    std::string out = common_header_fields(config, pair_observable_names(config));
+    std::string out =
+        common_header_fields(config, pair_observable_names(config), config.turn_diagnostics);
     if (config.gate_path_diagnostics)
     {
         append_gate_header_fields(out);
+    }
+    if (config.turn_diagnostics)
+    {
+        append_turn_header_fields(out);
     }
 
     std::string rows;

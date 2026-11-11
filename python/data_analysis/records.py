@@ -108,14 +108,57 @@ FLAG_INTERIOR_PATH = 1 << 3
 FLAG_CONNECTED = 1 << 4
 FLAG_FN_POSITIVE = 1 << 5
 FLAG_MN_POSITIVE = 1 << 6
+# The refined percolation events of the temporal-turn diagnostics
+# (MIPT_DIST_TURN_DIAGNOSTICS=1, or `dist_graph_replay.exe augment` offline).
+# Each implies the one after it: C_common_source <= C_certified <= C_doubled <= C.
+# A file without the diagnostics never sets them, and its `flag_bits=` line
+# does not name them -- which is how turns.py tells "absent" from "zero".
+FLAG_CONNECTED_COMMON_SOURCE = 1 << 7
+FLAG_CONNECTED_CERTIFIED = 1 << 8
+FLAG_CONNECTED_DOUBLED = 1 << 9
 
+# Every bit, by the name the header's `flag_bits=` line gives it. Bits 5 and 6
+# are set in every v2 record but only *named* in a file written with the turn
+# diagnostics on; flag_bit_masks() reads what a file actually declares.
 FLAG_NAMES = {
     "evaluated": FLAG_EVALUATED,
     "survives_i": FLAG_SURVIVES_I,
     "survives_j": FLAG_SURVIVES_J,
     "interior_path": FLAG_INTERIOR_PATH,
     "connected": FLAG_CONNECTED,
+    "fn_positive": FLAG_FN_POSITIVE,
+    "mn_positive": FLAG_MN_POSITIVE,
+    "connected_common_source": FLAG_CONNECTED_COMMON_SOURCE,
+    "connected_certified": FLAG_CONNECTED_CERTIFIED,
+    "connected_doubled": FLAG_CONNECTED_DOUBLED,
 }
+
+
+def flag_bit_masks(header: dict[str, Any]) -> dict[str, int]:
+    """The flag bits a record file *declares*, as ``{name: mask}``.
+
+    Read off the header's ``flag_bits=`` line (``0:evaluated,1:survives_i,...``)
+    and checked against :data:`FLAG_NAMES`: a file that puts a known name on a
+    different bit is refused here rather than silently misread, which is the
+    reason the C++ writes the mapping into every file. A name this module does
+    not know is passed through, so a newer writer's extra bits do not break an
+    older reader. Empty for a file without the line (format v1).
+    """
+    text = str(header.get("flag_bits", "") or "")
+    masks: dict[str, int] = {}
+    for entry in filter(None, (part.strip() for part in text.split(","))):
+        bit, separator, name = entry.partition(":")
+        if not separator or not bit.strip().isdigit():
+            raise ValueError(f"Malformed flag_bits entry {entry!r} in {text!r}.")
+        mask = 1 << int(bit)
+        expected = FLAG_NAMES.get(name)
+        if expected is not None and expected != mask:
+            raise ValueError(
+                f"The file declares flag {name!r} at bit {int(bit)}, but this reader "
+                f"has it at bit {expected.bit_length() - 1}; the flag layout disagrees."
+            )
+        masks[name] = mask
+    return masks
 
 _NUMERIC_HEADER_KEYS = {
     "version": int,
@@ -131,6 +174,8 @@ _NUMERIC_HEADER_KEYS = {
     "statevector_precision": int,
     "connectivity": int,
     "connectivity_graph_version": int,
+    "turn_diagnostics": int,
+    "turn_diagnostics_version": int,
     "master_seed": int,
     "p": float,
     "b_min": float,

@@ -98,7 +98,48 @@ namespace mipt::dist::gap
 // pair-summary row, and gate_diagnostics_version in the provenance block (0 when
 // MIPT_DIST_GATE_DIAGNOSTICS is off, GATE_DIAGNOSTICS_VERSION when on). A v2 file
 // has neither, so its header no longer matches and it is refused by name.
-inline constexpr int GAP_FORMAT_VERSION = 3;
+// 4: the sixteen temporal-turn columns (the shape of each canonical gate path --
+// sm_* for the shortest-maximin path, wd_* for the widest: path class, turn
+// count, connector status, trace-only bridge, gate layers in path order -- then
+// min_turns_ij, connected_common_source_ij, connected_certified_ij, the gates of
+// each path the doubled network cancels, and connected_doubled_ij) on every
+// outcome and pair-summary row, and turn_diagnostics_version right after
+// gate_diagnostics_version (0 when MIPT_DIST_TURN_DIAGNOSTICS is off,
+// TURN_DIAGNOSTICS_VERSION when on). A v3 file has neither, so it is refused by
+// name exactly as a v2 file is.
+inline constexpr int GAP_FORMAT_VERSION = 4;
+
+// What each format added, for the two refusals that name a stale file's
+// version -- the resume (scan_outcomes) and the offline audit -- so they say
+// the same thing. Version 1 is not listed: nothing reads it.
+inline const char *gap_format_history()
+{
+    return "v2 added the certified fGMN interval, without which a row cannot be reclassified; "
+           "v3 added gate_diagnostics_version and the gate-path columns; v4 added "
+           "turn_diagnostics_version and the sixteen temporal-turn columns (sm_*/wd_* path "
+           "shapes and cancelled gates, min_turns_ij, connected_common_source_ij, "
+           "connected_certified_ij, connected_doubled_ij). Without those columns the pair "
+           "summary regenerated from the rows would not match the file";
+}
+
+// The gap format a file says it is, from its header line and first data row.
+// Every format since v1 carries a gap_format_version column, so one row settles
+// it; a file with no such column, or no rows, is unnamed rather than guessed.
+inline std::string stated_gap_format(const std::string &header_line, const std::string &first_row)
+{
+    const std::vector<std::string> names = util::resume::split_csv_row(header_line);
+    const auto it = std::find(names.begin(), names.end(), "gap_format_version");
+    if (it != names.end() && !first_row.empty())
+    {
+        const std::vector<std::string> values = util::resume::split_csv_row(first_row);
+        const std::size_t index = static_cast<std::size_t>(it - names.begin());
+        if (index < values.size() && !values[index].empty())
+        {
+            return "gap format v" + values[index];
+        }
+    }
+    return "an unknown gap format version";
+}
 // FGMN_STATUS_* are the solver's own codes; this one is ours.
 inline constexpr int STATUS_PREFILTERED = -1;
 
@@ -235,6 +276,10 @@ struct PairSnapshot
     // Gate quality on the pair's connecting paths; `available` is false unless
     // the run enabled MIPT_DIST_GATE_DIAGNOSTICS and the pair has a path.
     GatePathMetrics gate_path;
+    // Temporal-turn diagnostics for the pair; `evaluated` is false unless the
+    // run enabled MIPT_DIST_TURN_DIAGNOSTICS. Path shapes are filled only for
+    // connected pairs, by the same rule as gate_path.
+    PairTurns turns;
     bool entangled = false;        // fermion.mn > pair_zero_tol
     ZeroClass zero_class = ZeroClass::Silent; // meaningful only when !entangled
     const double *fermion_rho_ri = nullptr;   // raw reducer output, 32 doubles
@@ -264,6 +309,9 @@ struct ConnectedZeroPair
     PairConnectivity conn;
     PairMetrics fermion;
     ZeroClass zero_class = ZeroClass::Silent;
+    // The trigger's temporal-turn diagnostics, copied from its snapshot:
+    // `evaluated` is false unless the run enabled MIPT_DIST_TURN_DIAGNOSTICS.
+    PairTurns turns;
 };
 
 struct PairMeasurement
@@ -303,6 +351,7 @@ struct PairMeasurement
             zero.conn = snapshot.conn;
             zero.fermion = snapshot.fermion;
             zero.zero_class = snapshot.zero_class;
+            zero.turns = snapshot.turns;
             connected_zero.push_back(zero);
         }
         pairs.push_back(snapshot);
@@ -981,6 +1030,31 @@ inline void apply_solve(TripleResult &result, const SolveJob &job, double positi
 // The outcome CSV
 // ---------------------------------------------------------------------------
 
+// The sixteen temporal-turn columns (gap format v4, MIPT_DIST_TURN_DIAGNOSTICS),
+// shared verbatim by the outcome CSV and the pair summary, where they follow the
+// gate-path columns. sm_ reads the shortest-maximin gate path as a turn shape and
+// wd_ the widest one; each shape is its path class and connector status by name,
+// its turn count, whether it crosses a trace-only bridge, and the layers of the
+// gates it crosses in path order (`l1;l2;...`). min_turns_ij is the fewest turns
+// over every walk between the endpoints; then the refined percolation events
+// C_common_source and C_certified; then, per canonical path, how many of its
+// gates the doubled-network reduction cancels (> 0: that path does not survive
+// it); and last the doubled-network event C_doubled. The nesting is
+// C_common_source <= C_certified <= C_doubled <= C. See PairTurns in
+// dist_connectivity.hpp, and `append_turn_diagnostics` for when each is nan.
+inline constexpr std::size_t TURN_COLUMN_COUNT = 16;
+
+inline const std::array<const char *, TURN_COLUMN_COUNT> &turn_columns()
+{
+    static const std::array<const char *, TURN_COLUMN_COUNT> columns{
+        "sm_path_class_ij", "sm_turns_ij", "sm_connector_status_ij", "sm_trace_only_bridge_ij",
+        "sm_gate_layers_ij", "wd_path_class_ij", "wd_turns_ij", "wd_connector_status_ij",
+        "wd_trace_only_bridge_ij", "wd_gate_layers_ij", "min_turns_ij",
+        "connected_common_source_ij", "connected_certified_ij", "sm_cancelled_gates_ij",
+        "wd_cancelled_gates_ij", "connected_doubled_ij"};
+    return columns;
+}
+
 // The column list, once. The header is rendered from it and the resume reader
 // looks columns up in it by name, so the writer and the reader cannot disagree
 // about a position. `make test-dist` checks every rendered row has exactly this
@@ -996,7 +1070,7 @@ inline const std::vector<std::string> &outcome_columns()
             // provenance
             "N", "periods", "p", "circ_type", "circuit_name", "master_seed", "statevector_precision",
             "boundary_implementation", "connectivity_graph_version", "gap_format_version",
-            "gate_diagnostics_version",
+            "gate_diagnostics_version", "turn_diagnostics_version",
             // thresholds
             "pair_zero_tol", "occupation_mi_tol", "channel_floor", "fgmn_positive_tol",
             "prefilter_tol", "cut_positive_tol", "correlation_tol", "mosek_tol",
@@ -1026,10 +1100,22 @@ inline const std::vector<std::string> &outcome_columns()
             // missing path is never a zero. Like the channel columns, these sit
             // beside the percolation event and do not redefine it.
             "path_unitary_count_ij", "shortest_maximin_gate_ep_ij", "widest_gate_ep_ij",
-            "widest_even_mix_ij", "widest_odd_mix_ij",
-            // third-site graph
-            "survives_k", "idle_k", "interior_path_ik", "connected_ik", "shortest_path_ik",
-            "interior_path_jk", "connected_jk", "shortest_path_jk", "same_component_ijk"};
+            "widest_even_mix_ij", "widest_odd_mix_ij"};
+        // Temporal turns along the same two paths (gap format v4,
+        // MIPT_DIST_TURN_DIAGNOSTICS). Like the gate columns they sit beside
+        // the percolation event: C_common_source, C_certified and C_doubled
+        // refine C, they never redefine it.
+        for (const char *name : turn_columns())
+        {
+            c.push_back(name);
+        }
+        for (const char *field : {// third-site graph
+                                  "survives_k", "idle_k", "interior_path_ik", "connected_ik",
+                                  "shortest_path_ik", "interior_path_jk", "connected_jk",
+                                  "shortest_path_jk", "same_component_ijk"})
+        {
+            c.push_back(field);
+        }
         for (const char *edge : {"ik", "jk"})
         {
             for (const char *field : {"fn", "fmi", "g2", "f2", "rho_n", "abs_rho_n", "i_occ",
@@ -1157,13 +1243,17 @@ inline std::size_t edge_slot(int p, int q)
 
 // Fixed per-run text: the provenance and threshold block, rendered once.
 //
-// `gate` is gate_diagnostics_version, kept apart from `provenance` because the
-// four-site CSV shares the provenance block and does not carry it: the outcome
-// and pair-summary rows append it right after gap_format_version.
+// `gate` is gate_diagnostics_version and `turn` turn_diagnostics_version, kept
+// apart from `provenance` because the four-site CSV shares the provenance block
+// and carries neither: the outcome and pair-summary rows append them, in that
+// order, right after gap_format_version. Kept apart from each other too, because
+// the resume checks each against the run's own setting and names the one that
+// differs.
 struct RowPrefix
 {
     std::string provenance;
     std::string gate;
+    std::string turn;
     std::string thresholds;
 };
 
@@ -1171,6 +1261,101 @@ struct RowPrefix
 inline int gate_diagnostics_version(const RunConfig &config)
 {
     return config.gate_path_diagnostics ? GATE_DIAGNOSTICS_VERSION : 0;
+}
+
+// What turn_diagnostics_version a run writes: 0 with the diagnostics off.
+inline int turn_diagnostics_version(const RunConfig &config)
+{
+    return config.turn_diagnostics ? TURN_DIAGNOSTICS_VERSION : 0;
+}
+
+// The turn diagnostics a row reports for its pair: the snapshot, with the rule
+// the record writer applies to the same values (records::fill_turn_record_values)
+// -- a path value exists only for the complete percolation event C. Both shapes
+// and min_turns are blanked for a pair that is not C. That matters for controls:
+// a graph-disconnected pair whose endpoints share a component at the last slice
+// but one of which is measured there has a walk between the final-slice nodes,
+// and without this its row would carry the turn count of a walk that never
+// reaches the measured endpoint -- and disagree with the record of the same pair.
+// Blanking a shape blanks its cancelled-gate count with it. The three connected_
+// events already imply C, so they pass through unchanged. Applied once, where a
+// snapshot becomes a row; the writer below renders what it is given.
+inline PairTurns reported_turns(const PairTurns &turns, bool connected)
+{
+    PairTurns out = turns;
+    if (!connected)
+    {
+        out.shortest_maximin = PathShape{};
+        out.widest = PathShape{};
+        out.min_turns = -1;
+    }
+    return out;
+}
+
+// One path shape: five nans when it is unavailable, whatever its fields hold.
+// Otherwise the class and connector status by name, the turn count and the
+// trace-only flag as integers, and the gate layers in path order joined by ';'.
+inline void append_path_shape(std::string &out, const PathShape &shape)
+{
+    if (!shape.available)
+    {
+        out += ",nan,nan,nan,nan,nan";
+        return;
+    }
+    field(out, std::string(path_class_name(shape.path_class)));
+    field(out, static_cast<long long>(shape.turns));
+    field(out, std::string(connector_status_name(shape.connector_status)));
+    field_flag(out, shape.trace_only_bridge());
+    out += ',';
+    for (std::size_t k = 0; k < shape.gate_layers.size(); ++k)
+    {
+        if (k > 0)
+        {
+            out += ';';
+        }
+        out += std::to_string(shape.gate_layers[k]);
+    }
+}
+
+// A count that may be absent: an integer when it is >= 0, nan otherwise.
+inline void field_count(std::string &out, int value)
+{
+    if (value >= 0)
+    {
+        field(out, static_cast<long long>(value));
+    }
+    else
+    {
+        out += ",nan";
+    }
+}
+
+// The sixteen turn columns, in turn_columns() order. All nan when the
+// diagnostics did not run for the pair -- off, or not evaluated -- so a missing
+// value is never a zero. Otherwise each shape as above, min_turns as an integer
+// exactly when a walk exists, the three connected_ events as 0/1, and each
+// shape's cancelled-gate count as an integer exactly when the shape is available
+// and the count was computed (-1 is "not computed", never a count). Each part's
+// text alone says whether it is present (a class name, an integer, a 0/1), so
+// `turns_from_fields` restores `evaluated` and every written value and the round
+// trip is exact.
+inline void append_turn_diagnostics(std::string &out, const PairTurns &turns)
+{
+    if (!turns.evaluated)
+    {
+        out += ",nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan";
+        return;
+    }
+    append_path_shape(out, turns.shortest_maximin);
+    append_path_shape(out, turns.widest);
+    field_count(out, turns.min_turns);
+    field_flag(out, turns.connected_common_source);
+    field_flag(out, turns.connected_certified);
+    for (const PathShape *shape : {&turns.shortest_maximin, &turns.widest})
+    {
+        field_count(out, shape->available ? shape->cancelled_gates : -1);
+    }
+    field_flag(out, turns.connected_doubled);
 }
 
 // The five gate-path columns. All nan when the metrics are unavailable -- the
@@ -1207,6 +1392,7 @@ inline RowPrefix row_prefix(const RunConfig &config)
     p += ',' + std::to_string(CONNECTIVITY_GRAPH_VERSION);
     p += ',' + std::to_string(GAP_FORMAT_VERSION);
     out.gate = std::to_string(gate_diagnostics_version(config));
+    out.turn = std::to_string(turn_diagnostics_version(config));
 
     std::string &t = out.thresholds;
     append_double(t, config.pair_zero_tol);
@@ -1271,6 +1457,8 @@ inline void append_outcome_row(std::string &out, const RowPrefix &prefix,
     out += ',';
     out += prefix.gate;
     out += ',';
+    out += prefix.turn;
+    out += ',';
     out += prefix.thresholds;
 
     const PairMetrics &f = pair.fermion;
@@ -1326,6 +1514,10 @@ inline void append_outcome_row(std::string &out, const RowPrefix &prefix,
     // The row's own snapshot: an anchor's paths, or a control's (normally
     // unavailable, since a control is graph-disconnected by definition).
     append_gate_path(out, pair.gate_path);
+    // The same snapshot's turn shapes. A control is never C, so its shapes and
+    // min_turns are nan and its three connected_ events 0 (nan with the
+    // diagnostics off).
+    append_turn_diagnostics(out, reported_turns(pair.turns, pair.conn.connected));
 
     field_flag(out, conn_ik.survives_j);
     field(out, static_cast<long long>(conn_ik.idle_j));
@@ -1480,6 +1672,12 @@ struct RowSummary
     ComponentAnatomy anatomy;
     ChannelConnectivity channels;
     GatePathMetrics gate_path; // only the five written columns survive a round trip
+    // As reported (`reported_turns`), so the live row and one parsed back from
+    // the file render the same text. Only the sixteen written columns survive
+    // a round trip: each shape's availability, class, turn count, connector
+    // status, gate layers and cancelled-gate count; min_turns; `evaluated`; the
+    // three connected_ events.
+    PairTurns turns;
     bool survives_i = false;
     bool survives_j = false;
     bool interior_path = false;
@@ -1559,6 +1757,7 @@ struct PairSummaryRow
     ComponentAnatomy anatomy;
     ChannelConnectivity channels;
     GatePathMetrics gate_path; // only the five written columns survive a round trip
+    PairTurns turns;           // as reported; only the sixteen written columns survive
     bool survives_i = false;
     bool survives_j = false;
     bool interior_path = false;
@@ -1631,6 +1830,7 @@ inline PairSummaryRow summarize_pair(const RowSummary *rows, std::size_t count)
     out.anatomy = head.anatomy;
     out.channels = head.channels;
     out.gate_path = head.gate_path;
+    out.turns = head.turns;
     out.survives_i = head.survives_i;
     out.survives_j = head.survives_j;
     out.interior_path = head.interior_path;
@@ -1885,35 +2085,49 @@ class GapAggregate
 
 inline const std::vector<std::string> &pair_summary_columns()
 {
-    static const std::vector<std::string> columns{
-        // identity
-        "run_id", "realization_id", "anchor_role", "pair_i", "pair_j", "separation", "d",
-        "pair_class",
-        // provenance
-        "N", "periods", "p", "circ_type", "circuit_name", "master_seed", "statevector_precision",
-        "boundary_implementation", "connectivity_graph_version", "gap_format_version",
-        "gate_diagnostics_version",
-        // thresholds
-        "pair_zero_tol", "occupation_mi_tol", "channel_floor", "fgmn_positive_tol", "prefilter_tol",
-        "cut_positive_tol", "correlation_tol", "mosek_tol",
-        // the pair itself
-        "pair_fn", "pair_fmi", "pair_g2", "pair_f2", "pair_rho_n", "pair_abs_rho_n", "pair_i_occ",
-        // graph diagnostics
-        "survives_i", "survives_j", "interior_path_ij", "connected_ij", "component_size_ij",
-        "shortest_path_ij", "edge_disjoint_paths_ij", "vertex_disjoint_paths_ij",
-        "final_sites_in_component", "backbone_nodes", "articulation_nodes", "dangling_nodes",
-        "branches", "mean_branch_size", "max_branch_size", "endpoint_degree_i",
-        "endpoint_degree_j", "shortest_path_gates", "shortest_path_temporal",
-        "f_channel_log_weight", "g_channel_log_weight", "f_channel_bottleneck",
-        "g_channel_bottleneck", "f_channel_multiplicity", "g_channel_multiplicity",
-        "path_unitary_count_ij", "shortest_maximin_gate_ep_ij", "widest_gate_ep_ij",
-        "widest_even_mix_ij", "widest_odd_mix_ij",
-        // the thirds
-        "thirds", "thirds_same_component", "thirds_positive", "thirds_bounded_below_threshold",
-        "thirds_unresolved", "thirds_failed", "thirds_all_cuts_entangled",
-        "thirds_blocked_by_i", "thirds_blocked_by_j", "thirds_blocked_by_k",
-        "max_min_cut_fn", "max_fgmn_lower_bound", "max_fgmn_upper_bound", "max_cmi_ij_given_k",
-        "max_mi_ij_k", "best_third_k", "robust_fgmn", "explanatory_class"};
+    static const std::vector<std::string> columns = [] {
+        std::vector<std::string> c{
+            // identity
+            "run_id", "realization_id", "anchor_role", "pair_i", "pair_j", "separation", "d",
+            "pair_class",
+            // provenance
+            "N", "periods", "p", "circ_type", "circuit_name", "master_seed", "statevector_precision",
+            "boundary_implementation", "connectivity_graph_version", "gap_format_version",
+            "gate_diagnostics_version", "turn_diagnostics_version",
+            // thresholds
+            "pair_zero_tol", "occupation_mi_tol", "channel_floor", "fgmn_positive_tol",
+            "prefilter_tol", "cut_positive_tol", "correlation_tol", "mosek_tol",
+            // the pair itself
+            "pair_fn", "pair_fmi", "pair_g2", "pair_f2", "pair_rho_n", "pair_abs_rho_n",
+            "pair_i_occ",
+            // graph diagnostics
+            "survives_i", "survives_j", "interior_path_ij", "connected_ij", "component_size_ij",
+            "shortest_path_ij", "edge_disjoint_paths_ij", "vertex_disjoint_paths_ij",
+            "final_sites_in_component", "backbone_nodes", "articulation_nodes", "dangling_nodes",
+            "branches", "mean_branch_size", "max_branch_size", "endpoint_degree_i",
+            "endpoint_degree_j", "shortest_path_gates", "shortest_path_temporal",
+            "f_channel_log_weight", "g_channel_log_weight", "f_channel_bottleneck",
+            "g_channel_bottleneck", "f_channel_multiplicity", "g_channel_multiplicity",
+            "path_unitary_count_ij", "shortest_maximin_gate_ep_ij", "widest_gate_ep_ij",
+            "widest_even_mix_ij", "widest_odd_mix_ij"};
+        // The pair's temporal turns, exactly as its outcome rows carry them.
+        for (const char *name : turn_columns())
+        {
+            c.push_back(name);
+        }
+        for (const char *name :
+             {// the thirds
+              "thirds", "thirds_same_component", "thirds_positive", "thirds_bounded_below_threshold",
+              "thirds_unresolved", "thirds_failed", "thirds_all_cuts_entangled",
+              "thirds_blocked_by_i", "thirds_blocked_by_j", "thirds_blocked_by_k",
+              "max_min_cut_fn", "max_fgmn_lower_bound", "max_fgmn_upper_bound",
+              "max_cmi_ij_given_k", "max_mi_ij_k", "best_third_k", "robust_fgmn",
+              "explanatory_class"})
+        {
+            c.push_back(name);
+        }
+        return c;
+    }();
     return columns;
 }
 
@@ -1949,6 +2163,8 @@ inline void append_pair_summary_row(std::string &out, const RowPrefix &prefix,
     out += prefix.provenance;
     out += ',';
     out += prefix.gate;
+    out += ',';
+    out += prefix.turn;
     out += ',';
     out += prefix.thresholds;
 
@@ -1986,6 +2202,7 @@ inline void append_pair_summary_row(std::string &out, const RowPrefix &prefix,
     field(out, static_cast<long long>(row.channels.pair_multiplicity));
     field(out, static_cast<long long>(row.channels.hop_multiplicity));
     append_gate_path(out, row.gate_path);
+    append_turn_diagnostics(out, row.turns);
 
     field(out, static_cast<long long>(row.thirds));
     field(out, static_cast<long long>(row.thirds_same_component));
@@ -2356,17 +2573,38 @@ struct OutcomeColumns
     std::size_t f_log = 0, g_log = 0, f_bottleneck = 0, g_bottleneck = 0, f_mult = 0, g_mult = 0;
     std::size_t gate_version = 0, gate_unitaries = 0, gate_maximin = 0, gate_widest = 0;
     std::size_t gate_even = 0, gate_odd = 0;
+    // The five columns of one path shape, in the order append_path_shape writes,
+    // plus its cancelled-gate count, which sits after the events instead.
+    struct ShapeColumns
+    {
+        std::size_t path_class = 0, turns = 0, connector_status = 0, trace_only = 0, gate_layers = 0;
+        std::size_t cancelled_gates = 0;
+    };
+    // `certified` above is fgmn_class; these are the three refined C events.
+    std::size_t turn_version = 0, min_turns = 0, connected_common_source = 0;
+    std::size_t connected_certified = 0, connected_doubled = 0;
+    ShapeColumns shortest_maximin, widest;
 
     static OutcomeColumns resolve()
     {
         const auto &columns = outcome_columns();
-        auto at = [&](const char *name) {
+        auto at = [&](const std::string &name) {
             const auto it = std::find(columns.begin(), columns.end(), name);
             if (it == columns.end())
             {
-                throw std::logic_error(std::string("outcome column '") + name + "' does not exist.");
+                throw std::logic_error("outcome column '" + name + "' does not exist.");
             }
             return static_cast<std::size_t>(it - columns.begin());
+        };
+        auto shape = [&](const std::string &prefix) {
+            ShapeColumns s;
+            s.path_class = at(prefix + "_path_class_ij");
+            s.turns = at(prefix + "_turns_ij");
+            s.connector_status = at(prefix + "_connector_status_ij");
+            s.trace_only = at(prefix + "_trace_only_bridge_ij");
+            s.gate_layers = at(prefix + "_gate_layers_ij");
+            s.cancelled_gates = at(prefix + "_cancelled_gates_ij");
+            return s;
         };
         OutcomeColumns c;
         c.realization = at("realization_id");
@@ -2430,9 +2668,180 @@ struct OutcomeColumns
         c.gate_widest = at("widest_gate_ep_ij");
         c.gate_even = at("widest_even_mix_ij");
         c.gate_odd = at("widest_odd_mix_ij");
+        c.turn_version = at("turn_diagnostics_version");
+        c.shortest_maximin = shape("sm");
+        c.widest = shape("wd");
+        c.min_turns = at("min_turns_ij");
+        c.connected_common_source = at("connected_common_source_ij");
+        c.connected_certified = at("connected_certified_ij");
+        c.connected_doubled = at("connected_doubled_ij");
         return c;
     }
 };
+
+inline bool parse_path_class(const std::string &text, PathClass &out)
+{
+    for (const PathClass value : {PathClass::TimeMonotone, PathClass::CommonSource,
+                                  PathClass::ZigzagCertified, PathClass::ZigzagTraceOnly})
+    {
+        if (text == path_class_name(value))
+        {
+            out = value;
+            return true;
+        }
+    }
+    return false;
+}
+
+inline bool parse_connector_status(const std::string &text, ConnectorStatus &out)
+{
+    for (const ConnectorStatus value : {ConnectorStatus::NoBridge, ConnectorStatus::AllMeasured,
+                                        ConnectorStatus::Mixed, ConnectorStatus::Unmeasured})
+    {
+        if (text == connector_status_name(value))
+        {
+            out = value;
+            return true;
+        }
+    }
+    return false;
+}
+
+// An optional count, as `field_count` writes it: nan is -1 ("absent"), anything
+// else a non-negative integer. A negative number would render back as nan, so it
+// is refused rather than kept.
+inline int count_from_field(const std::string &text, const std::string &context)
+{
+    if (text == "nan")
+    {
+        return -1;
+    }
+    const long value = util::resume::parse_long_field(text, context);
+    if (value < 0)
+    {
+        util::resume::refuse("negative count '" + text + "' in " + context +
+                             "; an absent count is written as nan. The file is damaged.");
+    }
+    return static_cast<int>(value);
+}
+
+// Rebuild one path shape from its six columns. `append_path_shape` writes a
+// class name exactly when the shape is available, so the class alone restores
+// `available`. Everything else must then agree with it: six nans for an
+// unavailable shape, and a trace-only flag that says what the class says. A row
+// that breaks either is damaged rather than readable, because rewriting the
+// summary from it would silently "repair" the summary away from the rows.
+inline PathShape path_shape_from_fields(const std::vector<std::string> &fields,
+                                        const OutcomeColumns::ShapeColumns &s,
+                                        const std::string &path, const std::string &name)
+{
+    PathShape shape;
+    const std::string &label = fields[s.path_class];
+    if (label == "nan")
+    {
+        for (std::size_t index :
+             {s.turns, s.connector_status, s.trace_only, s.gate_layers, s.cancelled_gates})
+        {
+            if (fields[index] != "nan")
+            {
+                util::resume::refuse(path + " has an unavailable " + name +
+                                     " path shape with a value beside it ('" + fields[index] +
+                                     "'). The file is damaged.");
+            }
+        }
+        return shape;
+    }
+    if (!parse_path_class(label, shape.path_class))
+    {
+        util::resume::refuse(path + " names an unknown " + name + " path class '" + label + "'.");
+    }
+    if (!parse_connector_status(fields[s.connector_status], shape.connector_status))
+    {
+        util::resume::refuse(path + " names an unknown " + name + " connector status '" +
+                             fields[s.connector_status] + "'.");
+    }
+    shape.available = true;
+    shape.turns = static_cast<int>(
+        util::resume::parse_long_field(fields[s.turns], path + " " + name + "_turns_ij"));
+    // Every ';'-separated piece must be an integer, so an empty piece -- a
+    // doubled or trailing separator -- is refused rather than dropped, which
+    // would re-render as different text.
+    const std::string &layers = fields[s.gate_layers];
+    for (std::size_t start = 0; !layers.empty();)
+    {
+        const std::size_t end = layers.find(';', start);
+        const std::string piece =
+            layers.substr(start, end == std::string::npos ? std::string::npos : end - start);
+        shape.gate_layers.push_back(static_cast<int>(
+            util::resume::parse_long_field(piece, path + " " + name + "_gate_layers_ij")));
+        if (end == std::string::npos)
+        {
+            break;
+        }
+        start = end + 1;
+    }
+    const std::string expected_flag = shape.trace_only_bridge() ? "1" : "0";
+    if (fields[s.trace_only] != expected_flag)
+    {
+        util::resume::refuse(path + " carries " + name + "_trace_only_bridge_ij=" +
+                             fields[s.trace_only] + " beside the path class '" + label +
+                             "', which implies " + expected_flag + ". The file is damaged.");
+    }
+    shape.cancelled_gates =
+        count_from_field(fields[s.cancelled_gates], path + " " + name + "_cancelled_gates_ij");
+    return shape;
+}
+
+// Rebuild the sixteen turn columns. The three connected_ events are 0/1 exactly
+// when the diagnostics ran, so they restore `evaluated`; with it false every
+// other column must be nan, exactly as `append_turn_diagnostics` writes it.
+inline PairTurns turns_from_fields(const std::vector<std::string> &fields, const OutcomeColumns &c,
+                                   const std::string &path)
+{
+    PairTurns turns;
+    auto event = [&](std::size_t index, const char *name, bool &value) {
+        const std::string &text = fields[index];
+        if (text != "0" && text != "1")
+        {
+            util::resume::refuse(path + " holds '" + text + "' in " + name +
+                                 " beside evaluated turn diagnostics; it must be 0 or 1.");
+        }
+        value = text == "1";
+    };
+    if (fields[c.connected_common_source] == "nan" || fields[c.connected_certified] == "nan" ||
+        fields[c.connected_doubled] == "nan")
+    {
+        // The diagnostics-off path, i.e. every row of a default run, so the
+        // sixteen positions come from the resolved columns, in turn_columns()
+        // order, rather than a search by name.
+        const OutcomeColumns::ShapeColumns &sm = c.shortest_maximin;
+        const OutcomeColumns::ShapeColumns &wd = c.widest;
+        const std::array<std::size_t, TURN_COLUMN_COUNT> indices{
+            sm.path_class,      sm.turns,          sm.connector_status, sm.trace_only,
+            sm.gate_layers,     wd.path_class,     wd.turns,            wd.connector_status,
+            wd.trace_only,      wd.gate_layers,    c.min_turns,         c.connected_common_source,
+            c.connected_certified, sm.cancelled_gates, wd.cancelled_gates, c.connected_doubled};
+        for (std::size_t k = 0; k < TURN_COLUMN_COUNT; ++k)
+        {
+            if (fields[indices[k]] != "nan")
+            {
+                util::resume::refuse(path + " carries " + turn_columns()[k] + "=" +
+                                     fields[indices[k]] +
+                                     " for a pair whose turn diagnostics were not evaluated. "
+                                     "The file is damaged.");
+            }
+        }
+        return turns;
+    }
+    turns.evaluated = true;
+    event(c.connected_common_source, "connected_common_source_ij", turns.connected_common_source);
+    event(c.connected_certified, "connected_certified_ij", turns.connected_certified);
+    event(c.connected_doubled, "connected_doubled_ij", turns.connected_doubled);
+    turns.shortest_maximin = path_shape_from_fields(fields, c.shortest_maximin, path, "sm");
+    turns.widest = path_shape_from_fields(fields, c.widest, path, "wd");
+    turns.min_turns = count_from_field(fields[c.min_turns], path + " min_turns_ij");
+    return turns;
+}
 
 // Rebuild one RowSummary from a parsed outcome row.
 //
@@ -2532,6 +2941,9 @@ inline RowSummary row_summary_from_fields(const std::vector<std::string> &fields
         row.gate_path.widest_even_block_mixing = number(c.gate_even, "widest_even_mix_ij");
         row.gate_path.widest_odd_block_mixing = number(c.gate_odd, "widest_odd_mix_ij");
     }
+    // The sixteen turn columns, already as reported: `turns_from_fields`
+    // restores exactly what `append_turn_diagnostics` wrote.
+    row.turns = turns_from_fields(fields, c, path);
     row.survives_i = flag(c.survives_i);
     row.survives_j = flag(c.survives_j);
     row.interior_path = flag(c.interior);
@@ -2549,15 +2961,18 @@ inline RowSummary row_summary_from_fields(const std::vector<std::string> &fields
 // which is also what makes the two reconcile exactly.
 //
 // `expected_gate_version`, when non-empty, is the gate_diagnostics_version this
-// run writes. Every kept row must carry the same value: the summary is rewritten
-// with this run's prefix, so a row from a run with the diagnostics switched the
-// other way would come back under the wrong provenance.
+// run writes, and `expected_turn_version` likewise its turn_diagnostics_version.
+// Every kept row must carry the same values: the summary is rewritten with this
+// run's prefix, so a row from a run with either diagnostic switched the other way
+// would come back under the wrong provenance -- and, for the turns, with
+// sixteen columns of nan where the file has values, or the reverse.
 using PairSummarySink = std::function<void(const PairSummaryRow &)>;
 
 inline OutcomeScan scan_outcomes(const std::string &path, std::uint64_t completed,
                                  GapAggregate &aggregate, const PairGapSettings &settings,
                                  const PairSummarySink &sink = PairSummarySink(),
-                                 const std::string &expected_gate_version = std::string())
+                                 const std::string &expected_gate_version = std::string(),
+                                 const std::string &expected_turn_version = std::string())
 {
     std::ifstream file(path, std::ios::binary);
     if (!file)
@@ -2568,9 +2983,20 @@ inline OutcomeScan scan_outcomes(const std::string &path, std::uint64_t complete
     std::string line;
     if (!std::getline(file, line) || line + '\n' != expected)
     {
-        util::resume::refuse(
-            path + " has a different column layout than this binary writes. Finish it with "
-                   "the binary that wrote it, move it aside, or set MIPT_DIST_RESUME=0.");
+        // Say which format the file is when it says so itself and it is not
+        // this one; a v4-labelled file with another layout is merely damaged.
+        std::string row;
+        std::getline(file, row);
+        const std::string stated = stated_gap_format(line, row);
+        const std::string current = "gap format v" + std::to_string(GAP_FORMAT_VERSION);
+        std::string reason = path + " has a different column layout than this binary writes";
+        if (stated != current && stated.rfind("gap format v", 0) == 0)
+        {
+            reason += ": it is " + stated + " and this binary writes " + current + " (" +
+                      gap_format_history() + ")";
+        }
+        util::resume::refuse(reason + ". Finish it with the binary that wrote it, move it "
+                                      "aside, or set MIPT_DIST_RESUME=0.");
     }
     const auto &columns = outcome_columns();
     const OutcomeColumns c = OutcomeColumns::resolve();
@@ -2655,6 +3081,14 @@ inline OutcomeScan scan_outcomes(const std::string &path, std::uint64_t complete
                 path + " was written with gate_diagnostics_version=" + fields[c.gate_version] +
                 " but this run writes " + expected_gate_version +
                 " (MIPT_DIST_GATE_DIAGNOSTICS). Resume with the setting the file was "
+                "started with, move it aside, or set MIPT_DIST_RESUME=0.");
+        }
+        if (!expected_turn_version.empty() && fields[c.turn_version] != expected_turn_version)
+        {
+            util::resume::refuse(
+                path + " was written with turn_diagnostics_version=" + fields[c.turn_version] +
+                " but this run writes " + expected_turn_version +
+                " (MIPT_DIST_TURN_DIAGNOSTICS). Resume with the setting the file was "
                 "started with, move it aside, or set MIPT_DIST_RESUME=0.");
         }
         RowSummary row = row_summary_from_fields(fields, c, path, settings.positive_tol,
@@ -3023,6 +3457,9 @@ class PairGapAnalysis
                 const ChannelConnectivity channels =
                     settings_.channels ? connectivity.channels(pair.i, pair.j)
                                        : ChannelConnectivity{};
+                // As the outcome rows write it, so the live summary and one
+                // rebuilt from the file render the same text.
+                const PairTurns turns = reported_turns(pair.turns, pair.conn.connected);
                 summaries_.clear();
                 for (const TriplePlan::Third &third : plan.thirds[a])
                 {
@@ -3084,6 +3521,7 @@ class PairGapAnalysis
                     row.anatomy = anatomy;
                     row.channels = channels;
                     row.gate_path = pair.gate_path;
+                    row.turns = turns;
                     row.survives_i = pair.conn.survives_i;
                     row.survives_j = pair.conn.survives_j;
                     row.interior_path = pair.conn.interior_path;
@@ -3358,7 +3796,7 @@ class PairGapAnalysis
                           [&](const PairSummaryRow &summary) {
                               append_pair_summary_row(rebuilt, prefix_, run_, summary);
                           },
-                          prefix_.gate);
+                          prefix_.gate, prefix_.turn);
         restored_rows_ = scan.rows_kept;
         restored_trimmed_ = scan.trimmed;
         next_outcome_id_ = scan.rows_kept;

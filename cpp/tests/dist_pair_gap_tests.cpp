@@ -27,6 +27,7 @@
 
 #include <algorithm>
 #include <complex>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -318,7 +319,8 @@ std::unique_ptr<Trajectory> make_trajectory(std::uint32_t t, const dist::RunConf
     if (t % 3 == 1) measured = {3};
     if (t % 3 == 2) measured = {0, 5};
     out->history = ring_history(measured);
-    out->connectivity.build(out->history, true, config.gate_path_diagnostics);
+    out->connectivity.build(out->history, true, config.gate_path_diagnostics,
+                            config.turn_diagnostics);
     out->measurement.reset(N);
     out->measurement.realization = t;
     const int max_separation = N / 2;
@@ -345,6 +347,17 @@ std::unique_ptr<Trajectory> make_trajectory(std::uint32_t t, const dist::RunConf
             if (config.gate_path_diagnostics)
             {
                 snap.gate_path = out->connectivity.gate_path_metrics(i, j);
+            }
+            if (config.turn_diagnostics)
+            {
+                // As PairProtocol fills it: the pair-level events for every
+                // pair, the two canonical shapes only for a pair that is C.
+                snap.turns = out->connectivity.pair_turns(i, j);
+                if (!snap.conn.connected)
+                {
+                    snap.turns.shortest_maximin = dist::PathShape{};
+                    snap.turns.widest = dist::PathShape{};
+                }
             }
             snap.entangled = snap.fermion.mn > config.pair_zero_tol;
             snap.zero_class = dist::classify_unentangled(
@@ -1424,6 +1437,72 @@ std::string field_of(const std::vector<std::string> &fields,
                                            columns.begin())];
 }
 
+// The message a refusal carries, or empty when `action` did not refuse.
+std::string refusal_message(const std::function<void()> &action)
+{
+    try
+    {
+        action();
+    }
+    catch (const std::runtime_error &error)
+    {
+        return error.what();
+    }
+    return std::string();
+}
+
+// A copy of an outcome file's header and first row as an older gap format
+// would have written them: `drop` removed, gap_format_version set to `version`.
+void write_stale_outcome(const std::string &source, const std::string &target,
+                         const std::vector<std::string> &drop, const std::string &version)
+{
+    const auto &columns = gap::outcome_columns();
+    std::vector<std::size_t> dropped;
+    for (const std::string &name : drop)
+    {
+        dropped.push_back(static_cast<std::size_t>(
+            std::find(columns.begin(), columns.end(), name) - columns.begin()));
+    }
+    const std::size_t version_at = static_cast<std::size_t>(
+        std::find(columns.begin(), columns.end(), "gap_format_version") - columns.begin());
+    auto strip = [&](std::vector<std::string> fields, bool header) {
+        if (!header)
+        {
+            fields[version_at] = version;
+        }
+        std::string out;
+        for (std::size_t f = 0; f < fields.size(); ++f)
+        {
+            if (std::find(dropped.begin(), dropped.end(), f) != dropped.end())
+            {
+                continue;
+            }
+            out += out.empty() ? "" : ",";
+            out += fields[f];
+        }
+        return out + "\n";
+    };
+    std::ifstream input(source);
+    std::string header_line;
+    std::string row_line;
+    std::getline(input, header_line);
+    std::getline(input, row_line);
+    std::ofstream(target, std::ios::binary | std::ios::trunc)
+        << strip(mipt::util::resume::split_csv_row(header_line), true)
+        << strip(mipt::util::resume::split_csv_row(row_line), false);
+}
+
+// What a v3 file lacks: turn_diagnostics_version and the sixteen turn columns.
+std::vector<std::string> v4_only_columns()
+{
+    std::vector<std::string> out{"turn_diagnostics_version"};
+    for (const char *name : gap::turn_columns())
+    {
+        out.push_back(name);
+    }
+    return out;
+}
+
 void test_gate_path_columns(const std::string &base)
 {
     namespace audit = mipt::dist::gap::audit;
@@ -1448,7 +1527,7 @@ void test_gate_path_columns(const std::string &base)
         gap::append_gate_path(out, set);
         expect(out == ",3,0.25,0.5,0.125,1", "gate v3: an available gate path is written in full");
     }
-    expect(gap::GAP_FORMAT_VERSION == 3, "gate v3: the gap format version is 3");
+    expect(gap::GAP_FORMAT_VERSION >= 3, "gate v3: the gate columns are in every gap format from v3");
 
     for (const bool enabled : {false, true})
     {
@@ -1492,8 +1571,9 @@ void test_gate_path_columns(const std::string &base)
             ++rows;
             expect(field_of(fields, columns, "gate_diagnostics_version") == version,
                    "gate v3: gate_diagnostics_version is 0 off and the definition version on");
-            expect(field_of(fields, columns, "gap_format_version") == "3",
-                   "gate v3: rows carry gap format 3");
+            expect(field_of(fields, columns, "gap_format_version") ==
+                       std::to_string(gap::GAP_FORMAT_VERSION),
+                   "gate v3: rows carry the current gap format");
             const std::uint32_t t =
                 static_cast<std::uint32_t>(std::stoul(field_of(fields, columns, "realization_id")));
             const int i = std::stoi(field_of(fields, columns, "pair_i"));
@@ -1645,42 +1725,16 @@ void test_gate_path_columns(const std::string &base)
         // refused by the audit, and the refusal names the version.
         if (!enabled)
         {
-            std::vector<std::size_t> drop;
+            // A v2 file has none of v3's columns and none of v4's either.
+            std::vector<std::string> drop = v4_only_columns();
             for (const char *name : {"gate_diagnostics_version", "path_unitary_count_ij",
                                      "shortest_maximin_gate_ep_ij", "widest_gate_ep_ij",
                                      "widest_even_mix_ij", "widest_odd_mix_ij"})
             {
-                drop.push_back(static_cast<std::size_t>(
-                    std::find(columns.begin(), columns.end(), name) - columns.begin()));
+                drop.push_back(name);
             }
-            const std::size_t version_at = static_cast<std::size_t>(
-                std::find(columns.begin(), columns.end(), "gap_format_version") - columns.begin());
-            auto strip = [&](std::vector<std::string> fields, bool header) {
-                if (!header)
-                {
-                    fields[version_at] = "2";
-                }
-                std::string out;
-                for (std::size_t f = 0; f < fields.size(); ++f)
-                {
-                    if (std::find(drop.begin(), drop.end(), f) != drop.end())
-                    {
-                        continue;
-                    }
-                    out += out.empty() ? "" : ",";
-                    out += fields[f];
-                }
-                return out + "\n";
-            };
-            std::ifstream source(config.pair_gap.output_path);
-            std::string header_line;
-            std::string row_line;
-            std::getline(source, header_line);
-            std::getline(source, row_line);
             const std::string v2_path = dir + "/v2_connected_zero_thirds.csv";
-            std::ofstream(v2_path, std::ios::binary | std::ios::trunc)
-                << strip(mipt::util::resume::split_csv_row(header_line), true)
-                << strip(mipt::util::resume::split_csv_row(row_line), false);
+            write_stale_outcome(config.pair_gap.output_path, v2_path, drop, "2");
             std::string message;
             try
             {
@@ -1693,6 +1747,470 @@ void test_gate_path_columns(const std::string &base)
             expect(message.find("gap format v2") != std::string::npos &&
                        message.find("v3") != std::string::npos,
                    "gate v3: the audit refuses a v2 outcome file and names its version");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Gap format v4: turn_diagnostics_version and the sixteen temporal-turn columns
+// ---------------------------------------------------------------------------
+
+// The contract's names and order, spelled out rather than read back from
+// gap::turn_columns(), so a renamed or reordered column fails here.
+const char *const TURN_COLUMNS[] = {
+    "sm_path_class_ij",        "sm_turns_ij",           "sm_connector_status_ij",
+    "sm_trace_only_bridge_ij", "sm_gate_layers_ij",     "wd_path_class_ij",
+    "wd_turns_ij",             "wd_connector_status_ij", "wd_trace_only_bridge_ij",
+    "wd_gate_layers_ij",       "min_turns_ij",          "connected_common_source_ij",
+    "connected_certified_ij",  "sm_cancelled_gates_ij", "wd_cancelled_gates_ij",
+    "connected_doubled_ij"};
+constexpr std::size_t TURN_FIELDS = sizeof(TURN_COLUMNS) / sizeof(TURN_COLUMNS[0]);
+
+// The sixteen fields a pair's rows must carry, rendered here from the PairTurns
+// and the pair's C without going through gap::append_turn_diagnostics: a shape
+// (and its cancelled-gate count) and min_turns only for a C pair, the three
+// events whenever the diagnostics ran.
+std::vector<std::string> expected_turn_fields(const dist::PairTurns &turns, bool connected)
+{
+    std::vector<std::string> out(TURN_FIELDS, "nan");
+    if (!turns.evaluated)
+    {
+        return out;
+    }
+    auto shape = [&](const dist::PathShape &s, std::size_t at, std::size_t cancelled_at) {
+        if (!connected || !s.available)
+        {
+            return;
+        }
+        out[at] = dist::path_class_name(s.path_class);
+        out[at + 1] = std::to_string(s.turns);
+        out[at + 2] = dist::connector_status_name(s.connector_status);
+        out[at + 3] = s.path_class == dist::PathClass::ZigzagTraceOnly ? "1" : "0";
+        std::string layers;
+        for (std::size_t k = 0; k < s.gate_layers.size(); ++k)
+        {
+            layers += (k > 0 ? ";" : "") + std::to_string(s.gate_layers[k]);
+        }
+        out[at + 4] = layers;
+        if (s.cancelled_gates >= 0)
+        {
+            out[cancelled_at] = std::to_string(s.cancelled_gates);
+        }
+    };
+    shape(turns.shortest_maximin, 0, 13);
+    shape(turns.widest, 5, 14);
+    if (connected && turns.min_turns >= 0)
+    {
+        out[10] = std::to_string(turns.min_turns);
+    }
+    out[11] = turns.connected_common_source ? "1" : "0";
+    out[12] = turns.connected_certified ? "1" : "0";
+    out[15] = turns.connected_doubled ? "1" : "0";
+    return out;
+}
+
+std::vector<std::string> turn_fields(const std::vector<std::string> &fields,
+                                     const std::vector<std::string> &columns)
+{
+    std::vector<std::string> out;
+    for (const char *name : TURN_COLUMNS)
+    {
+        out.push_back(field_of(fields, columns, name));
+    }
+    return out;
+}
+
+std::string joined(const std::vector<std::string> &fields)
+{
+    std::string out;
+    for (const std::string &field : fields)
+    {
+        out += ',' + field;
+    }
+    return out;
+}
+
+void test_turn_columns(const std::string &base)
+{
+    namespace audit = mipt::dist::gap::audit;
+    expect(gap::GAP_FORMAT_VERSION == 4, "turn v4: the gap format version is 4");
+
+    // The column list is the contract's, and in both files it follows the gate
+    // columns directly, with the version right after gate_diagnostics_version.
+    {
+        bool same = gap::turn_columns().size() == TURN_FIELDS;
+        for (std::size_t k = 0; same && k < TURN_FIELDS; ++k)
+        {
+            same = std::string(gap::turn_columns()[k]) == TURN_COLUMNS[k];
+        }
+        expect(same, "turn v4: the sixteen turn columns are the contract's, in order");
+        for (const std::vector<std::string> *columns :
+             {&gap::outcome_columns(), &gap::pair_summary_columns()})
+        {
+            auto at = [&](const char *name) {
+                return std::find(columns->begin(), columns->end(), name) - columns->begin();
+            };
+            expect(at("turn_diagnostics_version") == at("gate_diagnostics_version") + 1,
+                   "turn v4: turn_diagnostics_version follows gate_diagnostics_version");
+            bool contiguous = true;
+            for (std::size_t k = 0; k < TURN_FIELDS; ++k)
+            {
+                contiguous = contiguous && at(TURN_COLUMNS[k]) == at("widest_odd_mix_ij") + 1 +
+                                                                      static_cast<long>(k);
+            }
+            expect(contiguous, "turn v4: the turn columns follow the gate-path columns directly");
+        }
+    }
+
+    // The writer by hand.
+    {
+        dist::PairTurns stale; // not evaluated: stale fields never leak
+        stale.min_turns = 2;
+        stale.connected_doubled = true;
+        stale.widest.available = true;
+        std::string out;
+        gap::append_turn_diagnostics(out, stale);
+        expect(out == joined(std::vector<std::string>(TURN_FIELDS, "nan")),
+               "turn v4: unevaluated diagnostics are sixteen nans, whatever the fields hold");
+
+        // Distinct values in every slot, so a permuted column cannot pass: a C
+        // pair needing three turns is not common-source, but is certified and
+        // survives the doubled network.
+        dist::PairTurns turns;
+        turns.evaluated = true;
+        turns.min_turns = 3;
+        turns.connected_common_source = false;
+        turns.connected_certified = true;
+        turns.connected_doubled = true;
+        turns.shortest_maximin.available = true;
+        turns.shortest_maximin.turns = 5;
+        turns.shortest_maximin.path_class = dist::PathClass::ZigzagTraceOnly;
+        turns.shortest_maximin.connector_status = dist::ConnectorStatus::Unmeasured;
+        turns.shortest_maximin.gate_layers = {1, 0, 1};
+        turns.shortest_maximin.cancelled_gates = 2;
+        turns.widest.turns = 5; // unavailable: never written
+        turns.widest.cancelled_gates = 4;
+        out.clear();
+        gap::append_turn_diagnostics(out, turns);
+        expect(out == ",zigzag_trace_only,5,unmeasured,1,1;0;1,nan,nan,nan,nan,nan,3,0,1,2,nan,1",
+               "turn v4: an evaluated pair is written in full, an unavailable shape as nan");
+        std::string reported;
+        gap::append_turn_diagnostics(reported, gap::reported_turns(turns, true));
+        expect(reported == out, "turn v4: a C pair is reported exactly as its snapshot");
+        turns.shortest_maximin.cancelled_gates = -1;
+        std::string hidden;
+        gap::append_turn_diagnostics(hidden, gap::reported_turns(turns, false));
+        expect(hidden == ",nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,0,1,nan,nan,1",
+               "turn v4: a pair that is not C reports no shape and no min_turns");
+        out.clear();
+        gap::append_turn_diagnostics(out, turns);
+        expect(out == ",zigzag_trace_only,5,unmeasured,1,1;0;1,nan,nan,nan,nan,nan,3,0,1,nan,nan,1",
+               "turn v4: a cancelled-gate count that was not computed (-1) is nan, never a count");
+    }
+
+    for (const bool enabled : {false, true})
+    {
+        const std::string dir = base + (enabled ? "/turn_on" : "/turn_off");
+        std::filesystem::create_directories(dir);
+        dist::RunConfig config = test_config(dir);
+        // The turn diagnostics read the gate diagnostics' canonical paths, so
+        // both runs have the gates on and differ only in the turn setting.
+        config.gate_path_diagnostics = true;
+        config.turn_diagnostics = enabled;
+        config.realizations = 6;
+        std::vector<std::unique_ptr<Trajectory>> trajectories;
+        for (std::uint32_t t = 0; t < 6; ++t)
+        {
+            trajectories.push_back(make_trajectory(t, config));
+        }
+        expect(trajectories[0]->connectivity.has_turns() == enabled,
+               "turn v4: the fixture's index precomputes the turn diagnostics exactly when on");
+        auto run = open_run(config, 0, dist::make_pair_bins(N));
+        process_range(*run, 0, 6, false);
+        run->analysis->finish(std::cerr);
+        const std::string version = enabled ? std::to_string(dist::TURN_DIAGNOSTICS_VERSION) : "0";
+        const std::vector<std::string> all_nan(TURN_FIELDS, "nan");
+        const std::vector<std::string> control_fields = [&] {
+            std::vector<std::string> fields = all_nan;
+            if (enabled)
+            {
+                fields[11] = fields[12] = fields[15] = "0";
+            }
+            return fields;
+        }();
+
+        // Every outcome row.
+        const auto &columns = gap::outcome_columns();
+        std::size_t rows = 0;
+        std::size_t anchor_rows = 0;
+        std::size_t control_rows = 0;
+        std::set<std::string> classes;
+        std::set<std::string> statuses;
+        bool cancelled_somewhere = false;
+        std::string first_row;
+        {
+            std::ifstream file(config.pair_gap.output_path);
+            std::string line;
+            std::getline(file, line);
+            while (std::getline(file, line))
+            {
+                const auto fields = mipt::util::resume::split_csv_row(line);
+                expect(fields.size() == columns.size(), "turn v4: every row has the declared columns");
+                if (fields.size() != columns.size())
+                {
+                    break;
+                }
+                if (first_row.empty())
+                {
+                    first_row = line;
+                }
+                ++rows;
+                expect(field_of(fields, columns, "turn_diagnostics_version") == version,
+                       "turn v4: turn_diagnostics_version is 0 off and the definition version on");
+                expect(field_of(fields, columns, "gate_diagnostics_version") ==
+                           std::to_string(mipt::GATE_DIAGNOSTICS_VERSION),
+                       "turn v4: gate_diagnostics_version is unaffected by the turn setting");
+                expect(field_of(fields, columns, "gap_format_version") == "4",
+                       "turn v4: rows carry gap format 4");
+                const std::uint32_t t =
+                    static_cast<std::uint32_t>(std::stoul(field_of(fields, columns, "realization_id")));
+                const int i = std::stoi(field_of(fields, columns, "pair_i"));
+                const int j = std::stoi(field_of(fields, columns, "pair_j"));
+                const gap::PairSnapshot &pair = trajectories[t]->measurement.pair(i, j);
+                const std::vector<std::string> found = turn_fields(fields, columns);
+                if (!enabled)
+                {
+                    expect(found == all_nan, "turn v4: with the diagnostics off every turn column is nan");
+                    continue;
+                }
+                if (field_of(fields, columns, "anchor_role") == "control")
+                {
+                    ++control_rows;
+                    expect(!pair.conn.connected, "turn v4: a control is not C");
+                    expect(found == control_fields,
+                           "turn v4: a control's shapes, cancelled gates and min_turns are nan and "
+                           "its three events 0");
+                    continue;
+                }
+                ++anchor_rows;
+                expect(found == expected_turn_fields(pair.turns, pair.conn.connected),
+                       "turn v4: an anchor's sixteen columns are its own snapshot's PairTurns");
+                expect(found == expected_turn_fields(trajectories[t]->connectivity.pair_turns(i, j), true),
+                       "turn v4: and that is the index's own pair_turns(i, j)");
+                expect(found[0] != "nan" && found[5] != "nan" && found[10] != "nan" &&
+                           found[13] != "nan" && found[14] != "nan",
+                       "turn v4: a C anchor's shapes, cancelled gates and min_turns are all present");
+                expect(!(found[11] == "1" && found[12] != "1") && !(found[12] == "1" && found[15] != "1"),
+                       "turn v4: C_common_source <= C_certified <= C_doubled on every anchor");
+                for (const std::size_t at : {std::size_t{0}, std::size_t{5}})
+                {
+                    classes.insert(found[at]);
+                    statuses.insert(found[at + 2]);
+                    const std::string &cancelled = found[at == 0 ? 13 : 14];
+                    cancelled_somewhere = cancelled_somewhere || cancelled != "0";
+                    // No turn, or one valley: every gate of the path lies in an
+                    // endpoint's past light cone, so the doubled network keeps it.
+                    if (found[at] == "time_monotone" || found[at] == "common_source")
+                    {
+                        expect(cancelled == "0",
+                               "turn v4: a time-monotone or common-source path cancels no gate");
+                    }
+                }
+            }
+        }
+        expect(rows > 0, "turn v4: the run wrote rows");
+        if (enabled)
+        {
+            expect(anchor_rows > 0 && control_rows > 0,
+                   "turn v4: the turn-on run exercises anchors and controls");
+            expect(classes.count("time_monotone") && classes.count("common_source") &&
+                       classes.count("zigzag_certified") && classes.count("zigzag_trace_only"),
+                   "turn v4: the fixture's anchors cover all four path classes");
+            expect(statuses.count("no_bridge") && statuses.count("all_measured") &&
+                       statuses.count("unmeasured"),
+                   "turn v4: and three connector statuses");
+            expect(cancelled_somewhere, "turn v4: some anchor path has a gate the doubled network cancels");
+        }
+
+        // The pair summary carries the same sixteen, per pair.
+        const std::string summary_path = run->analysis->summary_path();
+        {
+            const auto &all = gap::pair_summary_columns();
+            std::ifstream summary(summary_path);
+            std::string line;
+            std::getline(summary, line);
+            std::size_t summary_rows = 0;
+            while (std::getline(summary, line))
+            {
+                const auto fields = mipt::util::resume::split_csv_row(line);
+                expect(fields.size() == all.size(), "turn v4: summary rows have the declared columns");
+                if (fields.size() != all.size())
+                {
+                    break;
+                }
+                ++summary_rows;
+                expect(field_of(fields, all, "turn_diagnostics_version") == version,
+                       "turn v4: the summary carries turn_diagnostics_version");
+                const std::uint32_t t =
+                    static_cast<std::uint32_t>(std::stoul(field_of(fields, all, "realization_id")));
+                const gap::PairSnapshot &pair = trajectories[t]->measurement.pair(
+                    std::stoi(field_of(fields, all, "pair_i")), std::stoi(field_of(fields, all, "pair_j")));
+                expect(turn_fields(fields, all) == expected_turn_fields(pair.turns, pair.conn.connected),
+                       "turn v4: the summary's sixteen columns are the pair's reported PairTurns");
+            }
+            expect(summary_rows > 0, "turn v4: the summary is not empty");
+        }
+
+        // Round trip: a resume rebuilds the summary from the outcome rows
+        // byte-identically, and leaves the rows alone.
+        const std::string before_summary = read_file(summary_path);
+        const std::string before_rows = read_file(config.pair_gap.output_path);
+        const std::string aggregate_path = gap::aggregate_path_for(config.pair_gap.output_path);
+        const std::string before_aggregate = read_file(aggregate_path);
+        std::vector<dist::PairBin> bins = dist::make_pair_bins(N);
+        for (const auto &trajectory : trajectories)
+        {
+            bin_trajectory(bins, trajectory->measurement);
+        }
+        {
+            auto resumed = open_run(config, 6, bins);
+            resumed->analysis->finish(std::cerr);
+        }
+        expect(read_file(summary_path) == before_summary,
+               "turn v4: the summary rebuilt on resume is byte-identical, turn columns included");
+        expect(read_file(config.pair_gap.output_path) == before_rows,
+               "turn v4: and the outcome rows are untouched");
+
+        // The real offline audit restores the setting from the file and
+        // regenerates the same summary.
+        {
+            const audit::OutcomeMeta meta = audit::read_outcome_meta(config.pair_gap.output_path);
+            expect(meta.turn_diagnostics_version == (enabled ? dist::TURN_DIAGNOSTICS_VERSION : 0),
+                   "turn v4: the audit recovers turn_diagnostics_version");
+            for (const char *name : {"MIPT_DIST_AUDIT_PAIR_TOLS", "MIPT_DIST_AUDIT_FGMN_TOLS",
+                                     "MIPT_DIST_AUDIT_CUT_TOL", "MIPT_DIST_AUDIT_MOSEK_TOL",
+                                     "MIPT_DIST_AUDIT_RESOLVE", "MIPT_DIST_AUDIT_PREFIX"})
+            {
+                ::unsetenv(name);
+            }
+            std::ostringstream log;
+            const int status = audit::run_audit(config.pair_gap.output_path, "", "", log);
+            const std::string regenerated =
+                read_file(audit::audit_paths(config.pair_gap.output_path, "").pair_summary);
+            expect(status == 0 && regenerated == before_summary,
+                   "turn v4: --gap-audit regenerates the pair summary byte-identically");
+            expect(read_file(config.pair_gap.output_path) == before_rows &&
+                       read_file(summary_path) == before_summary,
+                   "turn v4: and leaves its inputs alone");
+        }
+
+        // A resume with the turn diagnostics switched the other way is refused
+        // by name, before anything is touched.
+        {
+            dist::RunConfig flipped = config;
+            flipped.turn_diagnostics = !enabled;
+            const std::string message = refusal_message([&] { (void)open_run(flipped, 6, bins); });
+            expect(message.find("turn_diagnostics_version") != std::string::npos &&
+                       message.find("MIPT_DIST_TURN_DIAGNOSTICS") != std::string::npos,
+                   "turn v4: resuming with MIPT_DIST_TURN_DIAGNOSTICS flipped is refused by name");
+            expect(read_file(config.pair_gap.output_path) == before_rows &&
+                       read_file(summary_path) == before_summary &&
+                       read_file(aggregate_path) == before_aggregate,
+                   "turn v4: and the refusal leaves the outcome rows, summary and aggregate alone");
+        }
+
+        if (!enabled)
+        {
+            continue;
+        }
+
+        // The parser on its own: a real row with its sixteen fields replaced.
+        // Every valid rendering comes back as the same text; every damaged one
+        // is refused rather than "repaired" on the way through a resume.
+        {
+            const gap::OutcomeColumns c = gap::OutcomeColumns::resolve();
+            const std::vector<std::string> base_fields = mipt::util::resume::split_csv_row(first_row);
+            auto with = [&](const std::vector<std::string> &turn) {
+                std::vector<std::string> fields = base_fields;
+                for (std::size_t k = 0; k < TURN_FIELDS; ++k)
+                {
+                    fields[static_cast<std::size_t>(
+                        std::find(columns.begin(), columns.end(), TURN_COLUMNS[k]) - columns.begin())] =
+                        turn[k];
+                }
+                return fields;
+            };
+            auto parse = [&](const std::vector<std::string> &turn) {
+                return gap::row_summary_from_fields(with(turn), c, "row", 1e-10, 1e-10);
+            };
+            const std::vector<std::vector<std::string>> valid{
+                all_nan,
+                {"common_source", "1", "no_bridge", "0", "", "nan", "nan", "nan", "nan", "nan", "1",
+                 "1", "1", "nan", "nan", "1"},
+                {"zigzag_trace_only", "3", "unmeasured", "1", "1;0;1", "zigzag_certified", "5",
+                 "mixed", "0", "0;1;0;1;0", "1", "0", "1", "2", "0", "1"}};
+            for (const auto &turn : valid)
+            {
+                std::string rendered;
+                gap::append_turn_diagnostics(rendered, parse(turn).turns);
+                expect(rendered == joined(turn),
+                       "turn v4: a written turn block parses back to the same text" + joined(turn));
+            }
+            auto damaged = [&](std::size_t at, const std::string &value) {
+                std::vector<std::string> turn = valid[2];
+                turn[at] = value;
+                return refuses([&] { (void)parse(turn); });
+            };
+            expect(damaged(3, "0"), "turn v4: a trace-only flag that contradicts the class is refused");
+            expect(damaged(0, "zigzag"), "turn v4: an unknown path class is refused");
+            expect(damaged(7, "sometimes"), "turn v4: an unknown connector status is refused");
+            expect(damaged(4, "1;0;"), "turn v4: a trailing gate-layer separator is refused");
+            expect(damaged(10, "-1"), "turn v4: a negative count is refused, absent is nan");
+            expect(damaged(15, "nan"), "turn v4: a half-evaluated turn block is refused");
+            {
+                std::vector<std::string> turn = valid[1];
+                turn[6] = "3"; // a value beside the unavailable wd shape
+                expect(refuses([&] { (void)parse(turn); }),
+                       "turn v4: a value beside an unavailable shape is refused");
+            }
+        }
+
+        // An unknown turn definition version is refused by the audit, which
+        // would otherwise relabel it with this binary's.
+        {
+            const std::string path = dir + "/v4_unknown_turn_version_connected_zero_thirds.csv";
+            std::vector<std::string> fields = mipt::util::resume::split_csv_row(first_row);
+            fields[static_cast<std::size_t>(
+                std::find(columns.begin(), columns.end(), "turn_diagnostics_version") -
+                columns.begin())] = "7";
+            std::string row;
+            for (const std::string &field : fields)
+            {
+                row += (row.empty() ? "" : ",") + field;
+            }
+            std::ofstream(path, std::ios::binary | std::ios::trunc) << gap::outcome_csv_header() << row
+                                                                     << '\n';
+            const std::string message = refusal_message([&] { (void)audit::read_outcome_meta(path); });
+            expect(message.find("turn_diagnostics_version=7") != std::string::npos,
+                   "turn v4: the audit refuses an unknown turn_diagnostics_version by name");
+        }
+
+        // A v3 file -- no turn_diagnostics_version, no turn columns -- is
+        // refused by name, by the audit and by the resume.
+        {
+            const std::string v3_path = dir + "/v3_connected_zero_thirds.csv";
+            write_stale_outcome(config.pair_gap.output_path, v3_path, v4_only_columns(), "3");
+            const std::string audited = refusal_message([&] { (void)audit::read_outcome_meta(v3_path); });
+            expect(audited.find("gap format v3") != std::string::npos &&
+                       audited.find("v4 added turn_diagnostics_version") != std::string::npos,
+                   "turn v4: the audit refuses a v3 outcome file, names it, and says what v4 added");
+            gap::GapAggregate ignored;
+            ignored.reset(N);
+            const std::string resumed = refusal_message(
+                [&] { (void)gap::scan_outcomes(v3_path, 1000000, ignored, config.pair_gap); });
+            expect(resumed.find("gap format v3") != std::string::npos &&
+                       resumed.find("gap format v4") != std::string::npos,
+                   "turn v4: so does the resume, naming both versions");
         }
     }
 }
@@ -2055,6 +2573,7 @@ int main()
     test_solver_failures(directory);
     test_pair_summary(directory);
     test_gate_path_columns(directory);
+    test_turn_columns(directory);
     test_named_triple_states();
     test_four_mode_ghz();
     test_high_precision_replay();

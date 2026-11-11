@@ -1007,6 +1007,14 @@ class PairProtocol
                 << "; widest-path and shortest-maximin gate entangling power per pair, "
                    "appended to the records (NaN unless connected)\n";
         }
+        if (config_.turn_diagnostics)
+        {
+            out << "turn_diagnostics=1: turn_diagnostics_version=" << TURN_DIAGNOSTICS_VERSION
+                << "; temporal-turn shapes of both canonical gate paths and min_turns per "
+                   "pair, appended to the records (NaN unless connected); record flag bits "
+                   "7/8/9 = connected_common_source/connected_certified/connected_doubled; "
+                   "their 2x2 tables against entanglement in the pair CSV\n";
+        }
         records::announce(out, sink_, config_.output_path);
     }
 
@@ -1130,6 +1138,13 @@ class PairProtocol
                 config_.gate_path_diagnostics
                     ? connectivity.gate_path_metrics(pairs_[pair_index][0], pairs_[pair_index][1])
                     : GatePathMetrics{};
+            // The temporal-turn shapes of the same two canonical paths, and the
+            // refined events. Also a lookup; left unevaluated when off, which
+            // keeps every turn value NaN and every turn flag bit clear.
+            const PairTurns turns =
+                config_.turn_diagnostics
+                    ? connectivity.pair_turns(pairs_[pair_index][0], pairs_[pair_index][1])
+                    : PairTurns{};
             if (collect_)
             {
                 gap::PairSnapshot snapshot;
@@ -1146,6 +1161,16 @@ class PairProtocol
                 // control carries NaN rather than the value of a path that
                 // does not reach it.
                 snapshot.gate_path = conn.connected ? gate_path : GatePathMetrics{};
+                // The turn shapes follow the same rule, for the same reason.
+                // min_turns and the existence flags stay: they are statements
+                // about the final-slice nodes, and the refined flags already
+                // carry endpoint survival.
+                snapshot.turns = turns;
+                if (!conn.connected)
+                {
+                    snapshot.turns.shortest_maximin = PathShape{};
+                    snapshot.turns.widest = PathShape{};
+                }
                 snapshot.entangled = entangled;
                 snapshot.zero_class = zero_class;
                 snapshot.fermion_rho_ri =
@@ -1202,14 +1227,22 @@ class PairProtocol
                         ++bin.disconnected_ent_zero;
                     }
                 }
+                // The three refinements of C, against the same `entangled` the
+                // plain cells use, over the same evaluated records -- which is
+                // what makes every count identity the resume checks exact.
+                if (config_.turn_diagnostics)
+                {
+                    bin.common_source.add(turns.connected_common_source, entangled);
+                    bin.certified.add(turns.connected_certified, entangled);
+                    bin.doubled.add(turns.connected_doubled, entangled);
+                }
             }
 
             if (write_records)
             {
-                std::uint32_t flags = conn.flags();
-                flags |= entangled ? FLAG_FN_POSITIVE : 0u;
-                flags |= mn_positive ? FLAG_MN_POSITIVE : 0u;
-                fill_record_values(metrics, fermion_metrics, conn, gate_path);
+                const std::uint32_t flags =
+                    records::pair_record_flags(conn, entangled, mn_positive, turns);
+                fill_record_values(metrics, fermion_metrics, conn, gate_path, turns);
                 sink_.add(static_cast<std::uint32_t>(realization),
                           static_cast<std::uint32_t>(bin_of_pair_[pair_index]),
                           embedding_of_pair_[pair_index], flags, record_values_.data());
@@ -1236,16 +1269,16 @@ class PairProtocol
     // other in this file and in dist_records.hpp for that reason, and
     // `make test-dist` pins the pairing by name.
     void fill_record_values(const PairMetrics &metrics, const PairMetrics &fermion_metrics,
-                            const PairConnectivity &conn, const GatePathMetrics &gate_path)
+                            const PairConnectivity &conn, const GatePathMetrics &gate_path,
+                            const PairTurns &turns)
     {
         const std::size_t slot = fill_detail_record_values(metrics, fermion_metrics);
-        // The gate-path diagnostics go after every detail-level value, exactly
-        // where records::pair_observable_names appends their names, and through
-        // the same host-tested helper that decides NaN-for-no-path.
-        if (config_.gate_path_diagnostics)
-        {
-            records::fill_gate_record_values(conn, gate_path, record_values_.data() + slot);
-        }
+        // The gate-path and turn diagnostics go after every detail-level value,
+        // exactly where records::pair_observable_names appends their names, and
+        // through the host-tested helper that owns their order and decides
+        // NaN-for-no-path.
+        records::fill_pair_diagnostic_values(config_, conn, gate_path, turns,
+                                             record_values_.data() + slot);
     }
 
     // The detail-level values; returns the next free slot.
@@ -2027,7 +2060,7 @@ inline void run_protocols(const RunConfig &config, PairProtocol *pairs, TriplePr
             // entanglement against a graph from any other draw would measure
             // nothing; see TrajectoryResult.
             connectivity.build(trajectory.history, config.connectivity_paths,
-                               config.gate_path_diagnostics);
+                               config.gate_path_diagnostics, config.turn_diagnostics);
             if (!connectivity.ready() && !connectivity_warned)
             {
                 connectivity_warned = true;
@@ -2046,6 +2079,17 @@ inline void run_protocols(const RunConfig &config, PairProtocol *pairs, TriplePr
                     " carries no finite gate capacities. The logical history did not "
                     "record the gates' entangling powers, so the diagnostics would be "
                     "NaN throughout.");
+            }
+            // Same reasoning for the turns: without the precomputed table
+            // every pair_turns() lookup would come back unevaluated, every turn
+            // value NaN and every record counted outside all three refined events.
+            if (config.turn_diagnostics && !connectivity.has_turns())
+            {
+                throw std::runtime_error(
+                    "MIPT_DIST_TURN_DIAGNOSTICS=1, but the spacetime graph of realization " +
+                    std::to_string(realization) +
+                    " has no temporal-turn table, so every turn value would be NaN and "
+                    "every record would fall outside all three refined events.");
             }
         }
         if (!backend_reported)
@@ -2177,6 +2221,10 @@ inline void apply_environment(RunConfig &config)
     // Per-pair gate quality along the spacetime paths; off by default. Its
     // preconditions are checked by validate_gate_diagnostics in run().
     config.gate_path_diagnostics = env::boolean("MIPT_DIST_GATE_DIAGNOSTICS", false);
+    // The temporal-turn shapes of the same paths and the refined events built
+    // on them; off by default, and refused without the gate diagnostics by
+    // validate_turn_diagnostics in run().
+    config.turn_diagnostics = env::boolean("MIPT_DIST_TURN_DIAGNOSTICS", false);
     config.record_detail = parse_record_detail(
         env::text("MIPT_DIST_RECORD_DETAIL", record_detail_name(RecordDetail::Channel)));
     config.record_stride = env::integer("MIPT_DIST_RECORD_STRIDE", 1, 1, 1000000000);
@@ -2374,6 +2422,9 @@ inline void run(const RunConfig &input)
 {
     validate_args(input);
     validate_pair_gap(input);
+    // Turns first: a turn run without the gate setting should be told about the
+    // setting it is missing, not about a gate precondition it never asked for.
+    records::validate_turn_diagnostics(input);
     records::validate_gate_diagnostics(input, records::enabled());
     if (input.k == 0)
     {
@@ -2526,6 +2577,26 @@ inline void print_usage(const char *argv0)
         << "    k=2 or k=0, MIPT_DIST_CONNECTIVITY=1, and records or\n"
         << "    MIPT_DIST_PAIR_GAP_TRIPLES=1 required. Changes the pair CSV and record\n"
         << "    headers, so a run cannot be resumed across this setting.\n"
+        << "  MIPT_DIST_TURN_DIAGNOSTICS=0 set to 1 to read the same two canonical gate\n"
+        << "    paths as temporal-turn shapes. The graph is undirected, so a path can run\n"
+        << "    backward in time, cross a gate and run forward again: one such turn is a\n"
+        << "    common source (both endpoints' past light cones hold the gate), and a\n"
+        << "    zig-zag also peaks at a late bridge gate, which cancels in the density\n"
+        << "    matrix unless a connector is measured after it. Appended to every k=2\n"
+        << "    record, after the gate values, for the shortest-maximin (sm_) and widest\n"
+        << "    (wd_) paths: turns, temporal_forward, temporal_backward, min_layer,\n"
+        << "    max_layer, class (0 time_monotone, 1 common_source, 2 zigzag_certified,\n"
+        << "    3 zigzag_trace_only), bridges, bridges_measured, bridges_trace_only,\n"
+        << "    cancelled_gates; then min_turns over every walk. NaN unless the pair is\n"
+        << "    connected. Record flag bits 7/8/9 mark C_common_source (some walk turns\n"
+        << "    at most once), C_certified (some walk peaks only at measured bridges) and\n"
+        << "    C_doubled (the endpoints stay joined after every gate outside the past\n"
+        << "    light cones of the measurements and the two endpoints cancels as\n"
+        << "    U^dag U; when it fails, rho_ij is exactly a product), nested inside C,\n"
+        << "    and the pair CSV gains the three events' 2x2 tables against entanglement\n"
+        << "    as its last fifteen columns. Never changes the percolation event. Needs\n"
+        << "    MIPT_DIST_GATE_DIAGNOSTICS=1, and changes the pair CSV and record headers,\n"
+        << "    so a run cannot be resumed across this setting either.\n"
         << "  k=2 / k=0 connected-zero triple analysis (parity-preserving circuits):\n"
         << "  MIPT_DIST_PAIR_GAP_TRIPLES=0 set to 1 to analyse every graph-connected pair\n"
         << "    with fN <= MIPT_DIST_PAIR_ZERO_TOL against every third site k != i, j:\n"

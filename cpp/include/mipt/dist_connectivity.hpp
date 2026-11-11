@@ -71,6 +71,7 @@
 #include <functional>
 #include <limits>
 #include <queue>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -98,6 +99,11 @@ enum ConnectivityFlag : std::uint32_t
     FLAG_CONNECTED = 1u << 4,     // the complete percolation event C
     FLAG_FN_POSITIVE = 1u << 5,   // fN > the configured zero tolerance
     FLAG_MN_POSITIVE = 1u << 6,   // the ordinary-trace negativity is positive
+    // Temporal-turn diagnostics (MIPT_DIST_TURN_DIAGNOSTICS); written only when
+    // they ran. See PairTurns below.
+    FLAG_CONNECTED_COMMON_SOURCE = 1u << 7, // C, and a walk with <= 1 temporal turn exists
+    FLAG_CONNECTED_CERTIFIED = 1u << 8,     // C, and a measurement-certified walk exists
+    FLAG_CONNECTED_DOUBLED = 1u << 9,       // C survives the doubled-network cancellation
 };
 
 struct PairConnectivity
@@ -223,6 +229,252 @@ struct GatePathMetrics
     double widest_entangling_power = std::numeric_limits<double>::quiet_NaN();
     double widest_even_block_mixing = std::numeric_limits<double>::quiet_NaN();
     double widest_odd_block_mixing = std::numeric_limits<double>::quiet_NaN();
+};
+
+// ---------------------------------------------------------------------------
+// Temporal turns (MIPT_DIST_TURN_DIAGNOSTICS)
+//
+// The question
+// ------------
+// The graph is undirected, so a path between two final-slice endpoints may run
+// *backward* in time, cross a gate, and run forward again. Two such shapes are
+// physically different objects:
+//
+//   * a **common source** -- one backward-to-forward turn, a V: from i down to
+//     a gate, across it, up to j. The gate at the bottom lies in the past light
+//     cone of both endpoints, so it can correlate them;
+//   * a **zig-zag** -- the path also turns forward-to-backward at a *peak*: it
+//     climbs a connector worldline to a late gate (the **bridge**), crosses it
+//     and descends another connector. A bridge acts only on connector modes. If
+//     those are never measured afterwards and are traced out at the end, the
+//     bridge cancels against its adjoint in the density matrix (U^dag U = I)
+//     and the path carries nothing at all: a **trace-only bridge**. If a
+//     connector *is* measured after the bridge, the record conditions on it and
+//     the bridge can swap entanglement onto the endpoints: a
+//     **measurement-certified bridge**.
+//
+// Conventions
+// -----------
+//   * A **turn** is a change of direction between two consecutive temporal
+//     edges of a path (gate edges between them do not count). A path between
+//     two final-slice nodes starts backward and ends forward, so its turn count
+//     is odd, or zero when it is a single final-layer gate.
+//   * A turn backward-to-forward is a **valley**; forward-to-backward is a
+//     **peak**. In a simple path exactly one gate edge sits between the two
+//     temporal edges of a turn (each node has one gate edge), and at a peak it
+//     is the bridge. `mode_in` is the connector the path climbs, `mode_out` the
+//     one it descends.
+//   * A bridge at layer t is **measured** if either connector is measured at
+//     any layer >= t (gates precede measurements inside a layer, so layer t
+//     itself counts). Otherwise it is **endpoint-anchored** if a connector is
+//     one of the two endpoints' modes -- an unmeasured connector then *is* that
+//     endpoint's worldline, so the bridge is in its past light cone and cannot
+//     cancel -- and **trace-only** if not.
+//   * Path classes: 0 turns = time_monotone; 1 turn = common_source; >= 2 turns
+//     = zigzag_trace_only if any bridge is trace-only (one cancelling bridge
+//     cuts the path), else zigzag_certified.
+//
+// Pair-level existence (path-independent)
+// ---------------------------------------
+// The two canonical paths are one witness each; whether a *better* path exists
+// is a separate question, answered over all non-backtracking walks between the
+// two final-slice nodes:
+//
+//   * min_turns: the fewest turns any such walk needs (0-1 BFS over
+//     (node, last temporal direction, arrived-by-gate) states);
+//   * common_source: min_turns <= 1. Exactly "the endpoints' past light cones
+//     intersect", which the tests check against an independent cone BFS;
+//   * certified: a walk exists whose every peak crosses a *measured* bridge.
+//     Endpoint-anchored bridges need not be admitted: a walk through one can be
+//     rerouted up that endpoint's own worldline with no peak there at all.
+//
+// The doubled network (the definitive test)
+// -----------------------------------------
+// The two walk criteria above are proxies. The exact statement is about the
+// density matrix rho_ij = Tr_env[K rho_0 K^dag], drawn as a doubled tensor
+// network (every gate appears as U on the ket layer and U^dag on the bra layer;
+// tracing a mode joins its two layers locally). Call a *sink* every measurement
+// projector and the two endpoints' final nodes. A gate whose future light cone
+// contains no sink acts only on modes that are traced out unconditioned, so it
+// can be moved to the end and cancels against its adjoint (U^dag U = I) -- and
+// so does everything in its future. What survives is exactly the gates in the
+// union of the sinks' past light cones,
+//
+//     R_M  (past cone of every measurement event, pair-independent)
+//     L_i, L_j  (past cones of the two endpoints' final nodes),
+//
+// and the network that remains connects modes only through those gates. So
+//
+//     doubled_network(i, j):  the two final nodes are joined by temporal edges
+//                             and gates in R_M u L_i u L_j,
+//
+// and when it fails the remaining network *factorizes* between i and j:
+// rho_ij = rho_i (x) rho_j exactly, whatever the gates are. That is a theorem,
+// not a heuristic, and `make test-dist` checks it against simulated states.
+// The converse does not hold -- a surviving connection can still carry an
+// accidentally small correlation -- so this is the sharpest *necessary*
+// condition the graph can state.
+//
+// A past cone is closed backward in time along temporal edges (where unmeasured)
+// and across in-layer gate edges; a gate is in a cone exactly when either of its
+// nodes is. Every gate a certified walk uses is in R_M u L_i u L_j, so
+//
+//     C_common_source <= C_certified <= C_doubled <= C,
+//
+// and none of this alters C.
+// ---------------------------------------------------------------------------
+
+inline constexpr int TURN_DIAGNOSTICS_VERSION = 1;
+inline constexpr const char *TURN_DIAGNOSTICS_DEFINITION =
+    "turn=direction change between consecutive temporal edges;peak=F-gate-B,bridge=its gate;"
+    "bridge measured if a connector is measured at layer>=bridge layer,else endpoint-anchored "
+    "if a connector is an endpoint mode,else trace-only;class:0 turns=time_monotone,"
+    "1=common_source,>=2=zigzag_trace_only if any trace-only bridge else zigzag_certified;"
+    "min_turns over non-backtracking walks;common_source=min_turns<=1;"
+    "certified=walk whose every peak is a measured bridge;"
+    "doubled_network=connected through temporal edges and gates in the past light cone of a "
+    "measurement or of either endpoint (every other gate cancels as U^dag U);"
+    "cancelled_gates=gates of a path outside that set";
+
+// An ordered path: `nodes[k]` and `nodes[k+1]` are the two ends of
+// `edges[k]` (graph_edges() indices). Starts at endpoint i's final-slice node.
+struct GraphPath
+{
+    std::vector<std::uint32_t> nodes;
+    std::vector<std::uint32_t> edges;
+    bool empty() const { return edges.empty(); }
+};
+
+enum class PathClass : int
+{
+    TimeMonotone = 0,
+    CommonSource = 1,
+    ZigzagCertified = 2,
+    ZigzagTraceOnly = 3,
+};
+
+inline const char *path_class_name(PathClass value)
+{
+    switch (value)
+    {
+    case PathClass::TimeMonotone: return "time_monotone";
+    case PathClass::CommonSource: return "common_source";
+    case PathClass::ZigzagCertified: return "zigzag_certified";
+    case PathClass::ZigzagTraceOnly: break;
+    }
+    return "zigzag_trace_only";
+}
+
+enum class BridgeStatus : int
+{
+    Measured = 0,
+    EndpointAnchored = 1,
+    TraceOnly = 2,
+};
+
+inline const char *bridge_status_name(BridgeStatus value)
+{
+    switch (value)
+    {
+    case BridgeStatus::Measured: return "measured";
+    case BridgeStatus::EndpointAnchored: return "endpoint_anchored";
+    case BridgeStatus::TraceOnly: break;
+    }
+    return "trace_only";
+}
+
+// Whether a path's connectors are measured after their bridges. Endpoint-
+// anchored bridges count as unmeasured here; they never make a path trace-only.
+enum class ConnectorStatus : int
+{
+    NoBridge = 0,
+    AllMeasured = 1,
+    Mixed = 2,
+    Unmeasured = 3,
+};
+
+inline const char *connector_status_name(ConnectorStatus value)
+{
+    switch (value)
+    {
+    case ConnectorStatus::NoBridge: return "no_bridge";
+    case ConnectorStatus::AllMeasured: return "all_measured";
+    case ConnectorStatus::Mixed: return "mixed";
+    case ConnectorStatus::Unmeasured: break;
+    }
+    return "unmeasured";
+}
+
+struct PathBridge
+{
+    std::uint32_t edge = 0;
+    int layer = 0;
+    int mode_in = 0;
+    int mode_out = 0;
+    // First layer >= `layer` at which each connector is measured; -1 if never.
+    int measured_layer_in = -1;
+    int measured_layer_out = -1;
+    BridgeStatus status = BridgeStatus::TraceOnly;
+};
+
+struct PathShape
+{
+    bool available = false;
+    int length = 0; // edges
+    int unitary = 0;
+    int temporal_forward = 0;
+    int temporal_backward = 0;
+    int turns = 0;
+    int valleys = 0;
+    int peaks = 0;
+    int min_layer = -1;
+    int max_layer = -1;
+    std::vector<int> gate_layers; // one per unitary edge, in path order
+    std::vector<PathBridge> bridges; // one per peak, in path order
+    int bridges_measured = 0;
+    int bridges_endpoint = 0;
+    int bridges_trace_only = 0;
+    // Gates of this path that the doubled-network reduction cancels for its
+    // two endpoints; > 0 means the path itself does not survive. Filled by
+    // pair_turns (it needs the endpoints' cones), -1 when not computed.
+    int cancelled_gates = -1;
+    PathClass path_class = PathClass::TimeMonotone;
+    ConnectorStatus connector_status = ConnectorStatus::NoBridge;
+
+    bool zigzag() const { return available && turns >= 2; }
+    bool trace_only_bridge() const { return available && path_class == PathClass::ZigzagTraceOnly; }
+};
+
+// Everything the turn diagnostics know about one final-slice pair.
+struct PairTurns
+{
+    bool evaluated = false;
+    // The two canonical paths of GatePathMetrics, read as shapes. Unavailable
+    // when the graph carries no gate metrics or the endpoints share no
+    // component.
+    PathShape shortest_maximin;
+    PathShape widest;
+    // Over all non-backtracking walks between the two final-slice nodes; -1
+    // when no walk exists.
+    int min_turns = -1;
+    bool common_source = false;
+    bool certified = false;
+    // The same with endpoint survival applied, i.e. the refined percolation
+    // events. Both imply PairConnectivity::connected.
+    bool connected_common_source = false;
+    bool connected_certified = false;
+    // The doubled-network test, without and with endpoint survival.
+    bool doubled_network = false;
+    bool connected_doubled = false;
+
+    std::uint32_t flags() const
+    {
+        std::uint32_t mask = 0;
+        mask |= connected_common_source ? FLAG_CONNECTED_COMMON_SOURCE : 0u;
+        mask |= connected_certified ? FLAG_CONNECTED_CERTIFIED : 0u;
+        mask |= connected_doubled ? FLAG_CONNECTED_DOUBLED : 0u;
+        return mask;
+    }
 };
 
 // Union-find with path halving and union by size. Small enough to keep here
@@ -456,10 +708,17 @@ class ConnectivityIndex
     // final-slice pair (one bottleneck sweep per site per capacity, plus the
     // shortest-path DAG walks), so gate_path_metrics() is a lookup. It changes
     // nothing else the index reports.
-    void build(const LogicalHistory &history, bool with_paths, bool with_gate_paths = false)
+    //
+    // `with_turns` additionally precomputes PairTurns for every final-slice
+    // pair: two walk searches per site, plus -- when the graph carries gate
+    // metrics -- both canonical paths of every pair read as shapes. Like the
+    // gate paths it changes nothing else the index reports.
+    void build(const LogicalHistory &history, bool with_paths, bool with_gate_paths = false,
+               bool with_turns = false)
     {
         ready_ = false;
         gate_paths_.clear();
+        pair_turns_.clear();
         n_ = history.n;
         layers_ = static_cast<int>(history.layers.size());
         if (!history.valid || n_ <= 0 || layers_ <= 0)
@@ -523,6 +782,23 @@ class ConnectivityIndex
         };
         for_each_edge(history, add_edge);
 
+        // The turn searches rely on every node carrying at most one gate edge
+        // (a mode sits in one bond per layer): a walk may then never take two
+        // gate edges in a row, because the second could only be the first one
+        // retraced. A history that breaks this -- two bonds on one mode in one
+        // layer -- would have its turns silently miscounted, so it is recorded
+        // here and the turn diagnostics refuse it. RPPU and qRPPU never do.
+        single_gate_nodes_ = true;
+        for (std::size_t node = 0; node < nodes && single_gate_nodes_; ++node)
+        {
+            int gates = 0;
+            for (std::uint32_t slot = offset_[node]; slot < offset_[node + 1u]; ++slot)
+            {
+                gates += graph_edges_[arc_edge_[slot]].kind == GraphEdgeKind::Unitary ? 1 : 0;
+            }
+            single_gate_nodes_ = gates <= 1;
+        }
+
         // Per-site final-slice facts. `mode_at_site` is the identity for every
         // circuit in the registry, but going through it is what keeps a future
         // transporting circuit from mislabelling both endpoints at once.
@@ -553,11 +829,235 @@ class ConnectivityIndex
         // tree path between them does. Doing it here rather than per anchor is
         // what keeps the anatomy affordable at 200k anchors.
         build_block_cut_tree();
+        build_measurement_table(history);
         ready_ = true;
         if (with_gate_paths && gate_metrics_)
         {
             fill_gate_paths();
         }
+        if (with_turns)
+        {
+            if (!single_gate_nodes_)
+            {
+                throw std::invalid_argument(
+                    "Turn diagnostics need at most one gate per mode per layer; this history "
+                    "puts two bonds on one mode in one layer, so its turns cannot be counted.");
+            }
+            fill_turns();
+        }
+    }
+
+    bool has_turns() const { return ready_ && !pair_turns_.empty(); }
+    // Whether the turn diagnostics are defined on this graph at all; see build().
+    bool turns_supported() const { return ready_ && single_gate_nodes_; }
+
+    // Spacetime node <-> (layer, mode).
+    int node_layer(std::uint32_t node) const { return static_cast<int>(node / static_cast<std::uint32_t>(n_)); }
+    int node_mode(std::uint32_t node) const { return static_cast<int>(node % static_cast<std::uint32_t>(n_)); }
+
+    // The first layer >= `layer` at which `mode` is measured, or -1 if it never
+    // is. Includes the final layer, whose measurements decide survival.
+    int next_measurement(int layer, int mode) const
+    {
+        if (!ready_ || layer < 0 || layer >= layers_ || mode < 0 || mode >= n_)
+        {
+            return -1;
+        }
+        return next_measurement_[static_cast<std::size_t>(layer) * static_cast<std::size_t>(n_) +
+                                 static_cast<std::size_t>(mode)];
+    }
+
+    // The canonical paths behind GatePathMetrics, with their ordered nodes.
+    // Identical to shortest_maximin_path / widest_gate_path, which return only
+    // the edges of these.
+    GraphPath shortest_maximin_trace(int site_i, int site_j) const
+    {
+        if (!gate_query_valid(site_i, site_j))
+        {
+            return {};
+        }
+        const std::uint32_t source = final_node(site_i);
+        std::vector<std::int32_t> distance;
+        std::vector<std::uint32_t> order;
+        bfs(source, distance, order);
+        std::vector<double> best;
+        shortest_bottleneck(distance, order, source, best);
+        return shortest_maximin_from(source, final_node(site_j), distance, order, best);
+    }
+
+    GraphPath widest_gate_trace(int site_i, int site_j,
+                                GateCapacity which = GateCapacity::EntanglingPower) const
+    {
+        if (!gate_query_valid(site_i, site_j))
+        {
+            return {};
+        }
+        const std::uint32_t source = final_node(site_i);
+        std::vector<double> widest;
+        widest_from(source, which, widest);
+        return widest_from_trace(source, final_node(site_j), which, widest);
+    }
+
+    // Read a path as a turn shape. `site_i`/`site_j` are the endpoints whose
+    // modes make a bridge endpoint-anchored. An empty or malformed path comes
+    // back unavailable.
+    PathShape path_shape(const GraphPath &path, int site_i, int site_j) const
+    {
+        PathShape out;
+        if (!ready_ || path.edges.empty() || path.nodes.size() != path.edges.size() + 1u ||
+            site_i < 0 || site_j < 0 || site_i >= n_ || site_j >= n_)
+        {
+            return out;
+        }
+        const int mode_i = mode_of_site_[static_cast<std::size_t>(site_i)];
+        const int mode_j = mode_of_site_[static_cast<std::size_t>(site_j)];
+        out.length = static_cast<int>(path.edges.size());
+        out.min_layer = node_layer(path.nodes.front());
+        out.max_layer = out.min_layer;
+        for (std::uint32_t node : path.nodes)
+        {
+            out.min_layer = std::min(out.min_layer, node_layer(node));
+            out.max_layer = std::max(out.max_layer, node_layer(node));
+        }
+        int last = 0; // +1 forward, -1 backward, 0 none yet
+        for (std::size_t k = 0; k < path.edges.size(); ++k)
+        {
+            const GraphEdge &edge = graph_edges_[path.edges[k]];
+            const std::uint32_t from = path.nodes[k];
+            const std::uint32_t to = path.nodes[k + 1u];
+            if (!((edge.a == from && edge.b == to) || (edge.a == to && edge.b == from)))
+            {
+                return PathShape{};
+            }
+            if (edge.kind == GraphEdgeKind::Unitary)
+            {
+                ++out.unitary;
+                out.gate_layers.push_back(edge.layer);
+                continue;
+            }
+            const int direction = node_layer(to) > node_layer(from) ? 1 : -1;
+            (direction > 0 ? out.temporal_forward : out.temporal_backward) += 1;
+            if (last != 0 && direction != last)
+            {
+                ++out.turns;
+                // A turn needs the gate edge between its two temporal edges; a
+                // simple path has exactly one there.
+                if (k == 0 || graph_edges_[path.edges[k - 1u]].kind != GraphEdgeKind::Unitary)
+                {
+                    return PathShape{};
+                }
+                if (last > 0)
+                {
+                    ++out.peaks;
+                    PathBridge bridge;
+                    bridge.edge = path.edges[k - 1u];
+                    bridge.layer = graph_edges_[bridge.edge].layer;
+                    bridge.mode_in = node_mode(path.nodes[k - 1u]);
+                    bridge.mode_out = node_mode(from);
+                    bridge.measured_layer_in = next_measurement(bridge.layer, bridge.mode_in);
+                    bridge.measured_layer_out = next_measurement(bridge.layer, bridge.mode_out);
+                    if (bridge.measured_layer_in >= 0 || bridge.measured_layer_out >= 0)
+                    {
+                        bridge.status = BridgeStatus::Measured;
+                        ++out.bridges_measured;
+                    }
+                    else if (bridge.mode_in == mode_i || bridge.mode_in == mode_j ||
+                             bridge.mode_out == mode_i || bridge.mode_out == mode_j)
+                    {
+                        bridge.status = BridgeStatus::EndpointAnchored;
+                        ++out.bridges_endpoint;
+                    }
+                    else
+                    {
+                        bridge.status = BridgeStatus::TraceOnly;
+                        ++out.bridges_trace_only;
+                    }
+                    out.bridges.push_back(bridge);
+                }
+                else
+                {
+                    ++out.valleys;
+                }
+            }
+            last = direction;
+        }
+        if (out.turns == 0)
+        {
+            out.path_class = PathClass::TimeMonotone;
+        }
+        else if (out.turns == 1 && out.peaks == 0)
+        {
+            out.path_class = PathClass::CommonSource;
+        }
+        else
+        {
+            out.path_class = out.bridges_trace_only > 0 ? PathClass::ZigzagTraceOnly
+                                                        : PathClass::ZigzagCertified;
+        }
+        const int bridges = static_cast<int>(out.bridges.size());
+        out.connector_status = bridges == 0 ? ConnectorStatus::NoBridge
+                               : out.bridges_measured == bridges ? ConnectorStatus::AllMeasured
+                               : out.bridges_measured == 0       ? ConnectorStatus::Unmeasured
+                                                                 : ConnectorStatus::Mixed;
+        out.available = true;
+        return out;
+    }
+
+    // The turn diagnostics for one final-slice pair. A lookup when build()
+    // precomputed them, computed on demand otherwise.
+    PairTurns pair_turns(int site_i, int site_j) const
+    {
+        if (!ready_ || site_i == site_j || site_i < 0 || site_j < 0 || site_i >= n_ ||
+            site_j >= n_)
+        {
+            return {};
+        }
+        if (!pair_turns_.empty())
+        {
+            return pair_turns_[static_cast<std::size_t>(site_i) * static_cast<std::size_t>(n_) +
+                               static_cast<std::size_t>(site_j)];
+        }
+        if (!single_gate_nodes_)
+        {
+            return {}; // unevaluated: the turn searches are not defined here
+        }
+        std::vector<int> turns;
+        std::vector<std::uint8_t> certified;
+        const std::uint32_t source = final_node(site_i);
+        walk_turns_from(source, turns);
+        walk_certified_from(source, certified);
+        PairTurns out;
+        fill_pair_existence(site_i, site_j, turns, certified, out);
+        std::vector<std::uint8_t> measurement;
+        std::vector<std::uint8_t> cone_i;
+        std::vector<std::uint8_t> cone_j;
+        measurement_cone(measurement);
+        endpoint_cone(site_i, cone_i);
+        endpoint_cone(site_j, cone_j);
+        fill_doubled(site_i, site_j, measurement, cone_i, cone_j, out);
+        if (gate_query_valid(site_i, site_j))
+        {
+            out.shortest_maximin = path_shape(shortest_maximin_trace(site_i, site_j), site_i, site_j);
+            out.widest = path_shape(widest_gate_trace(site_i, site_j), site_i, site_j);
+            count_cancelled(shortest_maximin_trace(site_i, site_j), measurement, cone_i, cone_j,
+                            out.shortest_maximin);
+            count_cancelled(widest_gate_trace(site_i, site_j), measurement, cone_i, cone_j, out.widest);
+        }
+        return out;
+    }
+
+    // The doubled-network relevance of one node for a pair: in the past light
+    // cone of a measurement or of either endpoint. Exposed for tests and the
+    // offline tools; O(V) per call, so not for inner loops.
+    bool doubled_relevant(std::uint32_t node, int site_i, int site_j) const
+    {
+        std::vector<std::uint8_t> measurement;
+        std::vector<std::uint8_t> cone_i;
+        std::vector<std::uint8_t> cone_j;
+        measurement_cone(measurement);
+        endpoint_cone(site_i, cone_i);
+        endpoint_cone(site_j, cone_j);
+        return measurement[node] != 0u || cone_i[node] != 0u || cone_j[node] != 0u;
     }
 
     // Whether every unitary edge carries finite gate metrics (RPPU/qRPPU do;
@@ -604,64 +1104,13 @@ class ConnectivityIndex
     // Empty when the query is not available.
     std::vector<std::uint32_t> shortest_maximin_path(int site_i, int site_j) const
     {
-        std::vector<std::uint32_t> out;
-        if (!gate_query_valid(site_i, site_j))
-        {
-            return out;
-        }
-        const std::uint32_t source = final_node(site_i);
-        const std::uint32_t sink = final_node(site_j);
-        std::vector<std::int32_t> distance;
-        std::vector<std::uint32_t> order;
-        bfs(source, distance, order);
-        std::vector<double> best;
-        shortest_bottleneck(distance, order, source, best);
-        std::vector<int> count;
-        std::vector<std::uint32_t> via;
-        fewest_gates(distance, order, source, best[sink], count, &via);
-        walk_back(source, sink, via, out);
-        return out;
+        return shortest_maximin_trace(site_i, site_j).edges;
     }
 
     std::vector<std::uint32_t> widest_gate_path(int site_i, int site_j,
                                                 GateCapacity which = GateCapacity::EntanglingPower) const
     {
-        std::vector<std::uint32_t> out;
-        if (!gate_query_valid(site_i, site_j))
-        {
-            return out;
-        }
-        const std::uint32_t source = final_node(site_i);
-        const std::uint32_t sink = final_node(site_j);
-        std::vector<double> widest;
-        widest_from(source, which, widest);
-        const double floor = widest[sink];
-        // Shortest path inside the subgraph of edges at least that wide.
-        const std::size_t nodes = node_count();
-        std::vector<std::uint32_t> via(nodes, UNSET);
-        std::vector<std::uint8_t> seen(nodes, 0u);
-        std::vector<std::uint32_t> queue{source};
-        seen[source] = 1u;
-        for (std::size_t head = 0; head < queue.size(); ++head)
-        {
-            const std::uint32_t node = queue[head];
-            if (node == sink)
-            {
-                break;
-            }
-            for (std::uint32_t slot = offset_[node]; slot < offset_[node + 1u]; ++slot)
-            {
-                const std::uint32_t next = adjacency_[slot];
-                if (seen[next] == 0u && capacity(slot, which) >= floor)
-                {
-                    seen[next] = 1u;
-                    via[next] = slot;
-                    queue.push_back(next);
-                }
-            }
-        }
-        walk_back(source, sink, via, out);
-        return out;
+        return widest_gate_trace(site_i, site_j, which).edges;
     }
 
     bool ready() const { return ready_; }
@@ -1022,7 +1471,7 @@ class ConnectivityIndex
                     count[node] = candidate;
                     if (via != nullptr)
                     {
-                        // The slot is node's own arc back to `previous`; walk_back
+                        // The slot is node's own arc back to `previous`; trace_back
                         // follows it.
                         (*via)[node] = slot;
                     }
@@ -1063,26 +1512,412 @@ class ConnectivityIndex
         }
     }
 
-    // Follow recorded in-slots from sink back to source; `via[v]` is a slot of
-    // v's own adjacency or of its predecessor's, both of which name the edge.
-    void walk_back(std::uint32_t source, std::uint32_t sink, const std::vector<std::uint32_t> &via,
-                   std::vector<std::uint32_t> &out) const
+    // The canonical shortest-maximin path from per-source structures: among
+    // shortest paths whose weakest gate attains the maximin, the one with the
+    // fewest gates, ties to the lowest adjacency slot.
+    GraphPath shortest_maximin_from(std::uint32_t source, std::uint32_t sink,
+                                    const std::vector<std::int32_t> &distance,
+                                    const std::vector<std::uint32_t> &order,
+                                    const std::vector<double> &best) const
     {
-        out.clear();
+        std::vector<int> count;
+        std::vector<std::uint32_t> via;
+        fewest_gates(distance, order, source, best[sink], count, &via);
+        return trace_back(source, sink, via);
+    }
+
+    // The canonical widest path: the shortest path inside the subgraph of edges
+    // at least as wide as the widest-path value.
+    GraphPath widest_from_trace(std::uint32_t source, std::uint32_t sink, GateCapacity which,
+                                const std::vector<double> &widest) const
+    {
+        const double floor = widest[sink];
+        const std::size_t nodes = node_count();
+        std::vector<std::uint32_t> via(nodes, UNSET);
+        std::vector<std::uint8_t> seen(nodes, 0u);
+        std::vector<std::uint32_t> queue{source};
+        seen[source] = 1u;
+        for (std::size_t head = 0; head < queue.size(); ++head)
+        {
+            const std::uint32_t node = queue[head];
+            if (node == sink)
+            {
+                break;
+            }
+            for (std::uint32_t slot = offset_[node]; slot < offset_[node + 1u]; ++slot)
+            {
+                const std::uint32_t next = adjacency_[slot];
+                if (seen[next] == 0u && capacity(slot, which) >= floor)
+                {
+                    seen[next] = 1u;
+                    via[next] = slot;
+                    queue.push_back(next);
+                }
+            }
+        }
+        return trace_back(source, sink, via);
+    }
+
+    // Follow the recorded in-slots back from sink to source: the ordered path.
+    GraphPath trace_back(std::uint32_t source, std::uint32_t sink,
+                         const std::vector<std::uint32_t> &via) const
+    {
+        GraphPath out;
         std::uint32_t node = sink;
+        out.nodes.push_back(node);
         while (node != source)
         {
             const std::uint32_t slot = via[node];
             if (slot == UNSET)
             {
-                out.clear();
-                return;
+                return {};
             }
-            out.push_back(arc_edge_[slot]);
+            out.edges.push_back(arc_edge_[slot]);
             const GraphEdge &edge = graph_edges_[arc_edge_[slot]];
             node = edge.a == node ? edge.b : edge.a;
+            out.nodes.push_back(node);
         }
-        std::reverse(out.begin(), out.end());
+        std::reverse(out.nodes.begin(), out.nodes.end());
+        std::reverse(out.edges.begin(), out.edges.end());
+        return out;
+    }
+
+    // next_measurement_[layer * n + mode], and whether each gate is a measured
+    // bridge candidate (a connector measured at or after its layer).
+    void build_measurement_table(const LogicalHistory &history)
+    {
+        next_measurement_.assign(node_count(), -1);
+        for (int mode = 0; mode < n_; ++mode)
+        {
+            int next = -1;
+            for (int layer = layers_ - 1; layer >= 0; --layer)
+            {
+                if (history.layers[static_cast<std::size_t>(layer)].measured[static_cast<std::size_t>(mode)])
+                {
+                    next = layer;
+                }
+                next_measurement_[static_cast<std::size_t>(layer) * static_cast<std::size_t>(n_) +
+                                  static_cast<std::size_t>(mode)] = next;
+            }
+        }
+        gate_measured_.assign(graph_edges_.size(), 0u);
+        for (std::size_t e = 0; e < graph_edges_.size(); ++e)
+        {
+            const GraphEdge &edge = graph_edges_[e];
+            if (edge.kind != GraphEdgeKind::Unitary)
+            {
+                continue;
+            }
+            const std::size_t base = static_cast<std::size_t>(edge.layer) * static_cast<std::size_t>(n_);
+            gate_measured_[e] = (next_measurement_[base + static_cast<std::size_t>(node_mode(edge.a))] >= 0 ||
+                                 next_measurement_[base + static_cast<std::size_t>(node_mode(edge.b))] >= 0)
+                                    ? 1u
+                                    : 0u;
+        }
+    }
+
+    // Walk states: node * 6 + direction * 2 + arrived_by_gate, direction 0 =
+    // none yet, 1 = backward, 2 = forward. A walk never immediately retraces an
+    // edge: a node has one gate edge and at most one temporal edge each way, so
+    // that rule is all "non-backtracking" needs.
+    static constexpr int WALK_STATES = 6;
+
+    template <typename Visit>
+    void walk_successors(std::uint32_t state, bool require_measured_peaks, Visit visit) const
+    {
+        const std::uint32_t node = state / WALK_STATES;
+        const int direction = static_cast<int>((state % WALK_STATES) / 2u);
+        const bool by_gate = (state % 2u) != 0u;
+        for (std::uint32_t slot = offset_[node]; slot < offset_[node + 1u]; ++slot)
+        {
+            const std::uint32_t next = adjacency_[slot];
+            const GraphEdge &edge = graph_edges_[arc_edge_[slot]];
+            if (edge.kind == GraphEdgeKind::Unitary)
+            {
+                if (by_gate)
+                {
+                    continue;
+                }
+                visit(next * WALK_STATES + static_cast<std::uint32_t>(direction) * 2u + 1u, 0);
+                continue;
+            }
+            const int step = node_layer(next) > node_layer(node) ? 2 : 1;
+            if (!by_gate && direction != 0 && step != direction)
+            {
+                continue; // straight back along the edge just used
+            }
+            const bool turn = direction != 0 && step != direction;
+            if (turn && step == 1 && require_measured_peaks)
+            {
+                // A peak: forward, the gate this node was entered by, backward.
+                bool measured = false;
+                for (std::uint32_t g = offset_[node]; g < offset_[node + 1u]; ++g)
+                {
+                    if (graph_edges_[arc_edge_[g]].kind == GraphEdgeKind::Unitary)
+                    {
+                        measured = gate_measured_[arc_edge_[g]] != 0u;
+                    }
+                }
+                if (!measured)
+                {
+                    continue;
+                }
+            }
+            visit(next * WALK_STATES + static_cast<std::uint32_t>(step) * 2u, turn ? 1 : 0);
+        }
+    }
+
+    // Fewest turns to every node (min over its states), -1 when unreachable.
+    void walk_turns_from(std::uint32_t source, std::vector<int> &turns) const
+    {
+        const std::size_t states = node_count() * WALK_STATES;
+        std::vector<int> best(states, -1);
+        std::deque<std::uint32_t> queue;
+        const std::uint32_t start = source * WALK_STATES;
+        best[start] = 0;
+        queue.push_back(start);
+        std::vector<std::uint8_t> done(states, 0u);
+        while (!queue.empty())
+        {
+            const std::uint32_t state = queue.front();
+            queue.pop_front();
+            if (done[state] != 0u)
+            {
+                continue;
+            }
+            done[state] = 1u;
+            walk_successors(state, false, [&](std::uint32_t next, int cost) {
+                const int candidate = best[state] + cost;
+                if (best[next] < 0 || candidate < best[next])
+                {
+                    best[next] = candidate;
+                    if (cost == 0)
+                    {
+                        queue.push_front(next);
+                    }
+                    else
+                    {
+                        queue.push_back(next);
+                    }
+                }
+            });
+        }
+        turns.assign(node_count(), -1);
+        for (std::size_t node = 0; node < node_count(); ++node)
+        {
+            for (int k = 0; k < WALK_STATES; ++k)
+            {
+                const int value = best[node * WALK_STATES + static_cast<std::size_t>(k)];
+                if (value >= 0 && (turns[node] < 0 || value < turns[node]))
+                {
+                    turns[node] = value;
+                }
+            }
+        }
+    }
+
+    // Which nodes a walk with only measured peaks reaches.
+    void walk_certified_from(std::uint32_t source, std::vector<std::uint8_t> &reached) const
+    {
+        const std::size_t states = node_count() * WALK_STATES;
+        std::vector<std::uint8_t> seen(states, 0u);
+        std::vector<std::uint32_t> stack{source * WALK_STATES};
+        seen[source * WALK_STATES] = 1u;
+        while (!stack.empty())
+        {
+            const std::uint32_t state = stack.back();
+            stack.pop_back();
+            walk_successors(state, true, [&](std::uint32_t next, int) {
+                if (seen[next] == 0u)
+                {
+                    seen[next] = 1u;
+                    stack.push_back(next);
+                }
+            });
+        }
+        reached.assign(node_count(), 0u);
+        for (std::size_t node = 0; node < node_count(); ++node)
+        {
+            for (int k = 0; k < WALK_STATES; ++k)
+            {
+                reached[node] |= seen[node * WALK_STATES + static_cast<std::size_t>(k)];
+            }
+        }
+    }
+
+    // Close `cone` backward in time from its marked nodes: down temporal edges
+    // (present only where the mode was unmeasured) and across in-layer gates.
+    void close_past_cone(std::vector<std::uint8_t> &cone, std::vector<std::uint32_t> stack) const
+    {
+        while (!stack.empty())
+        {
+            const std::uint32_t node = stack.back();
+            stack.pop_back();
+            for (std::uint32_t slot = offset_[node]; slot < offset_[node + 1u]; ++slot)
+            {
+                const std::uint32_t next = adjacency_[slot];
+                const bool gate = graph_edges_[arc_edge_[slot]].kind == GraphEdgeKind::Unitary;
+                if ((gate || node_layer(next) < node_layer(node)) && cone[next] == 0u)
+                {
+                    cone[next] = 1u;
+                    stack.push_back(next);
+                }
+            }
+        }
+    }
+
+    // R_M: every node from which some measurement event is causally reachable.
+    // A measurement at layer t acts after that layer's gates, so its node
+    // (t, m) is itself in the cone.
+    void measurement_cone(std::vector<std::uint8_t> &cone) const
+    {
+        cone.assign(node_count(), 0u);
+        std::vector<std::uint32_t> stack;
+        for (int layer = 0; layer < layers_; ++layer)
+        {
+            for (int mode = 0; mode < n_; ++mode)
+            {
+                if (next_measurement(layer, mode) == layer)
+                {
+                    const std::uint32_t node = node_index(layer, mode);
+                    cone[node] = 1u;
+                    stack.push_back(node);
+                }
+            }
+        }
+        close_past_cone(cone, std::move(stack));
+    }
+
+    void endpoint_cone(int site, std::vector<std::uint8_t> &cone) const
+    {
+        cone.assign(node_count(), 0u);
+        const std::uint32_t node = final_node(site);
+        cone[node] = 1u;
+        close_past_cone(cone, {node});
+    }
+
+    // Union-find over temporal edges plus the gates the doubled network keeps.
+    void fill_doubled(int site_i, int site_j, const std::vector<std::uint8_t> &measurement,
+                      const std::vector<std::uint8_t> &cone_i, const std::vector<std::uint8_t> &cone_j,
+                      PairTurns &out) const
+    {
+        DisjointSets sets;
+        sets.reset(node_count());
+        for (const GraphEdge &edge : graph_edges_)
+        {
+            if (edge.kind == GraphEdgeKind::Temporal || measurement[edge.a] != 0u ||
+                cone_i[edge.a] != 0u || cone_j[edge.a] != 0u)
+            {
+                sets.unite(edge.a, edge.b);
+            }
+        }
+        out.doubled_network = sets.find(final_node(site_i)) == sets.find(final_node(site_j));
+        const bool survive = survives_[static_cast<std::size_t>(site_i)] != 0u &&
+                             survives_[static_cast<std::size_t>(site_j)] != 0u;
+        out.connected_doubled = survive && out.doubled_network;
+    }
+
+    void count_cancelled(const GraphPath &path, const std::vector<std::uint8_t> &measurement,
+                         const std::vector<std::uint8_t> &cone_i, const std::vector<std::uint8_t> &cone_j,
+                         PathShape &shape) const
+    {
+        if (!shape.available)
+        {
+            return;
+        }
+        shape.cancelled_gates = 0;
+        for (std::uint32_t e : path.edges)
+        {
+            const GraphEdge &edge = graph_edges_[e];
+            if (edge.kind == GraphEdgeKind::Unitary && measurement[edge.a] == 0u &&
+                cone_i[edge.a] == 0u && cone_j[edge.a] == 0u)
+            {
+                ++shape.cancelled_gates;
+            }
+        }
+    }
+
+    void fill_pair_existence(int site_i, int site_j, const std::vector<int> &turns,
+                             const std::vector<std::uint8_t> &certified, PairTurns &out) const
+    {
+        out.evaluated = true;
+        const std::uint32_t sink = final_node(site_j);
+        out.min_turns = turns[sink];
+        out.common_source = out.min_turns >= 0 && out.min_turns <= 1;
+        out.certified = certified[sink] != 0u;
+        const bool survive = survives_[static_cast<std::size_t>(site_i)] != 0u &&
+                             survives_[static_cast<std::size_t>(site_j)] != 0u;
+        out.connected_common_source = survive && out.common_source;
+        out.connected_certified = survive && out.certified;
+    }
+
+    // Every ordered final-slice pair: two walk searches per source, and the two
+    // canonical paths of every target from per-source structures.
+    void fill_turns()
+    {
+        pair_turns_.assign(static_cast<std::size_t>(n_) * static_cast<std::size_t>(n_), PairTurns{});
+        std::vector<int> turns;
+        std::vector<std::uint8_t> certified;
+        std::vector<std::int32_t> distance;
+        std::vector<std::uint32_t> order;
+        std::vector<double> best;
+        std::vector<double> widest;
+        std::vector<std::uint8_t> measurement;
+        measurement_cone(measurement);
+        std::vector<std::vector<std::uint8_t>> cones(static_cast<std::size_t>(n_));
+        for (int site = 0; site < n_; ++site)
+        {
+            endpoint_cone(site, cones[static_cast<std::size_t>(site)]);
+        }
+        for (int i = 0; i < n_; ++i)
+        {
+            const std::uint32_t source = final_node(i);
+            walk_turns_from(source, turns);
+            walk_certified_from(source, certified);
+            if (gate_metrics_)
+            {
+                bfs(source, distance, order);
+                shortest_bottleneck(distance, order, source, best);
+                widest_from(source, GateCapacity::EntanglingPower, widest);
+            }
+            for (int j = 0; j < n_; ++j)
+            {
+                if (j == i)
+                {
+                    continue;
+                }
+                PairTurns &out = pair_turns_[static_cast<std::size_t>(i) * static_cast<std::size_t>(n_) +
+                                             static_cast<std::size_t>(j)];
+                fill_pair_existence(i, j, turns, certified, out);
+                const auto &cone_i = cones[static_cast<std::size_t>(i)];
+                const auto &cone_j = cones[static_cast<std::size_t>(j)];
+                if (j < i)
+                {
+                    // Symmetric in (i, j): reuse the mirrored pair's verdict.
+                    const PairTurns &mirror =
+                        pair_turns_[static_cast<std::size_t>(j) * static_cast<std::size_t>(n_) +
+                                    static_cast<std::size_t>(i)];
+                    out.doubled_network = mirror.doubled_network;
+                    out.connected_doubled = mirror.connected_doubled;
+                }
+                else
+                {
+                    fill_doubled(i, j, measurement, cone_i, cone_j, out);
+                }
+                if (gate_metrics_ &&
+                    root_[static_cast<std::size_t>(i)] == root_[static_cast<std::size_t>(j)])
+                {
+                    const std::uint32_t sink = final_node(j);
+                    const GraphPath shortest = shortest_maximin_from(source, sink, distance, order, best);
+                    const GraphPath wide =
+                        widest_from_trace(source, sink, GateCapacity::EntanglingPower, widest);
+                    out.shortest_maximin = path_shape(shortest, i, j);
+                    out.widest = path_shape(wide, i, j);
+                    count_cancelled(shortest, measurement, cone_i, cone_j, out.shortest_maximin);
+                    count_cancelled(wide, measurement, cone_i, cone_j, out.widest);
+                }
+            }
+        }
     }
 
     GatePathMetrics compute_gate_path(int site_i, int site_j) const
@@ -1697,8 +2532,15 @@ class ConnectivityIndex
     std::vector<std::uint32_t> arc_edge_;
     std::vector<GraphEdge> graph_edges_;
     bool gate_metrics_ = false;
+    bool single_gate_nodes_ = true;
     // n*n, filled only when build() was asked for gate paths.
     std::vector<GatePathMetrics> gate_paths_;
+    // layers*n: first measurement of each mode at or after each layer.
+    std::vector<int> next_measurement_;
+    // Per graph edge: a gate with a connector measured at or after its layer.
+    std::vector<std::uint8_t> gate_measured_;
+    // n*n, filled only when build() was asked for turns.
+    std::vector<PairTurns> pair_turns_;
     std::vector<int> mode_of_site_;
     std::vector<std::uint32_t> root_;
     std::vector<std::uint32_t> component_size_;

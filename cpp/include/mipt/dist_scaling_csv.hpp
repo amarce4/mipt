@@ -325,6 +325,12 @@ struct RunConfig
     // qRPPU only. Never changes `connected`. See dist_connectivity.hpp
     // (GatePathMetrics) and analysis/gate_entanglement.hpp.
     bool gate_path_diagnostics = false;
+    // Temporal-turn diagnostics (MIPT_DIST_TURN_DIAGNOSTICS): the turn shape of
+    // each pair's two canonical gate paths, and the common-source and
+    // measurement-certified refinements of `connected`. Needs the gate
+    // diagnostics, whose canonical paths it reads. See PairTurns in
+    // dist_connectivity.hpp.
+    bool turn_diagnostics = false;
 
     // --- per-record output ------------------------------------------------
     RecordDetail record_detail = RecordDetail::Channel;
@@ -480,6 +486,48 @@ inline void validate_args(const RunConfig &config)
 // a complete, correctly normalized file behind.
 // ---------------------------------------------------------------------------
 
+// One refinement of the percolation event C, tabulated against the same
+// entanglement classification the plain contingency table uses.
+//
+// The temporal-turn diagnostics (MIPT_DIST_TURN_DIAGNOSTICS) define three
+// events nested inside C, record by record: C_common_source, some walk joining
+// the endpoints turns at most once (their past light cones meet); C_certified,
+// some walk crosses only measured bridges at its peaks; and C_doubled, the
+// endpoints stay joined once every gate outside the past light cones of the
+// measurements and of the two endpoints has cancelled against its adjoint --
+// the exact statement, whose failure makes rho_ij a product. So
+// C_common_source <= C_certified <= C_doubled <= C. See PairTurns in
+// dist_connectivity.hpp. Each table's four cells count the records with
+// connectivity evaluated, so they partition `conn_records` exactly as the plain
+// table's do.
+//
+// "disconnected" here is the complement of the *refined* event, so a record
+// with C=1 that fails the refinement lands in a disconnected cell. That is the
+// point of the table: P(E | not C_D) against eta = P(E | not C) says whether
+// the pairs the refinement takes out of C were carrying any entanglement --
+// which, for C_doubled, they provably cannot be.
+struct RefinedContingency
+{
+    std::uint64_t connected = 0;
+    std::uint64_t connected_ent_positive = 0;
+    std::uint64_t connected_ent_zero = 0;
+    std::uint64_t disconnected_ent_positive = 0;
+    std::uint64_t disconnected_ent_zero = 0;
+
+    void add(bool event, bool entangled)
+    {
+        if (event)
+        {
+            ++connected;
+            ++(entangled ? connected_ent_positive : connected_ent_zero);
+        }
+        else
+        {
+            ++(entangled ? disconnected_ent_positive : disconnected_ent_zero);
+        }
+    }
+};
+
 struct PairBin
 {
     int separation = 0;
@@ -572,6 +620,13 @@ struct PairBin
     // Second-stage explanatory diagnostics; see dist_connectivity.hpp.
     RunningStats component_size;
     RunningStats shortest_path; // over connected records only
+
+    // The temporal-turn refinements of C. Advanced only when the run enables
+    // MIPT_DIST_TURN_DIAGNOSTICS, and written to the CSV only then, as the last
+    // fifteen columns of the row.
+    RefinedContingency common_source;
+    RefinedContingency certified;
+    RefinedContingency doubled;
 };
 
 // A GMN-family measure: its running mean plus the bookkeeping that says how
@@ -747,6 +802,12 @@ inline std::string pair_csv_header(const RunConfig &config)
     {
         header += ",gate_path_diagnostics,gate_diagnostics_version,gate_diagnostics_definition";
     }
+    // The turn diagnostics' run-level constants, by the same rule: present only
+    // when enabled, so a run with them off keeps its header byte for byte.
+    if (config.turn_diagnostics)
+    {
+        header += ",turn_diagnostics,turn_diagnostics_version,turn_diagnostics_definition";
+    }
     header +=
         ",separation,chord_length,d,embedding_count,"
         "mi_mean,mi_stderr,mi_samples,"
@@ -784,6 +845,24 @@ inline std::string pair_csv_header(const RunConfig &config)
         "i_occ_connected_classical_samples,"
         "component_size_mean,component_size_stderr,component_size_samples,"
         "shortest_path_mean,shortest_path_stderr,shortest_path_samples";
+    // The three refined 2x2 tables go last, so every column before them sits
+    // where a run without the diagnostics puts it.
+    if (config.turn_diagnostics)
+    {
+        header +=
+            ",connected_common_source_count,connected_common_source_ent_positive_count,"
+            "connected_common_source_ent_zero_count,"
+            "disconnected_common_source_ent_positive_count,"
+            "disconnected_common_source_ent_zero_count,"
+            "connected_certified_count,connected_certified_ent_positive_count,"
+            "connected_certified_ent_zero_count,"
+            "disconnected_certified_ent_positive_count,"
+            "disconnected_certified_ent_zero_count,"
+            "connected_doubled_count,connected_doubled_ent_positive_count,"
+            "connected_doubled_ent_zero_count,"
+            "disconnected_doubled_ent_positive_count,"
+            "disconnected_doubled_ent_zero_count";
+    }
     header += '\n';
     return header;
 }
@@ -818,6 +897,16 @@ inline std::string triple_csv_header(const RunConfig &config)
     return header;
 }
 
+// A refined table's five counters, in pair_csv_header()'s order.
+inline void append_refined_contingency(std::string &out, const RefinedContingency &cells)
+{
+    append_counter(out, cells.connected);
+    append_counter(out, cells.connected_ent_positive);
+    append_counter(out, cells.connected_ent_zero);
+    append_counter(out, cells.disconnected_ent_positive);
+    append_counter(out, cells.disconnected_ent_zero);
+}
+
 inline std::string render_pair_csv(const RunConfig &config, const std::vector<PairBin> &bins)
 {
     std::string out = pair_csv_header(config);
@@ -839,6 +928,13 @@ inline std::string render_pair_csv(const RunConfig &config, const std::vector<Pa
             line += std::to_string(GATE_DIAGNOSTICS_VERSION);
             line += ',';
             line += csv_quote(GATE_DIAGNOSTICS_DEFINITION);
+        }
+        if (config.turn_diagnostics)
+        {
+            line += ",1,";
+            line += std::to_string(TURN_DIAGNOSTICS_VERSION);
+            line += ',';
+            line += csv_quote(TURN_DIAGNOSTICS_DEFINITION);
         }
         line += ',';
         line += std::to_string(bin.separation);
@@ -895,6 +991,12 @@ inline std::string render_pair_csv(const RunConfig &config, const std::vector<Pa
         append_stats(line, bin.i_occ_connected_classical);
         append_stats(line, bin.component_size);
         append_stats(line, bin.shortest_path);
+        if (config.turn_diagnostics)
+        {
+            append_refined_contingency(line, bin.common_source);
+            append_refined_contingency(line, bin.certified);
+            append_refined_contingency(line, bin.doubled);
+        }
         line += '\n';
         out += line;
     }

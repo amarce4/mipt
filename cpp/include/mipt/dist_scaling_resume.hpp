@@ -303,6 +303,89 @@ inline void check_contingency(const PairBin &bin, const std::string &path, std::
     }
 }
 
+// One refined table's five counters (MIPT_DIST_TURN_DIAGNOSTICS), by the
+// event's column stem: `common_source`, `certified` or `doubled`.
+inline RefinedContingency restore_refined_contingency(
+    const csv::CsvTable &table, std::size_t row, std::string_view event)
+{
+    const std::string name(event);
+    RefinedContingency cells;
+    cells.connected = table.counter(row, "connected_" + name + "_count");
+    cells.connected_ent_positive = table.counter(row, "connected_" + name + "_ent_positive_count");
+    cells.connected_ent_zero = table.counter(row, "connected_" + name + "_ent_zero_count");
+    cells.disconnected_ent_positive =
+        table.counter(row, "disconnected_" + name + "_ent_positive_count");
+    cells.disconnected_ent_zero = table.counter(row, "disconnected_" + name + "_ent_zero_count");
+    return cells;
+}
+
+// The refined tables have exact invariants too, and more of them than the
+// plain one, because three facts hold record by record: each table partitions
+// the records the plain table partitions, all four classify on the same E, and
+// the events nest, C_common_source <= C_certified <= C_doubled <= C. So each
+// table's cells sum to conn_records, its connected count is its two connected
+// cells, its entangled margin equals the plain table's, and every connected
+// cell is bounded by the next-larger event's. Checking them after
+// check_contingency has accepted the plain table is what lets the plain one
+// serve as the reference.
+inline void check_refined_contingency(const PairBin &bin, const std::string &path, std::size_t row)
+{
+    const std::string where = path + " line " + std::to_string(row + 2);
+    const std::uint64_t entangled = bin.connected_ent_positive + bin.disconnected_ent_positive;
+    auto check = [&](const RefinedContingency &cells, const std::string &event) {
+        const std::uint64_t classified = cells.connected_ent_positive + cells.connected_ent_zero +
+                                         cells.disconnected_ent_positive +
+                                         cells.disconnected_ent_zero;
+        if (classified != bin.conn_records)
+        {
+            csv::refuse(
+                where + " has a " + event + " contingency table summing to " +
+                std::to_string(classified) + " against " + std::to_string(bin.conn_records) +
+                " records with connectivity. Its four cells partition those records, so "
+                "they must sum to exactly that.");
+        }
+        if (cells.connected_ent_positive + cells.connected_ent_zero != cells.connected)
+        {
+            csv::refuse(where + " has connected_" + event +
+                        "_count disagreeing with its two entanglement cells.");
+        }
+        if (cells.connected_ent_positive + cells.disconnected_ent_positive != entangled)
+        {
+            csv::refuse(
+                where + " counts " +
+                std::to_string(cells.connected_ent_positive + cells.disconnected_ent_positive) +
+                " entangled records in its " + event + " table but " +
+                std::to_string(entangled) +
+                " in the plain one. Both classify the same records on the same threshold.");
+        }
+    };
+    check(bin.common_source, "common_source");
+    check(bin.certified, "certified");
+    check(bin.doubled, "doubled");
+
+    // The plain table as a fourth link of the chain, so one comparison covers
+    // every adjacent pair of events.
+    RefinedContingency plain;
+    plain.connected = bin.connected;
+    plain.connected_ent_positive = bin.connected_ent_positive;
+    plain.connected_ent_zero = bin.connected_ent_zero;
+    const RefinedContingency *chain[] = {&bin.common_source, &bin.certified, &bin.doubled, &plain};
+    for (std::size_t link = 0; link + 1 < std::size(chain); ++link)
+    {
+        const RefinedContingency &inner = *chain[link];
+        const RefinedContingency &outer = *chain[link + 1];
+        if (inner.connected > outer.connected ||
+            inner.connected_ent_positive > outer.connected_ent_positive ||
+            inner.connected_ent_zero > outer.connected_ent_zero)
+        {
+            csv::refuse(
+                where + " has refined connectivity counts that violate C_common_source <= "
+                        "C_certified <= C_doubled <= C. Each event implies the next record "
+                        "by record, so none of its cells can outnumber the next one's.");
+        }
+    }
+}
+
 // --- k=2 -------------------------------------------------------------------
 
 inline Report load_pairs(const RunConfig &config, std::vector<PairBin> &bins)
@@ -329,6 +412,18 @@ inline Report load_pairs(const RunConfig &config, std::vector<PairBin> &bins)
             path + " was written with MIPT_DIST_GATE_DIAGNOSTICS=" +
             (config.gate_path_diagnostics ? "0" : "1") + ", but this run sets it to " +
             (config.gate_path_diagnostics ? "1" : "0") +
+            ". Resume it with the setting it was started under, move it aside, or set "
+            "MIPT_DIST_RESUME=0 to overwrite it.");
+    }
+    // The turn diagnostics, likewise: their columns exist only when enabled,
+    // and a file pooled across the setting would hold refined tables that
+    // cover part of its trajectories while claiming to cover all of them.
+    if (table.has_column("turn_diagnostics") != config.turn_diagnostics)
+    {
+        csv::refuse(
+            path + " was written with MIPT_DIST_TURN_DIAGNOSTICS=" +
+            (config.turn_diagnostics ? "0" : "1") + ", but this run sets it to " +
+            (config.turn_diagnostics ? "1" : "0") +
             ". Resume it with the setting it was started under, move it aside, or set "
             "MIPT_DIST_RESUME=0 to overwrite it.");
     }
@@ -370,6 +465,17 @@ inline Report load_pairs(const RunConfig &config, std::vector<PairBin> &bins)
             require_same_text(
                 "gate_diagnostics_definition", GATE_DIAGNOSTICS_DEFINITION,
                 table.text(row, "gate_diagnostics_definition"), path);
+        }
+        if (config.turn_diagnostics)
+        {
+            csv::require_same(
+                "turn_diagnostics", 1L, table.integer(row, "turn_diagnostics"), path);
+            csv::require_same(
+                "turn_diagnostics_version", static_cast<long>(TURN_DIAGNOSTICS_VERSION),
+                table.integer(row, "turn_diagnostics_version"), path);
+            require_same_text(
+                "turn_diagnostics_definition", TURN_DIAGNOSTICS_DEFINITION,
+                table.text(row, "turn_diagnostics_definition"), path);
         }
         PairBin &bin = bins[row];
         csv::require_same(
@@ -458,6 +564,13 @@ inline Report load_pairs(const RunConfig &config, std::vector<PairBin> &bins)
         bin.component_size = table.stats_by_stderr(row, "component_size");
         bin.shortest_path = table.stats_by_stderr(row, "shortest_path");
         check_contingency(bin, path, row);
+        if (config.turn_diagnostics)
+        {
+            bin.common_source = restore_refined_contingency(table, row, "common_source");
+            bin.certified = restore_refined_contingency(table, row, "certified");
+            bin.doubled = restore_refined_contingency(table, row, "doubled");
+            check_refined_contingency(bin, path, row);
+        }
 
         fold_completed(bin.mi.count, bin.embedding_count, path, row, completed);
     }
